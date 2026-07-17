@@ -70,7 +70,8 @@ typedef struct {
 
     /* RAOP-specific */
     bool encrypt;
-    bool alac;
+    bool alac;         /* force compressed ALAC (default already is compressed) */
+    bool raw;          /* force uncompressed audio instead of compressed ALAC */
     char *secret;
     char *password;
     char *et;
@@ -78,6 +79,7 @@ typedef struct {
     char *am;
     char *pk;
     char *pw;
+    char *cn;          /* mDNS cn field: codec/compression types the device supports */
     char *iface;
 
     /* AirPlay 2-specific */
@@ -398,10 +400,20 @@ static int run_raop(cli_config_t *cfg, int infile)
 
     latency = MS2TS(cfg->latency_ms, cfg->sample_rate);
 
+    /* Codec selection: default to compressed ALAC, which virtually every RAOP
+     * receiver advertises and which saves LAN bandwidth. Fall back to uncompressed
+     * only when the device's mDNS cn field is present and does not list ALAC (1),
+     * or when --raw is forced; --alac forces compressed regardless. */
+    bool use_alac = true;
+    if (cfg->cn && *cfg->cn && !strchr(cfg->cn, '1')) use_alac = false;
+    if (cfg->alac) use_alac = true;
+    if (cfg->raw) use_alac = false;
+    LOG_INFO("RAOP codec: %s", use_alac ? "ALAC (compressed)" : "ALAC-raw (uncompressed)");
+
     /* Create RAOP client */
     g_raopcl = raopcl_create(
         host_addr, 0, 0, cfg->dacp_id, cfg->active_remote,
-        cfg->alac ? RAOP_ALAC : RAOP_ALAC_RAW,
+        use_alac ? RAOP_ALAC : RAOP_ALAC_RAW,
         DEFAULT_FRAMES_PER_CHUNK, latency, crypto,
         (cfg->am && strcasestr(cfg->am, "airport")),  /* auth */
         cfg->secret ? cfg->secret : "",
@@ -658,16 +670,18 @@ static void print_usage(const char *name)
     printf("  --check                    Print check info and exit\n");
     printf("  --pair                     Enter pairing mode\n\n");
     printf("RAOP options:\n");
+    printf("  --alac                     Force compressed ALAC (default)\n");
+    printf("  --raw                      Force uncompressed audio (ALAC-raw)\n");
     printf("  --encrypt                  Enable audio payload encryption\n");
-    printf("  --alac                     Send ALAC compressed audio\n");
     printf("  --secret <secret>          AppleTV pairing secret\n");
     printf("  --password <password>      Device password\n");
     printf("  --if <ip>                  Local interface IP to bind\n");
-    printf("  --et <value>               mDNS et field\n");
-    printf("  --md <value>               mDNS md field\n");
+    printf("  --et <value>               mDNS et field (encryption types)\n");
+    printf("  --md <value>               mDNS md field (metadata types)\n");
     printf("  --am <value>               mDNS am field (model name)\n");
-    printf("  --pk <value>               mDNS pk field\n");
-    printf("  --pw <value>               mDNS pw field\n\n");
+    printf("  --pk <value>               mDNS pk field (public key)\n");
+    printf("  --pw <value>               mDNS pw field (password flag)\n");
+    printf("  --cn <value>               mDNS cn field (codec types); auto-selects codec\n\n");
     printf("AirPlay 2 options:\n");
     printf("  --auth <credentials>       HAP credentials (hex string)\n");
     printf("  --name <name>              Device name\n");
@@ -737,6 +751,8 @@ int main(int argc, char *argv[])
         {"hostname",     required_argument, 0, 'H'},
         {"txt",          required_argument, 0, 't'},
         {"ptp-offset",   required_argument, 0, 1004},
+        {"cn",           required_argument, 0, 1005},
+        {"raw",          no_argument,       0, 1006},
         {"ntp",          no_argument,       0, 1001},
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
@@ -783,6 +799,8 @@ int main(int argc, char *argv[])
         case 'H': cfg.ap2_hostname = optarg; break;
         case 't': cfg.ap2_txt = optarg; break;
         case 1004: sscanf(optarg, "%" PRId64, &cfg.ptp_offset_ns); break;
+        case 1005: cfg.cn = optarg; break;
+        case 1006: cfg.raw = true; break;
         case 1001: {
             uint64_t ntp = raopcl_get_ntp(NULL);
             printf("%" PRIu64 "\n", ntp);
