@@ -22,9 +22,11 @@ server-side integration state, see the provider's `PLAN.md`.
 
 ## Distribution
 
-- [ ] **Cross-platform builds** — only `cliairplay-macos-arm64` is built so far.
-      Need `linux-aarch64`, `linux-x86_64`, `macos-x86_64`.
-- [ ] **CI** in this repo to produce the release binaries above.
-- [ ] **MA container build** should build/fetch these binaries as part of the image
-      build, instead of committing a prebuilt binary into the provider `bin/` dir.
+- [x] **Cross-platform builds + CI** — `.github/workflows/build.yml` cross-builds all
+      four targets (linux x86_64/aarch64, macos arm64/x86_64) and uploads artifacts.
+- [ ] **Release process (later)** — a `v*` tag runs the `release` job (GitHub Release
+      with the four binaries + `SHA256SUMS`), but it has not been exercised yet. Cut a
+      first versioned release when ready.
+- [ ] **MA container build** should fetch the pinned release binaries as part of the
+      image build, instead of committing a prebuilt binary into the provider `bin/` dir.
       (The prebuilt `macos-arm64` binary is accepted for local testing only.)
