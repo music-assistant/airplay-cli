@@ -45,6 +45,10 @@ EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
 # Compiler flags
 DEFINES  = -DNDEBUG -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED
 CFLAGS  += -Wall -fPIC -ggdb -O2 $(DEFINES) -fdata-sections -ffunction-sections
+# The C++ sources (ours and libraop's) use C++11 features (lambdas, auto, range-for);
+# pin the standard since some compilers still default to an older one. Use the GNU
+# dialect (g++'s default) so GNU extensions in libraop's sources keep working.
+CXXFLAGS += -std=gnu++17
 LDFLAGS += -lpthread -ldl -lm -L.
 
 # Extra flags for cross-compilation, e.g. building macOS x86_64 on an arm64 host:
@@ -89,7 +93,10 @@ CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
 # replaced by our alac_ext.cpp which properly handles 24-bit audio.
-LIBCODECS_PATCHED = $(BUILDDIR)/libcodecs_patched.a
+# Keep the copy next to the original: on some platforms libcodecs.a is a "thin"
+# archive that references its member libraries by path relative to its own
+# directory, so copying it elsewhere would break those references at link time.
+LIBCODECS_PATCHED = $(CODECS)/$(HOST)/$(PLATFORM)/libcodecs_patched.a
 LIBRARY = $(LIBCODECS_PATCHED) $(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a
 
 ifneq ($(STATIC),)
@@ -126,6 +133,6 @@ $(BUILDDIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 clean:
-	rm -rf $(BUILDDIR) $(EXECUTABLE)
+	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED)
 
 .PHONY: all directory clean
