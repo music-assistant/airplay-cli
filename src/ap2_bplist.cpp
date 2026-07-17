@@ -5,11 +5,15 @@
  * See LICENSE
  */
 
+#include <cstdint>
 #include <cstring>
 #include <cstdlib>
 #include <vector>
 #include <string>
 
+/* bplist.h (from libraop) uses uint*_t but does not include <cstdint> itself.
+ * libc++ leaks it transitively via <string>/<vector>, but libstdc++ does not,
+ * so include it explicitly before pulling in bplist.h. */
 /* Access private members of bplist for integer reading */
 #define private public
 #include "../libraop/src/bplist.h"

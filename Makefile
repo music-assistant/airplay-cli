@@ -47,6 +47,11 @@ DEFINES  = -DNDEBUG -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED
 CFLAGS  += -Wall -fPIC -ggdb -O2 $(DEFINES) -fdata-sections -ffunction-sections
 LDFLAGS += -lpthread -ldl -lm -L.
 
+# Extra flags for cross-compilation, e.g. building macOS x86_64 on an arm64 host:
+#   make HOST=macos PLATFORM=x86_64 EXTRA_CFLAGS="-arch x86_64" EXTRA_LDFLAGS="-arch x86_64"
+CFLAGS  += $(EXTRA_CFLAGS)
+LDFLAGS += $(EXTRA_LDFLAGS)
+
 # Paths into libraop submodule
 TOOLS       = $(LIBRAOP)/crosstools/src
 DMAP_PARSER = $(LIBRAOP)/dmap-parser

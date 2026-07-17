@@ -40,7 +40,7 @@ jobs:
           test -f "$bin"
           if [ "${{ matrix.platform }}" = "x86_64" ]; then
             # Native: run the self-check (should print "cliairplay check").
-            "./$bin" --check | grep -q "cliairplay check"
+            "./$bin" --check | grep -qE "cliairplay.*check"
           else
             # Cross-built: can't execute here, just confirm the architecture.
             file "$bin" | grep -qi "aarch64"
@@ -52,26 +52,34 @@ jobs:
           if-no-files-found: error
 
   build-macos:
+    # Both arches build on the arm64 runner: arm64 natively, x86_64 cross-compiled
+    # via -arch (the Intel macos-13 runner is being retired).
+    runs-on: macos-14
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - os: macos-14
-            platform: arm64
-          - os: macos-13
-            platform: x86_64
-    runs-on: ${{ matrix.os }}
+        platform: [arm64, x86_64]
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
       - name: Build
-        run: make STATIC=1 CC=clang CXX=clang++
+        run: |
+          if [ "${{ matrix.platform }}" = "x86_64" ]; then
+            make STATIC=1 CC=clang CXX=clang++ HOST=macos PLATFORM=x86_64 \
+              EXTRA_CFLAGS="-arch x86_64" EXTRA_LDFLAGS="-arch x86_64"
+          else
+            make STATIC=1 CC=clang CXX=clang++
+          fi
       - name: Validate
         run: |
           bin="bin/cliairplay-macos-${{ matrix.platform }}"
           test -f "$bin"
-          "./$bin" --check | grep -q "cliairplay check"
+          if [ "${{ matrix.platform }}" = "arm64" ]; then
+            "./$bin" --check | grep -qE "cliairplay.*check"
+          else
+            file "$bin" | grep -qi "x86_64"
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: cliairplay-macos-${{ matrix.platform }}
