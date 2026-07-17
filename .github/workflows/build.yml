@@ -1,0 +1,106 @@
+name: Build
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-linux:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: x86_64
+            cc: gcc
+            cxx: g++
+            packages: ""
+          - platform: aarch64
+            cc: aarch64-linux-gnu-gcc
+            cxx: aarch64-linux-gnu-g++
+            packages: gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Install cross toolchain
+        if: matrix.packages != ''
+        run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
+      - name: Build
+        run: make STATIC=1 CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+      - name: Validate
+        run: |
+          bin="bin/cliairplay-linux-${{ matrix.platform }}"
+          test -f "$bin"
+          if [ "${{ matrix.platform }}" = "x86_64" ]; then
+            # Native: run the self-check (should print "cliairplay check").
+            "./$bin" --check | grep -q "cliairplay check"
+          else
+            # Cross-built: can't execute here, just confirm the architecture.
+            file "$bin" | grep -qi "aarch64"
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cliairplay-linux-${{ matrix.platform }}
+          path: bin/cliairplay-linux-${{ matrix.platform }}
+          if-no-files-found: error
+
+  build-macos:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-14
+            platform: arm64
+          - os: macos-13
+            platform: x86_64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+      - name: Build
+        run: make STATIC=1 CC=clang CXX=clang++
+      - name: Validate
+        run: |
+          bin="bin/cliairplay-macos-${{ matrix.platform }}"
+          test -f "$bin"
+          "./$bin" --check | grep -q "cliairplay check"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: cliairplay-macos-${{ matrix.platform }}
+          path: bin/cliairplay-macos-${{ matrix.platform }}
+          if-no-files-found: error
+
+  release:
+    # Publish binaries as release assets when a version tag is pushed.
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build-linux, build-macos]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+      - name: Collect binaries and checksums
+        run: |
+          mkdir release
+          find artifacts -type f -name 'cliairplay-*' -exec cp {} release/ \;
+          chmod +x release/cliairplay-*
+          (cd release && sha256sum cliairplay-* > SHA256SUMS)
+          ls -la release
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >
+          gh release create "${{ github.ref_name }}" release/*
+          --repo "${{ github.repository }}"
+          --title "${{ github.ref_name }}"
+          --generate-notes
