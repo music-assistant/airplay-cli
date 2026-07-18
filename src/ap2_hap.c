@@ -1,10 +1,10 @@
 /*
  * AirPlay 2 HAP - HomeKit Authentication Protocol
  *
- * Implements pair-verify for AirPlay 2 device authentication and
- * encrypted session framing for the RTSP control channel.
+ * Implements pair-verify and transient pair-setup for AirPlay 2 device
+ * authentication and encrypted session framing for the RTSP control channel.
  *
- * Protocol flow (HAP pair-verify):
+ * Protocol flow (HAP pair-verify, X-Apple-HKP: 3, needs stored credentials):
  *   1. Client generates ephemeral X25519 keypair
  *   2. Client sends state=0x01 + ephemeral public key to /pair-verify
  *   3. Server responds with state=0x02 + server ephemeral public + encrypted signature
@@ -12,7 +12,16 @@
  *   5. Server verifies, responds with state=0x04
  *   6. Session keys derived via HKDF-SHA-512 from shared secret
  *
- * After pair-verify, the RTSP channel uses HAP framing:
+ * Protocol flow (HAP transient pair-setup, X-Apple-HKP: 4, no credentials):
+ *   1. Client sends state=0x01 + method=0 + flags=0x10 to /pair-setup
+ *   2. Server responds with state=0x02 + SRP salt + SRP public key B
+ *   3. Client runs SRP-6a (SHA-512, 3072-bit group, fixed PIN "3939") and
+ *      sends state=0x03 + public key A + client proof M1
+ *   4. Server responds with state=0x04 + server proof; exchange stops here
+ *      (no M5/M6, nothing is stored) and the SRP session key becomes the
+ *      shared secret
+ *
+ * After pairing, the RTSP channel uses HAP framing:
  *   [2-byte LE length] [ChaCha20-Poly1305 encrypted payload + 16-byte tag]
  *   Max plaintext per frame: 1024 bytes
  *   Nonce: 4 zero bytes + 8-byte LE counter (incrementing per direction)
@@ -32,6 +41,8 @@
 #include <openssl/kdf.h>
 #include <openssl/err.h>
 #include <openssl/rand.h>
+#include <openssl/bn.h>
+#include <openssl/sha.h>
 
 #include "../libraop/crosstools/src/platform.h"
 #include "cross_log.h"
@@ -39,7 +50,7 @@
 
 extern log_level *loglevel;
 
-/* TLV8 tag types used in pair-verify */
+/* TLV8 tag types used in pair-setup/pair-verify */
 #define TLV_METHOD      0x00
 #define TLV_IDENTIFIER  0x01
 #define TLV_SALT        0x02
@@ -49,11 +60,34 @@ extern log_level *loglevel;
 #define TLV_STATE       0x06
 #define TLV_ERROR       0x07
 #define TLV_SIGNATURE   0x0A
+#define TLV_FLAGS       0x13
 
 /* HAP encrypted frame parameters */
 #define HAP_MAX_FRAME_SIZE   1024
 #define HAP_TAG_SIZE         16
 #define HAP_NONCE_SIZE       12
+
+/* SRP-6a parameters for transient pair-setup (SHA-512 hash) */
+#define SRP_N_BYTES          384    /* 3072-bit modulus */
+#define SRP_HASH_LEN         SHA512_DIGEST_LENGTH
+#define SRP_USERNAME         "Pair-Setup"
+#define SRP_TRANSIENT_PIN    "3939" /* fixed PIN mandated for transient pairing */
+#define HAP_TRANSIENT_FLAG   0x10   /* kTLVFlag transient in the M1 Flags TLV */
+
+/* RFC 5054 3072-bit group used by HAP pair-setup; generator g = 5 */
+static const char srp_n_hex_3072[] =
+    "FFFFFFFFFFFFFFFFC90FDAA22168C234C4C6628B80DC1CD129024E088A67CC74"
+    "020BBEA63B139B22514A08798E3404DDEF9519B3CD3A431B302B0A6DF25F1437"
+    "4FE1356D6D51C245E485B576625E7EC6F44C42E9A637ED6B0BFF5CB6F406B7ED"
+    "EE386BFB5A899FA5AE9F24117C4B1FE649286651ECE45B3DC2007CB8A163BF05"
+    "98DA48361C55D39A69163FA8FD24CF5F83655D23DCA3AD961C62F356208552BB"
+    "9ED529077096966D670C354E4ABC9804F1746C08CA18217C32905E462E36CE3B"
+    "E39E772C180E86039B2783A2EC07A28FB5C55DF06F4C52C9DE2BCBF695581718"
+    "3995497CEA956AE515D2261898FA051015728E5A8AAAC42DAD33170D04507A33"
+    "A85521ABDF1CBA64ECFB850458DBEF0A8AEA71575D060C7DB3970F85A6E1E4C7"
+    "ABF5AE8CDB0933D71E8C94E04A25619DCEE3D2261AD2EE6BF12FFA06D98A0864"
+    "D87602733EC86A64521F2B18177B200CBBE117577A615D6C770988C0BAD946E2"
+    "08E24FA074E5AB3143DB5BFCE0FD108E4B82D120A93AD2CAFFFFFFFFFFFFFFFF";
 
 struct ap2_hap_ctx {
     /* Long-term keys from pairing */
@@ -255,6 +289,247 @@ static int chacha20_poly1305_decrypt(const uint8_t *key, const uint8_t *nonce,
     return ok == 1 ? pt_len : -1;
 }
 
+/* ---- SRP-6a helpers (transient pair-setup) ---- */
+
+/* SHA-512 of two big numbers, each zero-padded on the left to pad_len bytes
+   (the PAD() operation from RFC 5054). */
+static bool srp_hash_two_padded(const BIGNUM *n1, const BIGNUM *n2, int pad_len,
+                                uint8_t out[SRP_HASH_LEN])
+{
+    bool ok = false;
+    unsigned int md_len;
+    uint8_t *buf = malloc(2 * pad_len);
+
+    if (!buf) return false;
+    if (BN_bn2binpad(n1, buf, pad_len) != pad_len) goto done;
+    if (BN_bn2binpad(n2, buf + pad_len, pad_len) != pad_len) goto done;
+    ok = EVP_Digest(buf, 2 * pad_len, out, &md_len, EVP_sha512(), NULL) == 1;
+done:
+    OPENSSL_cleanse(buf, 2 * pad_len);
+    free(buf);
+    return ok;
+}
+
+/* SHA-512 of a big number in minimal-length big-endian encoding. */
+static bool srp_hash_bn(const BIGNUM *bn, uint8_t out[SRP_HASH_LEN])
+{
+    uint8_t buf[SRP_N_BYTES];
+    unsigned int md_len;
+    bool ok;
+    int len = BN_num_bytes(bn);
+
+    if (len > (int)sizeof(buf)) return false;
+    BN_bn2bin(bn, buf);
+    ok = EVP_Digest(buf, len, out, &md_len, EVP_sha512(), NULL) == 1;
+    OPENSSL_cleanse(buf, sizeof(buf));
+    return ok;
+}
+
+/*
+ * Client side of SRP-6a (SHA-512, RFC 5054 3072-bit group) as used by HAP
+ * pair-setup. From the device's salt and public key B this produces our
+ * public key A, the client proof M1, the expected server proof HAMK and the
+ * session key K = SHA512(S).
+ *
+ * Byte conventions (matching pair_ap/owntone, verified against real devices):
+ *   k = SHA512(PAD(N) || PAD(g)) and u = SHA512(PAD(A) || PAD(B)), both
+ *   padded to the 384-byte modulus size; the values hashed into x, K, M1 and
+ *   HAMK use minimal-length big-endian encoding (salt as raw TLV bytes).
+ */
+static bool srp_client_compute(const uint8_t *salt, int salt_len,
+                               const uint8_t *b_pub, int b_pub_len,
+                               uint8_t a_pub[SRP_N_BYTES], int *a_pub_len,
+                               uint8_t proof_m1[SRP_HASH_LEN],
+                               uint8_t proof_hamk[SRP_HASH_LEN],
+                               uint8_t session_key[SRP_HASH_LEN])
+{
+    bool ok = false;
+    BN_CTX *bnctx = BN_CTX_new();
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    BIGNUM *N = NULL, *g = NULL, *a = NULL, *A = NULL, *B = NULL;
+    BIGNUM *k = NULL, *u = NULL, *x = NULL, *S = NULL;
+    BIGNUM *tmp1 = NULL, *tmp2 = NULL;
+    uint8_t digest[SRP_HASH_LEN], hash_n[SRP_HASH_LEN], hash_g[SRP_HASH_LEN];
+    uint8_t hash_user[SRP_HASH_LEN];
+    uint8_t num_buf[SRP_N_BYTES];
+    unsigned int md_len;
+    int num_len;
+
+    if (!bnctx || !md) goto done;
+
+    if (!BN_hex2bn(&N, srp_n_hex_3072)) goto done;
+    g = BN_new();
+    a = BN_new();
+    A = BN_new();
+    S = BN_new();
+    tmp1 = BN_new();
+    tmp2 = BN_new();
+    B = BN_bin2bn(b_pub, b_pub_len, NULL);
+    if (!g || !a || !A || !S || !tmp1 || !tmp2 || !B) goto done;
+    if (!BN_set_word(g, 5)) goto done;
+
+    /* SRP-6a safety check: reject B == 0 (mod N) */
+    if (!BN_nnmod(tmp1, B, N, bnctx) || BN_is_zero(tmp1)) {
+        LOG_ERROR("[HAP] SRP public key B is invalid");
+        goto done;
+    }
+
+    /* A = g^a mod N, with a 256-bit random private value */
+    if (!BN_rand(a, 256, BN_RAND_TOP_ONE, BN_RAND_BOTTOM_ANY)) goto done;
+    if (!BN_mod_exp(A, g, a, N, bnctx)) goto done;
+    *a_pub_len = BN_bn2bin(A, a_pub);
+
+    /* k = SHA512(PAD(N) || PAD(g)), u = SHA512(PAD(A) || PAD(B)) */
+    if (!srp_hash_two_padded(N, g, SRP_N_BYTES, digest)) goto done;
+    k = BN_bin2bn(digest, SRP_HASH_LEN, NULL);
+    if (!srp_hash_two_padded(A, B, SRP_N_BYTES, digest)) goto done;
+    u = BN_bin2bn(digest, SRP_HASH_LEN, NULL);
+    if (!k || !u) goto done;
+
+    /* SRP-6a safety check: u must not be zero */
+    if (BN_is_zero(u)) {
+        LOG_ERROR("[HAP] SRP scrambling parameter u is zero");
+        goto done;
+    }
+
+    /* x = SHA512(salt || SHA512(username ":" pin)) */
+    if (EVP_Digest(SRP_USERNAME ":" SRP_TRANSIENT_PIN,
+                   strlen(SRP_USERNAME ":" SRP_TRANSIENT_PIN),
+                   digest, &md_len, EVP_sha512(), NULL) != 1) goto done;
+    if (EVP_DigestInit_ex(md, EVP_sha512(), NULL) != 1 ||
+        EVP_DigestUpdate(md, salt, salt_len) != 1 ||
+        EVP_DigestUpdate(md, digest, SRP_HASH_LEN) != 1 ||
+        EVP_DigestFinal_ex(md, digest, &md_len) != 1) goto done;
+    x = BN_bin2bn(digest, SRP_HASH_LEN, NULL);
+    if (!x) goto done;
+
+    /* S = (B - k * g^x) ^ (a + u*x) mod N */
+    if (!BN_mod_exp(tmp1, g, x, N, bnctx)) goto done;   /* tmp1 = g^x */
+    if (!BN_mul(tmp1, k, tmp1, bnctx)) goto done;       /* tmp1 = k*g^x */
+    if (!BN_sub(tmp1, B, tmp1)) goto done;              /* tmp1 = B - k*g^x */
+    if (!BN_nnmod(tmp1, tmp1, N, bnctx)) goto done;     /* normalize to [0, N) */
+    if (!BN_mul(tmp2, u, x, bnctx)) goto done;
+    if (!BN_add(tmp2, tmp2, a)) goto done;              /* tmp2 = a + u*x */
+    if (!BN_mod_exp(S, tmp1, tmp2, N, bnctx)) goto done;
+
+    /* Session key K = SHA512(S) */
+    num_len = BN_num_bytes(S);
+    if (num_len > (int)sizeof(num_buf)) goto done;
+    BN_bn2bin(S, num_buf);
+    if (EVP_Digest(num_buf, num_len, session_key, &md_len, EVP_sha512(), NULL) != 1)
+        goto done;
+
+    /* Client proof M1 =
+     *   SHA512((SHA512(N) xor SHA512(g)) || SHA512(username) || salt || A || B || K) */
+    if (!srp_hash_bn(N, hash_n) || !srp_hash_bn(g, hash_g)) goto done;
+    for (int i = 0; i < SRP_HASH_LEN; i++)
+        digest[i] = hash_n[i] ^ hash_g[i];
+    if (EVP_Digest(SRP_USERNAME, strlen(SRP_USERNAME),
+                   hash_user, &md_len, EVP_sha512(), NULL) != 1) goto done;
+
+    num_len = BN_num_bytes(B);
+    if (num_len > (int)sizeof(num_buf)) goto done;
+    BN_bn2bin(B, num_buf);
+
+    if (EVP_DigestInit_ex(md, EVP_sha512(), NULL) != 1 ||
+        EVP_DigestUpdate(md, digest, SRP_HASH_LEN) != 1 ||
+        EVP_DigestUpdate(md, hash_user, SRP_HASH_LEN) != 1 ||
+        EVP_DigestUpdate(md, salt, salt_len) != 1 ||
+        EVP_DigestUpdate(md, a_pub, *a_pub_len) != 1 ||
+        EVP_DigestUpdate(md, num_buf, num_len) != 1 ||
+        EVP_DigestUpdate(md, session_key, SRP_HASH_LEN) != 1 ||
+        EVP_DigestFinal_ex(md, proof_m1, &md_len) != 1) goto done;
+
+    /* Expected server proof HAMK = SHA512(A || M1 || K) */
+    if (EVP_DigestInit_ex(md, EVP_sha512(), NULL) != 1 ||
+        EVP_DigestUpdate(md, a_pub, *a_pub_len) != 1 ||
+        EVP_DigestUpdate(md, proof_m1, SRP_HASH_LEN) != 1 ||
+        EVP_DigestUpdate(md, session_key, SRP_HASH_LEN) != 1 ||
+        EVP_DigestFinal_ex(md, proof_hamk, &md_len) != 1) goto done;
+
+    ok = true;
+
+done:
+    BN_clear_free(a);
+    BN_clear_free(x);
+    BN_clear_free(S);
+    BN_free(N);
+    BN_free(g);
+    BN_free(A);
+    BN_free(B);
+    BN_free(k);
+    BN_free(u);
+    BN_free(tmp1);
+    BN_free(tmp2);
+    BN_CTX_free(bnctx);
+    EVP_MD_CTX_free(md);
+    OPENSSL_cleanse(num_buf, sizeof(num_buf));
+    OPENSSL_cleanse(digest, sizeof(digest));
+    return ok;
+}
+
+/*
+ * POST a TLV body to /pair-setup (transient, X-Apple-HKP: 4) and read the
+ * complete RTSP response. Returns the HTTP status code (0 on transport
+ * error) and points *resp_body (with *resp_body_len) at the body inside resp_buf.
+ */
+static int hap_post_pair_setup(int sock_fd, int cseq,
+                               const uint8_t *body, int body_len,
+                               uint8_t *resp_buf, int resp_buf_size,
+                               uint8_t **resp_body, int *resp_body_len)
+{
+    char http_req[256];
+    int hdr_len = snprintf(http_req, sizeof(http_req),
+        "POST /pair-setup RTSP/1.0\r\n"
+        "Content-Type: application/octet-stream\r\n"
+        "X-Apple-HKP: 4\r\n"
+        "CSeq: %d\r\n"
+        "Content-Length: %d\r\n"
+        "\r\n", cseq, body_len);
+
+    *resp_body = NULL;
+    *resp_body_len = 0;
+
+    if (write(sock_fd, http_req, hdr_len) != hdr_len ||
+        write(sock_fd, body, body_len) != body_len) {
+        LOG_ERROR("[HAP] Failed to send pair-setup request (CSeq %d)", cseq);
+        return 0;
+    }
+
+    struct timeval tv = {.tv_sec = 8};
+    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+    /* Read until headers plus Content-Length body are complete */
+    int total = 0, header_len = 0, content_len = -1;
+    while (total < resp_buf_size - 1) {
+        if (header_len > 0 && total >= header_len + content_len)
+            break;
+        int n = read(sock_fd, resp_buf + total, resp_buf_size - 1 - total);
+        if (n <= 0) break;
+        total += n;
+        resp_buf[total] = '\0';
+        if (header_len == 0) {
+            char *end = strstr((char *)resp_buf, "\r\n\r\n");
+            if (end) {
+                header_len = (int)(end - (char *)resp_buf) + 4;
+                char *clh = strcasestr((char *)resp_buf, "Content-Length:");
+                content_len = clh ? atoi(clh + 15) : 0;
+            }
+        }
+    }
+
+    if (header_len == 0 || total < header_len + content_len) {
+        LOG_ERROR("[HAP] Incomplete pair-setup response (%d bytes)", total);
+        return 0;
+    }
+
+    int status = 0;
+    sscanf((char *)resp_buf, "%*s %d", &status);
+    *resp_body = resp_buf + header_len;
+    *resp_body_len = content_len;
+    return status;
+}
+
 /* ---- Hex parsing ---- */
 
 static bool hex_decode(const char *hex, uint8_t *out, int out_len)
@@ -271,9 +546,16 @@ static bool hex_decode(const char *hex, uint8_t *out, int out_len)
 
 struct ap2_hap_ctx *ap2_hap_create(const char *credentials_hex)
 {
-    if (!credentials_hex || strlen(credentials_hex) != 192) {
+    /* No credentials: bare context, only usable for transient pair-setup */
+    if (!credentials_hex) {
+        struct ap2_hap_ctx *ctx = calloc(1, sizeof(*ctx));
+        if (ctx) LOG_INFO("[HAP] Created context without credentials (transient pairing)");
+        return ctx;
+    }
+
+    if (strlen(credentials_hex) != 192) {
         LOG_ERROR("[HAP] Invalid credentials: expected 192 hex chars, got %d",
-                  credentials_hex ? (int)strlen(credentials_hex) : 0);
+                  (int)strlen(credentials_hex));
         return NULL;
     }
 
@@ -648,6 +930,141 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
 
     LOG_INFO("[HAP] Pair-verify completed successfully");
     return true;
+}
+
+bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
+{
+    if (!ctx) return false;
+
+    LOG_INFO("[HAP] Starting transient pair-setup...");
+
+    uint8_t resp_buf[8192];
+    uint8_t *body = NULL;
+    int body_len = 0;
+
+    /* M1: state=1, method=pair-setup, transient flag */
+    tlv_buf_t msg1;
+    tlv_init(&msg1);
+    tlv_add_uint8(&msg1, TLV_STATE, 0x01);
+    tlv_add_uint8(&msg1, TLV_METHOD, 0x00);
+    tlv_add_uint8(&msg1, TLV_FLAGS, HAP_TRANSIENT_FLAG);
+
+    int status = hap_post_pair_setup(sock_fd, 1, msg1.data, msg1.len,
+                                     resp_buf, sizeof(resp_buf), &body, &body_len);
+    tlv_free(&msg1);
+    if (status != 200) {
+        LOG_ERROR("[HAP] Pair-setup M1 rejected (status %d)%s", status,
+                  status == 470 ? " - device requires full HomeKit pairing" : "");
+        return false;
+    }
+
+    /* Parse M2: state=2, salt (16 bytes), SRP public key B (fragmented TLV) */
+    int state_len, salt_len, err_len, b_len = 0;
+    const uint8_t *state_val = tlv_find(body, body_len, TLV_STATE, &state_len);
+    const uint8_t *err = tlv_find(body, body_len, TLV_ERROR, &err_len);
+    if (err && err_len > 0) {
+        LOG_ERROR("[HAP] Pair-setup M2 error tag: %d", *err);
+        return false;
+    }
+    const uint8_t *salt = tlv_find(body, body_len, TLV_SALT, &salt_len);
+    uint8_t *b_pub = tlv_concat(body, body_len, TLV_PUBLIC_KEY, &b_len);
+
+    if (!state_val || *state_val != 0x02 || !salt || salt_len != 16 ||
+        !b_pub || b_len <= 0 || b_len > SRP_N_BYTES) {
+        LOG_ERROR("[HAP] Invalid pair-setup M2 content (state=%d, salt=%d, B=%d)",
+                  state_val ? *state_val : -1, salt ? salt_len : -1, b_len);
+        free(b_pub);
+        return false;
+    }
+
+    /* Copy the salt out of resp_buf, which gets reused for the M3 exchange */
+    uint8_t salt_buf[16];
+    memcpy(salt_buf, salt, sizeof(salt_buf));
+
+    /* Run SRP-6a: our public key A, proofs and the session key */
+    uint8_t a_pub[SRP_N_BYTES];
+    int a_pub_len = 0;
+    uint8_t proof_m1[SRP_HASH_LEN], proof_hamk[SRP_HASH_LEN], session_key[SRP_HASH_LEN];
+
+    bool srp_ok = srp_client_compute(salt_buf, sizeof(salt_buf), b_pub, b_len,
+                                     a_pub, &a_pub_len,
+                                     proof_m1, proof_hamk, session_key);
+    free(b_pub);
+    if (!srp_ok) {
+        LOG_ERROR("[HAP] SRP-6a computation failed");
+        return false;
+    }
+
+    LOG_INFO("[HAP] SRP challenge computed, sending M3...");
+
+    /* M3: state=3, public key A, client proof M1 */
+    tlv_buf_t msg3;
+    tlv_init(&msg3);
+    tlv_add_uint8(&msg3, TLV_STATE, 0x03);
+    tlv_add(&msg3, TLV_PUBLIC_KEY, a_pub, a_pub_len);
+    tlv_add(&msg3, TLV_PROOF, proof_m1, SRP_HASH_LEN);
+
+    status = hap_post_pair_setup(sock_fd, 2, msg3.data, msg3.len,
+                                 resp_buf, sizeof(resp_buf), &body, &body_len);
+    tlv_free(&msg3);
+    if (status != 200) {
+        LOG_ERROR("[HAP] Pair-setup M3 rejected (status %d)", status);
+        goto fail;
+    }
+
+    /* Parse M4: state=4, server proof HAMK - verifying it authenticates the
+     * device and confirms both sides derived the same session key */
+    state_val = tlv_find(body, body_len, TLV_STATE, &state_len);
+    err = tlv_find(body, body_len, TLV_ERROR, &err_len);
+    if (err && err_len > 0) {
+        LOG_ERROR("[HAP] Pair-setup M4 error tag: %d%s", *err,
+                  *err == 0x02 ? " (authentication failed)" : "");
+        goto fail;
+    }
+    int srv_proof_len;
+    const uint8_t *srv_proof = tlv_find(body, body_len, TLV_PROOF, &srv_proof_len);
+    if (!state_val || *state_val != 0x04 || !srv_proof || srv_proof_len != SRP_HASH_LEN) {
+        LOG_ERROR("[HAP] Invalid pair-setup M4 content (state=%d, proof=%d)",
+                  state_val ? *state_val : -1, srv_proof ? srv_proof_len : -1);
+        goto fail;
+    }
+    if (memcmp(srv_proof, proof_hamk, SRP_HASH_LEN) != 0) {
+        LOG_ERROR("[HAP] Server SRP proof mismatch in M4");
+        goto fail;
+    }
+
+    /* Derive the control channel keys. The HKDF input is the full 64-byte
+     * SRP session key (matching pair_ap/owntone). */
+    if (!hkdf_sha512(session_key, SRP_HASH_LEN,
+                     "Control-Salt", "Control-Write-Encryption-Key",
+                     ctx->write_key, 32) ||
+        !hkdf_sha512(session_key, SRP_HASH_LEN,
+                     "Control-Salt", "Control-Read-Encryption-Key",
+                     ctx->read_key, 32)) {
+        LOG_ERROR("[HAP] Failed to derive session keys");
+        goto fail;
+    }
+
+    ctx->write_nonce_counter = 0;
+    ctx->read_nonce_counter = 0;
+    ctx->verified = true;
+
+    /* The audio key is the first 32 bytes of the SRP session key, taking the
+     * same role as the X25519 shared secret after pair-verify */
+    memcpy(ctx->shared_secret, session_key, sizeof(ctx->shared_secret));
+
+    OPENSSL_cleanse(session_key, sizeof(session_key));
+    OPENSSL_cleanse(proof_m1, sizeof(proof_m1));
+    OPENSSL_cleanse(proof_hamk, sizeof(proof_hamk));
+
+    LOG_INFO("[HAP] Transient pair-setup completed successfully");
+    return true;
+
+fail:
+    OPENSSL_cleanse(session_key, sizeof(session_key));
+    OPENSSL_cleanse(proof_m1, sizeof(proof_m1));
+    OPENSSL_cleanse(proof_hamk, sizeof(proof_hamk));
+    return false;
 }
 
 int ap2_hap_encrypt(struct ap2_hap_ctx *ctx, const uint8_t *in, int in_len,

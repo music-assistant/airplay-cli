@@ -12,7 +12,7 @@
 #include <stdint.h>
 
 /*
- * HAP pair-verify context.
+ * HAP pairing context.
  *
  * Credentials format (192 hex chars = 96 bytes):
  *   bytes 0-63:  Client Ed25519 private key (64 bytes)
@@ -21,7 +21,11 @@
 
 struct ap2_hap_ctx;
 
-/* Create HAP context from hex credentials string (192 chars). */
+/*
+ * Create HAP context from hex credentials string (192 chars).
+ * Pass NULL to create a bare context without long-term keys, usable only
+ * with ap2_hap_pair_setup_transient().
+ */
 struct ap2_hap_ctx *ap2_hap_create(const char *credentials_hex);
 
 /* Set the client identifier used during pair-verify (e.g. DACP ID as raw bytes). */
@@ -40,6 +44,21 @@ void ap2_hap_destroy(struct ap2_hap_ctx *ctx);
  * On success, the context holds encryption keys for the session.
  */
 bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd);
+
+/*
+ * Perform HomeKit transient pair-setup (X-Apple-HKP: 4) over an established
+ * TCP connection. Used for devices without stored credentials (Sonos, WiiM
+ * and most third-party AirPlay 2 receivers): SRP-6a with the fixed PIN,
+ * messages M1-M4 only, no long-term keys are created or stored.
+ *
+ * :param ctx: HAP context (no credentials required).
+ * :param sock_fd: Connected TCP socket to the device.
+ * :returns: true on success, false on failure.
+ *
+ * On success, the context holds encryption keys for the session and
+ * ap2_hap_get_shared_secret() returns the audio key.
+ */
+bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd);
 
 /* Encrypt data for sending to the device. Caller must free output. */
 int ap2_hap_encrypt(struct ap2_hap_ctx *ctx, const uint8_t *in, int in_len,
