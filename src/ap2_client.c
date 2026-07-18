@@ -98,66 +98,7 @@ struct ap2cl_s {
     char session_uuid[40];
     uint32_t session_id;
     int cseq;
-
-    /* Auth-setup state (RAOP-compat) */
-    bool auth_setup_done;
 };
-
-/* ---- Auth-setup (RAOP-compat flow) ---- */
-
-static bool ap2_auth_setup(int sock_fd)
-{
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
-    EVP_PKEY *eph_key = NULL;
-    if (!ctx || EVP_PKEY_keygen_init(ctx) <= 0 || EVP_PKEY_keygen(ctx, &eph_key) <= 0) {
-        EVP_PKEY_CTX_free(ctx);
-        return false;
-    }
-    EVP_PKEY_CTX_free(ctx);
-
-    uint8_t pub[32];
-    size_t pub_len = 32;
-    EVP_PKEY_get_raw_public_key(eph_key, pub, &pub_len);
-    EVP_PKEY_free(eph_key);
-
-    uint8_t body[33];
-    body[0] = 0x01;
-    memcpy(body + 1, pub, 32);
-
-    char req[256];
-    int hdr_len = snprintf(req, sizeof(req),
-        "POST /auth-setup RTSP/1.0\r\nCSeq: 0\r\n"
-        "Content-Type: application/octet-stream\r\nContent-Length: 33\r\n\r\n");
-
-    if (write(sock_fd, req, hdr_len) != hdr_len || write(sock_fd, body, 33) != 33)
-        return false;
-
-    uint8_t resp[2048];
-    int total = 0;
-    struct timeval tv = {.tv_sec = 5};
-    setsockopt(sock_fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    while (total < (int)sizeof(resp) - 1) {
-        int n = read(sock_fd, resp + total, sizeof(resp) - total - 1);
-        if (n <= 0) break;
-        total += n;
-        resp[total] = '\0';
-        char *end = strstr((char *)resp, "\r\n\r\n");
-        if (end) {
-            int hdr = (end - (char *)resp) + 4;
-            int cl = 0;
-            char *clh = strcasestr((char *)resp, "Content-Length:");
-            if (clh) cl = atoi(clh + 15);
-            if (total >= hdr + cl) break;
-        }
-    }
-
-    int status = 0;
-    sscanf((char *)resp, "%*s %d", &status);
-    if (status != 200) return false;
-
-    LOG_INFO("[AP2] auth-setup completed");
-    return true;
-}
 
 /* ---- Native AP2 RTSP I/O ---- */
 
@@ -796,35 +737,9 @@ static bool ap2_native_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames
 
 static bool ap2_raop_compat_connect(struct ap2cl_s *p)
 {
-    /* Auth-setup on temporary connection */
-    struct addrinfo hints = {0}, *res;
-    hints.ai_family = AF_INET;
-    hints.ai_socktype = SOCK_STREAM;
-    char port_str[8];
-    snprintf(port_str, sizeof(port_str), "%d", p->device.port);
-
-    if (getaddrinfo(p->device.address, port_str, &hints, &res) != 0) return false;
-    int auth_sock = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
-    if (auth_sock < 0 || connect(auth_sock, res->ai_addr, res->ai_addrlen) != 0) {
-        freeaddrinfo(res);
-        if (auth_sock >= 0) close(auth_sock);
-        return false;
-    }
-    freeaddrinfo(res);
-
-    const char *info_req = "GET /info RTSP/1.0\r\nCSeq: 0\r\nUser-Agent: AirPlay/670.6.2\r\nContent-Length: 0\r\n\r\n";
-    write(auth_sock, info_req, strlen(info_req));
-    uint8_t discard[4096];
-    struct timeval tv = {.tv_sec = 2};
-    setsockopt(auth_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    read(auth_sock, discard, sizeof(discard));
-
-    if (!ap2_auth_setup(auth_sock)) {
-        LOG_WARN("[AP2] auth-setup failed, proceeding without");
-    } else {
-        p->auth_setup_done = true;
-    }
-    close(auth_sock);
+    /* auth-setup (the MFi X25519 exchange some AP2 receivers require) is handled
+     * inside libraop's raopcl_connect() via rtspcl_auth_setup() when the device's
+     * et field advertises type 4 — on the real RTSP socket, not a throwaway one. */
 
     /* Use libraop RAOP client */
     struct in_addr host_addr, player_addr;
