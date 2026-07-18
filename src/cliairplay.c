@@ -38,8 +38,9 @@
 #define VERSION "0.1.0"
 #define AP2_FRAMES_PER_CHUNK 352
 
-/* Protocol selection */
+/* Protocol selection (resolved, concrete protocol used for dispatch). */
 typedef enum {
+    PROTO_AUTO = 0,
     PROTO_RAOP = 1,
     PROTO_AIRPLAY2 = 2,
 } protocol_t;
@@ -54,7 +55,9 @@ typedef enum {
 /* CLI configuration parsed from arguments */
 typedef struct {
     /* Common settings */
-    protocol_t protocol;
+    protocol_t protocol;         /* resolved concrete protocol (RAOP/AIRPLAY2) */
+    ap2_proto_pref_t proto_pref; /* user --protocol preference (auto/raop/airplay2) */
+    ap2_route_t route;           /* resolved route (AirPlay 2 sub-decisions) */
     char *host;
     int port;
     int volume;
@@ -91,6 +94,7 @@ typedef struct {
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     int64_t ptp_offset_ns;  /* PTP clock offset in nanoseconds */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
+    bool buffered;          /* force buffered audio stream (type 103) */
 
     /* Audio format */
     int sample_rate;
@@ -536,6 +540,7 @@ static int run_raop(cli_config_t *cfg, int infile)
     status_eof();
     g_running = false;
     free(buf);
+    free(alac_buf);
     raopcl_disconnect(g_raopcl);
     raopcl_destroy(g_raopcl);
     g_raopcl = NULL;
@@ -571,12 +576,14 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     /* Pass through mDNS properties and interface for RAOP-compatible flow */
     ap2cl_set_raop_props(g_ap2cl, cfg->iface, cfg->secret,
                           cfg->et, cfg->md, cfg->am);
-    if (cfg->force_native)
+    /* Apply the resolved AirPlay 2 route (see ap2_resolve_route). force_native
+     * is a no-op when stored credentials already select the native flow. */
+    if (cfg->route.native)
         ap2cl_force_native(g_ap2cl);
     if (cfg->publish_ip)
         ap2cl_set_publish_ip(g_ap2cl, cfg->publish_ip);
-    if (cfg->ptp)
-        ap2cl_set_ptp(g_ap2cl, true);
+    ap2cl_set_ptp(g_ap2cl, cfg->route.ptp);
+    ap2cl_set_buffered(g_ap2cl, cfg->route.buffered);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
@@ -665,6 +672,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     status_eof();
     g_running = false;
     free(buf);
+    free(ap2_alac_buf);
     ap2cl_destroy(g_ap2cl);
     g_ap2cl = NULL;
     return 0;
@@ -687,7 +695,9 @@ static void print_usage(const char *name)
     printf("cliairplay v%s - Unified AirPlay streaming CLI\n\n", VERSION);
     printf("Usage: %s [options] <host_ip> <filename ('-' for stdin)>\n\n", name);
     printf("Protocol selection:\n");
-    printf("  --protocol <raop|airplay2>  Protocol to use (default: raop)\n\n");
+    printf("  --protocol <auto|raop|airplay2>  Protocol to use (default: auto).\n");
+    printf("                             auto picks RAOP vs AirPlay 2 from the mDNS\n");
+    printf("                             features in --txt; raop/airplay2 force it.\n\n");
     printf("Common options:\n");
     printf("  --port <port>              Device port (default: 5000)\n");
     printf("  --volume <0-100>           Initial volume level\n");
@@ -699,7 +709,8 @@ static void print_usage(const char *name)
     printf("  --cmdpipe <path>           Named pipe for metadata/commands\n");
     printf("  --udn <name>               UDN name for mDNS\n");
     printf("  --samplerate <rate>        Sample rate (default: 44100)\n");
-    printf("  --bitdepth <bits>          Bit depth: 16 or 24 (default: 16)\n");
+    printf("  --bitdepth <bits>          Bit depth: 16 or 24 (default: 16). 24-bit\n");
+    printf("                             uses native AirPlay 2 ALAC (0x80000/0x200000)\n");
     printf("  --channels <n>             Channel count (default: 2)\n");
     printf("  --if <ip>                  Local interface IP to bind (multi-homed hosts)\n");
     printf("  --debug <0-9>              Debug level (default: 3)\n");
@@ -729,7 +740,10 @@ static void print_usage(const char *name)
     printf("  --ptp-offset <ns>          PTP clock offset in nanoseconds\n");
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
-    printf("                             SupportsPTP feature bit)\n\n");
+    printf("                             SupportsPTP feature bit)\n");
+    printf("  --buffered                 Force the buffered audio stream (type 103,\n");
+    printf("                             native AP2, RTP over TCP + PTP anchor); else\n");
+    printf("                             auto when SupportsBufferedAudio + 24-bit\n\n");
     printf("Examples:\n");
     printf("  # RAOP streaming from stdin:\n");
     printf("  ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | %s 192.168.1.50 -\n\n", name);
@@ -743,7 +757,8 @@ static void print_usage(const char *name)
 int main(int argc, char *argv[])
 {
     cli_config_t cfg = {
-        .protocol = PROTO_RAOP,
+        .protocol = PROTO_AUTO,
+        .proto_pref = AP2_PROTO_AUTO,
         .port = 5000,
         .volume = 0,
         .latency_ms = 1000,
@@ -798,6 +813,7 @@ int main(int argc, char *argv[])
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
+        {"buffered",     no_argument,       0, 1010},
         {"ntp",          no_argument,       0, 1001},
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
@@ -812,8 +828,9 @@ int main(int argc, char *argv[])
                               long_options, NULL)) != -1) {
         switch (opt) {
         case 'P':
-            if (strcmp(optarg, "raop") == 0) cfg.protocol = PROTO_RAOP;
-            else if (strcmp(optarg, "airplay2") == 0) cfg.protocol = PROTO_AIRPLAY2;
+            if (strcmp(optarg, "auto") == 0) cfg.proto_pref = AP2_PROTO_AUTO;
+            else if (strcmp(optarg, "raop") == 0) cfg.proto_pref = AP2_PROTO_RAOP;
+            else if (strcmp(optarg, "airplay2") == 0) cfg.proto_pref = AP2_PROTO_AIRPLAY2;
             else { fprintf(stderr, "Unknown protocol: %s\n", optarg); return 1; }
             break;
         case 'p': cfg.port = atoi(optarg); break;
@@ -849,6 +866,7 @@ int main(int argc, char *argv[])
         case 1007: cfg.force_native = true; break;
         case 1008: cfg.publish_ip = optarg; break;
         case 1009: cfg.ptp = true; break;
+        case 1010: cfg.buffered = true; break;
         case 1001: {
             uint64_t ntp = raopcl_get_ntp(NULL);
             printf("%" PRIu64 "\n", ntp);
@@ -900,6 +918,24 @@ int main(int argc, char *argv[])
         print_usage(argv[0]);
         return 1;
     }
+
+    /* Resolve the streaming route from the discovery TXT and any overrides.
+     * --protocol auto (the default) picks RAOP vs AirPlay 2 from the mDNS
+     * features; explicit raop/airplay2 force the protocol; --ap2-native,
+     * --buffered and --ptp are forcing overrides. This is the single decision
+     * point: cfg.protocol becomes the concrete protocol used for dispatch and
+     * cfg.route carries the AirPlay 2 sub-decisions applied in run_airplay2(). */
+    bool have_creds = cfg.auth && strlen(cfg.auth) == 192;
+    cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
+                                  cfg.bit_depth, cfg.force_native, cfg.buffered,
+                                  cfg.ptp, cfg.ptp);
+    cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
+    LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
+             cfg.route.reason,
+             cfg.route.use_raop ? "n/a" : (cfg.route.ptp ? "PTP" : "NTP"),
+             (unsigned long long)cfg.route.features,
+             (unsigned long long)cfg.route.flags,
+             cfg.bit_depth);
 
     /* Setup signal handlers */
     signal(SIGINT, signal_handler);
