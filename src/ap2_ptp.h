@@ -86,10 +86,37 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
 bool ap2_ptp_engine_active(struct ap2_ptp_ctx *ctx);
 
 /*
- * Current PTP master time in nanoseconds. This is the timebase advertised via
- * the PTP Sync/Follow_Up messages; the realtime sync (control) packets must
- * carry wall-clock timestamps from this same source.
+ * Block for up to timeout_ms while the engine listens for peer Announce
+ * messages and runs BMCA, so the elected grandmaster is resolved before the
+ * caller builds the PTP session SETUP. Returns early once a peer has been seen
+ * and a coherent decision reached (we won, or we are slaving with an offset);
+ * otherwise it waits out the timeout and leaves us as grandmaster (the default
+ * when no peer competes). No-op if the engine is not active.
+ */
+void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms);
+
+/*
+ * Local host time in nanoseconds (CLOCK_REALTIME). When we are the elected
+ * grandmaster this IS the master timebase; the GM Announce/Sync/Follow_Up are
+ * stamped from here.
  */
 uint64_t ap2_ptp_now_ns(struct ap2_ptp_ctx *ctx);
+
+/*
+ * The clock identity of the currently elected grandmaster: our own clockID
+ * when we win BMCA, otherwise the winning peer's grandmasterIdentity. This is
+ * the timeline the media anchor (SETRATEANCHORTIME networkTimeTimelineID and
+ * the realtime sync-packet clock id) must be expressed against.
+ */
+uint64_t ap2_ptp_master_clock_id(struct ap2_ptp_ctx *ctx);
+
+/*
+ * Current time in the elected grandmaster's clock domain, in nanoseconds:
+ * local now plus the smoothed local->master offset. Equal to ap2_ptp_now_ns()
+ * when we are the grandmaster (offset 0); maps local time into the peer's clock
+ * when slaving. Wall-clock timestamps on the wire (sync packets, anchor) must
+ * come from here so the receiver schedules against the clock it actually drives.
+ */
+uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx);
 
 #endif /* __AP2_PTP_H_ */

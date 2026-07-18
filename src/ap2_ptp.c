@@ -80,6 +80,35 @@ extern log_level *loglevel;
 
 #define PTP_MAX_PEERS       8
 
+/* ---- BMCA / slave tuning ---- */
+
+/* Offset smoothing: fold each new local->master sample as an EMA with gain
+ * 1/PTP_OFFSET_EMA_DIV, but SNAP straight to the sample when it steps by more
+ * than PTP_OFFSET_SNAP_NS (first lock, or a clock reset) so we track rather
+ * than crawl. The offset is dominated by userspace-timestamping jitter of a
+ * few tens of microseconds, well under the SNAP threshold, so the EMA filters
+ * that jitter while the SNAP catches genuine steps. */
+#define PTP_OFFSET_EMA_DIV     8
+#define PTP_OFFSET_SNAP_NS     1000000LL          /* 1 ms */
+
+/* Revert to grandmaster if the elected peer stops announcing for this long
+ * (3x the 1 s announce interval, so a couple of dropped Announces don't flap). */
+#define PTP_PEER_SILENCE_NS    3000000000ULL      /* 3 s */
+
+/* An IEEE-1588 best-master dataset: the grandmaster attributes carried in an
+ * Announce (or synthesised for ourselves), enough to run the dataset
+ * comparison and to name the elected timeline. */
+struct ptp_dataset {
+    uint8_t  priority1;                    /* grandmasterPriority1 */
+    uint8_t  clock_class;                  /* grandmasterClockQuality.clockClass */
+    uint8_t  clock_accuracy;               /* grandmasterClockQuality.clockAccuracy */
+    uint16_t offset_scaled_log_variance;   /* grandmasterClockQuality.offsetScaledLogVariance */
+    uint8_t  priority2;                    /* grandmasterPriority2 */
+    uint64_t grandmaster_identity;         /* grandmasterIdentity */
+    uint16_t steps_removed;                /* stepsRemoved */
+    uint64_t source_port_identity;         /* sourcePortIdentity clockId of the Announce sender */
+};
+
 struct ap2_ptp_ctx {
     /* PTP-to-local offset in nanoseconds (set by provider) */
     int64_t offset_ns;
@@ -108,6 +137,21 @@ struct ap2_ptp_ctx {
      * is the standard/default transport (this stays false); the peer list and
      * this switch keep unicast one flip away for on-device experimentation. */
     bool unicast_mirror;
+
+    /* ---- BMCA / slave state (guarded by lock) ---- */
+    pthread_mutex_t lock;
+    bool is_grandmaster;            /* true: we drive the timeline; false: slaved to a peer */
+    uint64_t master_clock_id;       /* elected GM identity (peer's grandmasterIdentity when slaving) */
+    int64_t master_offset_ns;       /* smoothed local->master offset (add to local for master time) */
+    bool have_offset;               /* at least one offset sample folded in */
+    bool have_peer;                 /* at least one peer Announce parsed */
+    struct ptp_dataset best_peer;   /* most recent competing dataset */
+    uint64_t last_peer_announce_ns; /* local ns of the most recent peer Announce (silence detect) */
+    /* Two-step Sync/Follow_Up pairing (single outstanding, keyed by sequenceId). */
+    bool pending_sync_valid;
+    uint16_t pending_sync_seq;
+    uint64_t pending_sync_rx_ns;    /* t2: local reception time of the Sync */
+    int64_t pending_sync_corr_ns;   /* correctionField carried on the Sync */
 };
 
 /* ---- NTP timing responder ---- */
@@ -338,6 +382,204 @@ static int ptp_open_socket(struct ap2_ptp_ctx *ctx, uint16_t port)
     return s;
 }
 
+/* ---- BMCA + slave (peer-driven timeline) ---- */
+
+/* Decode a big-endian 64-bit value (clock identity / port identity). */
+static uint64_t ptp_read_u64(const uint8_t *b)
+{
+    uint64_t v = 0;
+    for (int i = 0; i < 8; i++) v = (v << 8) | b[i];
+    return v;
+}
+
+/* Decode a 10-byte PTP timestamp (48-bit seconds BE + 32-bit nanoseconds BE). */
+static uint64_t ptp_read_ts(const uint8_t *b)
+{
+    uint64_t sec = ((uint64_t)b[0] << 40) | ((uint64_t)b[1] << 32) |
+                   ((uint64_t)b[2] << 24) | ((uint64_t)b[3] << 16) |
+                   ((uint64_t)b[4] << 8)  |  (uint64_t)b[5];
+    uint32_t nsec = ((uint32_t)b[6] << 24) | ((uint32_t)b[7] << 16) |
+                    ((uint32_t)b[8] << 8)  |  (uint32_t)b[9];
+    return sec * 1000000000ULL + (uint64_t)nsec;
+}
+
+/* Decode the header correctionField (bytes 8..15): a signed value in units of
+ * 2^-16 ns. Return whole nanoseconds (sub-ns residue dropped). */
+static int64_t ptp_read_correction_ns(const uint8_t *hdr)
+{
+    uint64_t raw = ptp_read_u64(hdr + 8);
+    return (int64_t)raw / 65536;   /* /2^16, symmetric truncation, keeps sign */
+}
+
+/* Parse an Announce body into a best-master dataset. */
+static bool ptp_parse_announce(const uint8_t *buf, int n, struct ptp_dataset *ds)
+{
+    if (n < PTP_HDR_LEN + 30) return false;
+    const uint8_t *body = buf + PTP_HDR_LEN;
+    ds->priority1 = body[13];
+    ds->clock_class = body[14];
+    ds->clock_accuracy = body[15];
+    ds->offset_scaled_log_variance = ((uint16_t)body[16] << 8) | body[17];
+    ds->priority2 = body[18];
+    ds->grandmaster_identity = ptp_read_u64(body + 19);
+    ds->steps_removed = ((uint16_t)body[27] << 8) | body[28];
+    ds->source_port_identity = ptp_read_u64(buf + 20);
+    return true;
+}
+
+/* Our own advertised dataset (mirrors what ptp_send_announce emits). */
+static void ptp_own_dataset(const struct ap2_ptp_ctx *ctx, struct ptp_dataset *ds)
+{
+    ds->priority1 = PTP_PRIORITY1;
+    ds->clock_class = PTP_CLOCK_CLASS;
+    ds->clock_accuracy = PTP_CLOCK_ACCURACY;
+    ds->offset_scaled_log_variance = PTP_LOG_VARIANCE;
+    ds->priority2 = PTP_PRIORITY2;
+    ds->grandmaster_identity = ctx->clock_id;
+    ds->steps_removed = 0;
+    ds->source_port_identity = ctx->clock_id;
+}
+
+/*
+ * IEEE 1588-2008 dataset comparison (§9.3.2.5). Returns <0 if A is the better
+ * master, >0 if B is the better master, 0 if equivalent. When the two name
+ * different grandmasters (our case: our clock vs a receiver's) the
+ * priority/quality vector decides, identity breaking a final tie. The
+ * same-grandmaster branch is a reduced topology tiebreak (fewer stepsRemoved,
+ * then lower announcing identity) — sufficient for a two-node sender/receiver
+ * group and never reached while our and the peer's identities differ.
+ */
+static int ptp_dataset_compare(const struct ptp_dataset *a, const struct ptp_dataset *b)
+{
+    if (a->grandmaster_identity != b->grandmaster_identity) {
+        if (a->priority1 != b->priority1)
+            return a->priority1 < b->priority1 ? -1 : 1;
+        if (a->clock_class != b->clock_class)
+            return a->clock_class < b->clock_class ? -1 : 1;
+        if (a->clock_accuracy != b->clock_accuracy)
+            return a->clock_accuracy < b->clock_accuracy ? -1 : 1;
+        if (a->offset_scaled_log_variance != b->offset_scaled_log_variance)
+            return a->offset_scaled_log_variance < b->offset_scaled_log_variance ? -1 : 1;
+        if (a->priority2 != b->priority2)
+            return a->priority2 < b->priority2 ? -1 : 1;
+        return a->grandmaster_identity < b->grandmaster_identity ? -1 : 1;
+    }
+    if (a->steps_removed != b->steps_removed)
+        return a->steps_removed < b->steps_removed ? -1 : 1;
+    if (a->source_port_identity != b->source_port_identity)
+        return a->source_port_identity < b->source_port_identity ? -1 : 1;
+    return 0;
+}
+
+/* Fold one local->master offset sample in: snap on a step, EMA on jitter. */
+static void ptp_apply_offset_sample(struct ap2_ptp_ctx *ctx, int64_t raw_offset)
+{
+    pthread_mutex_lock(&ctx->lock);
+    if (!ctx->have_offset) {
+        ctx->master_offset_ns = raw_offset;
+        ctx->have_offset = true;
+    } else {
+        int64_t delta = raw_offset - ctx->master_offset_ns;
+        if (delta > PTP_OFFSET_SNAP_NS || delta < -PTP_OFFSET_SNAP_NS)
+            ctx->master_offset_ns = raw_offset;
+        else
+            ctx->master_offset_ns += delta / PTP_OFFSET_EMA_DIV;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+/* Run BMCA against a freshly received peer Announce and (re)assign our role. */
+static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
+                                uint64_t rx_ns, const char *srcip)
+{
+    struct ptp_dataset peer;
+    if (!ptp_parse_announce(buf, n, &peer)) return;
+
+    struct ptp_dataset own;
+    pthread_mutex_lock(&ctx->lock);
+    ptp_own_dataset(ctx, &own);
+    ctx->best_peer = peer;
+    ctx->have_peer = true;
+    ctx->last_peer_announce_ns = rx_ns;
+    bool was_gm = ctx->is_grandmaster;
+    /* We keep the timeline unless the peer is strictly better (cmp > 0). */
+    bool now_gm = ptp_dataset_compare(&own, &peer) <= 0;
+    ctx->is_grandmaster = now_gm;
+    ctx->master_clock_id = now_gm ? ctx->clock_id : peer.grandmaster_identity;
+    if (!now_gm && was_gm) {
+        /* Just started slaving: drop any stale lock so the offset re-acquires
+         * against the new master rather than smoothing from zero. */
+        ctx->have_offset = false;
+        ctx->pending_sync_valid = false;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+
+    if (was_gm != now_gm) {
+        LOG_INFO("[PTP] BMCA role -> %s (peer %s gm=%016" PRIx64 " prio1=%u/class=%u; "
+                 "ours prio1=%u/class=%u)", now_gm ? "GRANDMASTER" : "SLAVE", srcip,
+                 peer.grandmaster_identity, peer.priority1, peer.clock_class,
+                 own.priority1, own.clock_class);
+    } else {
+        LOG_DEBUG("[PTP] RX Announce from %s gm=%016" PRIx64 " prio1=%u (role unchanged: %s)",
+                  srcip, peer.grandmaster_identity, peer.priority1,
+                  now_gm ? "GM" : "slave");
+    }
+}
+
+/*
+ * Slave path, Sync. Two-step: stash reception time (t2) + correctionField keyed
+ * by sequenceId to pair with the Follow_Up. One-step: originTimestamp is in the
+ * Sync itself, so compute the offset immediately.
+ */
+static void ptp_handle_sync(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n, uint64_t rx_ns)
+{
+    uint16_t flags = ((uint16_t)buf[6] << 8) | buf[7];
+    uint16_t seq = ((uint16_t)buf[30] << 8) | buf[31];
+    int64_t corr_ns = ptp_read_correction_ns(buf);
+
+    if (flags & PTP_FLAG_TWO_STEP) {
+        pthread_mutex_lock(&ctx->lock);
+        ctx->pending_sync_valid = true;
+        ctx->pending_sync_seq = seq;
+        ctx->pending_sync_rx_ns = rx_ns;
+        ctx->pending_sync_corr_ns = corr_ns;
+        pthread_mutex_unlock(&ctx->lock);
+        return;
+    }
+    if (n < PTP_HDR_LEN + 10) return;
+    uint64_t t1 = ptp_read_ts(buf + PTP_HDR_LEN);
+    ptp_apply_offset_sample(ctx, (int64_t)t1 + corr_ns - (int64_t)rx_ns);
+    LOG_DEBUG("[PTP] slave offset (one-step) seq=%u t1=%" PRIu64 " t2=%" PRIu64,
+              seq, t1, rx_ns);
+}
+
+/*
+ * Slave path, Follow_Up. Pair with the stashed two-step Sync and compute
+ * local->master offset = (preciseOriginTimestamp + corr_sync + corr_fup) - t2,
+ * where t2 is the Sync reception time. This is nqptp's minimal one-way math:
+ * propagation delay is ignored (sub-ms and equal across receivers).
+ */
+static void ptp_handle_follow_up(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n)
+{
+    if (n < PTP_HDR_LEN + 10) return;
+    uint16_t seq = ((uint16_t)buf[30] << 8) | buf[31];
+    uint64_t t1 = ptp_read_ts(buf + PTP_HDR_LEN);
+    int64_t corr_fup = ptp_read_correction_ns(buf);
+
+    pthread_mutex_lock(&ctx->lock);
+    bool matched = ctx->pending_sync_valid && ctx->pending_sync_seq == seq;
+    uint64_t t2 = ctx->pending_sync_rx_ns;
+    int64_t corr_sync = ctx->pending_sync_corr_ns;
+    if (matched) ctx->pending_sync_valid = false;
+    pthread_mutex_unlock(&ctx->lock);
+    if (!matched) return;
+
+    int64_t offset = (int64_t)t1 + corr_sync + corr_fup - (int64_t)t2;
+    ptp_apply_offset_sample(ctx, offset);
+    LOG_DEBUG("[PTP] slave offset seq=%u t1=%" PRIu64 " t2=%" PRIu64 " corr=%" PRId64
+              " -> off=%" PRId64 "ns", seq, t1, t2, corr_sync + corr_fup, offset);
+}
+
 static void *ptp_thread_func(void *arg)
 {
     struct ap2_ptp_ctx *ctx = (struct ap2_ptp_ctx *)arg;
@@ -345,13 +587,37 @@ static void *ptp_thread_func(void *arg)
 
     while (ctx->ptp_running) {
         uint64_t now = ap2_ptp_now_ns(ctx);
-        if (now - last_announce >= PTP_ANNOUNCE_INTERVAL_NS) {
-            ptp_send_announce(ctx);
-            last_announce = now;
+
+        /* Read our current role once per iteration and revert to grandmaster if
+         * the elected peer has gone silent (dropped off the network). */
+        bool reclaimed = false;
+        pthread_mutex_lock(&ctx->lock);
+        if (!ctx->is_grandmaster && ctx->have_peer &&
+            now - ctx->last_peer_announce_ns > PTP_PEER_SILENCE_NS) {
+            ctx->is_grandmaster = true;
+            ctx->master_clock_id = ctx->clock_id;
+            ctx->have_peer = false;
+            ctx->have_offset = false;
+            ctx->pending_sync_valid = false;
+            reclaimed = true;
         }
-        if (now - last_sync >= PTP_SYNC_INTERVAL_NS) {
-            ptp_send_sync(ctx);
-            last_sync = now;
+        bool gm = ctx->is_grandmaster;
+        pthread_mutex_unlock(&ctx->lock);
+        if (reclaimed)
+            LOG_INFO("[PTP] peer silent > %llu ms; reclaiming GRANDMASTER",
+                     (unsigned long long)(PTP_PEER_SILENCE_NS / 1000000ULL));
+
+        /* Emit Announce/Sync/Follow_Up only while we hold the timeline. A slaved
+         * clock stays quiet so it does not compete with the elected master. */
+        if (gm) {
+            if (now - last_announce >= PTP_ANNOUNCE_INTERVAL_NS) {
+                ptp_send_announce(ctx);
+                last_announce = now;
+            }
+            if (now - last_sync >= PTP_SYNC_INTERVAL_NS) {
+                ptp_send_sync(ctx);
+                last_sync = now;
+            }
         }
 
         struct pollfd pfds[2] = {
@@ -375,14 +641,21 @@ static void *ptp_thread_func(void *arg)
             inet_ntop(AF_INET, &src.sin_addr, srcip, sizeof(srcip));
             switch (msg_type) {
             case PTP_MSG_DELAY_REQ:
-                LOG_DEBUG("[PTP] RX Delay_Req from %s", srcip);
-                if (n >= PTP_HDR_LEN + 10) ptp_send_delay_resp(ctx, buf, rx);
+                /* Only the grandmaster answers Delay_Req. */
+                if (gm && n >= PTP_HDR_LEN + 10) {
+                    LOG_DEBUG("[PTP] RX Delay_Req from %s", srcip);
+                    ptp_send_delay_resp(ctx, buf, rx);
+                }
                 break;
             case PTP_MSG_ANNOUNCE:
-                LOG_DEBUG("[PTP] RX Announce from %s (competing master)", srcip);
+                ptp_handle_announce(ctx, buf, n, rx, srcip);
                 break;
             case PTP_MSG_SYNC:
-                LOG_DEBUG("[PTP] RX Sync from %s", srcip);
+                /* Peer Sync only matters when we are slaving to it. */
+                if (!gm) ptp_handle_sync(ctx, buf, n, rx);
+                break;
+            case PTP_MSG_FOLLOW_UP:
+                if (!gm) ptp_handle_follow_up(ctx, buf, n);
                 break;
             default:
                 LOG_DEBUG("[PTP] RX msgType=0x%x from %s", msg_type, srcip);
@@ -402,6 +675,10 @@ struct ap2_ptp_ctx *ap2_ptp_create(void)
     ctx->timing_sock = -1;
     ctx->event_sock = -1;
     ctx->general_sock = -1;
+    pthread_mutex_init(&ctx->lock, NULL);
+    /* Default to grandmaster until (and unless) a peer wins BMCA, so the
+     * getters return a sane timeline before the engine ever runs. */
+    ctx->is_grandmaster = true;
     return ctx;
 }
 
@@ -411,6 +688,7 @@ void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx)
     ap2_ptp_stop(ctx);
     for (int i = 0; i < ctx->npeers; i++) free(ctx->peers[i]);
     free(ctx->device_ip);
+    pthread_mutex_destroy(&ctx->lock);
     free(ctx);
 }
 
@@ -578,6 +856,17 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
         ctx->clock_id_set = true;
     }
 
+    /* Start as grandmaster of our own clock; BMCA hands the timeline to a peer
+     * only if one announces a strictly better dataset during the session. */
+    pthread_mutex_lock(&ctx->lock);
+    ctx->is_grandmaster = true;
+    ctx->master_clock_id = ctx->clock_id;
+    ctx->master_offset_ns = 0;
+    ctx->have_offset = false;
+    ctx->have_peer = false;
+    ctx->pending_sync_valid = false;
+    pthread_mutex_unlock(&ctx->lock);
+
     ctx->event_sock = ptp_open_socket(ctx, PTP_EVENT_PORT);
     if (ctx->event_sock < 0) {
         LOG_ERROR("[PTP] Cannot bind UDP %d: %s (privileged port; run as root for PTP). "
@@ -605,8 +894,50 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
         return false;
     }
 
-    LOG_INFO("[PTP] Grandmaster started on UDP 319/320, clockID=%016" PRIx64
+    LOG_INFO("[PTP] Engine started on UDP 319/320, clockID=%016" PRIx64
              ", mcast=%s, iface=%s", ctx->clock_id, PTP_MCAST_ADDR,
              ctx->bind_addr.s_addr == INADDR_ANY ? "default" : inet_ntoa(ctx->bind_addr));
     return true;
+}
+
+void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms)
+{
+    if (!ctx || !ctx->engine_active || timeout_ms <= 0) return;
+
+    uint64_t deadline = ap2_ptp_now_ns(ctx) + (uint64_t)timeout_ms * 1000000ULL;
+    while (ap2_ptp_now_ns(ctx) < deadline) {
+        pthread_mutex_lock(&ctx->lock);
+        /* A coherent decision: either a peer appeared and we out-ranked it, or
+         * we are slaving to it and have locked at least one offset sample. */
+        bool decided = ctx->have_peer && (ctx->is_grandmaster || ctx->have_offset);
+        pthread_mutex_unlock(&ctx->lock);
+        if (decided) break;
+        usleep(10000);   /* 10 ms poll */
+    }
+
+    pthread_mutex_lock(&ctx->lock);
+    LOG_INFO("[PTP] BMCA settled: %s, timeline=%016" PRIx64 "%s",
+             ctx->is_grandmaster ? "GRANDMASTER" : "SLAVE", ctx->master_clock_id,
+             (!ctx->is_grandmaster && ctx->have_offset) ? " (offset locked)" :
+             (ctx->have_peer ? "" : " (no peer seen)"));
+    pthread_mutex_unlock(&ctx->lock);
+}
+
+uint64_t ap2_ptp_master_clock_id(struct ap2_ptp_ctx *ctx)
+{
+    if (!ctx) return 0;
+    pthread_mutex_lock(&ctx->lock);
+    uint64_t id = ctx->is_grandmaster ? ctx->clock_id : ctx->master_clock_id;
+    pthread_mutex_unlock(&ctx->lock);
+    return id;
+}
+
+uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx)
+{
+    uint64_t local = ap2_ptp_now_ns(ctx);
+    if (!ctx) return local;
+    pthread_mutex_lock(&ctx->lock);
+    int64_t off = ctx->is_grandmaster ? 0 : ctx->master_offset_ns;
+    pthread_mutex_unlock(&ctx->lock);
+    return (uint64_t)((int64_t)local + off);
 }

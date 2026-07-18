@@ -564,6 +564,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_ptp_set_clock_id(p->ptp, clock_id);
         if (ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
             p->use_ptp = true;
+            /* Let BMCA hear any competing Announce and resolve the grandmaster
+             * before we build the SETUP, so the timeline ClockID below is the
+             * elected master's (ours if we win, the receiver's if it does). */
+            ap2_ptp_engine_settle(p->ptp, 400);
         } else {
             ap2_ptp_start(p->ptp, p->device.address);
             timing_port = ap2_ptp_get_timing_port(p->ptp);
@@ -589,6 +593,11 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_gen_uuid(group_uuid);
         const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
 
+        /* Advertise the ELECTED grandmaster's clock as the timeline: our own
+         * clockID when we win BMCA, else the receiver's grandmasterIdentity.
+         * The media anchor is expressed against this same clock domain below. */
+        uint64_t timeline_id = ap2_ptp_master_clock_id(p->ptp);
+
         ap2_pl_node *root = ap2_pl_dict();
         ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
         ap2_pl_dict_set(root, "deviceID", ap2_pl_string(dev_colon));
@@ -598,15 +607,16 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(group_uuid));
         ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
         ap2_pl_dict_set(root, "timingPeerInfo",
-                        ap2_make_timing_peer(peer_id, clock_id, our_addr));
+                        ap2_make_timing_peer(peer_id, timeline_id, our_addr));
         ap2_pl_node *peer_list = ap2_pl_array();
-        ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, clock_id, our_addr));
+        ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, timeline_id, our_addr));
         ap2_pl_dict_set(root, "timingPeerList", peer_list);
 
         plist_len = ap2_pl_serialize(root, &plist_data);
         ap2_pl_free(root);
-        LOG_INFO("[AP2] PTP session SETUP (%d bytes, clockID=%016llx, addr=%s)",
-                 plist_len, (unsigned long long)clock_id, our_addr);
+        LOG_INFO("[AP2] PTP session SETUP (%d bytes, timelineID=%016llx%s, addr=%s)",
+                 plist_len, (unsigned long long)timeline_id,
+                 timeline_id == clock_id ? " [we are GM]" : " [slaving to peer]", our_addr);
     } else {
         struct ap2_plist *sp = ap2_plist_create();
         if (id_valid) ap2_plist_add_string(sp, "deviceID", dev_colon);
@@ -988,7 +998,7 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     uint32_t be = htonl(cur_pos);
     memcpy(pkt + 4, &be, 4);
 
-    uint64_t wall = ap2_ptp_now_ns(p->ptp);
+    uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
     uint32_t wall_hi = htonl((uint32_t)(wall >> 32));
     uint32_t wall_lo = htonl((uint32_t)(wall & 0xFFFFFFFF));
     memcpy(pkt + 8, &wall_hi, 4);
@@ -997,7 +1007,7 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     be = htonl(pos_lat);
     memcpy(pkt + 16, &be, 4);
 
-    uint64_t cid = ap2_ptp_clock_id(p->ptp);
+    uint64_t cid = ap2_ptp_master_clock_id(p->ptp);
     uint32_t cid_hi = htonl((uint32_t)(cid >> 32));
     uint32_t cid_lo = htonl((uint32_t)(cid & 0xFFFFFFFF));
     memcpy(pkt + 20, &cid_hi, 4);
@@ -1028,7 +1038,7 @@ static bool ap2_send_setrateanchortime(struct ap2cl_s *p, uint32_t rtp_time,
 
     ap2_pl_node *root = ap2_pl_dict();
     ap2_pl_dict_set(root, "networkTimeTimelineID",
-                    ap2_pl_int((int64_t)ap2_ptp_clock_id(p->ptp)));
+                    ap2_pl_int((int64_t)ap2_ptp_master_clock_id(p->ptp)));
     ap2_pl_dict_set(root, "networkTimeSecs", ap2_pl_int((int64_t)secs));
     ap2_pl_dict_set(root, "networkTimeFrac", ap2_pl_int((int64_t)network_time_frac));
     ap2_pl_dict_set(root, "rtpTime", ap2_pl_int((int64_t)rtp_time));
@@ -1443,7 +1453,7 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
                 lead_ns = (d >> 32) * 1000000000ULL +
                           (((d & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
             }
-            uint64_t anchor_ns = ap2_ptp_now_ns(p->ptp) + lead_ns;
+            uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + lead_ns;
             ap2_send_setrateanchortime(p, p->rtp_timestamp, anchor_ns, 1);
             p->anchored = true;
         }
@@ -1489,7 +1499,7 @@ void ap2cl_pause(struct ap2cl_s *p)
     if (!p) return;
     if (p->use_buffered && p->buffered_sock >= 0) {
         /* Freeze the buffered timeline in place with a rate-0 anchor. */
-        ap2_send_setrateanchortime(p, p->rtp_timestamp, ap2_ptp_now_ns(p->ptp), 0);
+        ap2_send_setrateanchortime(p, p->rtp_timestamp, ap2_ptp_master_now_ns(p->ptp), 0);
         p->state = AP2_PAUSED;
         return;
     }
@@ -1502,7 +1512,7 @@ void ap2cl_play(struct ap2cl_s *p)
     if (!p) return;
     if (p->use_buffered && p->buffered_sock >= 0) {
         /* Re-anchor at rate 1 a short lead ahead to resume the buffered stream. */
-        uint64_t anchor_ns = ap2_ptp_now_ns(p->ptp) + (uint64_t)p->latency_ms * 1000000ULL;
+        uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + (uint64_t)p->latency_ms * 1000000ULL;
         ap2_send_setrateanchortime(p, p->rtp_timestamp, anchor_ns, 1);
         p->state = AP2_STREAMING;
         return;
