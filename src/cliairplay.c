@@ -87,6 +87,8 @@ typedef struct {
     char *ap2_name;
     char *ap2_hostname;
     char *ap2_txt;    /* mDNS TXT records */
+    bool force_native;      /* force native AP2 flow (transient pairing) */
+    char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     int64_t ptp_offset_ns;  /* PTP clock offset in nanoseconds */
 
     /* Audio format */
@@ -542,6 +544,10 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     /* Pass through mDNS properties and interface for RAOP-compatible flow */
     ap2cl_set_raop_props(g_ap2cl, cfg->iface, cfg->secret,
                           cfg->et, cfg->md, cfg->am);
+    if (cfg->force_native)
+        ap2cl_force_native(g_ap2cl);
+    if (cfg->publish_ip)
+        ap2cl_set_publish_ip(g_ap2cl, cfg->publish_ip);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
@@ -665,6 +671,7 @@ static void print_usage(const char *name)
     printf("  --samplerate <rate>        Sample rate (default: 44100)\n");
     printf("  --bitdepth <bits>          Bit depth: 16 or 24 (default: 16)\n");
     printf("  --channels <n>             Channel count (default: 2)\n");
+    printf("  --if <ip>                  Local interface IP to bind (multi-homed hosts)\n");
     printf("  --debug <0-9>              Debug level (default: 3)\n");
     printf("  --ntp                      Print current NTP and exit\n");
     printf("  --check                    Print check info and exit\n");
@@ -675,7 +682,6 @@ static void print_usage(const char *name)
     printf("  --encrypt                  Enable audio payload encryption\n");
     printf("  --secret <secret>          AppleTV pairing secret\n");
     printf("  --password <password>      Device password\n");
-    printf("  --if <ip>                  Local interface IP to bind\n");
     printf("  --et <value>               mDNS et field (encryption types)\n");
     printf("  --md <value>               mDNS md field (metadata types)\n");
     printf("  --am <value>               mDNS am field (model name)\n");
@@ -683,7 +689,10 @@ static void print_usage(const char *name)
     printf("  --pw <value>               mDNS pw field (password flag)\n");
     printf("  --cn <value>               mDNS cn field (codec types); auto-selects codec\n\n");
     printf("AirPlay 2 options:\n");
-    printf("  --auth <credentials>       HAP credentials (hex string)\n");
+    printf("  --auth <credentials>       HAP credentials (hex string, stored pairing)\n");
+    printf("  --ap2-native               Force native AP2 flow without credentials\n");
+    printf("                             (transient pairing; default is RAOP-compat)\n");
+    printf("  --publish-ip <ip>          Address advertised to devices (multi-homed hosts)\n");
     printf("  --name <name>              Device name\n");
     printf("  --hostname <hostname>      Device hostname\n");
     printf("  --txt <records>            mDNS TXT records (key=value pairs)\n");
@@ -753,6 +762,8 @@ int main(int argc, char *argv[])
         {"ptp-offset",   required_argument, 0, 1004},
         {"cn",           required_argument, 0, 1005},
         {"raw",          no_argument,       0, 1006},
+        {"ap2-native",   no_argument,       0, 1007},
+        {"publish-ip",   required_argument, 0, 1008},
         {"ntp",          no_argument,       0, 1001},
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
@@ -801,6 +812,8 @@ int main(int argc, char *argv[])
         case 1004: sscanf(optarg, "%" PRId64, &cfg.ptp_offset_ns); break;
         case 1005: cfg.cn = optarg; break;
         case 1006: cfg.raw = true; break;
+        case 1007: cfg.force_native = true; break;
+        case 1008: cfg.publish_ip = optarg; break;
         case 1001: {
             uint64_t ntp = raopcl_get_ntp(NULL);
             printf("%" PRIu64 "\n", ntp);

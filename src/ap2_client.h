@@ -119,6 +119,15 @@ void ap2cl_set_raop_props(struct ap2cl_s *p,
                            const char *iface, const char *secret,
                            const char *et, const char *md, const char *am);
 
+/* Force the native AP2 flow even without stored credentials (uses transient
+ * pairing). Must be called before ap2cl_connect(). */
+void ap2cl_force_native(struct ap2cl_s *p);
+
+/* Set the address we advertise to the device (multi-homed hosts), used
+ * wherever the protocol carries our own address (e.g. timing peer lists).
+ * Defaults to the bind/source address when unset. */
+void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip);
+
 /* Get current state. */
 ap2_state_t ap2cl_state(struct ap2cl_s *p);
 

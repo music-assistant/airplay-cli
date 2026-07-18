@@ -7,8 +7,9 @@
  *    Used for: Sonos, third-party devices without stored credentials
  *    Limitations: 16-bit only
  *
- * 2. Native AP2 (with --auth): HAP pair-verify + encrypted RTSP + streams SETUP
- *    Used for: Apple TV, HomePod, Sonos with stored credentials
+ * 2. Native AP2: HAP pairing + encrypted RTSP + streams SETUP
+ *    With --auth: HAP pair-verify with stored credentials (Apple TV, HomePod)
+ *    Without --auth: transient pair-setup (Sonos, most third-party receivers)
  *    Supports: 24-bit/48kHz ALAC, encrypted audio
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
@@ -65,6 +66,8 @@ struct ap2cl_s {
     char *dacp_id;
     char *active_remote;
     char *iface;
+    char *publish_ip;         /* address we advertise to the device (multi-homed) */
+    struct in_addr bind_addr; /* resolved local bind address (INADDR_ANY if none) */
     char *secret;
     char *password;
     char *et;
@@ -303,8 +306,23 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", p->device.port);
 
+    /* Resolve the local bind address once (multi-homed hosts): used for the
+     * RTSP TCP socket and the RTP data/control UDP sockets below. */
+    p->bind_addr.s_addr = INADDR_ANY;
+    if (p->iface) {
+        char *ifname = NULL;
+        uint32_t netmask;
+        p->bind_addr = get_interface(p->iface, &ifname, &netmask);
+        NFREE(ifname);
+    }
+
     if (getaddrinfo(p->device.address, port_str, &hints, &res) != 0) return false;
     p->sock_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (p->sock_fd >= 0 && p->bind_addr.s_addr != INADDR_ANY) {
+        struct sockaddr_in la = {.sin_family = AF_INET, .sin_addr = p->bind_addr};
+        if (bind(p->sock_fd, (struct sockaddr *)&la, sizeof(la)) != 0)
+            LOG_WARN("[AP2] Cannot bind RTSP socket to %s", inet_ntoa(p->bind_addr));
+    }
     if (p->sock_fd < 0 || connect(p->sock_fd, res->ai_addr, res->ai_addrlen) != 0) {
         freeaddrinfo(res);
         if (p->sock_fd >= 0) { close(p->sock_fd); p->sock_fd = -1; }
@@ -337,32 +355,46 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     free(resp);
     if (status != 200) { LOG_ERROR("[AP2] /info failed: %d", status); return false; }
 
-    /* 2. HAP pair-verify */
-    p->hap = ap2_hap_create(p->auth_credentials);
-    if (!p->hap) { LOG_ERROR("[AP2] Invalid credentials"); return false; }
+    /* 2. HAP pairing: pair-verify with stored credentials (Apple TV/HomePod),
+     * transient pair-setup otherwise (Sonos and most third-party receivers) */
+    if (p->auth_credentials) {
+        p->hap = ap2_hap_create(p->auth_credentials);
+        if (!p->hap) { LOG_ERROR("[AP2] Invalid credentials"); return false; }
 
-    /* Set client_id from DACP ID as UPPERCASE ASCII string.
-     * Must match what was sent during pair-setup. MA's pair-setup uses the
-     * DACP ID as a 16-char uppercase hex string encoded as bytes. */
-    if (p->dacp_id) {
-        /* Uppercase the string */
-        char upper_dacp[32];
-        int len = strlen(p->dacp_id);
-        if (len > 30) len = 30;
-        for (int i = 0; i < len; i++) {
-            char c = p->dacp_id[i];
-            upper_dacp[i] = (c >= 'a' && c <= 'f') ? (c - 'a' + 'A') : c;
+        /* Set client_id from DACP ID as UPPERCASE ASCII string.
+         * Must match what was sent during pair-setup. MA's pair-setup uses the
+         * DACP ID as a 16-char uppercase hex string encoded as bytes. */
+        if (p->dacp_id) {
+            /* Uppercase the string */
+            char upper_dacp[32];
+            int len = strlen(p->dacp_id);
+            if (len > 30) len = 30;
+            for (int i = 0; i < len; i++) {
+                char c = p->dacp_id[i];
+                upper_dacp[i] = (c >= 'a' && c <= 'f') ? (c - 'a' + 'A') : c;
+            }
+            upper_dacp[len] = '\0';
+            ap2_hap_set_client_id(p->hap, (const uint8_t *)upper_dacp, len);
         }
-        upper_dacp[len] = '\0';
-        ap2_hap_set_client_id(p->hap, (const uint8_t *)upper_dacp, len);
-    }
 
-    LOG_INFO("[AP2] Performing HAP pair-verify...");
-    if (!ap2_hap_pair_verify(p->hap, p->sock_fd)) {
-        LOG_ERROR("[AP2] HAP pair-verify failed");
-        ap2_hap_destroy(p->hap);
-        p->hap = NULL;
-        return false;
+        LOG_INFO("[AP2] Performing HAP pair-verify...");
+        if (!ap2_hap_pair_verify(p->hap, p->sock_fd)) {
+            LOG_ERROR("[AP2] HAP pair-verify failed");
+            ap2_hap_destroy(p->hap);
+            p->hap = NULL;
+            return false;
+        }
+    } else {
+        p->hap = ap2_hap_create(NULL);
+        if (!p->hap) { LOG_ERROR("[AP2] Cannot create HAP context"); return false; }
+
+        LOG_INFO("[AP2] Performing HAP transient pair-setup...");
+        if (!ap2_hap_pair_setup_transient(p->hap, p->sock_fd)) {
+            LOG_ERROR("[AP2] HAP transient pair-setup failed");
+            ap2_hap_destroy(p->hap);
+            p->hap = NULL;
+            return false;
+        }
     }
     LOG_INFO("[AP2] Channel encrypted");
 
@@ -454,14 +486,17 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     }
 
     /* 5. Stream SETUP with streams array (BEFORE RECORD per Apple TV expectations) */
-    RAND_bytes(p->audio_key, 32);
+    /* The shk audio key must be the first 32 bytes of the pairing shared
+     * secret: that is also the key the audio sender encrypts with, and the
+     * receiver uses shk to decrypt the RTP payloads. */
+    memcpy(p->audio_key, ap2_hap_get_shared_secret(p->hap), 32);
     /* SSRC must match streamConnectionID that we register in stream SETUP,
      * otherwise the AP2 receiver can't identify which stream the RTP packet belongs to */
     p->ssrc = p->session_id;
 
     /* Open UDP sockets */
     p->data_sock = socket(AF_INET, SOCK_DGRAM, 0);
-    struct sockaddr_in bind_addr = {.sin_family = AF_INET, .sin_addr.s_addr = INADDR_ANY};
+    struct sockaddr_in bind_addr = {.sin_family = AF_INET, .sin_addr = p->bind_addr};
     bind(p->data_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr));
     struct sockaddr_in ds_local;
     len = sizeof(ds_local);
@@ -874,7 +909,7 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->sock_fd >= 0) close(p->sock_fd);
     if (p->data_sock >= 0) close(p->data_sock);
     if (p->ctrl_sock >= 0) close(p->ctrl_sock);
-    free(p->dacp_id); free(p->active_remote); free(p->iface);
+    free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
     free(p->secret); free(p->password); free(p->et); free(p->md); free(p->am);
     free(p->auth_credentials);
     free(p);
@@ -891,6 +926,22 @@ void ap2cl_set_raop_props(struct ap2cl_s *p,
     if (et) { free(p->et); p->et = strdup(et); }
     if (md) { free(p->md); p->md = strdup(md); }
     if (am) { free(p->am); p->am = strdup(am); }
+}
+
+void ap2cl_force_native(struct ap2cl_s *p)
+{
+    if (!p) return;
+    if (p->flow != FLOW_NATIVE_AP2) {
+        p->flow = FLOW_NATIVE_AP2;
+        LOG_INFO("[AP2] Forcing native AP2 flow (transient pairing without credentials)");
+    }
+}
+
+void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
+{
+    if (!p || !ip) return;
+    free(p->publish_ip);
+    p->publish_ip = strdup(ip);
 }
 
 bool ap2cl_connect(struct ap2cl_s *p)
