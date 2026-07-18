@@ -90,6 +90,7 @@ typedef struct {
     bool force_native;      /* force native AP2 flow (transient pairing) */
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     int64_t ptp_offset_ns;  /* PTP clock offset in nanoseconds */
+    bool ptp;               /* force PTP grandmaster timing for native AP2 */
 
     /* Audio format */
     int sample_rate;
@@ -574,6 +575,8 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         ap2cl_force_native(g_ap2cl);
     if (cfg->publish_ip)
         ap2cl_set_publish_ip(g_ap2cl, cfg->publish_ip);
+    if (cfg->ptp)
+        ap2cl_set_ptp(g_ap2cl, true);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
@@ -723,7 +726,10 @@ static void print_usage(const char *name)
     printf("  --name <name>              Device name\n");
     printf("  --hostname <hostname>      Device hostname\n");
     printf("  --txt <records>            mDNS TXT records (key=value pairs)\n");
-    printf("  --ptp-offset <ns>          PTP clock offset in nanoseconds\n\n");
+    printf("  --ptp-offset <ns>          PTP clock offset in nanoseconds\n");
+    printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
+    printf("                             binds UDP 319/320, needs root; else auto by\n");
+    printf("                             SupportsPTP feature bit)\n\n");
     printf("Examples:\n");
     printf("  # RAOP streaming from stdin:\n");
     printf("  ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | %s 192.168.1.50 -\n\n", name);
@@ -791,6 +797,7 @@ int main(int argc, char *argv[])
         {"raw",          no_argument,       0, 1006},
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
+        {"ptp",          no_argument,       0, 1009},
         {"ntp",          no_argument,       0, 1001},
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
@@ -841,6 +848,7 @@ int main(int argc, char *argv[])
         case 1006: cfg.raw = true; break;
         case 1007: cfg.force_native = true; break;
         case 1008: cfg.publish_ip = optarg; break;
+        case 1009: cfg.ptp = true; break;
         case 1001: {
             uint64_t ntp = raopcl_get_ntp(NULL);
             printf("%" PRIu64 "\n", ntp);

@@ -98,6 +98,11 @@ struct ap2cl_s {
     char session_uuid[40];
     uint32_t session_id;
     int cseq;
+
+    /* PTP timing selection */
+    bool use_ptp;      /* resolved: PTP grandmaster timing active this session */
+    bool ptp_forced;   /* ap2cl_set_ptp() was called (overrides auto-detect) */
+    bool ptp_enabled;  /* value passed to ap2cl_set_ptp() */
 };
 
 /* ---- Native AP2 RTSP I/O ---- */
@@ -237,6 +242,75 @@ static int ap2_rtsp_send(struct ap2cl_s *p, const char *method, const char *uri,
     return 0;
 }
 
+/* ---- Native AP2 connect helpers ---- */
+
+/* Format a random RFC-4122-shaped UUID string (uppercase, 36 chars + NUL). */
+static void ap2_gen_uuid(char out[37])
+{
+    uint8_t u[16];
+    RAND_bytes(u, 16);
+    snprintf(out, 37,
+             "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+             u[0], u[1], u[2], u[3], u[4], u[5], u[6], u[7],
+             u[8], u[9], u[10], u[11], u[12], u[13], u[14], u[15]);
+}
+
+/* Parse up to 8 bytes from a hex identifier string (e.g. the 16-char DACP ID).
+ * Returns the number of bytes parsed. */
+static int ap2_dacp_bytes(const char *dacp, uint8_t out[8])
+{
+    int n = 0;
+    if (!dacp) return 0;
+    int len = (int)strlen(dacp);
+    for (int i = 0; i + 1 < len && n < 8; i += 2) {
+        unsigned int v;
+        if (sscanf(dacp + i, "%2x", &v) != 1) break;
+        out[n++] = (uint8_t)v;
+    }
+    return n;
+}
+
+/* Format bytes as an uppercase colon-separated hex string ("1A:2B:..."). */
+static void ap2_colon_hex(const uint8_t *b, int n, char *out)
+{
+    int di = 0;
+    for (int i = 0; i < n; i++) {
+        di += sprintf(out + di, "%02X", b[i]);
+        if (i < n - 1) out[di++] = ':';
+    }
+    out[di] = '\0';
+}
+
+/* True if the mDNS TXT blob advertises SupportsPTP (features bit 41).
+ * features=0xLOW,0xHIGH; bit 41 is bit 9 of HIGH = 0x200. Also accepts "ft=". */
+static bool ap2_features_has_ptp(const char *txt)
+{
+    if (!txt) return false;
+    const char *f = strstr(txt, "features=");
+    if (f) f += 9;
+    else if ((f = strstr(txt, "ft="))) f += 3;
+    else return false;
+
+    unsigned long long low = 0, high = 0;
+    if (sscanf(f, "%llx,%llx", &low, &high) == 2)
+        return (high & 0x200ULL) != 0;
+    return false;
+}
+
+/* Build one timing-peer dict {ID, DeviceType, ClockID, SupportsClockPort..., Addresses:[addr]}. */
+static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, const char *addr)
+{
+    ap2_pl_node *d = ap2_pl_dict();
+    ap2_pl_dict_set(d, "ID", ap2_pl_string(id));
+    ap2_pl_dict_set(d, "DeviceType", ap2_pl_int(0));
+    ap2_pl_dict_set(d, "ClockID", ap2_pl_int((int64_t)clock_id));
+    ap2_pl_dict_set(d, "SupportsClockPortMatchingOverride", ap2_pl_bool(false));
+    ap2_pl_node *addrs = ap2_pl_array();
+    ap2_pl_array_append(addrs, ap2_pl_string(addr));
+    ap2_pl_dict_set(d, "Addresses", addrs);
+    return d;
+}
+
 /* ---- Native AP2 connect sequence ---- */
 
 static bool ap2_native_connect(struct ap2cl_s *p)
@@ -279,6 +353,17 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     inet_ntop(AF_INET, &local.sin_addr, local_addr, sizeof(local_addr));
     RAND_bytes((uint8_t *)&p->session_id, 4);
     snprintf(p->session_url, sizeof(p->session_url), "rtsp://%s/%u", local_addr, p->session_id);
+
+    /* Address we advertise to the device (timingPeerInfo.Addresses, SETPEERS):
+     * explicit --publish-ip, else the bound interface, else the RTSP local addr. */
+    char our_addr[INET_ADDRSTRLEN];
+    if (p->publish_ip && *p->publish_ip) {
+        snprintf(our_addr, sizeof(our_addr), "%s", p->publish_ip);
+    } else if (p->bind_addr.s_addr != INADDR_ANY) {
+        inet_ntop(AF_INET, &p->bind_addr, our_addr, sizeof(our_addr));
+    } else {
+        snprintf(our_addr, sizeof(our_addr), "%s", local_addr);
+    }
 
     /* Generate session UUID */
     uint8_t uuid_bytes[16];
@@ -339,36 +424,73 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     }
     LOG_INFO("[AP2] Channel encrypted");
 
-    /* 3. Start NTP timing responder */
+    /* Our AirPlay identity, derived from the (16-hex) DACP ID: an 8-byte
+     * colon deviceID, a 6-byte colon macAddress, and the 64-bit PTP clock
+     * identity. Keeping these in one place ensures the PTP grandmasterIdentity
+     * matches the ClockID we advertise in the session SETUP. */
+    uint8_t id_bytes[8] = {0};
+    int id_n = ap2_dacp_bytes(p->dacp_id, id_bytes);
+    bool id_valid = (id_n >= 8);
+    uint64_t clock_id = 0;
+    for (int i = 0; i < 8; i++) clock_id = (clock_id << 8) | id_bytes[i];
+    char dev_colon[24]; ap2_colon_hex(id_bytes, 8, dev_colon);
+    char mac_colon[18]; ap2_colon_hex(id_bytes, 6, mac_colon);
+
+    /* 3. Timing. PTP grandmaster when selected (forced by flag, else
+     * SupportsPTP feature bit); the legacy NTP responder otherwise. If PTP is
+     * wanted but 319/320 can't be bound (privilege), fall back to NTP. */
+    bool want_ptp = p->ptp_forced ? p->ptp_enabled
+                                  : ap2_features_has_ptp(p->device.txt_records);
     p->ptp = ap2_ptp_create();
-    ap2_ptp_start(p->ptp, p->device.address);
-    int timing_port = ap2_ptp_get_timing_port(p->ptp);
-
-    /* 4. Session SETUP (encrypted) */
-    struct ap2_plist *sp = ap2_plist_create();
-
-    /* deviceID must be colon-formatted uppercase hex from the 16-char DACP ID
-     * e.g. "B2763ADADB414A27" -> "B2:76:3A:DA:DB:41:4A:27" */
-    if (p->dacp_id && strlen(p->dacp_id) >= 16) {
-        char dev_colon[24];
-        int di = 0;
-        for (int i = 0; i < 16 && di < (int)sizeof(dev_colon) - 1; i++) {
-            char c = p->dacp_id[i];
-            if (c >= 'a' && c <= 'f') c = c - 'a' + 'A';
-            dev_colon[di++] = c;
-            if (i % 2 == 1 && i < 15) dev_colon[di++] = ':';
+    int timing_port = 0;
+    if (want_ptp) {
+        ap2_ptp_set_clock_id(p->ptp, clock_id);
+        if (ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
+            p->use_ptp = true;
+        } else {
+            ap2_ptp_start(p->ptp, p->device.address);
+            timing_port = ap2_ptp_get_timing_port(p->ptp);
         }
-        dev_colon[di] = '\0';
-        ap2_plist_add_string(sp, "deviceID", dev_colon);
+    } else {
+        ap2_ptp_start(p->ptp, p->device.address);
+        timing_port = ap2_ptp_get_timing_port(p->ptp);
     }
 
-    ap2_plist_add_string(sp, "sessionUUID", p->session_uuid);
-    ap2_plist_add_int(sp, "timingPort", timing_port);
-    ap2_plist_add_string(sp, "timingProtocol", "NTP");
+    /* 4. Session SETUP (encrypted). PTP and NTP use different session dicts. */
+    uint8_t *plist_data = NULL; int plist_len = 0;
+    if (p->use_ptp) {
+        char peer_id[37], group_uuid[37];
+        ap2_gen_uuid(peer_id);
+        ap2_gen_uuid(group_uuid);
+        const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
 
-    uint8_t *plist_data; int plist_len;
-    plist_len = ap2_plist_serialize(sp, &plist_data);
-    ap2_plist_free(sp);
+        ap2_pl_node *root = ap2_pl_dict();
+        ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
+        ap2_pl_dict_set(root, "deviceID", ap2_pl_string(dev_colon));
+        ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(p->session_uuid));
+        ap2_pl_dict_set(root, "name", ap2_pl_string(name));
+        ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
+        ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(group_uuid));
+        ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+        ap2_pl_dict_set(root, "timingPeerInfo",
+                        ap2_make_timing_peer(peer_id, clock_id, our_addr));
+        ap2_pl_node *peer_list = ap2_pl_array();
+        ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, clock_id, our_addr));
+        ap2_pl_dict_set(root, "timingPeerList", peer_list);
+
+        plist_len = ap2_pl_serialize(root, &plist_data);
+        ap2_pl_free(root);
+        LOG_INFO("[AP2] PTP session SETUP (%d bytes, clockID=%016llx, addr=%s)",
+                 plist_len, (unsigned long long)clock_id, our_addr);
+    } else {
+        struct ap2_plist *sp = ap2_plist_create();
+        if (id_valid) ap2_plist_add_string(sp, "deviceID", dev_colon);
+        ap2_plist_add_string(sp, "sessionUUID", p->session_uuid);
+        ap2_plist_add_int(sp, "timingPort", timing_port);
+        ap2_plist_add_string(sp, "timingProtocol", "NTP");
+        plist_len = ap2_plist_serialize(sp, &plist_data);
+        ap2_plist_free(sp);
+    }
 
     resp = NULL; resp_len = 0;
     status = ap2_rtsp_send(p, "SETUP", p->session_url, plist_data, plist_len,
@@ -379,7 +501,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         free(resp);
         return false;
     }
-    LOG_INFO("[AP2] Session SETUP OK");
+    LOG_INFO("[AP2] Session SETUP OK (%s timing)", p->use_ptp ? "PTP" : "NTP");
 
     /* Extract eventPort from session response */
     int event_port = 0;
@@ -431,9 +553,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * secret: that is also the key the audio sender encrypts with, and the
      * receiver uses shk to decrypt the RTP payloads. */
     memcpy(p->audio_key, ap2_hap_get_shared_secret(p->hap), 32);
-    /* SSRC must match streamConnectionID that we register in stream SETUP,
-     * otherwise the AP2 receiver can't identify which stream the RTP packet belongs to */
-    p->ssrc = p->session_id;
+    /* For NTP sessions the SSRC matches the streamConnectionID we register in
+     * stream SETUP; for PTP sessions the RTP SSRC is zero (the stream is keyed
+     * by the PTP clock identity instead). */
+    p->ssrc = p->use_ptp ? 0 : p->session_id;
 
     /* Open UDP sockets */
     p->data_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -598,6 +721,27 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         LOG_INFO("[AP2] RECORD OK");
     }
 
+    /* 6b. SETPEERS (PTP only): a bare binary-plist array of IP strings
+     * [receiver, us] so the receiver knows the timing group members. */
+    if (p->use_ptp) {
+        ap2_pl_node *arr = ap2_pl_array();
+        ap2_pl_array_append(arr, ap2_pl_string(p->device.address));
+        ap2_pl_array_append(arr, ap2_pl_string(our_addr));
+        uint8_t *sp_data = NULL;
+        int sp_len = ap2_pl_serialize(arr, &sp_data);
+        ap2_pl_free(arr);
+
+        resp = NULL; resp_len = 0;
+        int sp_status = ap2_rtsp_send(p, "SETPEERS", p->session_url, sp_data, sp_len,
+                                       "application/x-apple-binary-plist", &resp, &resp_len);
+        free(sp_data);
+        free(resp);
+        LOG_INFO("[AP2] SETPEERS [%s, %s] -> %d", p->device.address, our_addr, sp_status);
+
+        const char *peers[2] = { p->device.address, our_addr };
+        ap2_ptp_set_peers(p->ptp, peers, 2);
+    }
+
     /* Create ALAC encoder */
     p->alac = alac_create_encoder(AP2_FRAMES_PER_CHUNK,
                                    p->format.sample_rate,
@@ -651,16 +795,67 @@ static void ap2_send_sync_packet(struct ap2cl_s *p, bool first)
            (struct sockaddr *)&p->ctrl_addr, sizeof(p->ctrl_addr));
 }
 
+/* Send AP2 PTP sync (anchor) packet (28 bytes) to the control port.
+ * Format (owntone rtp_common.c sync_packet_ptp, realtime use_ptp path):
+ *   bytes 0-1:   header (0x90d7 first / 0x80d7 subsequent)
+ *   bytes 2-3:   fixed 0x0006
+ *   bytes 4-7:   current RTP timestamp (network order)
+ *   bytes 8-15:  wall-clock time in nanoseconds on the PTP master timebase (BE64)
+ *   bytes 16-19: RTP timestamp - latency (the sample currently rendering)
+ *   bytes 20-27: our PTP clock identity (BE64)
+ * The wall-clock ns and the clock identity come from the PTP grandmaster so the
+ * receiver, slaved to that clock, can place the anchor precisely. */
+static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
+{
+    if (p->ctrl_sock < 0) return;
+
+    uint8_t pkt[28];
+    pkt[0] = first ? 0x90 : 0x80;
+    pkt[1] = 0xd7;
+    pkt[2] = 0x00;
+    pkt[3] = 0x06;
+
+    uint32_t cur_pos = p->rtp_timestamp;
+    uint32_t latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
+    uint32_t pos_lat = cur_pos >= latency_frames ? cur_pos - latency_frames : 0;
+
+    uint32_t be = htonl(cur_pos);
+    memcpy(pkt + 4, &be, 4);
+
+    uint64_t wall = ap2_ptp_now_ns(p->ptp);
+    uint32_t wall_hi = htonl((uint32_t)(wall >> 32));
+    uint32_t wall_lo = htonl((uint32_t)(wall & 0xFFFFFFFF));
+    memcpy(pkt + 8, &wall_hi, 4);
+    memcpy(pkt + 12, &wall_lo, 4);
+
+    be = htonl(pos_lat);
+    memcpy(pkt + 16, &be, 4);
+
+    uint64_t cid = ap2_ptp_clock_id(p->ptp);
+    uint32_t cid_hi = htonl((uint32_t)(cid >> 32));
+    uint32_t cid_lo = htonl((uint32_t)(cid & 0xFFFFFFFF));
+    memcpy(pkt + 20, &cid_hi, 4);
+    memcpy(pkt + 24, &cid_lo, 4);
+
+    sendto(p->ctrl_sock, pkt, sizeof(pkt), 0,
+           (struct sockaddr *)&p->ctrl_addr, sizeof(p->ctrl_addr));
+    LOG_DEBUG("[AP2] TX PTP sync %s pos=%u wall=%" PRIu64 "ns", first ? "(initial)" : "",
+              cur_pos, wall);
+}
+
 static bool ap2_native_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames)
 {
     if (p->data_sock < 0 || !p->alac) return false;
 
-    /* Send initial sync packet before the very first audio packet */
+    /* Send initial sync/anchor packet before the very first audio packet, then
+     * periodically every ~100 chunks (~0.8s at 352fpp/44.1kHz). PTP sessions use
+     * the 28-byte anchor form; NTP sessions the 20-byte form. */
     if (p->first_packet) {
-        ap2_send_sync_packet(p, true);
+        if (p->use_ptp) ap2_send_sync_packet_ptp(p, true);
+        else ap2_send_sync_packet(p, true);
     } else if ((p->seq_number % 100) == 0) {
-        /* Periodic sync packets every ~100 chunks (~0.8 seconds at 352fpp/44.1kHz) */
-        ap2_send_sync_packet(p, false);
+        if (p->use_ptp) ap2_send_sync_packet_ptp(p, false);
+        else ap2_send_sync_packet(p, false);
     }
 
     /* ALAC encode */
@@ -857,6 +1052,14 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
     if (!p || !ip) return;
     free(p->publish_ip);
     p->publish_ip = strdup(ip);
+}
+
+void ap2cl_set_ptp(struct ap2cl_s *p, bool enable)
+{
+    if (!p) return;
+    p->ptp_forced = true;
+    p->ptp_enabled = enable;
+    LOG_INFO("[AP2] PTP timing %s", enable ? "forced ON" : "forced OFF");
 }
 
 bool ap2cl_connect(struct ap2cl_s *p)

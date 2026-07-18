@@ -123,6 +123,12 @@ void ap2cl_set_raop_props(struct ap2cl_s *p,
  * pairing). Must be called before ap2cl_connect(). */
 void ap2cl_force_native(struct ap2cl_s *p);
 
+/* Force PTP (IEEE-1588) timing for the native AP2 flow on or off, overriding
+ * the automatic SupportsPTP (features bit 41) detection. Must be called before
+ * ap2cl_connect(). When PTP is selected but 319/320 cannot be bound, the client
+ * falls back to NTP timing. */
+void ap2cl_set_ptp(struct ap2cl_s *p, bool enable);
+
 /* Set the address we advertise to the device (multi-homed hosts), used
  * wherever the protocol carries our own address (e.g. timing peer lists).
  * Defaults to the bind/source address when unset. */

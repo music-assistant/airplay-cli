@@ -401,3 +401,205 @@ int ap2_plist_serialize(struct ap2_plist *p, uint8_t **out)
     *out = objs.data;
     return objs.len;
 }
+
+/* ---- General nested plist node API ---- */
+
+enum { PLN_DICT, PLN_ARRAY, PLN_STRING, PLN_INT, PLN_BOOL, PLN_DATA };
+
+struct ap2_pl_node {
+    int type;
+    int index;            /* assigned during serialization */
+    char *str;            /* PLN_STRING */
+    int64_t ival;         /* PLN_INT */
+    bool bval;            /* PLN_BOOL */
+    uint8_t *data;        /* PLN_DATA */
+    size_t dlen;
+    /* Containers: keys is non-NULL only for dicts (key string nodes),
+     * vals holds dict values or array elements. */
+    struct ap2_pl_node **keys;
+    struct ap2_pl_node **vals;
+    int n;
+    int cap;
+};
+
+static struct ap2_pl_node *pl_new(int type)
+{
+    struct ap2_pl_node *n = calloc(1, sizeof(*n));
+    if (n) n->type = type;
+    return n;
+}
+
+ap2_pl_node *ap2_pl_dict(void) { return pl_new(PLN_DICT); }
+ap2_pl_node *ap2_pl_array(void) { return pl_new(PLN_ARRAY); }
+
+ap2_pl_node *ap2_pl_string(const char *s)
+{
+    struct ap2_pl_node *n = pl_new(PLN_STRING);
+    if (n) n->str = strdup(s ? s : "");
+    return n;
+}
+
+ap2_pl_node *ap2_pl_int(int64_t v)
+{
+    struct ap2_pl_node *n = pl_new(PLN_INT);
+    if (n) n->ival = v;
+    return n;
+}
+
+ap2_pl_node *ap2_pl_bool(bool b)
+{
+    struct ap2_pl_node *n = pl_new(PLN_BOOL);
+    if (n) n->bval = b;
+    return n;
+}
+
+ap2_pl_node *ap2_pl_data(const uint8_t *d, size_t len)
+{
+    struct ap2_pl_node *n = pl_new(PLN_DATA);
+    if (!n) return NULL;
+    n->data = malloc(len ? len : 1);
+    if (d && len) memcpy(n->data, d, len);
+    n->dlen = len;
+    return n;
+}
+
+static void pl_grow(struct ap2_pl_node *c)
+{
+    if (c->n < c->cap) return;
+    c->cap = c->cap ? c->cap * 2 : 8;
+    c->vals = realloc(c->vals, c->cap * sizeof(*c->vals));
+    if (c->type == PLN_DICT)
+        c->keys = realloc(c->keys, c->cap * sizeof(*c->keys));
+}
+
+void ap2_pl_dict_set(ap2_pl_node *dict, const char *key, ap2_pl_node *val)
+{
+    if (!dict || dict->type != PLN_DICT || !val) return;
+    pl_grow(dict);
+    dict->keys[dict->n] = ap2_pl_string(key);
+    dict->vals[dict->n] = val;
+    dict->n++;
+}
+
+void ap2_pl_array_append(ap2_pl_node *arr, ap2_pl_node *val)
+{
+    if (!arr || arr->type != PLN_ARRAY || !val) return;
+    pl_grow(arr);
+    arr->vals[arr->n++] = val;
+}
+
+void ap2_pl_free(ap2_pl_node *node)
+{
+    if (!node) return;
+    if (node->type == PLN_DICT) {
+        for (int i = 0; i < node->n; i++) {
+            ap2_pl_free(node->keys[i]);
+            ap2_pl_free(node->vals[i]);
+        }
+    } else if (node->type == PLN_ARRAY) {
+        for (int i = 0; i < node->n; i++) ap2_pl_free(node->vals[i]);
+    }
+    free(node->keys);
+    free(node->vals);
+    free(node->str);
+    free(node->data);
+    free(node);
+}
+
+/* Depth-first index assignment: root is object 0 (the trailer's top object),
+ * every other node gets a unique index as it is first visited. */
+static void pl_assign(struct ap2_pl_node *n, struct ap2_pl_node ***all,
+                      int *count, int *cap)
+{
+    n->index = *count;
+    if (*count >= *cap) {
+        *cap = *cap ? *cap * 2 : 16;
+        *all = realloc(*all, *cap * sizeof(**all));
+    }
+    (*all)[(*count)++] = n;
+    if (n->type == PLN_DICT) {
+        for (int i = 0; i < n->n; i++) pl_assign(n->keys[i], all, count, cap);
+        for (int i = 0; i < n->n; i++) pl_assign(n->vals[i], all, count, cap);
+    } else if (n->type == PLN_ARRAY) {
+        for (int i = 0; i < n->n; i++) pl_assign(n->vals[i], all, count, cap);
+    }
+}
+
+static void write_ref(buf_t *b, int idx, int ref_size)
+{
+    for (int j = ref_size - 1; j >= 0; j--)
+        buf_append_byte(b, (idx >> (j * 8)) & 0xFF);
+}
+
+int ap2_pl_serialize(const ap2_pl_node *root, uint8_t **out)
+{
+    if (!root) return 0;
+
+    struct ap2_pl_node **all = NULL;
+    int total = 0, cap = 0;
+    pl_assign((struct ap2_pl_node *)root, &all, &total, &cap);
+
+    uint8_t ref_size = (total < 256) ? 1 : 2;
+
+    buf_t objs;
+    buf_init(&objs);
+    buf_append(&objs, "bplist00", 8);
+
+    int *offsets = calloc(total, sizeof(int));
+    for (int i = 0; i < total; i++) {
+        struct ap2_pl_node *n = all[i];
+        offsets[n->index] = objs.len;
+        switch (n->type) {
+        case PLN_DICT:
+            write_size(&objs, 0xD0, n->n);
+            for (int k = 0; k < n->n; k++) write_ref(&objs, n->keys[k]->index, ref_size);
+            for (int k = 0; k < n->n; k++) write_ref(&objs, n->vals[k]->index, ref_size);
+            break;
+        case PLN_ARRAY:
+            write_size(&objs, 0xA0, n->n);
+            for (int k = 0; k < n->n; k++) write_ref(&objs, n->vals[k]->index, ref_size);
+            break;
+        case PLN_STRING:
+            write_size(&objs, 0x50, strlen(n->str));
+            buf_append(&objs, n->str, strlen(n->str));
+            break;
+        case PLN_INT:
+            write_int_value(&objs, n->ival);
+            break;
+        case PLN_BOOL:
+            buf_append_byte(&objs, n->bval ? 0x09 : 0x08);
+            break;
+        case PLN_DATA:
+            write_size(&objs, 0x40, n->dlen);
+            buf_append(&objs, n->data, n->dlen);
+            break;
+        default: break;
+        }
+    }
+
+    int offset_table_start = objs.len;
+    uint8_t ofs_size = 1;
+    if (offset_table_start > 0xFF) ofs_size = 2;
+    if (offset_table_start > 0xFFFF) ofs_size = 4;
+
+    for (int i = 0; i < total; i++) {
+        uint32_t ofs = offsets[i];
+        for (int j = ofs_size - 1; j >= 0; j--)
+            buf_append_byte(&objs, (ofs >> (j * 8)) & 0xFF);
+    }
+
+    uint8_t trailer[32];
+    memset(trailer, 0, 32);
+    trailer[6] = ofs_size;
+    trailer[7] = ref_size;
+    uint32_t no = htonl((uint32_t)total);
+    memcpy(trailer + 12, &no, 4);
+    uint32_t ots = htonl((uint32_t)offset_table_start);
+    memcpy(trailer + 28, &ots, 4);
+    buf_append(&objs, trailer, 32);
+
+    free(offsets);
+    free(all);
+    *out = objs.data;
+    return objs.len;
+}
