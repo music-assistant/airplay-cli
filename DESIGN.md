@@ -30,9 +30,9 @@ That reshapes the work into two phases:
   open-source sender; it should be built on top of a rock-solid Phase 1, behind
   capability gates, and validated with packet captures.
 
-Recommendation: **ship Phase 1 first**, then treat Phase 2 as a deliberate R&D effort.
-"Implement everything the best way possible" = don't let the ambitious, unproven part
-destabilize the part that already works.
+Recommendation (endorsed): **build Phase 1 to rock-solid first, then do the full Phase 2.**
+Phase 1 lands on proven paths; Phase 2 is built on top of it, capability-gated, and
+validated with packet captures — so the ambitious part never destabilizes the working part.
 
 ---
 
@@ -202,5 +202,33 @@ buffered streaming are the hard protocol work (top tier), each validated on-devi
 - Does the Apple TV accept transient, or force full pairing at its default access setting?
 - Which of {Sonos, JBL MA9100, Apple TV 4K, WiiM Pro} actually reject realtime and need buffered?
 
-(Device-specific expectations + the full test plan are in the companion TEST-PLAN doc.)
+---
+
+## 9. Device park — verified findings (hardware-grounded)
+
+From primary-source research (real device logs in owntone#1853, our own PLAN.md hardware notes,
+pyatv source). These sharpen Phase 1 priorities and the test plan.
+
+| Device | Path | Pairing | Timing | Notes |
+|---|---|---|---|---|
+| **Sonos** (Era 100 / Move 2) | RAOP-compat works today; **native AP2 SETUP → 200 but silent until real PTP** | **transient (`HKP:4`)**; forced verify fails | **PTP needed** for native AP2 audio | `features=0x445F8A00,0x1C340` → AP2+buffered+PTP; `flags=0x4` (no PIN). Enrolled-in-Home changes auth. Soak-test drift. |
+| **JBL MA9100** (AVR) | **no public data**; siblings (Bar/Charge) 403 on RAOP → need AP2 | unknown (likely transient) | unknown | Not in our model list. Test "RAOP → 403 → fall back to AP2". Capture real mDNS. |
+| **Apple TV 4K** | native AP2 primary; bare RAOP 403 | **persisted `HKP:3`** (transient → 200 + TLV `0x02`, silent) | PTP = multi-room | Our end-to-end session already works. Owner can disable "Require Device Verification". |
+| **WiiM Pro** | **both** RAOP and native AP2 work | transient, no PIN | **flexible: NTP *or* PTP** | 16/44.1 cap. Most forgiving test device. |
+
+**Two findings that change Phase 1:**
+
+1. **Sonos native-AP2 `400` is likely a pairing-mode bug, not a device limitation.** We hardcode
+   `HKP:3` for *every* pair attempt; Sonos only accepts **transient `HKP:4`**. Combined with no PTP,
+   that explains both the `400` and the "silent" reports. So **transient pairing (Phase 1) may itself
+   unlock native AP2 on Sonos** — the top hypothesis to test on-device.
+2. **Never trust an RTSP `2xx` as "audio works."** Sonos returns `200` and plays nothing without PTP;
+   Apple TV returns `200` + a TLV `0x02` error on wrong pairing and dies silently. The test harness must
+   verify **actual RTP flow / audible output**, not status codes.
+
+**PTP regression class to guard:** enabling PTP once silently broke a legacy RAOP-only device (Bose
+SoundLink Air) — sessions opened, no audio. PTP must be capability-gated (bit 41) and regression-tested
+against a pure-RAOP device in the same group.
+
+(Device-specific expectations + the full route matrix are in the companion `TEST-PLAN.md`.)
 </content>
