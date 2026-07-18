@@ -235,6 +235,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         g_metadata.progress = atoi(value);
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
             raopcl_set_progress_ms(g_raopcl, g_metadata.progress * 1000, g_metadata.duration * 1000);
+        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+            ap2cl_set_progress(g_ap2cl, g_metadata.progress, g_metadata.duration);
         }
     } else if (strcmp(key, "ARTWORK") == 0) {
         if (access(value, F_OK) == 0) {
@@ -249,6 +251,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                 fclose(artfile);
                 if (cfg->protocol == PROTO_RAOP && g_raopcl) {
                     raopcl_set_artwork(g_raopcl, "image/jpg", numbytes, buffer);
+                } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+                    ap2cl_set_artwork(g_ap2cl, "image/jpg", numbytes, buffer);
                 }
                 free(buffer);
             }
@@ -299,7 +303,28 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                             "asar", 's', g_metadata.artist,
                             "asal", 's', g_metadata.album,
                             "astn", 'i', 1);
+        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+            ap2cl_set_metadata(g_ap2cl, g_metadata.title, g_metadata.artist,
+                               g_metadata.album, g_metadata.duration);
         }
+    }
+}
+
+/* Some receivers (notably Sonos) will not emit any audio until they have received
+ * at least one metadata command. Push the current metadata (or a minimal
+ * placeholder title) once the session is established, so audio starts regardless
+ * of whether — or when — the caller sends a SENDMETA command. Any later metadata
+ * from the caller simply overwrites this. */
+static void send_initial_metadata(const cli_config_t *cfg)
+{
+    const char *title = (g_metadata.title && *g_metadata.title) ? g_metadata.title : "cliairplay";
+    if (cfg->protocol == PROTO_RAOP && g_raopcl) {
+        raopcl_set_daap(g_raopcl, 4, "minm", 's', title,
+                        "asar", 's', g_metadata.artist,
+                        "asal", 's', g_metadata.album, "astn", 'i', 1);
+    } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+        ap2cl_set_metadata(g_ap2cl, title, g_metadata.artist,
+                           g_metadata.album, g_metadata.duration);
     }
 }
 
@@ -442,6 +467,7 @@ static int run_raop(cli_config_t *cfg, int infile)
     latency = raopcl_latency(g_raopcl);
     status_connected_legacy(inet_ntoa(player_addr), cfg->port,
                             (int)TS2MS(latency, raopcl_sample_rate(g_raopcl)));
+    send_initial_metadata(cfg);
 
     /* Schedule start time */
     if (cfg->ntp_start || cfg->wait_ms) {
@@ -564,6 +590,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     if (cfg->volume > 0) {
         ap2cl_set_volume(g_ap2cl, cfg->volume);
     }
+    send_initial_metadata(cfg);
 
     /* Schedule start time */
     if (cfg->ntp_start) {
