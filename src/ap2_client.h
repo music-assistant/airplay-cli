@@ -174,6 +174,14 @@ void ap2cl_force_native(struct ap2cl_s *p);
  * falls back to NTP timing. */
 void ap2cl_set_ptp(struct ap2cl_s *p, bool enable);
 
+/* Prefer a shared PTP daemon clock (multi-room) for the native AP2 flow. When
+ * enabled and a live `cliairplay --ptp-daemon` is present on this host, the
+ * client reads the elected clock from shared memory and does NOT bind UDP
+ * 319/320 or run its own engine; it registers its receiver IP with the daemon.
+ * With no live daemon it falls back to the in-process engine. Must be called
+ * before ap2cl_connect(). */
+void ap2cl_set_ptp_shared(struct ap2cl_s *p, bool enable);
+
 /* Set the address we advertise to the device (multi-homed hosts), used
  * wherever the protocol carries our own address (e.g. timing peer lists).
  * Defaults to the bind/source address when unset. */

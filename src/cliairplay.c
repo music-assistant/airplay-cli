@@ -34,6 +34,7 @@
 #include "cross_log.h"
 #include "ap2_client.h"
 #include "ap2_rtsp.h"
+#include "ap2_ptp.h"
 
 #define VERSION "0.1.0"
 #define AP2_FRAMES_PER_CHUNK 352
@@ -94,6 +95,7 @@ typedef struct {
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     int64_t ptp_offset_ns;  /* PTP clock offset in nanoseconds */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
+    bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
     bool buffered;          /* force buffered audio stream (type 103) */
 
     /* Audio format */
@@ -583,6 +585,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     if (cfg->publish_ip)
         ap2cl_set_publish_ip(g_ap2cl, cfg->publish_ip);
     ap2cl_set_ptp(g_ap2cl, cfg->route.ptp);
+    ap2cl_set_ptp_shared(g_ap2cl, cfg->ptp_shared);
     ap2cl_set_buffered(g_ap2cl, cfg->route.buffered);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
@@ -688,6 +691,38 @@ static void signal_handler(int sig)
     g_status = STATUS_STOPPED;
 }
 
+/* ---- PTP daemon mode ---- */
+
+static volatile bool g_ptp_daemon_stop = false;
+
+static void ptp_daemon_signal_handler(int sig)
+{
+    (void)sig;
+    g_ptp_daemon_stop = true;
+}
+
+/* Run `cliairplay --ptp-daemon`: own UDP 319/320, run the shared PTP clock, and
+ * serve the control channel until signaled. Returns the process exit code. */
+static int run_ptp_daemon(cli_config_t *cfg)
+{
+    struct in_addr bind_addr;
+    bind_addr.s_addr = INADDR_ANY;
+    if (cfg->iface && *cfg->iface) {
+        char *ifname = NULL;
+        uint32_t netmask;
+        bind_addr = get_interface(cfg->iface, &ifname, &netmask);
+        LOG_INFO("[PTP] daemon binding multicast to %s [%s]",
+                 inet_ntoa(bind_addr), ifname ? ifname : "?");
+        NFREE(ifname);
+    }
+
+    signal(SIGINT, ptp_daemon_signal_handler);
+    signal(SIGTERM, ptp_daemon_signal_handler);
+    signal(SIGPIPE, SIG_IGN);
+
+    return ap2_ptp_run_daemon(bind_addr, &g_ptp_daemon_stop);
+}
+
 /* ---- Usage ---- */
 
 static void print_usage(const char *name)
@@ -743,7 +778,15 @@ static void print_usage(const char *name)
     printf("                             SupportsPTP feature bit)\n");
     printf("  --buffered                 Force the buffered audio stream (type 103,\n");
     printf("                             native AP2, RTP over TCP + PTP anchor); else\n");
-    printf("                             auto when SupportsBufferedAudio + 24-bit\n\n");
+    printf("                             auto when SupportsBufferedAudio + 24-bit\n");
+    printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
+    printf("                             read the elected clock from shared memory and do\n");
+    printf("                             not bind 319/320 when a daemon is present; else\n");
+    printf("                             fall back to the in-process engine\n");
+    printf("  --ptp-daemon               Run ONLY the shared PTP clock: bind 319/320 once,\n");
+    printf("                             publish the elected master to shared memory, and\n");
+    printf("                             serve the control channel until signaled. One per\n");
+    printf("                             host; needs root. Takes no host/audio args.\n\n");
     printf("Examples:\n");
     printf("  # RAOP streaming from stdin:\n");
     printf("  ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | %s 192.168.1.50 -\n\n", name);
@@ -776,6 +819,7 @@ int main(int argc, char *argv[])
     };
 
     bool pairing_mode = false;
+    bool ptp_daemon_mode = false;
     int infile = -1;
 
     static struct option long_options[] = {
@@ -814,6 +858,8 @@ int main(int argc, char *argv[])
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
         {"buffered",     no_argument,       0, 1010},
+        {"ptp-daemon",   no_argument,       0, 1011},
+        {"ptp-shared",   no_argument,       0, 1012},
         {"ntp",          no_argument,       0, 1001},
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
@@ -867,6 +913,8 @@ int main(int argc, char *argv[])
         case 1008: cfg.publish_ip = optarg; break;
         case 1009: cfg.ptp = true; break;
         case 1010: cfg.buffered = true; break;
+        case 1011: ptp_daemon_mode = true; break;
+        case 1012: cfg.ptp_shared = true; break;
         case 1001: {
             uint64_t ntp = raopcl_get_ntp(NULL);
             printf("%" PRIu64 "\n", ntp);
@@ -911,6 +959,15 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Pairing failed.\n");
         }
         return 0;
+    }
+
+    /* PTP daemon mode: no host/audio source; run the shared clock until signaled.
+     * MA starts one of these per host for multi-room AirPlay 2 (see README). */
+    if (ptp_daemon_mode) {
+        int rc = run_ptp_daemon(&cfg);
+        netsock_close();
+        cross_ssl_free();
+        return rc;
     }
 
     /* Validate required args */

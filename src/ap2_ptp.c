@@ -38,6 +38,7 @@
 #include "../libraop/src/raop_client.h"
 #include "cross_log.h"
 #include "ap2_ptp.h"
+#include "ap2_ptp_shm.h"
 
 extern log_level *loglevel;
 
@@ -152,6 +153,14 @@ struct ap2_ptp_ctx {
     uint16_t pending_sync_seq;
     uint64_t pending_sync_rx_ns;    /* t2: local reception time of the Sync */
     int64_t pending_sync_corr_ns;   /* correctionField carried on the Sync */
+
+    /* ---- shared daemon clock (streaming side, --ptp-shared) ---- */
+    /* When shm_active, the master getters below read the elected clock from the
+     * daemon's shared memory instead of this engine (which is not running in a
+     * streaming process); ap2_client.c is oblivious to the source. */
+    bool shm_active;
+    struct ap2_ptp_shm_reader shm_reader;
+    char *shared_ip;                /* receiver IP registered with the daemon (for unregister) */
 };
 
 /* ---- NTP timing responder ---- */
@@ -686,6 +695,12 @@ void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx)
 {
     if (!ctx) return;
     ap2_ptp_stop(ctx);
+    if (ctx->shm_active) {
+        if (ctx->shared_ip) ap2_ptp_shared_unregister(ctx, ctx->shared_ip);
+        ap2_ptp_shm_reader_close(&ctx->shm_reader);
+        ctx->shm_active = false;
+    }
+    free(ctx->shared_ip);
     for (int i = 0; i < ctx->npeers; i++) free(ctx->peers[i]);
     free(ctx->device_ip);
     pthread_mutex_destroy(&ctx->lock);
@@ -902,7 +917,32 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
 
 void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms)
 {
-    if (!ctx || !ctx->engine_active || timeout_ms <= 0) return;
+    if (!ctx || timeout_ms <= 0) return;
+
+    if (ctx->shm_active) {
+        /* Shared mode: wait for the daemon to advance its publish counter so we
+         * build the SETUP against a fresh, live clock rather than a stale one. */
+        uint64_t deadline = ap2_ptp_now_ns(ctx) + (uint64_t)timeout_ms * 1000000ULL;
+        struct ap2_ptp_shm_sample first;
+        bool have_first = ap2_ptp_shm_read(&ctx->shm_reader, &first);
+        while (ap2_ptp_now_ns(ctx) < deadline) {
+            struct ap2_ptp_shm_sample s;
+            if (ap2_ptp_shm_read(&ctx->shm_reader, &s) &&
+                (!have_first || s.update_count != first.update_count) &&
+                ((s.flags & AP2_PTP_SHM_F_GRANDMASTER) ||
+                 (s.flags & AP2_PTP_SHM_F_OFFSET_LOCKED)))
+                break;
+            usleep(10000);
+        }
+        struct ap2_ptp_shm_sample s;
+        if (ap2_ptp_shm_read(&ctx->shm_reader, &s))
+            LOG_INFO("[PTP] shared clock settled: timeline=%016" PRIx64 " offset=%" PRId64
+                     "ns role=%s", s.master_clock_id, s.local_to_master_offset,
+                     (s.flags & AP2_PTP_SHM_F_GRANDMASTER) ? "daemon-GM" : "daemon-slave");
+        return;
+    }
+
+    if (!ctx->engine_active) return;
 
     uint64_t deadline = ap2_ptp_now_ns(ctx) + (uint64_t)timeout_ms * 1000000ULL;
     while (ap2_ptp_now_ns(ctx) < deadline) {
@@ -926,6 +966,11 @@ void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms)
 uint64_t ap2_ptp_master_clock_id(struct ap2_ptp_ctx *ctx)
 {
     if (!ctx) return 0;
+    if (ctx->shm_active) {
+        struct ap2_ptp_shm_sample s;
+        if (ap2_ptp_shm_read(&ctx->shm_reader, &s)) return s.master_clock_id;
+        return ctx->clock_id;   /* daemon clock briefly unreadable: our own id */
+    }
     pthread_mutex_lock(&ctx->lock);
     uint64_t id = ctx->is_grandmaster ? ctx->clock_id : ctx->master_clock_id;
     pthread_mutex_unlock(&ctx->lock);
@@ -936,8 +981,249 @@ uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx)
 {
     uint64_t local = ap2_ptp_now_ns(ctx);
     if (!ctx) return local;
+    if (ctx->shm_active) {
+        /* The daemon publishes a local->master offset; the daemon and this
+         * process share CLOCK_REALTIME, so master-now is our own now + offset. */
+        struct ap2_ptp_shm_sample s;
+        int64_t off = ap2_ptp_shm_read(&ctx->shm_reader, &s) ? s.local_to_master_offset : 0;
+        return (uint64_t)((int64_t)local + off);
+    }
     pthread_mutex_lock(&ctx->lock);
     int64_t off = ctx->is_grandmaster ? 0 : ctx->master_offset_ns;
     pthread_mutex_unlock(&ctx->lock);
     return (uint64_t)((int64_t)local + off);
+}
+
+/* ---- shared daemon clock: streaming-side attach + peer registration ---- */
+
+bool ap2_ptp_shared_active(struct ap2_ptp_ctx *ctx)
+{
+    return ctx && ctx->shm_active;
+}
+
+bool ap2_ptp_attach_shared(struct ap2_ptp_ctx *ctx)
+{
+    if (!ctx) return false;
+
+    /* Prove a LIVE daemon first (control ping), so a stale shm left by a crashed
+     * daemon cannot fool us into shared mode. */
+    char ack[256] = {0};
+    if (!ap2_ptp_ctrl_send("?", 250, ack, sizeof(ack))) {
+        LOG_INFO("[PTP] No PTP daemon on the control channel; using in-process engine");
+        return false;
+    }
+    if (!ap2_ptp_shm_reader_open(&ctx->shm_reader)) {
+        LOG_WARN("[PTP] Daemon answered but its shared clock is unreadable; "
+                 "using in-process engine");
+        return false;
+    }
+    struct ap2_ptp_shm_sample s;
+    if (!ap2_ptp_shm_read(&ctx->shm_reader, &s)) {
+        LOG_WARN("[PTP] Daemon shared clock present but no sample yet; "
+                 "using in-process engine");
+        ap2_ptp_shm_reader_close(&ctx->shm_reader);
+        return false;
+    }
+    ctx->shm_active = true;
+    LOG_INFO("[PTP] Attached shared daemon clock (%s); timeline=%016" PRIx64
+             ", not binding 319/320", ack, s.master_clock_id);
+    return true;
+}
+
+void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip)
+{
+    if (!ctx || !ctx->shm_active || !ip || !*ip) return;
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "R %s", ip);
+    char ack[128] = {0};
+    bool ok = ap2_ptp_ctrl_send(cmd, 250, ack, sizeof(ack));
+    if (!ctx->shared_ip) ctx->shared_ip = strdup(ip);
+    LOG_INFO("[PTP] Registered receiver %s with daemon -> %s", ip, ok ? ack : "(no ack)");
+}
+
+void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip)
+{
+    if (!ctx || !ip || !*ip) return;
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), "U %s", ip);
+    ap2_ptp_ctrl_send(cmd, 100, NULL, 0);
+    LOG_DEBUG("[PTP] Unregistered receiver %s from daemon", ip);
+}
+
+/* ---- PTP daemon ---- */
+
+/* Aggregate receiver peer set, refcounted so independent streams to the SAME
+ * receiver register/unregister cleanly. */
+struct ptp_peerset {
+    struct { char ip[INET_ADDRSTRLEN]; int refs; } e[PTP_MAX_PEERS];
+    int n;
+};
+
+static void peerset_apply(struct ptp_peerset *ps, struct ap2_ptp_ctx *ctx)
+{
+    const char *ips[PTP_MAX_PEERS];
+    int n = 0;
+    for (int i = 0; i < ps->n; i++)
+        if (ps->e[i].refs > 0) ips[n++] = ps->e[i].ip;
+    ap2_ptp_set_peers(ctx, ips, n);
+}
+
+static void peerset_add(struct ptp_peerset *ps, const char *ip)
+{
+    for (int i = 0; i < ps->n; i++)
+        if (strcmp(ps->e[i].ip, ip) == 0) { ps->e[i].refs++; return; }
+    if (ps->n >= PTP_MAX_PEERS) {
+        LOG_WARN("[PTP] peer set full (%d); ignoring %s", PTP_MAX_PEERS, ip);
+        return;
+    }
+    snprintf(ps->e[ps->n].ip, sizeof(ps->e[ps->n].ip), "%s", ip);
+    ps->e[ps->n].refs = 1;
+    ps->n++;
+}
+
+static void peerset_remove(struct ptp_peerset *ps, const char *ip)
+{
+    for (int i = 0; i < ps->n; i++) {
+        if (strcmp(ps->e[i].ip, ip) == 0) {
+            if (ps->e[i].refs > 0) ps->e[i].refs--;
+            return;
+        }
+    }
+}
+
+static int peerset_count(const struct ptp_peerset *ps)
+{
+    int c = 0;
+    for (int i = 0; i < ps->n; i++) if (ps->e[i].refs > 0) c++;
+    return c;
+}
+
+/* Snapshot the engine's elected clock into a shm sample, atomically. */
+static void daemon_fill_sample(struct ap2_ptp_ctx *ctx, uint64_t start_ns,
+                               struct ap2_ptp_shm_sample *out)
+{
+    uint64_t local = ap2_ptp_now_ns(ctx);
+    pthread_mutex_lock(&ctx->lock);
+    bool gm = ctx->is_grandmaster;
+    uint64_t cid = gm ? ctx->clock_id : ctx->master_clock_id;
+    int64_t off = gm ? 0 : ctx->master_offset_ns;
+    bool locked = gm ? true : ctx->have_offset;
+    pthread_mutex_unlock(&ctx->lock);
+
+    memset(out, 0, sizeof(*out));
+    out->master_clock_id = cid;
+    out->local_time = local;
+    out->local_to_master_offset = off;
+    out->master_clock_start_time = start_ns;
+    out->flags = (gm ? AP2_PTP_SHM_F_GRANDMASTER : 0u) |
+                 (locked ? AP2_PTP_SHM_F_OFFSET_LOCKED : 0u);
+}
+
+/* Read and act on one control datagram; reply with a status ack. */
+static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_ctx *ctx)
+{
+    char buf[512];
+    struct sockaddr_in src;
+    socklen_t sl = sizeof(src);
+    int n = recvfrom(sock, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&src, &sl);
+    if (n <= 0) return;
+    buf[n] = '\0';
+
+    char *save = NULL;
+    char *tok = strtok_r(buf, " \t\r\n", &save);
+    if (!tok) return;
+    char cmd = tok[0];
+    bool changed = false;
+
+    switch (cmd) {
+    case 'R':   /* register (add) */
+    case 'T': { /* nqptp-compatible alias: ADD (see header note) */
+        char *ip;
+        while ((ip = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
+            struct in_addr tmp;
+            if (inet_pton(AF_INET, ip, &tmp) == 1) { peerset_add(ps, ip); changed = true; }
+        }
+        break;
+    }
+    case 'U': { /* unregister (remove) */
+        char *ip;
+        while ((ip = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
+            peerset_remove(ps, ip);
+            changed = true;
+        }
+        break;
+    }
+    case 'B': case 'E': case 'P':   /* begin/end/pause: no-ops for a sender GM */
+    case '?':                        /* liveness probe */
+        break;
+    default:
+        break;
+    }
+
+    if (changed) peerset_apply(ps, ctx);
+
+    /* Ack with the current group state so a client can confirm the daemon is
+     * live and see the elected grandmaster. */
+    pthread_mutex_lock(&ctx->lock);
+    bool gm = ctx->is_grandmaster;
+    uint64_t cid = gm ? ctx->clock_id : ctx->master_clock_id;
+    pthread_mutex_unlock(&ctx->lock);
+    char ack[128];
+    int an = snprintf(ack, sizeof(ack), "OK peers=%d gm=%016" PRIx64 " role=%s",
+                      peerset_count(ps), cid, gm ? "grandmaster" : "slave");
+    sendto(sock, ack, an, 0, (struct sockaddr *)&src, sl);
+}
+
+int ap2_ptp_run_daemon(struct in_addr bind_addr, volatile bool *stop)
+{
+    struct ap2_ptp_ctx *ctx = ap2_ptp_create();
+    if (!ctx) { LOG_ERROR("[PTP] daemon: cannot create context"); return 1; }
+
+    struct ap2_ptp_shm_writer w;
+    if (!ap2_ptp_shm_writer_open(&w)) {
+        ap2_ptp_destroy(ctx);
+        return 1;
+    }
+
+    int ctrl = ap2_ptp_ctrl_server_open();
+    if (ctrl < 0) {
+        LOG_ERROR("[PTP] daemon: control channel unavailable (another daemon running?)");
+        ap2_ptp_shm_writer_close(&w);
+        ap2_ptp_destroy(ctx);
+        return 1;
+    }
+
+    if (!ap2_ptp_engine_start(ctx, bind_addr, NULL)) {
+        LOG_ERROR("[PTP] daemon: cannot bind UDP 319/320 (run as root / grant "
+                  "CAP_NET_BIND_SERVICE). Multi-room PTP sync is unavailable.");
+        close(ctrl);
+        ap2_ptp_shm_writer_close(&w);
+        ap2_ptp_destroy(ctx);
+        return 2;
+    }
+
+    uint64_t start_ns = ap2_ptp_now_ns(ctx);
+    struct ptp_peerset ps = {0};
+    LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d",
+             AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT);
+
+    /* Publish immediately so an early-attaching stream sees a live sample. */
+    struct ap2_ptp_shm_sample sample;
+    daemon_fill_sample(ctx, start_ns, &sample);
+    ap2_ptp_shm_publish(&w, sample);
+
+    while (!*stop) {
+        struct pollfd pfd = {.fd = ctrl, .events = POLLIN};
+        int pr = poll(&pfd, 1, 100);   /* ~10 Hz publish cadence */
+        if (pr > 0 && (pfd.revents & POLLIN))
+            daemon_handle_ctrl(ctrl, &ps, ctx);
+        daemon_fill_sample(ctx, start_ns, &sample);
+        ap2_ptp_shm_publish(&w, sample);
+    }
+
+    LOG_INFO("[PTP] daemon shutting down");
+    close(ctrl);
+    ap2_ptp_shm_writer_close(&w);
+    ap2_ptp_destroy(ctx);
+    return 0;
 }

@@ -104,6 +104,7 @@ struct ap2cl_s {
     bool use_ptp;      /* resolved: PTP grandmaster timing active this session */
     bool ptp_forced;   /* ap2cl_set_ptp() was called (overrides auto-detect) */
     bool ptp_enabled;  /* value passed to ap2cl_set_ptp() */
+    bool ptp_shared;   /* prefer a shared PTP daemon clock (multi-room) if present */
 
     /* Buffered audio (type 103): RTP is pushed over a TCP connection to the
      * receiver's dataPort instead of the realtime UDP data socket. */
@@ -562,7 +563,16 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     int timing_port = 0;
     if (want_ptp) {
         ap2_ptp_set_clock_id(p->ptp, clock_id);
-        if (ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
+        /* Multi-room: when a shared PTP daemon owns 319/320 on this host, attach
+         * its elected clock read-only and register our receiver with it, rather
+         * than running our own engine (only one process per host can bind
+         * 319/320). Without --ptp-shared, or with no live daemon, fall through to
+         * the in-process engine — the single-device path, byte-for-byte. */
+        if (p->ptp_shared && ap2_ptp_attach_shared(p->ptp)) {
+            p->use_ptp = true;
+            ap2_ptp_shared_register(p->ptp, p->device.address);
+            ap2_ptp_engine_settle(p->ptp, 400);
+        } else if (ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
             p->use_ptp = true;
             /* Let BMCA hear any competing Announce and resolve the grandmaster
              * before we build the SETUP, so the timeline ClockID below is the
@@ -1390,6 +1400,13 @@ void ap2cl_set_ptp(struct ap2cl_s *p, bool enable)
     p->ptp_forced = true;
     p->ptp_enabled = enable;
     LOG_INFO("[AP2] PTP timing %s", enable ? "forced ON" : "forced OFF");
+}
+
+void ap2cl_set_ptp_shared(struct ap2cl_s *p, bool enable)
+{
+    if (!p) return;
+    p->ptp_shared = enable;
+    LOG_INFO("[AP2] Shared PTP daemon clock %s", enable ? "preferred" : "disabled");
 }
 
 void ap2cl_set_buffered(struct ap2cl_s *p, bool enable)

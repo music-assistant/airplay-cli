@@ -51,6 +51,13 @@ CFLAGS  += -Wall -fPIC -ggdb -O2 $(DEFINES) -fdata-sections -ffunction-sections
 CXXFLAGS += -std=gnu++17
 LDFLAGS += -lpthread -ldl -lm -L.
 
+# POSIX shared memory (shm_open/shm_unlink) for the --ptp-daemon shared clock:
+# glibc exposes these via librt; macOS has them in libSystem, so link -lrt on
+# Linux only.
+ifeq ($(HOST),linux)
+LDFLAGS += -lrt
+endif
+
 # Extra flags for cross-compilation, e.g. building macOS x86_64 on an arm64 host:
 #   make HOST=macos PLATFORM=x86_64 EXTRA_CFLAGS="-arch x86_64" EXTRA_LDFLAGS="-arch x86_64"
 CFLAGS  += $(EXTRA_CFLAGS)
@@ -84,7 +91,7 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_session.c ap2_rtsp.c ap2_hap.c ap2_ptp.c ap2_plist.c
+AP2_SOURCES = ap2_client.c ap2_session.c ap2_rtsp.c ap2_hap.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \

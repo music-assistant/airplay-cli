@@ -116,7 +116,50 @@ uint64_t ap2_ptp_master_clock_id(struct ap2_ptp_ctx *ctx);
  * when we are the grandmaster (offset 0); maps local time into the peer's clock
  * when slaving. Wall-clock timestamps on the wire (sync packets, anchor) must
  * come from here so the receiver schedules against the clock it actually drives.
+ *
+ * When the context is attached to a shared daemon clock (ap2_ptp_attach_shared),
+ * both master getters read the elected clock from shared memory instead of the
+ * in-process engine, so ap2_client.c is oblivious to where the clock lives.
  */
 uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx);
+
+/* ---- shared daemon clock (multi-room: one engine, many streams) ---- */
+
+/*
+ * Attach this context to the clock published by `cliairplay --ptp-daemon` on
+ * this host. Confirms a LIVE daemon (control-channel ping) before mapping the
+ * shm read-only, so a stale shm from a crashed daemon does not fool us. When it
+ * returns true the caller MUST NOT start the in-process engine or the NTP
+ * responder: the master getters now read the daemon's elected clock, and the
+ * streaming process never binds UDP 319/320.
+ *
+ * :returns: true if a live daemon clock was attached; false otherwise (the
+ *           caller falls back to the in-process engine — single-device path).
+ */
+bool ap2_ptp_attach_shared(struct ap2_ptp_ctx *ctx);
+
+/* True if this context is reading the shared daemon clock (vs an in-process engine). */
+bool ap2_ptp_shared_active(struct ap2_ptp_ctx *ctx);
+
+/*
+ * Register/unregister a receiver IP with the local daemon over the control
+ * channel, so the daemon aggregates it into the PTP timing peer set and runs
+ * BMCA across all streams' receivers. No-op unless shared mode is active. The
+ * registered IP is remembered and auto-unregistered on ap2_ptp_destroy().
+ */
+void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip);
+void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip);
+
+/*
+ * Run the PTP daemon: own UDP 319/320, run the grandmaster+BMCA+slave engine,
+ * publish the elected-master clock to shared memory, and serve the control
+ * channel (streams register their receiver IPs). Blocks until *stop becomes
+ * true (set from a signal handler). This is the body of `--ptp-daemon`.
+ *
+ * :param bind_addr: multicast egress/join interface (INADDR_ANY for default).
+ * :param stop: pointer to a flag polled for shutdown.
+ * :returns: 0 on clean shutdown; non-zero if the engine could not bind 319/320.
+ */
+int ap2_ptp_run_daemon(struct in_addr bind_addr, volatile bool *stop);
 
 #endif /* __AP2_PTP_H_ */
