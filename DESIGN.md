@@ -194,7 +194,26 @@ buffered streaming are the hard protocol work (top tier), each validated on-devi
 
 ---
 
-## 8. Open questions for on-device validation (need packet captures)
+## 8. Multi-homed hosts: bind IP vs publish IP
+
+Two distinct needs on hosts with multiple interfaces (Docker bridge, HAOS, VLANs):
+
+- **`--if <ip>` (bind IP)** — which local interface the sockets use. Honored today by RAOP
+  and the RAOP-compat flow (`get_interface()`); the **native AP2 flow must be fixed** to
+  honor it too (bind the RTSP TCP socket before connect; bind the data/control UDP sockets
+  to it instead of `INADDR_ANY`). The `--ptp-daemon` must bind 319/320 on it as well.
+- **`--publish-ip <ip>` (new, optional)** — the address we *advertise to the device* wherever
+  the protocol carries our own address: `timingPeerInfo.Addresses` in the PTP session SETUP
+  and the `SETPEERS` peer list (Phase 2). Defaults to the bind/source IP when not given.
+  Needed when the reachable address differs from the bound one (e.g. Docker bridge).
+
+MA already resolves exactly this pair (`streams.bind_ip` / `streams.publish_ip`) and passes
+`--if` today; it will pass `--publish-ip` the same way. Phase-2 components must honor both
+from the start.
+
+---
+
+## 9. Open questions for on-device validation (need packet captures)
 
 - BMCA: does the sender or a receiver become grandmaster? `Priority1` values (~248/250)?
 - PTP transport: multicast (224.0.1.129) or unicast to the SETPEERS peer list?
@@ -204,7 +223,7 @@ buffered streaming are the hard protocol work (top tier), each validated on-devi
 
 ---
 
-## 9. Device park — verified findings (hardware-grounded)
+## 10. Device park — verified findings (hardware-grounded)
 
 From primary-source research (real device logs in owntone#1853, our own PLAN.md hardware notes,
 pyatv source). These sharpen Phase 1 priorities and the test plan.

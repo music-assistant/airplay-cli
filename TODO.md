@@ -11,6 +11,13 @@ server-side integration state, see the provider's `PLAN.md`.
 - [ ] **Buffered streaming mode** — not implemented. Needed to decouple network
       jitter from playback and smooth out stream start.
 
+## Networking
+
+- [ ] **Multi-homed hosts** — extend `--if` (bind IP) to the native AirPlay 2 flow (RTSP
+      TCP + data/control UDP currently use kernel-default / `INADDR_ANY`) and the PTP
+      daemon; add optional `--publish-ip` for the address we advertise to devices
+      (`timingPeerInfo.Addresses`, `SETPEERS`), defaulting to the bind IP. See DESIGN.md §8.
+
 ## Timing
 
 - [ ] **PTP timing** — not implemented. Currently only an NTP responder plus an
