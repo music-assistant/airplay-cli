@@ -3,29 +3,33 @@
 Roadmap for the unified AirPlay binary (RAOP + AirPlay 2). For the Music Assistant
 server-side integration state, see the provider's `PLAN.md`.
 
-## Audio
+## Done (built; device-audio validation still pending where noted)
 
-- [ ] **24-bit audio** — the encoder fix is in place (ALAC `mFormatFlags` derived
-      from the real bit depth), but end-to-end playback is **not yet tested**. Only
-      viable over the native AirPlay 2 path (Sonos rejects 24-bit ALAC over RAOP).
-- [ ] **Buffered streaming mode** — not implemented. Needed to decouple network
-      jitter from playback and smooth out stream start.
+- [x] **Transient pairing** (`X-Apple-HKP: 4`, SRP-6a) — native AP2 without stored creds; validated on real Sonos (session establishes).
+- [x] **Native AP2 realtime + PTP grandmaster** — two-way PTP validated against a real Sonos; **on-device audio unconfirmed** (see BMCA/slave below).
+- [x] **mDNS auto-selection** (`--protocol auto`) — RAOP vs native/compat, transient vs pair-verify, PTP vs NTP, realtime vs buffered, all from the TXT.
+- [x] **24-bit** native ALAC (0x80000/0x200000) via `--bitdepth 24`. Device-unverified.
+- [x] **Buffered (type 103)** — TCP push + SETRATEANCHORTIME + FLUSHBUFFERED, PTP-gated. Device-unverified (no OSS sender exists to compare against).
+- [x] **Multi-homed** — `--if` honored in native AP2; `--publish-ip` for advertised address.
+- [x] **RAOP-compat fix + metadata quirk** — auth-setup handed to libraop; AP2 flows now deliver metadata + a baseline frame at connect. RAOP + AP2-compat audible on Sonos.
 
-## Networking
+## Timing — remaining
 
-- [ ] **Multi-homed hosts** — extend `--if` (bind IP) to the native AirPlay 2 flow (RTSP
-      TCP + data/control UDP currently use kernel-default / `INADDR_ANY`) and the PTP
-      daemon; add optional `--publish-ip` for the address we advertise to devices
-      (`timingPeerInfo.Addresses`, `SETPEERS`), defaulting to the bind IP. See DESIGN.md §8.
+- [ ] **PTP BMCA + slave mode (likely the native-audio fix)** — the engine is grandmaster-only;
+      real devices (Sonos) advertise their own `Announce` and may win the election. Implement
+      BMCA and, when a peer wins, **slave** to it (nqptp-style offset from its Sync/Follow_Up)
+      and express the media anchor in the elected master's clock domain. Without this, our
+      anchor is in the wrong clock domain and audio can stay silent even though PTP "runs".
+- [ ] **`--ptp-daemon` mode** — hoist the in-process grandmaster into a shared daemon (shm
+      clock à la nqptp) so the multiple per-device cliairplay processes MA spawns can share
+      one PTP clock (only one process can bind 319/320). Prereq for multi-room. Do after the
+      master/slave model is confirmed on-device.
 
-## Timing
+## Validation (needs real devices — Sonos / JBL MA9100 / Apple TV 4K / WiiM Pro)
 
-- [ ] **PTP timing** — not implemented. Currently only an NTP responder plus an
-      offset placeholder in `ap2_ptp.c`. Required by Apple devices (and Samsung) for
-      native AirPlay 2 sync. Open question: run a PTP **daemon mode inside the binary**,
-      or a **centralized PTP client in the MA provider** that the binary coordinates with.
-- [ ] **24-bit over AirPlay 2 may depend on PTP and/or buffered streaming** — confirm
-      the dependency and the implementation order once PTP + buffering exist.
+- [ ] Native AP2 + PTP **audible** on Sonos (the critical open item).
+- [ ] Buffered + 24-bit end-to-end; multi-room sync; PTP regression on a RAOP-only device.
+- [ ] See `TEST-PLAN.md` for the full route matrix.
 
 ## Distribution
 
