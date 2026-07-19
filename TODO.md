@@ -34,15 +34,30 @@ server-side integration state, see the provider's `PLAN.md`.
       gate is passed.
 - [ ] **RAOP + AP2-compat regression pass** after the native fixes (those paths are
       untouched raopcl code, so low risk — but confirm by ear).
-- [ ] **Multi-room sync** — start `--ptp-daemon`, run ≥2 streams with `--ptp-shared`, confirm
-      they lock to one grandmaster and are audibly in sync. The daemon predates the gPTP/
-      iOS-recipe changes to the engine TX path — retest its shm/attach flow after them.
+- [x] **Multi-room sync VERIFIED** (Era 100 pair + Move, pulsed tone in sync,
+      2026-07-19): one `--ptp-daemon` clock, per-device `--ptp-shared` streams, one
+      shared `--ntpstart`. Requirements discovered on device: anchor line derived
+      from ntpstart (unix-epoch fixed-point), immediate time-announce at start,
+      deadline pacing bounded by the receiver's ~2s buffer window, and per-process
+      RTP-timeline offsets (identical timelines get cross-wired by Sonos household
+      stream tracking — the stricter device goes silent).
 - [ ] Buffered + 24-bit end-to-end; native+PTP on JBL MA9100 / Apple TV 4K / WiiM Pro;
       PTP regression on a RAOP-only device.
 - [ ] Non-root 319/320 bind path (`--ptp-daemon` returns 2) on Linux/containers — validated by
       inspection only (macOS lets the user bind those ports).
 - [ ] `Pdelay_Req` responder (gPTP peer-delay) — not needed by Sonos (uses E2E
       `Delay_Req`, which we answer), but other gPTP receivers may probe with it.
+- [ ] Buffered follow-ups: try AAC payload (iOS buffered streams carry AAC; Sonos
+      accepts our ALAC SETUP + anchor but does not render), and fix the buffered
+      drain hang after EOF (process lingered minutes past a 20s stream).
+- [ ] Parse `audioLatencies` from the GET /info reply (the SETUP echo of
+      latencyMin/Max is receiver-optional; Sonos omits it) so the reported window
+      is populated for every device.
+- [ ] CLI contract: accept plain unix time for the group start (e.g.
+      `--start-unix-ms`) so MA never handles NTP fixed-point; keep `--ntpstart`
+      for compatibility.
+- [ ] Mixed-protocol group test: RAOP + native-PTP members on one `--ntpstart`
+      (requires aligning the RAOP and AP2 "audible at start+lead" conventions).
 - [ ] See `TEST-PLAN.md` for the full route matrix.
 
 ## Distribution
