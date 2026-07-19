@@ -1,17 +1,21 @@
 /*
- * AirPlay 2 PTP - Precision Time Protocol support
+ * AirPlay 2 PTP - sender-side timing engine
  *
- * AirPlay 2 devices (especially Apple HomePod, Apple TV) use PTP (IEEE 1588)
- * for clock synchronization instead of NTP.
+ * AirPlay 2 receivers slave to the SENDER's clock via PTP in the gPTP
+ * (IEEE 802.1AS) dialect over UDP 319/320: every TX message carries
+ * majorSdoId=1 (receivers silently discard plain-1588 framing), the announce
+ * dataset mirrors iOS senders (priority 128, clockClass 6, PATH_TRACE TLV),
+ * and timing is served UNICAST to the session's timing peers. The engine
+ * always holds grandmaster for its session — receivers only follow a clock
+ * from the timing-peer list and cannot anchor to their own — and answers
+ * Delay_Req/Pdelay_Req/Signaling from the receivers.
  *
- * Architecture:
- *   The PTP clock synchronization runs centralized in the Music Assistant
- *   provider (Python side). The binary receives the PTP-to-local clock
- *   offset via --ptp-offset <nanoseconds> and adjusts timestamps accordingly.
- *
- *   For devices that use NTP timing (most third-party), no offset is needed.
- *   For PTP devices, the provider computes the offset by running a PTP client
- *   (or NQPTP daemon) and passes it to each cliairplay instance.
+ * Deployment modes:
+ *   - In-process: a single stream runs the engine itself (binds 319/320).
+ *   - Shared daemon (`cliairplay --ptp-daemon` + per-stream `--ptp-shared`):
+ *     one process per host owns 319/320 and publishes the clock over POSIX
+ *     shm (see ap2_ptp_shm.h); streams attach read-only, so any number of
+ *     concurrent players share one timeline for multi-room sync.
  *
  * This file also implements a minimal NTP timing responder for devices that
  * send NTP timing requests on the timing UDP port (required for RAOP-compat flow).

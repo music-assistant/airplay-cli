@@ -535,7 +535,7 @@ static int run_raop(cli_config_t *cfg, int infile)
     /* Codec selection: default to compressed ALAC, which virtually every RAOP
      * receiver advertises and which saves LAN bandwidth. Fall back to uncompressed
      * only when the device's mDNS cn field is present and does not list ALAC (1),
-     * or when --raw is forced; --alac forces compressed regardless. */
+     * or when --raw is forced. */
     bool use_alac = true;
     if (cfg->cn && *cfg->cn && !strchr(cfg->cn, '1')) use_alac = false;
     if (cfg->raw) use_alac = false;

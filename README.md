@@ -1,14 +1,187 @@
 # cliairplay
 
-Unified AirPlay streaming CLI for Music Assistant. Replaces both `cliraop` (RAOP/AirPlay 1) and `cliap2` (AirPlay 2/owntone) with a single binary.
+Unified AirPlay streaming CLI for Music Assistant. One binary speaks RAOP
+(AirPlay 1) and AirPlay 2 — both the RAOP-compatible flow and the native HAP
+flow — replacing the previous `cliraop` and `cliap2` binaries.
+
+Music Assistant spawns one `cliairplay` process per player and feeds it raw PCM
+on stdin. For synchronized multi-room AirPlay 2 playback it additionally runs
+one `cliairplay --ptp-daemon` per host, which owns the PTP clock that every
+per-device stream on that host shares.
+
+Protocol and architecture detail lives in `DESIGN.md`; the device validation
+matrix in `TEST-PLAN.md`.
 
 ## Features
 
-- **RAOP (AirPlay 1)**: Full support via libraop - ALAC encoding, NTP sync, encryption
-- **AirPlay 2 RAOP-compat**: auth-setup + RAOP flow for Sonos and third-party devices
-- **AirPlay 2 Native**: HAP pair-verify + encrypted RTSP + binary plist SETUP (for Apple devices)
-- **16-bit and 24-bit ALAC** encoding (24-bit requires native AP2 flow)
-- **Unified CLI** with `--protocol raop|airplay2` and auto-detection of native vs compat flow
+- **RAOP (AirPlay 1)** via libraop: ALAC (compressed by default), NTP timing,
+  optional RSA payload encryption, legacy Apple TV pairing.
+- **AirPlay 2 RAOP-compat**: auth-setup + the RAOP flow — the proven path for
+  AirPlay 2 receivers without stored credentials.
+- **AirPlay 2 native**: HAP pairing (transient, or pair-verify with stored
+  credentials), encrypted RTSP, binary-plist SETUP, ChaCha20-Poly1305 audio,
+  realtime (type 96) streaming with PTP or NTP timing.
+- **PTP timing**: an in-process gPTP-dialect grandmaster engine, plus a
+  shared-clock daemon mode (`--ptp-daemon`/`--ptp-shared`) for multi-room.
+- **Route auto-selection** (`--protocol auto`): the binary picks RAOP vs
+  AirPlay 2, native vs compat, transient vs pair-verify, and PTP vs NTP from
+  the device's mDNS TXT records.
+- **Hi-res audio**: 24-bit ALAC (44.1 kHz and 48 kHz) on the native realtime
+  stream.
+- **Group starts**: `--start-unix-ms` schedules the first sample to be audible
+  at an exact wall-clock instant on every protocol path, so mixed
+  RAOP + AirPlay 2 groups start aligned.
+
+## Usage
+
+```bash
+# RAOP (or let --protocol auto decide from --txt):
+ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | \
+  ./bin/cliairplay-macos-arm64 --protocol raop --port 5000 \
+  --volume 50 --cmdpipe /tmp/cap 192.168.1.50 -
+
+# AirPlay 2, native flow with stored credentials (Apple TV / HomePod):
+ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | \
+  ./bin/cliairplay-macos-arm64 --protocol airplay2 --port 7000 \
+  --auth <192-hex-credentials> --volume 50 192.168.1.50 -
+```
+
+Audio is read as raw interleaved PCM from `<filename>` or stdin (`-`) at the
+given `--samplerate`/`--bitdepth`/`--channels` (default s16le 44100 stereo).
+At `--bitdepth 24` the input must be **s32le**; the binary truncates it to the
+24-bit samples the ALAC encoder consumes. Input is drained eagerly into a 4 MB
+ring buffer, decoupled from network pacing, so the source pipeline fills ahead
+of a scheduled start.
+
+### The start contract
+
+`--start-unix-ms <ms>` means: **the first sample is audible exactly at that
+unix-epoch instant**, on every protocol path (RAOP and both AirPlay 2 flows).
+Every member of a sync group is given the same value and aligns by
+construction — including mixed RAOP + AirPlay 2 groups.
+
+Delivery is not gated on the start time: frames are released up to the
+receiver's buffer window ahead of each frame's deadline (the device-reported
+`latencyMax`, or 1.75 s when the receiver does not report one), so receiver
+buffers fill before a scheduled start and the start cannot underrun.
+
+`--latency <ms>` is the playback lead (default 2000 ms, the AirPlay-standard
+2 s), clamped into the window the device reports at stream SETUP. The
+effective lead and the device window are printed as a `[STATUS] latency ...`
+line so the caller can plan group starts from real device capabilities.
+
+### Pairing
+
+- **Apple TV / HomePod (AirPlay 2, PIN)**:
+  `cliairplay --pair-setup <ip> --port 7000 --dacp <id>` runs full HomeKit
+  pair-setup — the device shows a PIN, and on success the credentials are
+  printed on stdout (`CREDENTIALS: <192 hex chars>`). Stream later with
+  `--auth <creds>` and the **same `--dacp`** (the pairing identity is derived
+  from it).
+- **Sonos and most third-party AirPlay 2 receivers** need no pairing step: the
+  native flow uses transient pairing automatically.
+- **Legacy Apple TV (RAOP)**: `cliairplay --pair` produces the `--secret` used
+  by the RAOP flow.
+
+### Multi-room (shared PTP clock)
+
+Only one process per host can bind the privileged PTP ports (UDP 319/320), and
+every receiver in a sync group must lock to the same grandmaster:
+
+```bash
+# One per host (root, or CAP_NET_BIND_SERVICE on Linux):
+cliairplay --ptp-daemon [--if <ip>] &
+
+# Per device, each with --ptp-shared and the SAME start time:
+cliairplay --protocol airplay2 --ptp-shared --start-unix-ms <T> ... <ip1> -
+cliairplay --protocol airplay2 --ptp-shared --start-unix-ms <T> ... <ip2> -
+```
+
+The daemon binds 319/320 once, runs the PTP engine, publishes the elected
+clock to POSIX shared memory (`/cliairplay-ptp`), and serves a localhost UDP
+control channel (`127.0.0.1:9010`) where streams register their receiver IPs.
+Streams started with `--ptp-shared` attach the shm read-only and never bind
+319/320; when no live daemon is present they fall back to the in-process
+engine, identical to a single-device session. MA starts the daemon when the
+first PTP stream begins and stops it (SIGTERM) when the last one ends.
+
+## Command-line reference
+
+```
+cliairplay [options] <host_ip> <filename ('-' for stdin)>
+```
+
+### Protocol selection
+
+| Option | Description |
+|--------|-------------|
+| `--protocol <auto\|raop\|airplay2>` | Streaming protocol (default: `auto`, which resolves the full route — RAOP vs AirPlay 2, native vs compat, PTP vs NTP — from the mDNS TXT records in `--txt`). `raop`/`airplay2` force the protocol; `airplay2` uses the native flow with `--auth` or `--ap2-native`, the RAOP-compat flow otherwise. |
+
+### Common
+
+| Option | Description |
+|--------|-------------|
+| `--port <port>` | Device RTSP port (default: 5000; AirPlay 2 devices use 7000). |
+| `--volume <0-100>` | Initial volume. Mapped linear-in-dB onto -30..0 dB (the AirPlay ecosystem convention); 0 mutes. |
+| `--latency <ms>` | Playback lead / buffer (default: 2000, clamped into the device-reported window). |
+| `--start-unix-ms <ms>` | Absolute start time as unix-epoch milliseconds: the first sample is audible at exactly this instant. Pass the **same** value to every member of a sync group. |
+| `--samplerate <rate>` | Input sample rate (default: 44100). |
+| `--bitdepth <16\|24>` | Input bit depth (default: 16). 24 requires the native AirPlay 2 flow and s32le input. |
+| `--channels <n>` | Input channel count (default: 2). |
+| `--if <ip>` | Local interface IP to bind all sockets to (multi-homed hosts). |
+| `--dacp <id>` | DACP ID advertised for remote-control callbacks; also the HAP pairing identity. |
+| `--activeremote <id>` | Active-Remote ID for DACP callbacks. |
+| `--cmdpipe <path>` | Named pipe for runtime commands/metadata (see below). |
+| `--udn <name>` | UDN / instance name used for mDNS. |
+| `--debug <0-9>` | Log verbosity (default: 3). |
+
+### RAOP
+
+| Option | Description |
+|--------|-------------|
+| `--raw` | Force uncompressed ALAC frames. Default is compressed ALAC; the binary also falls back to uncompressed when the device's `cn` field lacks ALAC. |
+| `--encrypt` | Enable RAOP audio-payload encryption (default: clear). |
+| `--password <pw>` | Device password, if the receiver requires one. |
+| `--secret <secret>` | Legacy Apple TV pairing secret (from `--pair`). |
+| `--et <v>` `--md <v>` `--am <v>` `--pk <v>` `--pw <v>` `--cn <v>` | mDNS TXT fields from the receiver's `_raop._tcp` record (encryption types, metadata types, model, public key, password flag, codec types). |
+
+### AirPlay 2
+
+| Option | Description |
+|--------|-------------|
+| `--auth <hex>` | HAP credentials (192 hex chars, from `--pair-setup`). Selects the native flow with pair-verify. |
+| `--ap2-native` | Force the native flow without credentials (transient pairing). Without this or `--auth`, an explicit `--protocol airplay2` uses the RAOP-compat flow. |
+| `--txt <k=v ...>` | mDNS TXT records of the `_airplay._tcp` service; drives route auto-selection. |
+| `--publish-ip <ip>` | Address advertised to devices (timing-peer lists) when it differs from the bind address (Docker bridge, NAT). |
+| `--name <name>` | Device name (native flow). |
+| `--hostname <host>` | Device hostname (native flow). |
+| `--ptp` | Force PTP grandmaster timing (binds UDP 319/320, needs privilege). Default: auto by the SupportsPTP feature bit. |
+| `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. |
+| `--buffered` | Force the buffered audio stream (type 103, RTP over TCP + PTP anchor). Parked — see `DESIGN.md`; realtime covers hi-res. |
+
+### Utility / daemon modes
+
+| Option | Description |
+|--------|-------------|
+| `--check` | Print `cliairplay <version> check` and exit (binary validation). |
+| `--pair` | Legacy Apple TV RAOP pairing; produces the `--secret` for the RAOP flow. |
+| `--pair-setup` | HomeKit pair-setup against `<host_ip>` (with `--port` and `--dacp`): the device shows a PIN, and on success the `--auth` credentials are printed on stdout. Stream later with the same `--dacp`. |
+| `--ptp-daemon` | Run **only** the shared PTP clock: bind UDP 319/320 once, run the engine, publish the elected master to shared memory, serve the control channel until SIGINT/SIGTERM. One per host; needs privilege. Honors `--if`; takes no host/audio args. |
+
+### Runtime commands (`--cmdpipe`)
+
+Newline-terminated `KEY=VALUE` lines written to the command pipe control a
+running stream:
+
+- `VOLUME=<0-100>`
+- `ACTION=PLAY|PAUSE|STOP`
+- Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
+  `ARTWORK=<local file path>` (URLs are ignored), followed by
+  `ACTION=SENDMETA` to push the set.
+
+Some receivers (notably Sonos) do not emit audio until they have received
+metadata; the binary pushes an initial metadata set at connect on its own, so
+audio starts regardless of whether the caller ever sends `SENDMETA`.
 
 ## Building
 
@@ -20,143 +193,36 @@ make STATIC=1
 make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
 ```
 
-Requires libraop submodule with pre-built static libraries (OpenSSL, libcodecs, libmdns).
+Requires the libraop submodule with pre-built static libraries (OpenSSL,
+libcodecs, libmdns).
 
-## Usage
+## Platforms and CI
 
-```bash
-# RAOP streaming
-ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | \
-  ./bin/cliairplay-macos-arm64 --protocol raop --port 7000 --alac \
-  --volume 50 192.168.1.50 -
-
-# AirPlay 2 (auto-detects native vs compat based on --auth)
-ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | \
-  ./bin/cliairplay-macos-arm64 --protocol airplay2 --port 7000 \
-  --auth <192-hex-credential-chars> --volume 50 192.168.1.50 -
-```
-
-## Command-line options
-
-```
-cliairplay [options] <host_ip> <filename ('-' for stdin)>
-```
-
-Audio is read as raw interleaved PCM from `<filename>` or stdin (`-`), at the
-`--samplerate`/`--bitdepth`/`--channels` given (default s16le 44100 stereo).
-
-### Protocol
-
-| Option | Description |
-|--------|-------------|
-| `--protocol <auto\|raop\|airplay2>` | Streaming protocol (default: `auto`, which picks RAOP vs AirPlay 2 from the mDNS features in `--txt`). `airplay2` picks the native HAP flow when `--auth` is given, otherwise the RAOP-compatible flow. |
-
-### Common
-
-| Option | Description |
-|--------|-------------|
-| `--port <port>` | Device RTSP port (default: 5000; AirPlay 2 devices use 7000). |
-| `--volume <0-100>` | Initial volume. |
-| `--latency <ms>` | Output buffer / read-ahead duration (default: 1000). |
-| `--ntpstart <ntp>` | Absolute NTP timestamp at which playback should start (used for multi-device sync). |
-| `--start-unix-ms <ms>` | Absolute start time as plain unix-epoch milliseconds (preferred over `--ntpstart`: the caller never handles NTP formats). Pass the **same** value to every member of a sync group. |
-| `--wait <ms>` | Delay before starting the stream. |
-| `--samplerate <rate>` | Input sample rate (default: 44100). |
-| `--bitdepth <16\|24>` | Input bit depth (default: 16; 24 requires the native AirPlay 2 flow). |
-| `--channels <n>` | Input channel count (default: 2). |
-| `--dacp <id>` | DACP ID advertised for remote-control callbacks. |
-| `--activeremote <id>` | Active-Remote ID for DACP callbacks. |
-| `--cmdpipe <path>` | Named pipe to read runtime commands/metadata from (see below). |
-| `--udn <name>` | UDN / instance name used for mDNS. |
-| `--debug <0-9>` | Log verbosity (default: 3). |
-
-### RAOP
-
-| Option | Description |
-|--------|-------------|
-| `--alac` | Send **compressed** ALAC. Without it, audio is sent as uncompressed ALAC frames (`RAOP_ALAC_RAW`). |
-| `--encrypt` | Enable RAOP audio-payload encryption (default: clear). |
-| `--password <pw>` | Device password, if the receiver requires one. |
-| `--secret <secret>` | Legacy Apple TV pairing secret. |
-| `--if <ip>` | Local interface IP to bind the RTP sockets to. |
-| `--et <v>` `--md <v>` `--am <v>` `--pk <v>` `--pw <v>` | mDNS TXT fields from the receiver's `_raop._tcp` record (encryption types, metadata types, model, public key, password flag). |
-
-### AirPlay 2
-
-| Option | Description |
-|--------|-------------|
-| `--auth <hex>` | HAP credentials (192 hex chars). Presence selects the **native** AirPlay 2 flow; absence uses the RAOP-compatible flow. |
-| `--name <name>` | Device name (native flow). |
-| `--hostname <host>` | Device hostname (native flow). |
-| `--txt <k=v ...>` | mDNS TXT records for the `_airplay._tcp` service. |
-| `--ptp-offset <ns>` | PTP clock offset in nanoseconds. |
-| `--ptp` | Force PTP grandmaster timing (native AP2). Binds UDP 319/320 (needs privilege); otherwise auto by the SupportsPTP feature bit. |
-| `--ptp-shared` | Prefer a shared PTP daemon clock (multi-room). When a live `--ptp-daemon` is present on this host, read the elected clock from shared memory and do **not** bind 319/320 or run an engine; otherwise fall back to the in-process engine. |
-| `--buffered` | Force the buffered audio stream (type 103, RTP-over-TCP + PTP anchor). |
-
-### Utility / daemon modes
-
-| Option | Description |
-|--------|-------------|
-| `--ntp` | Print the current NTP timestamp and exit. |
-| `--check` | Print `cliairplay <version> check` and exit (used for binary validation). |
-| `--pair` | Legacy Apple TV RAOP pairing; produces the `--secret` used by the RAOP flow. |
-| `--pair-setup` | HomeKit pair-setup against `<host_ip>` (with `--port` and `--dacp`): the device shows a PIN, and on success the `--auth` credentials are printed on stdout. Stream later with the same `--dacp`. |
-| `--ptp-daemon` | Run **only** the shared PTP clock (multi-room): bind UDP 319/320 once, run the grandmaster/BMCA/slave engine, publish the elected master to shared memory, and serve the control channel until signaled (SIGINT/SIGTERM). One per host; needs privilege to bind 319/320. Honors `--if`; takes no host/audio args. |
-
-### Runtime commands (`--cmdpipe`)
-
-Newline-terminated `KEY=VALUE` lines written to the command pipe control a running
-stream. Common ones: `VOLUME=<0-100>`, `ACTION=PLAY|PAUSE|STOP`, and metadata
-(`TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=`, `PROGRESS=`, `ARTWORK=<url>`) followed by
-`ACTION=SENDMETA`. Some receivers (e.g. Sonos) require a metadata command before they
-begin emitting audio.
+CI (`.github/workflows/build.yml`) cross-builds four targets on every push —
+`linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64` — validates
+`--check` on the natively runnable ones, and uploads the binaries as
+artifacts. Pushing a `v*` tag additionally runs a release job (GitHub Release
+with the four binaries + `SHA256SUMS`); no versioned release has been cut yet.
 
 ## Architecture
 
 ```
-cliairplay.c          CLI entry, argument parsing, playback loops, --ptp-daemon
-ap2_client.c          AP2 orchestrator: RAOP-compat + native AP2 flows
-ap2_hap.c             HAP pair-verify (X25519, Ed25519, ChaCha20-Poly1305)
-ap2_plist.c           Binary plist builder (supports nested streams array)
-ap2_ptp.c             NTP responder + PTP grandmaster/BMCA/slave engine + shared-clock attach + daemon loop
-ap2_ptp_shm.c         Shared PTP clock: POSIX shm double-buffer + control channel
-ap2_session.c         Native AP2 RTSP session (encrypted channel)
-alac_ext.cpp          ALAC encoder override with proper 24-bit support
+src/cliairplay.c      CLI entry, route dispatch, playback loops, input ring,
+                      cmdpipe, --pair-setup and --ptp-daemon modes
+src/ap2_client.c      AP2 orchestrator: route resolution, RAOP-compat + native
+                      flows, realtime/buffered senders, anchor & pacing
+src/ap2_hap.c         HAP pair-verify, transient and PIN pair-setup, encrypted
+                      RTSP framing (ChaCha20-Poly1305)
+src/ap2_rtsp.c        RTSP request/response over the (optionally encrypted) channel
+src/ap2_session.c     Native AP2 RTSP session helpers (encrypted channel)
+src/ap2_plist.c       Binary plist writer (nested streams array)
+src/ap2_bplist.cpp    Binary plist reader (keyed offset-table traversal)
+src/ap2_ptp.c         NTP responder + PTP engine (gPTP dialect, BMCA,
+                      hold-grandmaster, unicast grants) + daemon loop
+src/ap2_ptp_shm.c     Shared PTP clock: POSIX shm double-buffer + control channel
+src/alac_ext.cpp      ALAC encoder override with proper 24-bit support
 libraop/              Upstream philippe44/libraop (RAOP protocol + crypto)
 ```
-
-## Multi-room PTP (shared clock daemon)
-
-Only one process per host can bind the privileged PTP ports (UDP 319/320), and
-every receiver in a sync group must lock to the same grandmaster. To stream
-AirPlay 2 with PTP to several speakers at once, Music Assistant runs a single
-shared PTP daemon and points every per-device streaming process at it:
-
-- **Daemon** — `cliairplay --ptp-daemon [--if <ip>]`. Runs *only* the PTP engine:
-  binds 319/320 once, runs BMCA (grandmaster, or slaves to a better peer), and
-  publishes the elected clock to POSIX shared memory `"/cliairplay-ptp"` using a
-  lock-free double buffer (writer fills `main`, barrier, copies to `secondary`;
-  readers accept a snapshot only when both copies match). It also listens on a
-  localhost UDP control channel (`127.0.0.1:9010`) where streams register their
-  receiver IP(s): `R <ip>` add, `U <ip>` remove, `?` liveness probe (nqptp's
-  `T`/`B`/`E`/`P` are accepted, with `T` treated as an additive register).
-
-- **Streams** — each per-device stream adds `--ptp-shared`. When a live daemon is
-  present it attaches the shm read-only, reads the elected `master_clock_id` and
-  local→master offset for the SETUP `timingPeerInfo.ClockID`, the
-  `SETRATEANCHORTIME networkTimeTimelineID`, and the realtime PTP sync packets,
-  and registers its receiver IP with the daemon — **without** binding 319/320 or
-  running its own engine. With no daemon (or no `--ptp-shared`) a stream runs the
-  in-process engine exactly as a single-device session does.
-
-MA lifecycle: start `cliairplay --ptp-daemon` once per host when the first
-native-AP2 PTP stream begins; run each per-device stream with `--ptp-shared` and
-the **same `--start-unix-ms`** (all members of a group must be given an identical
-start time so every device schedules the first sample at the same wall-clock
-instant); stop the daemon (SIGTERM) when the last PTP stream ends. The daemon
-must run with privilege to bind 319/320 (root, or `CAP_NET_BIND_SERVICE` on
-Linux).
 
 ## License
 

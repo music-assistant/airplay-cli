@@ -1,108 +1,36 @@
-# cliairplay — TODO
+# cliairplay — open items
 
-Roadmap for the unified AirPlay binary (RAOP + AirPlay 2). For the Music Assistant
-server-side integration state, see the provider's `PLAN.md`.
+Genuinely open work only. Completed work lives in git history; validation
+status per route lives in `TEST-PLAN.md`.
 
-## Done (built; device-audio validation still pending where noted)
-
-- [x] **Transient pairing** (`X-Apple-HKP: 4`, SRP-6a) — native AP2 without stored creds; validated on real Sonos (session establishes).
-- [x] **Native AP2 realtime + PTP — CONTINUOUS AUDIO on Sonos (Era 100, full 20s
-      test tone).** The full chain that unlocked it: keyed port parse (audio
-      previously went to the receiver's control port), metadata with `RTP-Info`
-      (Sonos 400s without it and withholds audio), trailing-nonce wire format,
-      hold-grandmaster, **gPTP framing** (`majorSdoId=1` — receivers discard
-      plain-1588 messages outright), the iOS announce dataset/TLVs served unicast
-      to the timing peers, the anchor semantics (`frame_1 = play_pos + 11035`,
-      `frame_2 = frame_1 + 77175`), and a **frozen anchor line** (the mapping is
-      fixed at stream start and every time-announce extrapolates along it —
-      per-packet re-derivation from the send head made the receiver re-seat its
-      timeline and drop its buffer).
-- [x] **PTP BMCA + slave mode** — election machinery retained behind `hold_master`
-      (the sender always keeps the session timeline; receivers can only follow a clock
-      from the timing-peer list, so surrendering it mutes them). Synthetic harness 45/45.
-- [x] **`--ptp-daemon` + `--ptp-shared` (multi-room)** — one daemon per host owns 319/320 and publishes the elected clock to POSIX shm (`/cliairplay-ptp`, lock-free double-buffer); per-device streams read it with `--ptp-shared` and never bind 319/320, falling back to the in-process engine when no daemon is present. Control channel on `127.0.0.1:9010`. Hardware-free tests pass; **multi-device lock unverified**.
-- [x] **mDNS auto-selection** (`--protocol auto`) — RAOP vs native/compat, transient vs pair-verify, PTP vs NTP, realtime vs buffered, all from the TXT.
-- [x] **24-bit** native ALAC (0x80000/0x200000) via `--bitdepth 24`. Device-unverified.
-- [x] **Buffered (type 103)** — TCP push + SETRATEANCHORTIME + FLUSHBUFFERED, PTP-gated. Device-unverified (no OSS sender exists to compare against).
-- [x] **Multi-homed** — `--if` honored in native AP2; `--publish-ip` for advertised address.
-- [x] **RAOP-compat fix + metadata quirk** — auth-setup handed to libraop; AP2 flows now deliver metadata + a baseline frame at connect. RAOP + AP2-compat audible on Sonos.
-
-## Validation (needs real devices — Sonos / JBL MA9100 / Apple TV 4K / WiiM Pro)
-
-- [x] **Native AP2 + PTP continuous audio on Sonos** (Era 100 stereo pair, transient
-      pairing, realtime type 96, full-duration test tone, 2026-07-19). The critical
-      gate is passed.
-- [ ] **RAOP + AP2-compat regression pass** after the native fixes (those paths are
-      untouched raopcl code, so low risk — but confirm by ear).
-- [x] **Multi-room sync VERIFIED** (Era 100 pair + Move, pulsed tone in sync,
-      2026-07-19): one `--ptp-daemon` clock, per-device `--ptp-shared` streams, one
-      shared `--ntpstart`. Requirements discovered on device: anchor line derived
-      from ntpstart (unix-epoch fixed-point), immediate time-announce at start,
-      deadline pacing bounded by the receiver's ~2s buffer window, and per-process
-      RTP-timeline offsets (identical timelines get cross-wired by Sonos household
-      stream tracking — the stricter device goes silent).
-- [x] **Native AP2 + PTP on Apple TV 4K** (2026-07-19) via full HomeKit pair-setup
-      (`--pair-setup` → on-screen PIN → stored creds → pair-verify at stream time).
-      Audible; clock-locked like Sonos.
-- [x] **Volume curve — investigated, kept the AirPlay-standard mapping.** The
-      -30..0 dB linear-in-dB curve is the ecosystem convention (libraop's
-      `raopcl_float_volume`, shairport-sync's default range, iOS senders), so an
-      MA slider position is exactly as loud as an iPhone at the same position;
-      changing it would diverge from every AirPlay implementation and shift
-      loudness for all existing RAOP users. Fixed the real defect instead: the
-      native path duplicated the formula — it now calls `raopcl_float_volume`
-      (one source of truth, both paths identical, mute at 0). If loudness
-      alignment with e.g. Sonos-native is ever wanted, that belongs in MA's
-      per-player volume normalization, not in the protocol curve.
-- [x] **24-bit hi-res — AUDIBLE over REALTIME + PTP on Apple TV** (2026-07-19).
-      Correcting an earlier wrong call: 24-bit is NOT buffered-only. The Apple TV
-      accepts and plays `audioFormat 0x80000` (ALAC 44100/24) on the realtime path —
-      even though its advertised realtime table lists only 16-bit — over the same
-      realtime+PTP path that's already solid. No buffered needed. (Sonos has no
-      24-bit anywhere; that 400 was device-specific, not a stream-type rule.)
-- [ ] **Format selection — default to advertised, hi-res via opt-in.** Neither signal
-      is reliable on its own: the Apple TV renders 24-bit it does NOT advertise (table
-      understates), while the Sonos 200-ACCEPTS 48/24 SETUP then renders SILENCE (SETUP
-      lies — worse than a 400, undetectable). Verified by ear 2026-07-19: Sonos plays
-      44.1/16, silent on 48/24 at the same volume. So: DEFAULT to the best format the
-      `/info` table advertises (always renders — Sonos→16, JBL/WiiM→baseline 44.1/16),
-      and expose an advanced per-player "force hi-res / 24-bit" override for devices
-      known to handle it (Apple TV, HomePod). Do NOT auto-push beyond the advertised
-      table — a SETUP 200 is necessary but not sufficient. Hi-res confirmed end-to-end
-      on Apple TV: 44.1/24 and 48/24, decoded as ALAC_44100_24_2 / ALAC_48000_24_2 by
-      the reference receiver (0 errors) and audible at correct speed (voice clip).
-- [ ] **Buffered (type 103) — parked, low value.** Its only edge over realtime was
-      hi-res, which realtime now delivers; the remaining niche is lossy-network
-      resilience (TCP retransmit). The TCP length-prefix off-by-2 is fixed (verified on
-      a reference receiver), but the Apple TV won't send Delay_Req on a buffered stream
-      so its SETRATEANCHORTIME never clears — needs an iOS→Apple TV capture if ever
-      revisited.
-- [ ] native+PTP on JBL MA9100 / WiiM Pro (paired + /info read; not ear-tested);
-      PTP regression on a RAOP-only device.
-- [ ] Non-root 319/320 bind path (`--ptp-daemon` returns 2) on Linux/containers — validated by
-      inspection only (macOS lets the user bind those ports).
-- [ ] `Pdelay_Req` responder (gPTP peer-delay) — not needed by Sonos (uses E2E
-      `Delay_Req`, which we answer), but other gPTP receivers may probe with it.
-- [ ] Buffered follow-ups: try AAC payload (iOS buffered streams carry AAC; Sonos
-      accepts our ALAC SETUP + anchor but does not render), and fix the buffered
-      drain hang after EOF (process lingered minutes past a 20s stream).
-- [ ] Parse `audioLatencies` from the GET /info reply (the SETUP echo of
-      latencyMin/Max is receiver-optional; Sonos omits it) so the reported window
-      is populated for every device.
-- [ ] CLI contract: accept plain unix time for the group start (e.g.
-      `--start-unix-ms`) so MA never handles NTP fixed-point; keep `--ntpstart`
-      for compatibility.
-- [ ] Mixed-protocol group test: RAOP + native-PTP members on one `--ntpstart`
-      (requires aligning the RAOP and AP2 "audible at start+lead" conventions).
-- [ ] See `TEST-PLAN.md` for the full route matrix.
-
-## Distribution
-
-- [x] **Cross-platform builds + CI** — `.github/workflows/build.yml` cross-builds all
-      four targets (linux x86_64/aarch64, macos arm64/x86_64) and uploads artifacts.
-- [ ] **Release process (later)** — a `v*` tag runs the `release` job (GitHub Release
-      with the four binaries + `SHA256SUMS`), but it has not been exercised yet. Cut a
-      first versioned release when ready.
-- [ ] **MA container build** should fetch the pinned release binaries as part of the
-      image build, instead of committing a prebuilt binary into the provider `bin/` dir.
-      (The prebuilt `macos-arm64` binary is accepted for local testing only.)
+- [ ] **Buffered (type 103) playback anchoring on Apple TV.** Framing and
+      anchoring are implemented and the framing is verified against a
+      reference receiver, but the Apple TV never measures our clock on a
+      buffered stream so its rate anchor never clears. Parked (realtime
+      carries hi-res); revisiting needs a capture of an iOS → Apple TV
+      buffered session.
+- [ ] **Parse `audioLatencies` from GET /info.** The SETUP echo of
+      `latencyMin`/`latencyMax` is receiver-optional (Sonos omits it); the
+      /info table would populate the pacing window and the reported
+      `[STATUS] latency` line for every device instead of falling back to the
+      1.75 s default.
+- [ ] **Format negotiation with try-fallback.** Default to the best format
+      the device advertises and gate hi-res behind an explicit opt-in (the
+      advertised table understates on Apple TV, and a SETUP 200 can lie —
+      Sonos silently renders nothing on 48/24). A try-then-fall-back
+      negotiation would let opt-in hi-res degrade gracefully.
+- [ ] **Non-root 319/320 on Linux.** The `--ptp-daemon` bind-failure path
+      (exit code 2) is validated by inspection only; verify on a real
+      Linux/container host and document the `CAP_NET_BIND_SERVICE` setup for
+      the MA deployment.
+- [ ] **First release tag + MA container fetch.** The `v*` release job
+      (binaries + `SHA256SUMS`) exists but has never run. Cut a first
+      versioned release, then make the MA container build fetch the pinned
+      release binaries instead of committing a prebuilt binary into the
+      provider `bin/` dir (the committed `macos-arm64` binary is for local
+      testing only).
+- [ ] **Remaining ear-tests.** JBL MA9100 and WiiM Pro are session-verified
+      (paired, /info read) but not ear-tested; RAOP/RAOP-compat want a
+      regression pass by ear after the native-AP2 work; and a RAOP-only
+      device inside a PTP-active group needs a regression check. See the
+      matrix in `TEST-PLAN.md`.
