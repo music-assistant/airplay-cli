@@ -193,6 +193,17 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip);
  * ap2cl_connect(). */
 void ap2cl_set_buffered(struct ap2cl_s *p, bool enable);
 
+/*
+ * Get the effective playback lead and the receiver-reported buffering window.
+ *
+ * :param p: client context.
+ * :param lead_ms: receives the effective lead in ms (config clamped into the
+ *                 device window), or NULL.
+ * :param dev_min: receives the device's latencyMin in frames (0 = unreported), or NULL.
+ * :param dev_max: receives the device's latencyMax in frames (0 = unreported), or NULL.
+ */
+void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint32_t *dev_max);
+
 /* Get current state. */
 ap2_state_t ap2cl_state(struct ap2cl_s *p);
 

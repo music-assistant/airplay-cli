@@ -426,7 +426,8 @@ static void ptp_send_sync(struct ap2_ptp_ctx *ctx)
 
 /* Answer a received Delay_Req with a Delay_Resp echoing the requester's
  * port identity and sequenceId, and our receive timestamp. */
-static void ptp_send_delay_resp(struct ap2_ptp_ctx *ctx, const uint8_t *req, uint64_t rx_ns)
+static void ptp_send_delay_resp(struct ap2_ptp_ctx *ctx, const uint8_t *req, uint64_t rx_ns,
+                                const struct sockaddr_in *requester)
 {
     uint16_t seq = (req[30] << 8) | req[31];
     uint16_t len = PTP_HDR_LEN + 10 + 10;
@@ -436,7 +437,12 @@ static void ptp_send_delay_resp(struct ap2_ptp_ctx *ctx, const uint8_t *req, uin
                   ctx->clock_id, seq, 0x00, PTP_LOG_SYNC_INTERVAL);
     ptp_write_ts(b + PTP_HDR_LEN, rx_ns);              /* receiveTimestamp */
     memcpy(b + PTP_HDR_LEN + 10, req + 20, 10);        /* requestingPortIdentity */
-    ptp_send(ctx, ctx->general_sock, PTP_GENERAL_PORT, b, len);
+    /* Unicast to the requester ONLY: with several receivers on one clock
+     * (multi-room daemon) a broadcast reply delivers every receiver the
+     * others' responses as well. */
+    struct sockaddr_in dst = *requester;
+    dst.sin_port = htons(PTP_GENERAL_PORT);
+    sendto(ctx->general_sock, b, len, 0, (struct sockaddr *)&dst, sizeof(dst));
     LOG_DEBUG("[PTP] TX Delay_Resp seq=%u rx=%" PRIu64 "ns", seq, rx_ns);
 }
 
@@ -841,7 +847,7 @@ static void *ptp_thread_func(void *arg)
                 /* Only the grandmaster answers Delay_Req. */
                 if (gm && n >= PTP_HDR_LEN + 10) {
                     LOG_DEBUG("[PTP] RX Delay_Req from %s", srcip);
-                    ptp_send_delay_resp(ctx, buf, rx);
+                    ptp_send_delay_resp(ctx, buf, rx, &src);
                 }
                 break;
             case PTP_MSG_ANNOUNCE:

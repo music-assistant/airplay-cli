@@ -60,6 +60,8 @@ struct ap2cl_s {
     ap2_audio_format_t format;
     ap2_state_t state;
     int latency_ms;
+    uint32_t dev_latency_min;      /* receiver-reported buffering window (frames) */
+    uint32_t dev_latency_max;
     int volume;
     ap2_flow_t flow;
 
@@ -104,6 +106,8 @@ struct ap2cl_s {
     bool rt_anchor_valid;
     uint64_t rt_anchor_wall0;      /* master-clock ns of the anchor point */
     uint32_t rt_anchor_pos0;       /* rtp timestamp at the anchor point */
+    uint64_t start_ntp;            /* shared group start (NTP fixed-point), 0 = none */
+    uint32_t rtp_offset;           /* per-process timeline offset (see start_at) */
     uint64_t audio_nonce_counter;
     char session_url[128];
     char session_uuid[40];
@@ -796,6 +800,29 @@ static bool ap2_native_connect(struct ap2cl_s *p)
             remote_ctrl = (int)v;
         LOG_DEBUG("[AP2] Stream response ports: data=%d control=%d", remote_data, remote_ctrl);
 
+        /* The receiver reports its buffering window (frames). Clamp our lead
+         * into it so the configured latency can never violate the device;
+         * the effective value is surfaced so the caller (MA) can plan group
+         * starts from real device capabilities instead of a config guess. */
+        if (ap2_bplist_find_uint(resp, (size_t)resp_len, "latencyMin", &v) && v > 0)
+            p->dev_latency_min = (uint32_t)v;
+        if (ap2_bplist_find_uint(resp, (size_t)resp_len, "latencyMax", &v) && v > 0)
+            p->dev_latency_max = (uint32_t)v;
+        if (p->dev_latency_min || p->dev_latency_max) {
+            int lat_frames = MS2TS(p->latency_ms, p->format.sample_rate);
+            int min_f = p->dev_latency_min ? (int)p->dev_latency_min : 0;
+            int max_f = p->dev_latency_max ? (int)p->dev_latency_max : lat_frames;
+            int clamped = lat_frames < min_f ? min_f : (lat_frames > max_f ? max_f : lat_frames);
+            int clamped_ms = clamped * 1000 / p->format.sample_rate;
+            if (clamped_ms != p->latency_ms) {
+                LOG_INFO("[AP2] Device latency window %d..%d frames: adjusting lead "
+                         "%dms -> %dms", min_f, max_f, p->latency_ms, clamped_ms);
+                p->latency_ms = clamped_ms;
+            }
+            LOG_INFO("[AP2] Device latency: min=%u max=%u frames, effective lead %dms",
+                     p->dev_latency_min, p->dev_latency_max, p->latency_ms);
+        }
+
         if (remote_data > 0) {
             memset(&p->data_addr, 0, sizeof(p->data_addr));
             p->data_addr.sin_family = AF_INET;
@@ -964,8 +991,23 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
      * packet extrapolates along that same line, so all time-announces agree. */
     uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
     if (!p->rt_anchor_valid) {
-        p->rt_anchor_wall0 = wall;
-        p->rt_anchor_pos0 = p->rtp_timestamp;
+        if (p->start_ntp) {
+            /* Group playback: derive the line from the SHARED --ntpstart so
+             * every player maps the same sample to the same wall instant
+             * (playback of the start sample begins latency_ms after it).
+             * Valid because our timeline — in-process GM or the shared daemon
+             * — is host CLOCK_REALTIME, the same clock the ntpstart value
+             * comes from (libraop's NTP fixed-point uses the UNIX epoch:
+             * seconds<<32 | frac, seconds since 1970 — no 1900 offset). */
+            uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
+                             + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
+            p->rt_anchor_wall0 = unix_ns;
+            p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
+                              + p->rtp_offset;
+        } else {
+            p->rt_anchor_wall0 = wall;
+            p->rt_anchor_pos0 = p->rtp_timestamp;
+        }
         p->rt_anchor_valid = true;
     }
     int64_t elapsed_ns = (int64_t)(wall - p->rt_anchor_wall0)
@@ -1436,9 +1478,29 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
 {
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
+        /* Offset the RTP timeline per process: streams in one group share
+         * ntpstart, and with identical pos0 two sessions from one host are
+         * wire-identical twins (same clock id, anchor tuple, ssrc, source) —
+         * Sonos household stream tracking then cross-wires them and one
+         * device goes silent. The anchor line carries the same offset, so
+         * the audible schedule is untouched. */
+        p->rtp_offset = (uint32_t)(getpid() * 2654435761u) & 0x0FFFFF00u;
+        /* head_ts stays in the pure scheduling domain (pacing compares it to
+         * the wall frame clock); the offset is applied only to the on-wire
+         * RTP timestamps and the anchor, which advance in lockstep. */
         p->head_ts = NTP2TS(ntp_start, p->format.sample_rate);
-        p->rtp_timestamp = (uint32_t)p->head_ts;
+        p->rtp_timestamp = (uint32_t)p->head_ts + p->rtp_offset;
+        p->seq_number = (uint16_t)(getpid() * 40503u);
+        p->start_ntp = ntp_start;
         p->state = AP2_STREAMING;
+        /* Announce the timeline IMMEDIATELY: with a future ntpstart the first
+         * audio chunk (and the anchor coupled to it) would otherwise only go
+         * out once pacing releases it, and a receiver that sees no time
+         * announce shortly after RECORD can abandon the stream. The line is
+         * fully determined by ntpstart, so this and the per-chunk announces
+         * agree. */
+        if (p->use_ptp && !p->use_buffered && p->ctrl_sock >= 0)
+            ap2_send_sync_packet_ptp(p, true);
         /* Buffered playback is scheduled entirely by the anchor: map the start
          * RTP sample to the PTP timeline at the requested start instant
          * (anchor = PTP now + (ntp_start - now)). */
@@ -1491,10 +1553,21 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
          * provide flow control, so accept whenever we are streaming and let
          * backpressure pace us (rather than the realtime latency window). */
         if (p->use_buffered) return true;
+        /* Pace against the ANCHOR DEADLINE, capped to the receiver's buffer:
+         * frame head plays at (head + lead) on the shared frame clock, and a
+         * frame delivered more than the receiver's latencyMax before its
+         * deadline overflows its buffer and is dropped (Sonos: 88200 = 2.0s).
+         * Release frames at most `window` ahead of their deadline — the
+         * reported window when known, else 77175 (1.75s, inside every
+         * AirPlay receiver's standard 2s). This also makes scheduled group
+         * starts (future ntpstart) safe: earliness stays bounded no matter
+         * how far ahead the start lies. */
         uint64_t now_ntp = raopcl_get_ntp(NULL);
         uint64_t now_ts = NTP2TS(now_ntp, p->format.sample_rate);
         uint64_t latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
-        return (now_ts + latency_frames) >= p->head_ts;
+        uint64_t window = p->dev_latency_max > 11025
+                          ? p->dev_latency_max - 11025 : 77175;
+        return (now_ts + window) >= (p->head_ts + latency_frames);
     }
     if (!p->raopcl) return false;
     return raopcl_accept_frames(p->raopcl);
@@ -1636,6 +1709,13 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
 {
     if (!p || !p->raopcl) return false;
     return raopcl_set_progress_ms(p->raopcl, elapsed_s * 1000, duration_s * 1000);
+}
+
+void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint32_t *dev_max)
+{
+    if (lead_ms) *lead_ms = p ? p->latency_ms : 0;
+    if (dev_min) *dev_min = p ? p->dev_latency_min : 0;
+    if (dev_max) *dev_max = p ? p->dev_latency_max : 0;
 }
 
 ap2_state_t ap2cl_state(struct ap2cl_s *p) { return p ? p->state : AP2_DOWN; }

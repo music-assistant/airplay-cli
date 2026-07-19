@@ -599,6 +599,17 @@ static int run_airplay2(cli_config_t *cfg, int infile)
 
     status_connected();
 
+    /* Surface the effective lead and the receiver-reported buffering window so
+     * the caller (MA) can plan group starts from real device capabilities. */
+    {
+        int lead_ms = 0;
+        uint32_t dev_min = 0, dev_max = 0;
+        ap2cl_latency_info(g_ap2cl, &lead_ms, &dev_min, &dev_max);
+        printf("[STATUS] latency lead_ms=%d device_min_frames=%u device_max_frames=%u\n",
+               lead_ms, dev_min, dev_max);
+        fflush(stdout);
+    }
+
     /* Set volume */
     if (cfg->volume > 0) {
         ap2cl_set_volume(g_ap2cl, cfg->volume);
