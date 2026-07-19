@@ -94,6 +94,16 @@ struct ap2cl_s {
     uint32_t ssrc;
     uint64_t head_ts;
     bool first_packet;
+
+    /* Frozen realtime anchor line (PTP): the rtp<->wall mapping is fixed once
+     * at stream start and every periodic time-announce extrapolates along it.
+     * Re-deriving the anchor from the send head each time makes consecutive
+     * anchors disagree (the head races ahead during the initial buffer fill
+     * and wobbles with pipe pacing), and each inconsistent re-anchor makes
+     * the receiver re-seat its timeline and drop its buffer. */
+    bool rt_anchor_valid;
+    uint64_t rt_anchor_wall0;      /* master-clock ns of the anchor point */
+    uint32_t rt_anchor_pos0;       /* rtp timestamp at the anchor point */
     uint64_t audio_nonce_counter;
     char session_url[128];
     char session_uuid[40];
@@ -949,18 +959,25 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     /* Anchor semantics (from shairport-sync's receiver math): the receiver
      * schedules playback as "frame_1 - 11035 plays at the packet timestamp"
      * and derives its buffer latency from frame_2 - frame_1 (Apple senders:
-     * 77175). Our send head runs latency_ms AHEAD of realtime, so the frame
-     * playing NOW is (head - latency); anchoring the head itself would place
-     * all audio in the receiver's future and mute it. */
-    uint32_t latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
-    uint32_t play_pos = p->rtp_timestamp - latency_frames;
+     * 77175). The mapping is FROZEN at stream start — playback of the first
+     * frame begins latency_ms after the anchor point — and every periodic
+     * packet extrapolates along that same line, so all time-announces agree. */
+    uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
+    if (!p->rt_anchor_valid) {
+        p->rt_anchor_wall0 = wall;
+        p->rt_anchor_pos0 = p->rtp_timestamp;
+        p->rt_anchor_valid = true;
+    }
+    int64_t elapsed_ns = (int64_t)(wall - p->rt_anchor_wall0)
+                       - (int64_t)p->latency_ms * 1000000LL;
+    uint32_t play_pos = p->rt_anchor_pos0
+                      + (uint32_t)((elapsed_ns * p->format.sample_rate) / 1000000000LL);
     uint32_t frame_1 = play_pos + 11035;
     uint32_t frame_2 = frame_1 + 77175;
 
     uint32_t be = htonl(frame_1);
     memcpy(pkt + 4, &be, 4);
 
-    uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
     uint32_t wall_hi = htonl((uint32_t)(wall >> 32));
     uint32_t wall_lo = htonl((uint32_t)(wall & 0xFFFFFFFF));
     memcpy(pkt + 8, &wall_hi, 4);
@@ -1477,6 +1494,7 @@ void ap2cl_pause(struct ap2cl_s *p)
         return;
     }
     if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
+    p->rt_anchor_valid = false;    /* resume re-anchors on a fresh line */
     p->state = AP2_PAUSED;
 }
 
@@ -1504,6 +1522,7 @@ void ap2cl_stop(struct ap2cl_s *p)
     if (p->use_buffered && p->buffered_sock >= 0)
         ap2_send_flushbuffered(p);
     if (p->raopcl) raopcl_stop(p->raopcl);
+    p->rt_anchor_valid = false;
     p->state = AP2_DOWN;
 }
 
