@@ -1031,9 +1031,16 @@ static bool ap2_send_setrateanchortime(struct ap2cl_s *p, uint32_t rtp_time,
     int status = ap2_rtsp_send(p, "SETRATEANCHORTIME", p->session_url, body, body_len,
                                "application/x-apple-binary-plist", &resp, &resp_len);
     free(body);
-    free(resp);
     LOG_INFO("[AP2] SETRATEANCHORTIME rtp=%u anchor=%" PRIu64 "ns rate=%" PRIu64 " -> %d",
              rtp_time, anchor_ns, rate, status);
+    if (status != 200 && resp && resp_len > 0) {
+        int dump = resp_len < 64 ? resp_len : 64;
+        char hex[200];
+        for (int i = 0; i < dump; i++) sprintf(hex + i * 3, "%02x ", resp[i]);
+        hex[dump * 3] = '\0';
+        LOG_INFO("[AP2] SETRATEANCHORTIME response body (%d bytes): %s", resp_len, hex);
+    }
+    free(resp);
     return status == 200;
 }
 
@@ -1443,8 +1450,17 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
                 lead_ns = (d >> 32) * 1000000000ULL +
                           (((d & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
             }
-            uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + lead_ns;
-            ap2_send_setrateanchortime(p, p->rtp_timestamp, anchor_ns, 1);
+            /* A strict receiver 400s a rate anchor on a timeline it has not
+             * acquired yet, and it only starts measuring our clock (unicast
+             * Delay_Req) a second or two into the session — retry until the
+             * anchor is accepted, re-deriving it from the clock each attempt. */
+            bool anchored_ok = false;
+            for (int try = 0; try < 12 && !anchored_ok; try++) {
+                if (try) usleep(500000);
+                uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + lead_ns;
+                anchored_ok = ap2_send_setrateanchortime(p, p->rtp_timestamp,
+                                                         anchor_ns, 1);
+            }
             p->anchored = true;
         }
         return true;
