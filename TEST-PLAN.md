@@ -45,7 +45,7 @@ session healthy, no audio confirmation) · `?` untested · `n/a` not applicable.
 | R7 | 24-bit ALAC over realtime (44.1/24 and 48/24) | n/a (no 24-bit; 48/24 silent-accepts) | ? | EAR 2026-07-19 (+ reference-receiver decode, 0 errors) | ? |
 | R8 | Buffered (type 103) + PTP | parked | parked | parked | parked |
 | R9 | Multi-room sync: 2+ devices, `--ptp-daemon` + `--ptp-shared`, one `--start-unix-ms` | EAR 2026-07-19 (Era 100 pair + Move, sample-aligned) | ? | ? | ? |
-| R10 | Mixed-protocol group: RAOP + native-AP2 members, one `--start-unix-ms` | EAR 2026-07-19 (Era 100 pair AP2+PTP + Move RAOP/NTP, in sync; 3-way incl. Apple TV pair-verify: Sonos members perfect, ATV lags by its TV's HDMI pipeline -> per-player sync_adjust in MA) | ? | ? | ? |
+| R10 | Mixed-protocol group: RAOP + native-AP2 members, one `--start-unix-ms` | EAR 2026-07-19 (Era 100 pair AP2+PTP + Move RAOP/NTP, in sync; 3-way incl. Apple TV pair-verify IN SYNC after automatic arrivalToRenderLatencyMs compensation (ATV reports ~107ms)) | ? | ? | ? |
 | R11 | PTP regression: RAOP-only device plays while PTP is active for the group | ? | — | — | — |
 
 Notes:

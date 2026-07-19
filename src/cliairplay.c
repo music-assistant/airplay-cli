@@ -702,8 +702,9 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         int lead_ms = 0;
         uint32_t dev_min = 0, dev_max = 0;
         ap2cl_latency_info(g_ap2cl, &lead_ms, &dev_min, &dev_max);
-        printf("[STATUS] latency lead_ms=%d device_min_frames=%u device_max_frames=%u\n",
-               lead_ms, dev_min, dev_max);
+        printf("[STATUS] latency lead_ms=%d device_min_frames=%u device_max_frames=%u "
+               "device_render_ms=%d\n",
+               lead_ms, dev_min, dev_max, ap2cl_render_latency_ms(g_ap2cl));
         fflush(stdout);
     }
 

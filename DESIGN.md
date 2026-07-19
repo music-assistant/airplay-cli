@@ -186,6 +186,18 @@ T, on every protocol path.** Group members — including mixed RAOP + native-AP2
 groups — are handed the same T and align by construction; cross-protocol
 sample alignment is verified by ear on real devices.
 
+**Downstream render-latency compensation.** A receiver whose audible output
+sits behind an external pipeline reports the delay in its stream-SETUP reply
+as `arrivalToRenderLatencyMs` (Apple TV: ~107 ms for its decode + HDMI + TV
+chain; Sonos omits the key and self-compensates). Members reporting it are
+scheduled that much earlier — the anchor line shifts by the value — so their
+ACOUSTIC output lands on T with the rest of the group. This is the same
+mechanism Apple senders use, which is why an iPhone keeps an Apple TV and a
+Sonos in sync. Verified by ear: a three-way group (Era 100 pair AP2+PTP, Move
+RAOP, Apple TV AP2 pair-verify through a TV) plays in sync with the
+compensation and lags without it. Manual per-player offsets remain a
+caller-side override for gear that misreports.
+
 Per path:
 
 - **RAOP / RAOP-compat** — raopcl renders a frame one latency after its

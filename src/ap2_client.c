@@ -62,6 +62,7 @@ struct ap2cl_s {
     int latency_ms;
     uint32_t dev_latency_min;      /* receiver-reported buffering window (frames) */
     uint32_t dev_latency_max;
+    int dev_render_ms;             /* receiver-reported arrival->render latency (ms) */
     int volume;
     ap2_flow_t flow;
 
@@ -589,6 +590,19 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     }
     LOG_INFO("[AP2] Channel encrypted");
 
+    /* Diagnostic: post-pairing /info — the encrypted-channel reply is the
+     * full form (e.g. audioLatencies). Dump-only; env-gated. */
+    if (getenv("CLIAIRPLAY_DUMP_INFO2")) {
+        uint8_t *iresp = NULL; int iresp_len = 0;
+        int istatus = ap2_rtsp_send(p, "GET", "/info", NULL, 0, NULL, &iresp, &iresp_len);
+        if (istatus == 200 && iresp && iresp_len > 0) {
+            FILE *f = fopen(getenv("CLIAIRPLAY_DUMP_INFO2"), "wb");
+            if (f) { fwrite(iresp, 1, iresp_len, f); fclose(f); }
+            LOG_INFO("[AP2] post-pairing /info dumped (%d bytes)", iresp_len);
+        }
+        free(iresp);
+    }
+
     /* Our AirPlay identity, derived from the (16-hex) DACP ID: an 8-byte
      * colon deviceID, a 6-byte colon macAddress, and the 64-bit PTP clock
      * identity. Keeping these in one place ensures the PTP grandmasterIdentity
@@ -806,6 +820,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         return false;
     }
 
+    if (getenv("CLIAIRPLAY_DUMP_SETUP") && resp && resp_len > 0) {
+        FILE *f = fopen(getenv("CLIAIRPLAY_DUMP_SETUP"), "wb");
+        if (f) { fwrite(resp, 1, resp_len, f); fclose(f); }
+        LOG_INFO("[AP2] stream SETUP response dumped (%d bytes)", resp_len);
+    }
+
     /* Parse the remote ports from the response plist,
      * {"streams": [{"dataPort": N, "controlPort": N, ...}]}, by KEY with real
      * offset-table traversal. Positional guessing must never be used here: a
@@ -822,6 +842,18 @@ static bool ap2_native_connect(struct ap2cl_s *p)
             v >= 1024 && v <= 65535)
             remote_ctrl = (int)v;
         LOG_DEBUG("[AP2] Stream response ports: data=%d control=%d", remote_data, remote_ctrl);
+
+        /* Downstream pipeline delay the device itself reports (Apple TV: its
+         * decode+HDMI+display chain, ~100ms). Members with a reported render
+         * latency are scheduled that much earlier so their ACOUSTIC output
+         * aligns with the rest of the group; devices that self-compensate
+         * (Sonos) omit the key and get no shift. */
+        if (ap2_bplist_find_uint(resp, (size_t)resp_len, "arrivalToRenderLatencyMs", &v) &&
+            v <= 2000) {
+            p->dev_render_ms = (int)v;
+            LOG_INFO("[AP2] Device reports arrival->render latency %dms; "
+                     "compensating the timeline", p->dev_render_ms);
+        }
 
         /* The receiver reports its buffering window (frames). Clamp our lead
          * into it so the configured latency can never violate the device;
@@ -1030,7 +1062,8 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->latency_ms * 1000000ULL;
+            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->latency_ms * 1000000ULL
+                               - (uint64_t)p->dev_render_ms * 1000000ULL;
             p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
                               + p->rtp_offset;
         } else {
@@ -1787,6 +1820,8 @@ void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint
     if (dev_min) *dev_min = p ? p->dev_latency_min : 0;
     if (dev_max) *dev_max = p ? p->dev_latency_max : 0;
 }
+
+int ap2cl_render_latency_ms(struct ap2cl_s *p) { return p ? p->dev_render_ms : 0; }
 
 ap2_state_t ap2cl_state(struct ap2cl_s *p) { return p ? p->state : AP2_DOWN; }
 bool ap2cl_is_connected(struct ap2cl_s *p) { return p && p->state >= AP2_CONNECTED; }
