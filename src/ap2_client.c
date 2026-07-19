@@ -83,10 +83,17 @@ struct ap2cl_s {
 
     /* Native AP2 flow */
     int sock_fd;                  /* TCP connection */
+    /* The RTSP socket carries whole request/response cycles from multiple
+     * threads (streaming thread: SETRATEANCHORTIME/FLUSHBUFFERED/TEARDOWN;
+     * cmdpipe thread: SET_PARAMETER volume/metadata, /feedback keepalive).
+     * This lock serializes the cycles so a response cannot be attributed to
+     * the wrong request and the HAP nonce sequence stays intact. */
+    pthread_mutex_t rtsp_lock;
     struct ap2_hap_ctx *hap;      /* HAP encryption context */
     struct ap2_ptp_ctx *ptp;      /* Timing */
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
+    int events_sock;              /* reverse TCP events connection (kept open) */
     struct sockaddr_in data_addr;
     struct sockaddr_in ctrl_addr;
     struct alac_codec_s *alac;    /* ALAC encoder for native flow */
@@ -130,7 +137,7 @@ struct ap2cl_s {
 
 /* ---- Native AP2 RTSP I/O ---- */
 
-static int ap2_rtsp_send_ex(struct ap2cl_s *p, const char *method, const char *uri,
+static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, const char *uri,
                           const uint8_t *body, int body_len, const char *ct,
                           const char *extra_hdr,
                           uint8_t **resp_body, int *resp_len)
@@ -265,6 +272,20 @@ static int ap2_rtsp_send_ex(struct ap2cl_s *p, const char *method, const char *u
     }
     *resp_body = NULL; *resp_len = 0;
     return 0;
+}
+
+/* Serialize the full request/response cycle (see the rtsp_lock field note);
+ * taking the lock here covers every RTSP caller, whichever thread it runs on. */
+static int ap2_rtsp_send_ex(struct ap2cl_s *p, const char *method, const char *uri,
+                          const uint8_t *body, int body_len, const char *ct,
+                          const char *extra_hdr,
+                          uint8_t **resp_body, int *resp_len)
+{
+    pthread_mutex_lock(&p->rtsp_lock);
+    int status = ap2_rtsp_send_ex_unlocked(p, method, uri, body, body_len, ct,
+                                           extra_hdr, resp_body, resp_len);
+    pthread_mutex_unlock(&p->rtsp_lock);
+    return status;
 }
 
 /* Convenience wrapper: send an RTSP request with no extra headers. */
@@ -699,8 +720,9 @@ static bool ap2_native_connect(struct ap2cl_s *p)
             setsockopt(events_sock, SOL_SOCKET, SO_RCVTIMEO, &etv, sizeof(etv));
             if (connect(events_sock, (struct sockaddr *)&ev_addr, sizeof(ev_addr)) == 0) {
                 LOG_INFO("[AP2] Events connection OK");
-                /* Keep the socket open - we don't need to read from it, just keep it alive */
-                /* TODO: store in ctx for proper cleanup */
+                /* Keep the socket open - we don't need to read from it, just
+                 * keep it alive; closed again on disconnect/destroy. */
+                p->events_sock = events_sock;
             } else {
                 LOG_WARN("[AP2] Events connect failed");
                 close(events_sock);
@@ -893,8 +915,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                          inet_ntoa(p->bind_addr));
         }
         if (p->buffered_sock >= 0) {
+            /* Bound both directions so a receiver that stops draining the
+             * stream can never hang the process: the blocking send loop in
+             * ap2_buffered_send_chunk relies on SO_SNDTIMEO expiring. */
             struct timeval stv = {.tv_sec = 8};
             setsockopt(p->buffered_sock, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
+            setsockopt(p->buffered_sock, SOL_SOCKET, SO_RCVTIMEO, &stv, sizeof(stv));
         }
         if (p->buffered_sock < 0 ||
             connect(p->buffered_sock, (struct sockaddr *)&p->data_addr,
@@ -1356,7 +1382,9 @@ struct ap2cl_s *ap2cl_create(
     p->sock_fd = -1;
     p->data_sock = -1;
     p->ctrl_sock = -1;
+    p->events_sock = -1;
     p->buffered_sock = -1;
+    pthread_mutex_init(&p->rtsp_lock, NULL);
     if (dacp_id) p->dacp_id = strdup(dacp_id);
     if (active_remote) p->active_remote = strdup(active_remote);
     if (password) p->password = strdup(password);
@@ -1381,9 +1409,16 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->hap) ap2_hap_destroy(p->hap);
     if (p->ptp) ap2_ptp_destroy(p->ptp);
     if (p->alac) alac_delete_encoder(p->alac);
-    if (p->sock_fd >= 0) close(p->sock_fd);
+    /* Close the RTSP socket under the lock so an in-flight request/response
+     * cycle on another thread finishes first and a later cycle sees -1
+     * instead of writing into a reused descriptor. */
+    pthread_mutex_lock(&p->rtsp_lock);
+    if (p->sock_fd >= 0) { close(p->sock_fd); p->sock_fd = -1; }
+    pthread_mutex_unlock(&p->rtsp_lock);
+    pthread_mutex_destroy(&p->rtsp_lock);
     if (p->data_sock >= 0) close(p->data_sock);
     if (p->ctrl_sock >= 0) close(p->ctrl_sock);
+    if (p->events_sock >= 0) close(p->events_sock);
     if (p->buffered_sock >= 0) close(p->buffered_sock);
     free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
     free(p->secret); free(p->password); free(p->et); free(p->md); free(p->am);
@@ -1461,6 +1496,10 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
 {
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
+        if (p->events_sock >= 0) {
+            close(p->events_sock);
+            p->events_sock = -1;
+        }
         if (p->buffered_sock >= 0) {
             close(p->buffered_sock);
             p->buffered_sock = -1;
@@ -1469,7 +1508,10 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
             uint8_t *resp = NULL; int resp_len = 0;
             ap2_rtsp_send(p, "TEARDOWN", p->session_url, NULL, 0, NULL, &resp, &resp_len);
             free(resp);
+            /* Under the lock: see ap2cl_destroy. */
+            pthread_mutex_lock(&p->rtsp_lock);
             close(p->sock_fd); p->sock_fd = -1;
+            pthread_mutex_unlock(&p->rtsp_lock);
         }
     } else if (p->raopcl) {
         raopcl_disconnect(p->raopcl);
@@ -1620,6 +1662,19 @@ void ap2cl_stop(struct ap2cl_s *p)
     if (p->raopcl) raopcl_stop(p->raopcl);
     p->rt_anchor_valid = false;
     p->state = AP2_DOWN;
+}
+
+bool ap2cl_feedback(struct ap2cl_s *p)
+{
+    /* Native flow only: the RAOP-compat flow rides libraop, whose keepalive
+     * is raopcl_keepalive(). The response body carries stream status we do
+     * not need; the POST itself is what resets the receiver's idle timer. */
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return false;
+    uint8_t *resp = NULL; int resp_len = 0;
+    int status = ap2_rtsp_send(p, "POST", "/feedback", NULL, 0, NULL, &resp, &resp_len);
+    free(resp);
+    LOG_DEBUG("[AP2] /feedback keepalive -> %d", status);
+    return status == 200;
 }
 
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume)

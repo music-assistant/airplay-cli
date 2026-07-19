@@ -49,7 +49,7 @@ Audio is read as raw interleaved PCM from `<filename>` or stdin (`-`), at the
 
 | Option | Description |
 |--------|-------------|
-| `--protocol <raop\|airplay2>` | Streaming protocol (default: `raop`). `airplay2` picks the native HAP flow when `--auth` is given, otherwise the RAOP-compatible flow. |
+| `--protocol <auto\|raop\|airplay2>` | Streaming protocol (default: `auto`, which picks RAOP vs AirPlay 2 from the mDNS features in `--txt`). `airplay2` picks the native HAP flow when `--auth` is given, otherwise the RAOP-compatible flow. |
 
 ### Common
 
@@ -59,6 +59,7 @@ Audio is read as raw interleaved PCM from `<filename>` or stdin (`-`), at the
 | `--volume <0-100>` | Initial volume. |
 | `--latency <ms>` | Output buffer / read-ahead duration (default: 1000). |
 | `--ntpstart <ntp>` | Absolute NTP timestamp at which playback should start (used for multi-device sync). |
+| `--start-unix-ms <ms>` | Absolute start time as plain unix-epoch milliseconds (preferred over `--ntpstart`: the caller never handles NTP formats). Pass the **same** value to every member of a sync group. |
 | `--wait <ms>` | Delay before starting the stream. |
 | `--samplerate <rate>` | Input sample rate (default: 44100). |
 | `--bitdepth <16\|24>` | Input bit depth (default: 16; 24 requires the native AirPlay 2 flow). |
@@ -93,14 +94,15 @@ Audio is read as raw interleaved PCM from `<filename>` or stdin (`-`), at the
 | `--ptp-shared` | Prefer a shared PTP daemon clock (multi-room). When a live `--ptp-daemon` is present on this host, read the elected clock from shared memory and do **not** bind 319/320 or run an engine; otherwise fall back to the in-process engine. |
 | `--buffered` | Force the buffered audio stream (type 103, RTP-over-TCP + PTP anchor). |
 
-### Utility / daemon (no host or audio args)
+### Utility / daemon modes
 
 | Option | Description |
 |--------|-------------|
 | `--ntp` | Print the current NTP timestamp and exit. |
 | `--check` | Print `cliairplay <version> check` and exit (used for binary validation). |
-| `--pair` | Enter interactive pairing mode (PIN from the device) to obtain HAP credentials. |
-| `--ptp-daemon` | Run **only** the shared PTP clock (multi-room): bind UDP 319/320 once, run the grandmaster/BMCA/slave engine, publish the elected master to shared memory, and serve the control channel until signaled (SIGINT/SIGTERM). One per host; needs privilege to bind 319/320. Honors `--if`. |
+| `--pair` | Legacy Apple TV RAOP pairing; produces the `--secret` used by the RAOP flow. |
+| `--pair-setup` | HomeKit pair-setup against `<host_ip>` (with `--port` and `--dacp`): the device shows a PIN, and on success the `--auth` credentials are printed on stdout. Stream later with the same `--dacp`. |
+| `--ptp-daemon` | Run **only** the shared PTP clock (multi-room): bind UDP 319/320 once, run the grandmaster/BMCA/slave engine, publish the elected master to shared memory, and serve the control channel until signaled (SIGINT/SIGTERM). One per host; needs privilege to bind 319/320. Honors `--if`; takes no host/audio args. |
 
 ### Runtime commands (`--cmdpipe`)
 
@@ -149,9 +151,12 @@ shared PTP daemon and points every per-device streaming process at it:
   in-process engine exactly as a single-device session does.
 
 MA lifecycle: start `cliairplay --ptp-daemon` once per host when the first
-native-AP2 PTP stream begins; run each per-device stream with `--ptp-shared`;
-stop the daemon (SIGTERM) when the last PTP stream ends. The daemon must run with
-privilege to bind 319/320 (root, or `CAP_NET_BIND_SERVICE` on Linux).
+native-AP2 PTP stream begins; run each per-device stream with `--ptp-shared` and
+the **same `--start-unix-ms`** (all members of a group must be given an identical
+start time so every device schedules the first sample at the same wall-clock
+instant); stop the daemon (SIGTERM) when the last PTP stream ends. The daemon
+must run with privilege to bind 319/320 (root, or `CAP_NET_BIND_SERVICE` on
+Linux).
 
 ## License
 

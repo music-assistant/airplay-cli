@@ -54,12 +54,15 @@ extern log_level *loglevel;
 #define PTP_HDR_LEN         34
 
 /* messageType (low nibble of byte 0) */
-#define PTP_MSG_SYNC        0x0
-#define PTP_MSG_DELAY_REQ   0x1
-#define PTP_MSG_FOLLOW_UP   0x8
-#define PTP_MSG_DELAY_RESP  0x9
-#define PTP_MSG_ANNOUNCE    0xB
-#define PTP_MSG_SIGNALING   0xC
+#define PTP_MSG_SYNC             0x0
+#define PTP_MSG_DELAY_REQ        0x1
+#define PTP_MSG_PDELAY_REQ       0x2
+#define PTP_MSG_PDELAY_RESP      0x3
+#define PTP_MSG_FOLLOW_UP        0x8
+#define PTP_MSG_DELAY_RESP       0x9
+#define PTP_MSG_PDELAY_RESP_FUP  0xA
+#define PTP_MSG_ANNOUNCE         0xB
+#define PTP_MSG_SIGNALING        0xC
 
 /* Unicast-negotiation TLVs (IEEE-1588 16.1). Apple receivers request unicast
  * Announce/Sync/Delay_Resp from the sender's clock via Signaling. */
@@ -444,6 +447,44 @@ static void ptp_send_delay_resp(struct ap2_ptp_ctx *ctx, const uint8_t *req, uin
     dst.sin_port = htons(PTP_GENERAL_PORT);
     sendto(ctx->general_sock, b, len, 0, (struct sockaddr *)&dst, sizeof(dst));
     LOG_DEBUG("[PTP] TX Delay_Resp seq=%u rx=%" PRIu64 "ns", seq, rx_ns);
+}
+
+/* Answer a received Pdelay_Req (gPTP peer-delay probe) with the two-step
+ * Pdelay_Resp + Pdelay_Resp_Follow_Up pair, mirroring owntone's libairptp.
+ * 802.1AS receivers can mark a neighbour that leaves the probe unanswered
+ * not-asCapable and then distrust its timeline, so the reply goes out in any
+ * role (peer-delay measures the link, not the timeline). Both messages echo
+ * the requester's sequenceId and port identity and are sent unicast to the
+ * requester only (same reasoning as ptp_send_delay_resp). */
+static void ptp_send_pdelay_resp(struct ap2_ptp_ctx *ctx, const uint8_t *req, uint64_t rx_ns,
+                                 const struct sockaddr_in *requester)
+{
+    uint16_t seq = (req[30] << 8) | req[31];
+    uint16_t len = PTP_HDR_LEN + 10 + 10;
+    struct sockaddr_in dst = *requester;
+
+    /* Pdelay_Resp (event port): requestReceiptTimestamp = our rx time. */
+    uint8_t b[PTP_HDR_LEN + 10 + 10];
+    ptp_write_hdr(b, PTP_MSG_PDELAY_RESP, len,
+                  PTP_FLAG_UNICAST | PTP_FLAG_PTP_TIMESCALE | PTP_FLAG_TWO_STEP,
+                  ctx->clock_id, seq, 0x00, PTP_LOG_SYNC_INTERVAL);
+    ptp_write_ts(b + PTP_HDR_LEN, rx_ns);              /* requestReceiptTimestamp */
+    memcpy(b + PTP_HDR_LEN + 10, req + 20, 10);        /* requestingPortIdentity */
+    dst.sin_port = htons(PTP_EVENT_PORT);
+    sendto(ctx->event_sock, b, len, 0, (struct sockaddr *)&dst, sizeof(dst));
+
+    /* Pdelay_Resp_Follow_Up (general port): responseOriginTimestamp = the
+     * Resp's software egress time, read from the same local clock as rx_ns
+     * so the requester's turnaround term (t3 - t2) is coherent. */
+    uint8_t f[PTP_HDR_LEN + 10 + 10];
+    ptp_write_hdr(f, PTP_MSG_PDELAY_RESP_FUP, len,
+                  PTP_FLAG_UNICAST | PTP_FLAG_PTP_TIMESCALE,
+                  ctx->clock_id, seq, 0x00, PTP_LOG_SYNC_INTERVAL);
+    ptp_write_ts(f + PTP_HDR_LEN, ap2_ptp_now_ns(ctx)); /* responseOriginTimestamp */
+    memcpy(f + PTP_HDR_LEN + 10, req + 20, 10);
+    dst.sin_port = htons(PTP_GENERAL_PORT);
+    sendto(ctx->general_sock, f, len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    LOG_DEBUG("[PTP] TX Pdelay_Resp+Follow_Up seq=%u rx=%" PRIu64 "ns", seq, rx_ns);
 }
 
 /*
@@ -849,6 +890,13 @@ static void *ptp_thread_func(void *arg)
                     LOG_DEBUG("[PTP] RX Delay_Req from %s", srcip);
                     ptp_send_delay_resp(ctx, buf, rx, &src);
                 }
+                break;
+            case PTP_MSG_PDELAY_REQ:
+                /* Peer-delay is answered in ANY role (grandmaster, slave or
+                 * holding): it is a link-local measurement, not master-scoped,
+                 * and an ignored probe can cost us asCapable status. */
+                LOG_DEBUG("[PTP] RX Pdelay_Req from %s", srcip);
+                ptp_send_pdelay_resp(ctx, buf, rx, &src);
                 break;
             case PTP_MSG_ANNOUNCE:
                 ptp_handle_announce(ctx, buf, n, rx, srcip);

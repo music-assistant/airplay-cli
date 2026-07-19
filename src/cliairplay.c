@@ -340,6 +340,7 @@ static void *cmdpipe_reader_thread(void *arg)
 {
     cli_config_t *cfg = (cli_config_t *)arg;
     uint64_t last_keepalive = raopcl_get_ntp(NULL);
+    uint64_t last_feedback = last_keepalive;
 
     g_cmdpipe_fd = open(cfg->cmdpipe, O_RDWR | O_NONBLOCK);
     if (g_cmdpipe_fd == -1) {
@@ -357,6 +358,14 @@ static void *cmdpipe_reader_thread(void *arg)
         if (cfg->protocol == PROTO_RAOP && g_raopcl && now - last_keepalive >= MS2NTP(20000)) {
             raopcl_keepalive(g_raopcl);
             last_keepalive = now;
+        }
+        /* Native AP2 keepalive: real senders POST /feedback about every 2 s
+         * and long sessions can hit receiver-side idle timeouts without it
+         * (no-op for the RAOP-compat flow, which libraop keeps alive). */
+        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl && ap2cl_is_connected(g_ap2cl) &&
+            now - last_feedback >= MS2NTP(2000)) {
+            ap2cl_feedback(g_ap2cl);
+            last_feedback = now;
         }
 
         if (n <= 0 || !(pfds.revents & POLLIN)) continue;

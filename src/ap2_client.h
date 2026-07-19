@@ -146,6 +146,12 @@ void ap2cl_play(struct ap2cl_s *p);
 /* Stop playback. */
 void ap2cl_stop(struct ap2cl_s *p);
 
+/* Session keepalive: POST /feedback over the encrypted RTSP channel, as real
+ * Apple senders do every ~2 s (long sessions can otherwise hit receiver-side
+ * idle timeouts). Native AP2 flow only; a no-op returning false otherwise.
+ * Returns true when the receiver answered 200. */
+bool ap2cl_feedback(struct ap2cl_s *p);
+
 /* Set volume (0-100). */
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
 
