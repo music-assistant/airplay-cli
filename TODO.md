@@ -52,9 +52,21 @@ server-side integration state, see the provider's `PLAN.md`.
       Do it once in a shared helper and apply to BOTH the native AP2 path and the
       RAOP/compat path (raopcl_float_volume) so all protocols track the same curve;
       -144 stays mute. Re-verify by ear on Sonos + Apple TV at a few settings.
-- [ ] Buffered + 24-bit end-to-end (24-bit currently 400s at Stream SETUP — the
-      audioFormat bit is likely wrong for the stream type); native+PTP on JBL MA9100
-      / WiiM Pro; PTP regression on a RAOP-only device.
+- [ ] **Buffered + 24-bit (parked — needs an iOS→Apple TV capture).** Findings from
+      device /info: 24-bit is a BUFFERED-only format, and among the tested devices
+      only the Apple TV advertises it (`bufferStream` bits 19/21); Sonos/JBL/WiiM are
+      16-bit only. 24-bit audioFormat (0x80000) IS accepted at Stream SETUP. The
+      blocker is buffered playback: the Apple TV never sends Delay_Req on a buffered
+      stream (won't measure our PTP clock), so SETRATEANCHORTIME 400s forever. The
+      TCP frame length-prefix off-by-2 is fixed (verified on a reference receiver).
+      Low priority: realtime already covers every device at lower latency, and 24-bit
+      only helps one endpoint.
+- [ ] **Format negotiation** — parse `supportedAudioFormatsExtended` / `supportedFormats`
+      from `GET /info` and pick the best format the device supports for the chosen
+      stream type; fall back to baseline ALAC 44100/16 when the device omits the table
+      (JBL, WiiM, all classic receivers). Never blind-send a format → 400.
+- [ ] native+PTP on JBL MA9100 / WiiM Pro (paired + /info read; not ear-tested);
+      PTP regression on a RAOP-only device.
 - [ ] Non-root 319/320 bind path (`--ptp-daemon` returns 2) on Linux/containers — validated by
       inspection only (macOS lets the user bind those ports).
 - [ ] `Pdelay_Req` responder (gPTP peer-delay) — not needed by Sonos (uses E2E
