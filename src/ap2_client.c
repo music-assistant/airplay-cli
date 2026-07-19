@@ -1170,14 +1170,17 @@ static bool ap2_buffered_send_chunk(struct ap2cl_s *p, uint8_t *sample, int fram
     free(encoded);
 
     int payload_len = 12 + ct_len + AP2_CHACHA_TAG_SIZE;
-    for (int i = 0; i < 8; i++)
-        pkt[payload_len + i] = (uint8_t)((counter >> (8 * i)) & 0xFF);  /* trailing nonce */
+    memcpy(pkt + payload_len, nonce + 4, 8);   /* trailing nonce (nonce[4..11]) */
     payload_len += 8;
 
-    frame[0] = (uint8_t)((payload_len >> 8) & 0xFF);   /* 2-byte big-endian length */
-    frame[1] = (uint8_t)(payload_len & 0xFF);
+    /* The 2-byte big-endian prefix is the TOTAL frame length INCLUDING itself:
+     * the receiver reads it, then reads (length - 2) more bytes for the RTP
+     * packet. */
+    int total = 2 + payload_len;
+    frame[0] = (uint8_t)((total >> 8) & 0xFF);
+    frame[1] = (uint8_t)(total & 0xFF);
 
-    int total = 2 + payload_len, off = 0;
+    int off = 0;
     bool ok = true;
     while (off < total) {
         ssize_t w = write(p->buffered_sock, frame + off, total - off);
@@ -1501,9 +1504,16 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
          * agree. */
         if (p->use_ptp && !p->use_buffered && p->ctrl_sock >= 0)
             ap2_send_sync_packet_ptp(p, true);
-        /* Buffered playback is scheduled entirely by the anchor: map the start
-         * RTP sample to the PTP timeline at the requested start instant
-         * (anchor = PTP now + (ntp_start - now)). */
+        /* Buffered playback is scheduled entirely by the anchor: map the
+         * current RTP sample to the PTP timeline at the requested start
+         * instant. A strict receiver 400s the anchor until it has acquired
+         * our clock (a second or two of Delay_Req), so retry.
+         * NOTE (parked): buffered is only needed for hi-res 24-bit, which
+         * among the tested devices only the Apple TV supports — and the Apple
+         * TV will not measure our PTP clock on a buffered stream at all, so its
+         * anchor never clears. Cracking that needs a capture of iOS -> Apple TV
+         * buffered. Sonos does accept the anchor but offers no 24-bit, so
+         * buffered has no payoff there. */
         if (p->use_buffered && !p->anchored) {
             uint64_t now_ntp = raopcl_get_ntp(NULL);
             uint64_t lead_ns = 0;
@@ -1512,10 +1522,6 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
                 lead_ns = (d >> 32) * 1000000000ULL +
                           (((d & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
             }
-            /* A strict receiver 400s a rate anchor on a timeline it has not
-             * acquired yet, and it only starts measuring our clock (unicast
-             * Delay_Req) a second or two into the session — retry until the
-             * anchor is accepted, re-deriving it from the clock each attempt. */
             bool anchored_ok = false;
             for (int try = 0; try < 12 && !anchored_ok; try++) {
                 if (try) usleep(500000);
