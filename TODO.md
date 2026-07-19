@@ -44,4 +44,11 @@ status per route lives in `TEST-PLAN.md`.
       playback, MRP also unlocks a **metadata-only display mode**: expose an
       Apple TV as a display target that shows the active playback session of
       an MA queue without routing audio to it — the same product shape as the
-      cast-displays work in MA.
+      cast-displays work in MA. Expected third benefit: **standby prevention** —
+      tvOS gates its "media playing, don't sleep" logic on the system
+      now-playing session that MRP establishes, which is why an Apple TV sleeps
+      mid-stream today despite receiving audio. Acceptance test for the MRP
+      work: stream past the tvOS sleep timeout and confirm it stays awake.
+      Bundle with the provider's Companion-protocol TODO (explicit wake on
+      playback start + power-state tracking, pyatv-style) for full Apple TV
+      power management.
