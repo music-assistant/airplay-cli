@@ -41,8 +41,14 @@ server-side integration state, see the provider's `PLAN.md`.
       deadline pacing bounded by the receiver's ~2s buffer window, and per-process
       RTP-timeline offsets (identical timelines get cross-wired by Sonos household
       stream tracking — the stricter device goes silent).
-- [ ] Buffered + 24-bit end-to-end; native+PTP on JBL MA9100 / Apple TV 4K / WiiM Pro;
-      PTP regression on a RAOP-only device.
+- [x] **Native AP2 + PTP on Apple TV 4K** (2026-07-19) via full HomeKit pair-setup
+      (`--pair-setup` → on-screen PIN → stored creds → pair-verify at stream time).
+      Audible; clock-locked like Sonos.
+- [ ] Volume curve: the -30..0 dB map is quiet on some receivers (Apple TV needed a
+      big TV-side ramp). Widen the usable band / match Apple's mapping.
+- [ ] Buffered + 24-bit end-to-end (24-bit currently 400s at Stream SETUP — the
+      audioFormat bit is likely wrong for the stream type); native+PTP on JBL MA9100
+      / WiiM Pro; PTP regression on a RAOP-only device.
 - [ ] Non-root 319/320 bind path (`--ptp-daemon` returns 2) on Linux/containers — validated by
       inspection only (macOS lets the user bind those ports).
 - [ ] `Pdelay_Req` responder (gPTP peer-delay) — not needed by Sonos (uses E2E
