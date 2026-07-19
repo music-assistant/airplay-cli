@@ -192,13 +192,6 @@ static void status_elapsed_legacy(uint64_t elapsed_ms, uint64_t frames, struct r
 
 /* ---- Helper functions ---- */
 
-static bool starts_with(const char *pre, const char *str)
-{
-    size_t lenpre = strlen(pre);
-    size_t lenstr = strlen(str);
-    return lenstr >= lenpre && memcmp(pre, str, lenpre) == 0;
-}
-
 /*
  * Truncate s32le samples to s24le (packed 3 bytes) for ALAC encoder.
  * Input: 4 bytes per sample (s32le), Output: 3 bytes per sample (s24le)
@@ -383,8 +376,10 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_play(g_ap2cl);
         }
+        /* No status emission here: reporting elapsed_ms=0 would snap the
+         * sender's position display backwards. The periodic reporter (gated on
+         * STATUS_PLAYING) re-reports the true elapsed within a second. */
         g_status = STATUS_PLAYING;
-        status_playing(0);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STOP") == 0) {
         g_status = STATUS_STOPPED;
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
@@ -598,8 +593,9 @@ static int run_raop(cli_config_t *cfg, int infile)
     while (g_status != STATUS_STOPPED && (!got_eof || raopcl_is_playing(g_raopcl))) {
         uint64_t now = raopcl_get_ntp(NULL);
 
-        /* Periodic status reporting */
-        if (now - last > MS2NTP(1000)) {
+        /* Periodic status reporting (only while playing, so a pause does not keep
+           emitting a "playing" status that would revive the sender's play state) */
+        if (g_status == STATUS_PLAYING && now - last > MS2NTP(1000)) {
             last = now;
             if (frames > (uint64_t)raopcl_latency(g_raopcl)) {
                 uint32_t elapsed = TS2MS(frames - raopcl_latency(g_raopcl), raopcl_sample_rate(g_raopcl));
@@ -743,8 +739,9 @@ static int run_airplay2(cli_config_t *cfg, int infile)
             break;
         }
 
-        /* Periodic status reporting */
-        if (now - last > MS2NTP(1000)) {
+        /* Periodic status reporting (only while playing, so a pause does not keep
+           emitting a "playing" status that would revive the sender's play state) */
+        if (g_status == STATUS_PLAYING && now - last > MS2NTP(1000)) {
             last = now;
             uint32_t latency_frames = MS2TS(cfg->latency_ms, cfg->sample_rate);
             if (frames > latency_frames) {
@@ -1178,6 +1175,14 @@ int main(int argc, char *argv[])
              (unsigned long long)cfg.route.features,
              (unsigned long long)cfg.route.flags,
              cfg.bit_depth);
+    /* Machine-parseable route report on stdout so the caller (MA) can log and
+     * surface which route this stream actually took. */
+    printf("[STATUS] route protocol=%s flow=%s timing=%s buffered=%d\n",
+           cfg.route.use_raop ? "raop" : "airplay2",
+           cfg.route.use_raop ? "legacy" : (cfg.route.native ? "native" : "raop-compat"),
+           (!cfg.route.use_raop && cfg.route.ptp) ? "ptp" : "ntp",
+           cfg.route.buffered ? 1 : 0);
+    fflush(stdout);
 
     /* Setup signal handlers */
     signal(SIGINT, signal_handler);
