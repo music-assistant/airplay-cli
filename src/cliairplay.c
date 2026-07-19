@@ -348,7 +348,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                 if (cfg->protocol == PROTO_RAOP && g_raopcl) {
                     raopcl_set_artwork(g_raopcl, "image/jpg", numbytes, buffer);
                 } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-                    ap2cl_set_artwork(g_ap2cl, "image/jpg", numbytes, buffer);
+                    ap2cl_set_artwork(g_ap2cl, "image/jpeg", numbytes, buffer);
                 }
                 free(buffer);
             }

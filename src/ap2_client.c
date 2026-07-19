@@ -1804,13 +1804,51 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
 
 bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, const char *data)
 {
-    if (!p || !p->raopcl) return false;
+    if (!p) return false;
+    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
+        /* Same shape as the RAOP path: the image bytes as the SET_PARAMETER
+         * body with its image content type, anchored via RTP-Info (receivers
+         * such as Apple TV render it on their now-playing display). */
+        char rtpinfo[48];
+        snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
+        uint8_t *resp = NULL; int resp_len = 0;
+        int status = ap2_rtsp_send_ex(p, "SET_PARAMETER", p->session_url,
+                                      (const uint8_t *)data, size, content_type,
+                                      rtpinfo, &resp, &resp_len);
+        free(resp);
+        LOG_INFO("[AP2] native artwork SET_PARAMETER -> status %d (%d bytes, %s)",
+                 status, size, content_type);
+        return status >= 200 && status < 300;
+    }
+    if (!p->raopcl) return false;
     return raopcl_set_artwork(p->raopcl, (char *)content_type, size, (char *)data);
 }
 
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
 {
-    if (!p || !p->raopcl) return false;
+    if (!p) return false;
+    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
+        /* progress: <start>/<current>/<end>, all in the STREAM's RTP timestamp
+         * units (the per-process timeline offset included, so the values match
+         * the timestamps the receiver sees on the audio packets). */
+        uint32_t now_w = (uint32_t)NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate)
+                       + p->rtp_offset;
+        uint32_t start = now_w - (uint32_t)((uint64_t)elapsed_s * p->format.sample_rate);
+        uint32_t end = duration_s
+                       ? start + (uint32_t)((uint64_t)duration_s * p->format.sample_rate)
+                       : now_w;
+        char body[128];
+        int blen = snprintf(body, sizeof(body), "progress: %u/%u/%u\r\n",
+                            start, now_w, end);
+        uint8_t *resp = NULL; int resp_len = 0;
+        int status = ap2_rtsp_send(p, "SET_PARAMETER", p->session_url,
+                                   (uint8_t *)body, blen, "text/parameters",
+                                   &resp, &resp_len);
+        free(resp);
+        LOG_DEBUG("[AP2] native progress SET_PARAMETER -> status %d", status);
+        return status >= 200 && status < 300;
+    }
+    if (!p->raopcl) return false;
     return raopcl_set_progress_ms(p->raopcl, elapsed_s * 1000, duration_s * 1000);
 }
 
