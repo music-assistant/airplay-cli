@@ -35,6 +35,7 @@
 #include "ap2_client.h"
 #include "ap2_rtsp.h"
 #include "ap2_ptp.h"
+#include "ap2_hap.h"
 
 #define VERSION "0.1.0"
 #define AP2_FRAMES_PER_CHUNK 352
@@ -702,6 +703,69 @@ static void signal_handler(int sig)
     g_status = STATUS_STOPPED;
 }
 
+/* ---- HomeKit pair-setup mode ---- */
+
+/* Read the on-screen PIN from stdin (prompt on stderr, so stdout stays clean
+ * for the CREDENTIALS line the caller parses). */
+static const char *pair_setup_pin_prompt(void *arg)
+{
+    static char pin[32];
+    (void)arg;
+    fprintf(stderr, "Enter the PIN shown on the device: ");
+    fflush(stderr);
+    if (!fgets(pin, sizeof(pin), stdin)) return NULL;
+    pin[strcspn(pin, "\r\n")] = '\0';
+    return pin[0] ? pin : NULL;
+}
+
+/* Run `cliairplay --pair-setup <host> --port 7000 --dacp <id>`: full HomeKit
+ * pairing (PIN) producing --auth credentials on stdout. Returns exit code. */
+static int run_pair_setup(cli_config_t *cfg)
+{
+    struct sockaddr_in addr = {.sin_family = AF_INET, .sin_port = htons(cfg->port)};
+    if (inet_pton(AF_INET, cfg->host, &addr.sin_addr) != 1) {
+        fprintf(stderr, "--pair-setup needs a literal IPv4 address\n");
+        return 1;
+    }
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0 || connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        fprintf(stderr, "Cannot connect to %s:%d\n", cfg->host, cfg->port);
+        if (sock >= 0) close(sock);
+        return 1;
+    }
+
+    struct ap2_hap_ctx *hap = ap2_hap_create(NULL);
+    if (!hap) { close(sock); return 1; }
+
+    /* The pairing identifier must match the DACP id later used at stream
+     * time (pair-verify signs with it), uppercased like the stream path. */
+    const char *dacp = cfg->dacp_id ? cfg->dacp_id : "0";
+    char upper_dacp[32];
+    int len = (int)strlen(dacp);
+    if (len > 30) len = 30;
+    for (int i = 0; i < len; i++) {
+        char c = dacp[i];
+        upper_dacp[i] = (c >= 'a' && c <= 'f') ? (c - 'a' + 'A') : c;
+    }
+    upper_dacp[len] = '\0';
+    ap2_hap_set_client_id(hap, (const uint8_t *)upper_dacp, len);
+
+    char creds[193];
+    bool ok = ap2_hap_pair_setup_pin(hap, sock, pair_setup_pin_prompt, NULL, creds);
+    ap2_hap_destroy(hap);
+    close(sock);
+
+    if (!ok) {
+        fprintf(stderr, "Pairing failed.\n");
+        return 1;
+    }
+    printf("CREDENTIALS: %s\n", creds);
+    fflush(stdout);
+    fprintf(stderr, "Pairing successful. Pass the credentials via --auth "
+                    "(with the same --dacp).\n");
+    return 0;
+}
+
 /* ---- PTP daemon mode ---- */
 
 static volatile bool g_ptp_daemon_stop = false;
@@ -762,7 +826,10 @@ static void print_usage(const char *name)
     printf("  --debug <0-9>              Debug level (default: 3)\n");
     printf("  --ntp                      Print current NTP and exit\n");
     printf("  --check                    Print check info and exit\n");
-    printf("  --pair                     Enter pairing mode\n\n");
+    printf("  --pair                     Legacy AppleTV RAOP pairing (--secret)\n");
+    printf("  --pair-setup               HomeKit pair-setup: the device shows a PIN,\n");
+    printf("                             prints --auth credentials on success. Needs\n");
+    printf("                             <address>, --port and --dacp\n\n");
     printf("RAOP options:\n");
     printf("  --alac                     Force compressed ALAC (default)\n");
     printf("  --raw                      Force uncompressed audio (ALAC-raw)\n");
@@ -831,6 +898,7 @@ int main(int argc, char *argv[])
 
     bool pairing_mode = false;
     bool ptp_daemon_mode = false;
+    bool pair_setup_mode = false;
     int infile = -1;
 
     static struct option long_options[] = {
@@ -874,6 +942,7 @@ int main(int argc, char *argv[])
         {"ntp",          no_argument,       0, 1001},
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
+        {"pair-setup",   no_argument,       0, 1013},
         {"help",         no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -925,6 +994,7 @@ int main(int argc, char *argv[])
         case 1009: cfg.ptp = true; break;
         case 1010: cfg.buffered = true; break;
         case 1011: ptp_daemon_mode = true; break;
+        case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
         case 1001: {
             uint64_t ntp = raopcl_get_ntp(NULL);
@@ -959,7 +1029,7 @@ int main(int argc, char *argv[])
     netsock_init();
     cross_ssl_load();
 
-    /* Pairing mode */
+    /* Pairing mode (legacy AppleTV RAOP pairing -> --secret) */
     if (pairing_mode) {
         char *pair_udn = NULL, *pair_secret = NULL;
         if (AppleTVpairing(NULL, &pair_udn, &pair_secret)) {
@@ -970,6 +1040,18 @@ int main(int argc, char *argv[])
             fprintf(stderr, "Pairing failed.\n");
         }
         return 0;
+    }
+
+    /* HomeKit pair-setup mode: PIN on the device's screen -> --auth credentials */
+    if (pair_setup_mode) {
+        if (!cfg.host) {
+            fprintf(stderr, "--pair-setup needs the device address (and --port)\n");
+            return 1;
+        }
+        int rc = run_pair_setup(&cfg);
+        netsock_close();
+        cross_ssl_free();
+        return rc;
     }
 
     /* PTP daemon mode: no host/audio source; run the shared clock until signaled.

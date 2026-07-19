@@ -338,6 +338,7 @@ static bool srp_hash_bn(const BIGNUM *bn, uint8_t out[SRP_HASH_LEN])
  */
 static bool srp_client_compute(const uint8_t *salt, int salt_len,
                                const uint8_t *b_pub, int b_pub_len,
+                               const char *pin,
                                uint8_t a_pub[SRP_N_BYTES], int *a_pub_len,
                                uint8_t proof_m1[SRP_HASH_LEN],
                                uint8_t proof_hamk[SRP_HASH_LEN],
@@ -393,9 +394,11 @@ static bool srp_client_compute(const uint8_t *salt, int salt_len,
     }
 
     /* x = SHA512(salt || SHA512(username ":" pin)) */
-    if (EVP_Digest(SRP_USERNAME ":" SRP_TRANSIENT_PIN,
-                   strlen(SRP_USERNAME ":" SRP_TRANSIENT_PIN),
-                   digest, &md_len, EVP_sha512(), NULL) != 1) goto done;
+    char userpass[128];
+    int up_len = snprintf(userpass, sizeof(userpass), "%s:%s", SRP_USERNAME, pin);
+    if (up_len <= 0 || up_len >= (int)sizeof(userpass)) goto done;
+    if (EVP_Digest(userpass, (size_t)up_len, digest, &md_len, EVP_sha512(), NULL) != 1)
+        goto done;
     if (EVP_DigestInit_ex(md, EVP_sha512(), NULL) != 1 ||
         EVP_DigestUpdate(md, salt, salt_len) != 1 ||
         EVP_DigestUpdate(md, digest, SRP_HASH_LEN) != 1 ||
@@ -469,29 +472,30 @@ done:
 }
 
 /*
- * POST a TLV body to /pair-setup (transient, X-Apple-HKP: 4) and read the
- * complete RTSP response. Returns the HTTP status code (0 on transport
- * error) and points *resp_body (with *resp_body_len) at the body inside resp_buf.
+ * POST a TLV body to /pair-setup (X-Apple-HKP: 4 = transient, 3 = full
+ * HomeKit pairing with a PIN) and read the complete RTSP response. Returns
+ * the HTTP status code (0 on transport error) and points *resp_body (with
+ * *resp_body_len) at the body inside resp_buf.
  */
-static int hap_post_pair_setup(int sock_fd, int cseq,
+static int hap_post_pair_setup_path(int sock_fd, const char *path, int cseq, int hkp,
                                const uint8_t *body, int body_len,
                                uint8_t *resp_buf, int resp_buf_size,
                                uint8_t **resp_body, int *resp_body_len)
 {
     char http_req[256];
     int hdr_len = snprintf(http_req, sizeof(http_req),
-        "POST /pair-setup RTSP/1.0\r\n"
+        "POST %s RTSP/1.0\r\n"
         "Content-Type: application/octet-stream\r\n"
-        "X-Apple-HKP: 4\r\n"
+        "X-Apple-HKP: %d\r\n"
         "CSeq: %d\r\n"
         "Content-Length: %d\r\n"
-        "\r\n", cseq, body_len);
+        "\r\n", path, hkp, cseq, body_len);
 
     *resp_body = NULL;
     *resp_body_len = 0;
 
     if (write(sock_fd, http_req, hdr_len) != hdr_len ||
-        write(sock_fd, body, body_len) != body_len) {
+        (body_len > 0 && write(sock_fd, body, body_len) != body_len)) {
         LOG_ERROR("[HAP] Failed to send pair-setup request (CSeq %d)", cseq);
         return 0;
     }
@@ -949,7 +953,7 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     tlv_add_uint8(&msg1, TLV_METHOD, 0x00);
     tlv_add_uint8(&msg1, TLV_FLAGS, HAP_TRANSIENT_FLAG);
 
-    int status = hap_post_pair_setup(sock_fd, 1, msg1.data, msg1.len,
+    int status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 1, 4, msg1.data, msg1.len,
                                      resp_buf, sizeof(resp_buf), &body, &body_len);
     tlv_free(&msg1);
     if (status != 200) {
@@ -987,6 +991,7 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     uint8_t proof_m1[SRP_HASH_LEN], proof_hamk[SRP_HASH_LEN], session_key[SRP_HASH_LEN];
 
     bool srp_ok = srp_client_compute(salt_buf, sizeof(salt_buf), b_pub, b_len,
+                                     SRP_TRANSIENT_PIN,
                                      a_pub, &a_pub_len,
                                      proof_m1, proof_hamk, session_key);
     free(b_pub);
@@ -1004,7 +1009,7 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     tlv_add(&msg3, TLV_PUBLIC_KEY, a_pub, a_pub_len);
     tlv_add(&msg3, TLV_PROOF, proof_m1, SRP_HASH_LEN);
 
-    status = hap_post_pair_setup(sock_fd, 2, msg3.data, msg3.len,
+    status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 2, 4, msg3.data, msg3.len,
                                  resp_buf, sizeof(resp_buf), &body, &body_len);
     tlv_free(&msg3);
     if (status != 200) {
@@ -1061,6 +1066,268 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     return true;
 
 fail:
+    OPENSSL_cleanse(session_key, sizeof(session_key));
+    OPENSSL_cleanse(proof_m1, sizeof(proof_m1));
+    OPENSSL_cleanse(proof_hamk, sizeof(proof_hamk));
+    return false;
+}
+
+bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
+                            ap2_hap_pin_cb pin_cb, void *pin_arg,
+                            char creds_hex_out[193])
+{
+    if (!ctx || !pin_cb || !creds_hex_out) return false;
+    if (ctx->client_id_len <= 0) {
+        LOG_ERROR("[HAP] Pair-setup needs a client identifier (set the DACP id first)");
+        return false;
+    }
+
+    LOG_INFO("[HAP] Starting HomeKit pair-setup (PIN)...");
+
+    uint8_t resp_buf[8192];
+    uint8_t *body = NULL;
+    int body_len = 0;
+    uint8_t session_key[SRP_HASH_LEN] = {0};
+    uint8_t proof_m1[SRP_HASH_LEN] = {0}, proof_hamk[SRP_HASH_LEN] = {0};
+    EVP_PKEY *lt_key = NULL;
+    EVP_PKEY_CTX *kctx = NULL;
+    EVP_MD_CTX *sctx = NULL;
+    uint8_t *enc_in = NULL;
+
+    /* Apple TV / HomePod display the PIN only after /pair-pin-start; HomeKit
+     * accessories with a printed code do not need it, so treat any response as
+     * success and continue. */
+    int status = hap_post_pair_setup_path(sock_fd, "/pair-pin-start", 0, 3, NULL, 0,
+                                          resp_buf, sizeof(resp_buf), &body, &body_len);
+    LOG_INFO("[HAP] /pair-pin-start -> %d (device should now show its PIN)", status);
+
+    /* M1: state=1, method=0 (pair-setup with PIN) */
+    tlv_buf_t msg1;
+    tlv_init(&msg1);
+    tlv_add_uint8(&msg1, TLV_STATE, 0x01);
+    tlv_add_uint8(&msg1, TLV_METHOD, 0x00);
+    status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 1, 3, msg1.data, msg1.len,
+                                         resp_buf, sizeof(resp_buf), &body, &body_len);
+    tlv_free(&msg1);
+    if (status != 200) {
+        LOG_ERROR("[HAP] Pair-setup M1 rejected (status %d)", status);
+        return false;
+    }
+
+    /* M2: salt + SRP public key B */
+    int state_len, salt_len, err_len, b_len = 0;
+    const uint8_t *state_val = tlv_find(body, body_len, TLV_STATE, &state_len);
+    const uint8_t *err = tlv_find(body, body_len, TLV_ERROR, &err_len);
+    if (err && err_len > 0) {
+        LOG_ERROR("[HAP] Pair-setup M2 error tag: %d%s", *err,
+                  *err == 0x06 ? " (device busy / too many pairings?)" : "");
+        return false;
+    }
+    const uint8_t *salt = tlv_find(body, body_len, TLV_SALT, &salt_len);
+    uint8_t *b_pub = tlv_concat(body, body_len, TLV_PUBLIC_KEY, &b_len);
+    if (!state_val || *state_val != 0x02 || !salt || salt_len != 16 ||
+        !b_pub || b_len <= 0 || b_len > SRP_N_BYTES) {
+        LOG_ERROR("[HAP] Invalid pair-setup M2 content");
+        free(b_pub);
+        return false;
+    }
+    uint8_t salt_buf[16];
+    memcpy(salt_buf, salt, sizeof(salt_buf));
+
+    /* The device is showing its PIN now — ask the caller for it. */
+    const char *pin = pin_cb(pin_arg);
+    if (!pin || !*pin) {
+        LOG_ERROR("[HAP] No PIN provided");
+        free(b_pub);
+        return false;
+    }
+
+    uint8_t a_pub[SRP_N_BYTES];
+    int a_pub_len = 0;
+    bool srp_ok = srp_client_compute(salt_buf, sizeof(salt_buf), b_pub, b_len, pin,
+                                     a_pub, &a_pub_len, proof_m1, proof_hamk,
+                                     session_key);
+    free(b_pub);
+    if (!srp_ok) {
+        LOG_ERROR("[HAP] SRP-6a computation failed");
+        return false;
+    }
+
+    /* M3: public key A + client proof */
+    tlv_buf_t msg3;
+    tlv_init(&msg3);
+    tlv_add_uint8(&msg3, TLV_STATE, 0x03);
+    tlv_add(&msg3, TLV_PUBLIC_KEY, a_pub, a_pub_len);
+    tlv_add(&msg3, TLV_PROOF, proof_m1, SRP_HASH_LEN);
+    status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 2, 3, msg3.data, msg3.len,
+                                     resp_buf, sizeof(resp_buf), &body, &body_len);
+    tlv_free(&msg3);
+    if (status != 200) {
+        LOG_ERROR("[HAP] Pair-setup M3 rejected (status %d)", status);
+        goto fail;
+    }
+
+    /* M4: verify the server proof (wrong PIN shows up here as error 2) */
+    state_val = tlv_find(body, body_len, TLV_STATE, &state_len);
+    err = tlv_find(body, body_len, TLV_ERROR, &err_len);
+    if (err && err_len > 0) {
+        LOG_ERROR("[HAP] Pair-setup M4 error tag: %d%s", *err,
+                  *err == 0x02 ? " (wrong PIN?)" : "");
+        goto fail;
+    }
+    {
+        int srv_proof_len;
+        const uint8_t *srv_proof = tlv_find(body, body_len, TLV_PROOF, &srv_proof_len);
+        if (!state_val || *state_val != 0x04 || !srv_proof ||
+            srv_proof_len != SRP_HASH_LEN ||
+            memcmp(srv_proof, proof_hamk, SRP_HASH_LEN) != 0) {
+            LOG_ERROR("[HAP] Server SRP proof mismatch in M4");
+            goto fail;
+        }
+    }
+
+    /* M5: exchange long-term Ed25519 identities over the SRP-derived key */
+    {
+        uint8_t enc_key[32], device_x[32];
+        if (!hkdf_sha512(session_key, SRP_HASH_LEN,
+                         "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info",
+                         enc_key, 32) ||
+            !hkdf_sha512(session_key, SRP_HASH_LEN,
+                         "Pair-Setup-Controller-Sign-Salt",
+                         "Pair-Setup-Controller-Sign-Info", device_x, 32)) {
+            LOG_ERROR("[HAP] HKDF failed for pair-setup keys");
+            goto fail;
+        }
+
+        /* Fresh long-term keypair; the seed+public become the stored creds */
+        kctx = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+        if (!kctx || EVP_PKEY_keygen_init(kctx) <= 0 ||
+            EVP_PKEY_keygen(kctx, &lt_key) <= 0) {
+            LOG_ERROR("[HAP] Ed25519 keygen failed");
+            goto fail;
+        }
+        size_t seed_len = 32, pub_len = 32;
+        if (EVP_PKEY_get_raw_private_key(lt_key, ctx->client_lt_private, &seed_len) <= 0 ||
+            EVP_PKEY_get_raw_public_key(lt_key, ctx->client_lt_public, &pub_len) <= 0) {
+            LOG_ERROR("[HAP] Ed25519 key export failed");
+            goto fail;
+        }
+        memcpy(ctx->client_lt_private + 32, ctx->client_lt_public, 32);
+
+        /* sig = Ed25519(device_x || identifier || ltpk) */
+        uint8_t info[32 + 64 + 32];
+        int info_len = 0;
+        memcpy(info, device_x, 32); info_len += 32;
+        memcpy(info + info_len, ctx->client_id, ctx->client_id_len);
+        info_len += ctx->client_id_len;
+        memcpy(info + info_len, ctx->client_lt_public, 32); info_len += 32;
+
+        uint8_t sig[64];
+        size_t sig_len = sizeof(sig);
+        sctx = EVP_MD_CTX_new();
+        if (!sctx || EVP_DigestSignInit(sctx, NULL, NULL, NULL, lt_key) <= 0 ||
+            EVP_DigestSign(sctx, sig, &sig_len, info, info_len) <= 0) {
+            LOG_ERROR("[HAP] Ed25519 signing failed");
+            goto fail;
+        }
+
+        tlv_buf_t sub;
+        tlv_init(&sub);
+        tlv_add(&sub, TLV_IDENTIFIER, ctx->client_id, ctx->client_id_len);
+        tlv_add(&sub, TLV_PUBLIC_KEY, ctx->client_lt_public, 32);
+        tlv_add(&sub, TLV_SIGNATURE, sig, 64);
+
+        uint8_t nonce[HAP_NONCE_SIZE] = {0, 0, 0, 0, 'P', 'S', '-', 'M', 's', 'g', '0', '5'};
+        enc_in = malloc(sub.len + HAP_TAG_SIZE);
+        int ct_len = chacha20_poly1305_encrypt(enc_key, nonce, NULL, 0,
+                                               sub.data, sub.len,
+                                               enc_in, enc_in + sub.len);
+        int sub_len = sub.len;
+        tlv_free(&sub);
+        OPENSSL_cleanse(enc_key, sizeof(enc_key));
+        if (ct_len != sub_len) {
+            LOG_ERROR("[HAP] M5 encryption failed");
+            goto fail;
+        }
+
+        tlv_buf_t msg5;
+        tlv_init(&msg5);
+        tlv_add_uint8(&msg5, TLV_STATE, 0x05);
+        tlv_add(&msg5, TLV_ENCRYPTED, enc_in, sub_len + HAP_TAG_SIZE);
+        status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 3, 3, msg5.data, msg5.len,
+                                         resp_buf, sizeof(resp_buf), &body, &body_len);
+        tlv_free(&msg5);
+        free(enc_in); enc_in = NULL;
+        if (status != 200) {
+            LOG_ERROR("[HAP] Pair-setup M5 rejected (status %d)", status);
+            goto fail;
+        }
+    }
+
+    /* M6: decrypt the accessory's identity and store its long-term public key */
+    {
+        state_val = tlv_find(body, body_len, TLV_STATE, &state_len);
+        err = tlv_find(body, body_len, TLV_ERROR, &err_len);
+        if (err && err_len > 0) {
+            LOG_ERROR("[HAP] Pair-setup M6 error tag: %d", *err);
+            goto fail;
+        }
+        int enc_len = 0;
+        uint8_t *enc = tlv_concat(body, body_len, TLV_ENCRYPTED, &enc_len);
+        if (!state_val || *state_val != 0x06 || !enc || enc_len <= HAP_TAG_SIZE) {
+            LOG_ERROR("[HAP] Invalid pair-setup M6 content");
+            free(enc);
+            goto fail;
+        }
+        uint8_t enc_key[32];
+        if (!hkdf_sha512(session_key, SRP_HASH_LEN,
+                         "Pair-Setup-Encrypt-Salt", "Pair-Setup-Encrypt-Info",
+                         enc_key, 32)) {
+            free(enc);
+            goto fail;
+        }
+        uint8_t nonce[HAP_NONCE_SIZE] = {0, 0, 0, 0, 'P', 'S', '-', 'M', 's', 'g', '0', '6'};
+        uint8_t *plain = malloc(enc_len);
+        int pt_len = chacha20_poly1305_decrypt(enc_key, nonce, NULL, 0,
+                                               enc, enc_len - HAP_TAG_SIZE,
+                                               enc + enc_len - HAP_TAG_SIZE, plain);
+        OPENSSL_cleanse(enc_key, sizeof(enc_key));
+        free(enc);
+        if (pt_len <= 0) {
+            LOG_ERROR("[HAP] M6 decryption failed");
+            free(plain);
+            goto fail;
+        }
+        int acc_pk_len = 0;
+        const uint8_t *acc_pk = tlv_find(plain, pt_len, TLV_PUBLIC_KEY, &acc_pk_len);
+        if (!acc_pk || acc_pk_len != 32) {
+            LOG_ERROR("[HAP] M6 missing accessory public key");
+            free(plain);
+            goto fail;
+        }
+        memcpy(ctx->server_lt_public, acc_pk, 32);
+        free(plain);
+    }
+
+    /* Serialize credentials: [64B seed+pub][32B accessory LTPK] as 192 hex */
+    for (int i = 0; i < 64; i++)
+        sprintf(creds_hex_out + i * 2, "%02x", ctx->client_lt_private[i]);
+    for (int i = 0; i < 32; i++)
+        sprintf(creds_hex_out + 128 + i * 2, "%02x", ctx->server_lt_public[i]);
+    creds_hex_out[192] = '\0';
+
+    EVP_PKEY_free(lt_key);
+    EVP_PKEY_CTX_free(kctx);
+    EVP_MD_CTX_free(sctx);
+    OPENSSL_cleanse(session_key, sizeof(session_key));
+    LOG_INFO("[HAP] HomeKit pair-setup completed; credentials ready");
+    return true;
+
+fail:
+    free(enc_in);
+    EVP_PKEY_free(lt_key);
+    EVP_PKEY_CTX_free(kctx);
+    EVP_MD_CTX_free(sctx);
     OPENSSL_cleanse(session_key, sizeof(session_key));
     OPENSSL_cleanse(proof_m1, sizeof(proof_m1));
     OPENSSL_cleanse(proof_hamk, sizeof(proof_hamk));

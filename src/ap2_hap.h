@@ -60,6 +60,26 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd);
  */
 bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd);
 
+/* Callback that supplies the PIN the device is currently displaying. */
+typedef const char *(*ap2_hap_pin_cb)(void *arg);
+
+/*
+ * Full HomeKit pair-setup (X-Apple-HKP: 3) for devices that reject transient
+ * pairing (Apple TV, HomePod). The device displays a PIN after M1; pin_cb is
+ * invoked to collect it. On success the long-term keys are stored in the
+ * context (ready for pair-verify) and serialized into creds_hex_out in the
+ * same 192-hex format ap2_hap_create() accepts.
+ *
+ * :param ctx: HAP context created without credentials.
+ * :param sock_fd: connected TCP socket to the device's RTSP port.
+ * :param pin_cb: callback returning the on-screen PIN (NULL aborts).
+ * :param pin_arg: opaque argument passed to pin_cb.
+ * :param creds_hex_out: receives the credentials (192 hex chars + NUL).
+ */
+bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
+                            ap2_hap_pin_cb pin_cb, void *pin_arg,
+                            char creds_hex_out[193]);
+
 /* Encrypt data for sending to the device. Caller must free output. */
 int ap2_hap_encrypt(struct ap2_hap_ctx *ctx, const uint8_t *in, int in_len,
                     uint8_t **out);
