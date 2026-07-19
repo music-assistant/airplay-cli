@@ -58,12 +58,17 @@ server-side integration state, see the provider's `PLAN.md`.
       even though its advertised realtime table lists only 16-bit — over the same
       realtime+PTP path that's already solid. No buffered needed. (Sonos has no
       24-bit anywhere; that 400 was device-specific, not a stream-type rule.)
-- [ ] **Format negotiation (try-then-fall-back).** Read `supportedAudioFormatsExtended`
-      / `supportedFormats` from `GET /info` as a STARTING GUESS, but treat it as a
-      hint, not a contract — the Apple TV accepts 24-bit realtime it doesn't advertise.
-      Request the best format the source needs; on a Stream SETUP 400, step down
-      (24→16, drop sample rate) and retry. Baseline fallback ALAC 44100/16 for classic
-      receivers (JBL, WiiM) that omit the table.
+- [ ] **Format selection — default to advertised, hi-res via opt-in.** Neither signal
+      is reliable on its own: the Apple TV renders 24-bit it does NOT advertise (table
+      understates), while the Sonos 200-ACCEPTS 48/24 SETUP then renders SILENCE (SETUP
+      lies — worse than a 400, undetectable). Verified by ear 2026-07-19: Sonos plays
+      44.1/16, silent on 48/24 at the same volume. So: DEFAULT to the best format the
+      `/info` table advertises (always renders — Sonos→16, JBL/WiiM→baseline 44.1/16),
+      and expose an advanced per-player "force hi-res / 24-bit" override for devices
+      known to handle it (Apple TV, HomePod). Do NOT auto-push beyond the advertised
+      table — a SETUP 200 is necessary but not sufficient. Hi-res confirmed end-to-end
+      on Apple TV: 44.1/24 and 48/24, decoded as ALAC_44100_24_2 / ALAC_48000_24_2 by
+      the reference receiver (0 errors) and audible at correct speed (voice clip).
 - [ ] **Buffered (type 103) — parked, low value.** Its only edge over realtime was
       hi-res, which realtime now delivers; the remaining niche is lossy-network
       resilience (TCP retransmit). The TCP length-prefix off-by-2 is fixed (verified on
