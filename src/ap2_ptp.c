@@ -59,6 +59,12 @@ extern log_level *loglevel;
 #define PTP_MSG_FOLLOW_UP   0x8
 #define PTP_MSG_DELAY_RESP  0x9
 #define PTP_MSG_ANNOUNCE    0xB
+#define PTP_MSG_SIGNALING   0xC
+
+/* Unicast-negotiation TLVs (IEEE-1588 16.1). Apple receivers request unicast
+ * Announce/Sync/Delay_Resp from the sender's clock via Signaling. */
+#define PTP_TLV_REQUEST_UNICAST 0x0004
+#define PTP_TLV_GRANT_UNICAST   0x0005
 
 /* flagField, expressed as (octet6 << 8) | octet7 */
 #define PTP_FLAG_TWO_STEP       0x0200
@@ -68,11 +74,17 @@ extern log_level *loglevel;
 /* Best-master-clock advertisement. Lower Priority1 wins BMCA; ~248 is
  * competitive against the values observed from Apple grandmasters so we tend
  * to be selected as the group's grandmaster. */
-#define PTP_PRIORITY1       248
-#define PTP_PRIORITY2       248
-#define PTP_CLOCK_CLASS     248             /* application default, not traceable */
-#define PTP_CLOCK_ACCURACY  0xFE            /* unknown */
-#define PTP_LOG_VARIANCE    0xFFFF
+/* The grandmaster dataset iOS senders announce (from owntone's libairptp, which
+ * mirrors captured iOS traffic): priority 128, clockClass 6 (GPS-locked),
+ * accuracy 0x21 (100ns), variance 0x436A, timeSource GPS. Receivers compare
+ * this against their own clock (Sonos: 248/248/0xFE/0x436A), so it must
+ * out-rank them for the session anchor to be valid. */
+#define PTP_PRIORITY1       128
+#define PTP_PRIORITY2       128
+#define PTP_CLOCK_CLASS     6
+#define PTP_CLOCK_ACCURACY  0x21
+#define PTP_LOG_VARIANCE    0x436A
+#define PTP_TIME_SOURCE     0x20            /* GPS */
 
 #define PTP_ANNOUNCE_INTERVAL_NS  1000000000ULL   /* 1 s   -> logInterval 0  */
 #define PTP_SYNC_INTERVAL_NS       125000000ULL   /* 125 ms -> logInterval -3 */
@@ -132,6 +144,7 @@ struct ap2_ptp_ctx {
     struct in_addr mcast_addr;
     uint16_t sync_seq;
     uint16_t announce_seq;
+    uint16_t signaling_seq;
     char *peers[PTP_MAX_PEERS];
     int npeers;
     /* When true, timing messages are ALSO sent unicast to each peer. Multicast
@@ -142,6 +155,15 @@ struct ap2_ptp_ctx {
     /* ---- BMCA / slave state (guarded by lock) ---- */
     pthread_mutex_t lock;
     bool is_grandmaster;            /* true: we drive the timeline; false: slaved to a peer */
+    /* The AirPlay sender is the session's timing authority: receivers only
+     * consider masters from the SETPEERS timing-peer list (i.e. us) and cannot
+     * follow their own clock, so surrendering the timeline mutes them. With
+     * hold_master (the default) a competing Announce is recorded but never
+     * wins the election; the BMCA/slave machinery below stays available for
+     * diagnostics and the synthetic harness. */
+    bool hold_master;
+    bool hold_notice_logged;        /* one INFO line per session about an ignored peer GM */
+    bool unicast_granted;           /* a peer negotiated unicast PTP via Signaling */
     uint64_t master_clock_id;       /* elected GM identity (peer's grandmasterIdentity when slaving) */
     int64_t master_offset_ns;       /* smoothed local->master offset (add to local for master time) */
     bool have_offset;               /* at least one offset sample folded in */
@@ -257,7 +279,11 @@ static void ptp_write_hdr(uint8_t *b, int msg_type, uint16_t msg_len, uint16_t f
                           uint64_t clock_id, uint16_t seq, uint8_t control, int8_t log_interval)
 {
     memset(b, 0, PTP_HDR_LEN);
-    b[0] = msg_type & 0x0F;          /* transportSpecific=0 | messageType */
+    /* majorSdoId (transportSpecific) = 1: AirPlay receivers run the gPTP
+     * (IEEE 802.1AS) profile over UDP and silently DISCARD any PTP message
+     * with majorSdoId 0, so a plain-1588 first byte hides our clock from
+     * them entirely (confirmed against a Sonos packet capture). */
+    b[0] = 0x10 | (msg_type & 0x0F);
     b[1] = PTP_VERSION & 0x0F;       /* reserved=0 | versionPTP=2 */
     b[2] = (msg_len >> 8) & 0xFF;
     b[3] = msg_len & 0xFF;
@@ -266,39 +292,75 @@ static void ptp_write_hdr(uint8_t *b, int msg_type, uint16_t msg_len, uint16_t f
     b[7] = flags & 0xFF;             /* flagField octet 7 */
     /* correctionField (8..15) and messageTypeSpecific (16..19) stay zero */
     for (int i = 0; i < 8; i++) b[20 + i] = (clock_id >> (56 - 8 * i)) & 0xFF;
-    b[28] = 0x00; b[29] = 0x01;      /* sourcePortIdentity.portNumber = 1 */
+    b[28] = 0x80; b[29] = 0x05;      /* sourcePortIdentity.portNumber, as iOS */
     b[30] = (seq >> 8) & 0xFF;
     b[31] = seq & 0xFF;
     b[32] = control;
     b[33] = (uint8_t)log_interval;
 }
 
-/* Send a PTP message to the multicast group (and, if enabled, unicast peers). */
+/* Send a PTP message. iOS senders unicast timing straight to each timing peer
+ * (never an open multicast election), so with a peer list the message goes
+ * unicast to every peer; without one (daemon idle, pre-SETPEERS) it falls back
+ * to the multicast group. */
 static void ptp_send(struct ap2_ptp_ctx *ctx, int sock, uint16_t port,
                      const uint8_t *buf, int len)
 {
-    struct sockaddr_in dst = {.sin_family = AF_INET, .sin_port = htons(port)};
-    dst.sin_addr = ctx->mcast_addr;
-    sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
-
+    bool sent = false;
     if (ctx->unicast_mirror) {
         for (int i = 0; i < ctx->npeers; i++) {
             struct sockaddr_in u = {.sin_family = AF_INET, .sin_port = htons(port)};
-            if (inet_pton(AF_INET, ctx->peers[i], &u.sin_addr) == 1)
+            if (inet_pton(AF_INET, ctx->peers[i], &u.sin_addr) == 1) {
                 sendto(sock, buf, len, 0, (struct sockaddr *)&u, sizeof(u));
+                sent = true;
+            }
         }
     }
+    if (!sent) {
+        struct sockaddr_in dst = {.sin_family = AF_INET, .sin_port = htons(port)};
+        dst.sin_addr = ctx->mcast_addr;
+        sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    }
+}
+
+/* Periodic Signaling (iOS sends one per second to its timing peers): two
+ * Apple ORGANIZATION_EXTENSION TLVs (OUI 00:0D:93, subtypes 1 and 5) whose
+ * payload starts 00 00 03 01, remainder zero. 106 bytes total. */
+static void ptp_send_signaling(struct ap2_ptp_ctx *ctx)
+{
+    uint16_t len = PTP_HDR_LEN + 10 + 26 + 36;
+    uint8_t b[PTP_HDR_LEN + 10 + 26 + 36];
+    memset(b, 0, sizeof(b));
+    ptp_write_hdr(b, PTP_MSG_SIGNALING, len,
+                  PTP_FLAG_UNICAST | PTP_FLAG_PTP_TIMESCALE,
+                  ctx->clock_id, ctx->signaling_seq, 0x05, -128);
+    /* targetPortIdentity left zero (wildcard) */
+    uint8_t *tlv = b + PTP_HDR_LEN + 10;
+    tlv[0] = 0x00; tlv[1] = 0x03; tlv[2] = 0x00; tlv[3] = 0x16;   /* len 22 */
+    tlv[4] = 0x00; tlv[5] = 0x0D; tlv[6] = 0x93;
+    tlv[7] = 0x00; tlv[8] = 0x00; tlv[9] = 0x01;
+    tlv[10] = 0x00; tlv[11] = 0x00; tlv[12] = 0x03; tlv[13] = 0x01;
+    tlv += 26;
+    tlv[0] = 0x00; tlv[1] = 0x03; tlv[2] = 0x00; tlv[3] = 0x20;   /* len 32 */
+    tlv[4] = 0x00; tlv[5] = 0x0D; tlv[6] = 0x93;
+    tlv[7] = 0x00; tlv[8] = 0x00; tlv[9] = 0x05;
+    tlv[10] = 0x00; tlv[11] = 0x00; tlv[12] = 0x03; tlv[13] = 0x01;
+    ptp_send(ctx, ctx->general_sock, PTP_GENERAL_PORT, b, len);
+    ctx->signaling_seq++;
 }
 
 static void ptp_send_announce(struct ap2_ptp_ctx *ctx)
 {
-    uint8_t b[64];
-    uint16_t len = PTP_HDR_LEN + 30;
-    ptp_write_hdr(b, PTP_MSG_ANNOUNCE, len, PTP_FLAG_PTP_TIMESCALE, ctx->clock_id,
-                  ctx->announce_seq, 0x05, PTP_LOG_ANNOUNCE_INTERVAL);
+    /* iOS-shaped Announce: flags UNICAST|TIMESCALE, originTimestamp 0,
+     * currentUtcOffset 0, control 0, and a PATH_TRACE TLV carrying the clock
+     * id (receivers running the gPTP profile expect it; 76 bytes total). */
+    uint8_t b[96];
+    uint16_t len = PTP_HDR_LEN + 30 + 12;
+    ptp_write_hdr(b, PTP_MSG_ANNOUNCE, len, PTP_FLAG_UNICAST | PTP_FLAG_PTP_TIMESCALE,
+                  ctx->clock_id, ctx->announce_seq, 0x00, PTP_LOG_ANNOUNCE_INTERVAL);
     uint8_t *body = b + PTP_HDR_LEN;
-    ptp_write_ts(body, ap2_ptp_now_ns(ctx));      /* originTimestamp */
-    body[10] = 0; body[11] = 37;                  /* currentUtcOffset = 37 (TAI-UTC) */
+    memset(body, 0, 10);                          /* originTimestamp = 0 (as iOS) */
+    body[10] = 0; body[11] = 0;                   /* currentUtcOffset = 0 (as iOS) */
     body[12] = 0;                                 /* reserved */
     body[13] = PTP_PRIORITY1;
     body[14] = PTP_CLOCK_CLASS;
@@ -308,7 +370,11 @@ static void ptp_send_announce(struct ap2_ptp_ctx *ctx)
     body[18] = PTP_PRIORITY2;
     for (int i = 0; i < 8; i++) body[19 + i] = (ctx->clock_id >> (56 - 8 * i)) & 0xFF;
     body[27] = 0; body[28] = 0;                   /* stepsRemoved = 0 */
-    body[29] = 0xA0;                              /* timeSource = INTERNAL_OSCILLATOR */
+    body[29] = PTP_TIME_SOURCE;
+    /* PATH_TRACE TLV: type 0x0008, length 8, value = grandmaster clock id */
+    body[30] = 0x00; body[31] = 0x08;
+    body[32] = 0x00; body[33] = 0x08;
+    for (int i = 0; i < 8; i++) body[34 + i] = (ctx->clock_id >> (56 - 8 * i)) & 0xFF;
 
     ptp_send(ctx, ctx->general_sock, PTP_GENERAL_PORT, b, len);
     LOG_DEBUG("[PTP] TX Announce seq=%u gm=%016" PRIx64 " prio1=%d", ctx->announce_seq,
@@ -324,17 +390,35 @@ static void ptp_send_sync(struct ap2_ptp_ctx *ctx)
     uint16_t len = PTP_HDR_LEN + 10;
 
     uint8_t s[PTP_HDR_LEN + 10];
-    ptp_write_hdr(s, PTP_MSG_SYNC, len, PTP_FLAG_TWO_STEP, ctx->clock_id, seq,
-                  0x00, PTP_LOG_SYNC_INTERVAL);
+    ptp_write_hdr(s, PTP_MSG_SYNC, len,
+                  PTP_FLAG_UNICAST | PTP_FLAG_PTP_TIMESCALE | PTP_FLAG_TWO_STEP,
+                  ctx->clock_id, seq, 0x00, PTP_LOG_SYNC_INTERVAL);
     memset(s + PTP_HDR_LEN, 0, 10);               /* originTimestamp = 0 (two-step) */
     ptp_send(ctx, ctx->event_sock, PTP_EVENT_PORT, s, len);
     uint64_t egress = ap2_ptp_now_ns(ctx);        /* best-effort software egress time */
 
-    uint8_t f[PTP_HDR_LEN + 10];
-    ptp_write_hdr(f, PTP_MSG_FOLLOW_UP, len, 0, ctx->clock_id, seq,
-                  0x02, PTP_LOG_SYNC_INTERVAL);
+    /* Follow_Up carries the precise timestamp plus the two TLVs iOS appends:
+     * the 802.1AS Follow_Up information TLV (zeroed rate/phase fields) and an
+     * Apple TLV repeating the clock id. 96 bytes total. */
+    uint16_t flen = PTP_HDR_LEN + 10 + 32 + 20;
+    uint8_t f[PTP_HDR_LEN + 10 + 32 + 20];
+    memset(f, 0, sizeof(f));
+    ptp_write_hdr(f, PTP_MSG_FOLLOW_UP, flen,
+                  PTP_FLAG_UNICAST | PTP_FLAG_PTP_TIMESCALE,
+                  ctx->clock_id, seq, 0x00, PTP_LOG_SYNC_INTERVAL);
     ptp_write_ts(f + PTP_HDR_LEN, egress);        /* preciseOriginTimestamp */
-    ptp_send(ctx, ctx->general_sock, PTP_GENERAL_PORT, f, len);
+    uint8_t *tlv = f + PTP_HDR_LEN + 10;
+    /* 802.1AS Follow_Up information: ORG_EXT, len 28, OUI 00:80:C2 subtype 1 */
+    tlv[0] = 0x00; tlv[1] = 0x03; tlv[2] = 0x00; tlv[3] = 0x1C;
+    tlv[4] = 0x00; tlv[5] = 0x80; tlv[6] = 0xC2;
+    tlv[7] = 0x00; tlv[8] = 0x00; tlv[9] = 0x01;  /* remaining 22 bytes zero */
+    tlv += 32;
+    /* Apple clock-id TLV: ORG_EXT, len 16, OUI 00:0D:93 subtype 4 + clock id */
+    tlv[0] = 0x00; tlv[1] = 0x03; tlv[2] = 0x00; tlv[3] = 0x10;
+    tlv[4] = 0x00; tlv[5] = 0x0D; tlv[6] = 0x93;
+    tlv[7] = 0x00; tlv[8] = 0x00; tlv[9] = 0x04;
+    for (int i = 0; i < 8; i++) tlv[10 + i] = (ctx->clock_id >> (56 - 8 * i)) & 0xFF;
+    ptp_send(ctx, ctx->general_sock, PTP_GENERAL_PORT, f, flen);
 
     LOG_DEBUG("[PTP] TX Sync+Follow_Up seq=%u t=%" PRIu64 "ns", seq, egress);
     ctx->sync_seq++;
@@ -347,11 +431,87 @@ static void ptp_send_delay_resp(struct ap2_ptp_ctx *ctx, const uint8_t *req, uin
     uint16_t seq = (req[30] << 8) | req[31];
     uint16_t len = PTP_HDR_LEN + 10 + 10;
     uint8_t b[PTP_HDR_LEN + 10 + 10];
-    ptp_write_hdr(b, PTP_MSG_DELAY_RESP, len, 0, ctx->clock_id, seq, 0x03, 0x7F);
+    ptp_write_hdr(b, PTP_MSG_DELAY_RESP, len,
+                  PTP_FLAG_UNICAST | PTP_FLAG_PTP_TIMESCALE | PTP_FLAG_TWO_STEP,
+                  ctx->clock_id, seq, 0x00, PTP_LOG_SYNC_INTERVAL);
     ptp_write_ts(b + PTP_HDR_LEN, rx_ns);              /* receiveTimestamp */
     memcpy(b + PTP_HDR_LEN + 10, req + 20, 10);        /* requestingPortIdentity */
     ptp_send(ctx, ctx->general_sock, PTP_GENERAL_PORT, b, len);
     LOG_DEBUG("[PTP] TX Delay_Resp seq=%u rx=%" PRIu64 "ns", seq, rx_ns);
+}
+
+/*
+ * Handle a Signaling message: grant REQUEST_UNICAST_TRANSMISSION TLVs.
+ *
+ * Apple receivers negotiate unicast PTP — they ask the sender's clock for
+ * unicast Announce/Sync/Delay_Resp instead of relying on multicast. We reply
+ * with one GRANT TLV per request (echoing message type, rate and duration,
+ * renewal invited) and serve the peer through the unicast mirror.
+ */
+static void ptp_handle_signaling(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
+                                 const struct sockaddr_in *src, const char *srcip)
+{
+    /* header (34) + targetPortIdentity (10), then TLVs */
+    int off = PTP_HDR_LEN + 10;
+    if (n < off + 4) return;
+
+    uint8_t reply[PTP_HDR_LEN + 10 + 8 * 12];
+    uint8_t *tlv_out = reply + PTP_HDR_LEN + 10;
+    int granted = 0;
+    char kinds[64] = "";
+
+    while (off + 4 <= n && granted < 8) {
+        uint16_t tlv_type = (buf[off] << 8) | buf[off + 1];
+        uint16_t tlv_len = (buf[off + 2] << 8) | buf[off + 3];
+        const uint8_t *val = buf + off + 4;
+        if (off + 4 + tlv_len > n) break;
+
+        if (tlv_type == PTP_TLV_REQUEST_UNICAST && tlv_len >= 6) {
+            uint8_t req_msg_type = val[0] >> 4;
+            int8_t log_period = (int8_t)val[1];
+            uint32_t duration = ((uint32_t)val[2] << 24) | ((uint32_t)val[3] << 16) |
+                                ((uint32_t)val[4] << 8) | val[5];
+            if (duration == 0) duration = 300;
+
+            tlv_out[0] = (PTP_TLV_GRANT_UNICAST >> 8) & 0xFF;
+            tlv_out[1] = PTP_TLV_GRANT_UNICAST & 0xFF;
+            tlv_out[2] = 0; tlv_out[3] = 8;
+            tlv_out[4] = (uint8_t)(req_msg_type << 4);
+            tlv_out[5] = (uint8_t)log_period;
+            tlv_out[6] = (duration >> 24) & 0xFF; tlv_out[7] = (duration >> 16) & 0xFF;
+            tlv_out[8] = (duration >> 8) & 0xFF;  tlv_out[9] = duration & 0xFF;
+            tlv_out[10] = 0;
+            tlv_out[11] = 1;                       /* renewal invited */
+            tlv_out += 12;
+            granted++;
+
+            size_t kl = strlen(kinds);
+            snprintf(kinds + kl, sizeof(kinds) - kl, "%s0x%x", kl ? "," : "", req_msg_type);
+        }
+        off += 4 + tlv_len;
+    }
+    if (!granted) return;
+
+    uint16_t seq = (buf[30] << 8) | buf[31];
+    uint16_t len = (uint16_t)(PTP_HDR_LEN + 10 + granted * 12);
+    ptp_write_hdr(reply, PTP_MSG_SIGNALING, len, PTP_FLAG_UNICAST, ctx->clock_id,
+                  seq, 0x05, 0x7F);
+    memcpy(reply + PTP_HDR_LEN, buf + 20, 10);     /* target = requester's port identity */
+
+    struct sockaddr_in dst = *src;
+    dst.sin_port = htons(PTP_GENERAL_PORT);
+    sendto(ctx->general_sock, reply, len, 0, (struct sockaddr *)&dst, sizeof(dst));
+
+    pthread_mutex_lock(&ctx->lock);
+    bool first = !ctx->unicast_granted;
+    ctx->unicast_granted = true;
+    ctx->unicast_mirror = true;                    /* serve the peer unicast from now on */
+    pthread_mutex_unlock(&ctx->lock);
+    if (first)
+        LOG_INFO("[PTP] Granted unicast transmission to %s (msgTypes %s) — serving "
+                 "Announce/Sync unicast", srcip, kinds);
+    else
+        LOG_DEBUG("[PTP] Renewed unicast grant for %s (msgTypes %s)", srcip, kinds);
 }
 
 static int ptp_open_socket(struct ap2_ptp_ctx *ctx, uint16_t port)
@@ -507,12 +667,26 @@ static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int
     struct ptp_dataset own;
     pthread_mutex_lock(&ctx->lock);
     ptp_own_dataset(ctx, &own);
+    bool first_peer = !ctx->have_peer;
     ctx->best_peer = peer;
     ctx->have_peer = true;
     ctx->last_peer_announce_ns = rx_ns;
     bool was_gm = ctx->is_grandmaster;
     /* We keep the timeline unless the peer is strictly better (cmp > 0). */
     bool now_gm = ptp_dataset_compare(&own, &peer) <= 0;
+    if (ctx->hold_master && !now_gm) {
+        /* Sender stays the timing authority: note the competing GM once, keep
+         * announcing our own timeline. */
+        if (!ctx->hold_notice_logged) {
+            ctx->hold_notice_logged = true;
+            pthread_mutex_unlock(&ctx->lock);
+            LOG_INFO("[PTP] Peer %s announces a better dataset (gm=%016" PRIx64
+                     "); holding grandmaster — the sender owns the session timeline",
+                     srcip, peer.grandmaster_identity);
+            pthread_mutex_lock(&ctx->lock);
+        }
+        now_gm = true;
+    }
     ctx->is_grandmaster = now_gm;
     ctx->master_clock_id = now_gm ? ctx->clock_id : peer.grandmaster_identity;
     if (!now_gm && was_gm) {
@@ -523,6 +697,13 @@ static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int
     }
     pthread_mutex_unlock(&ctx->lock);
 
+    if (first_peer) {
+        LOG_INFO("[PTP] Peer %s clock dataset: gm=%016" PRIx64 " prio1=%u class=%u "
+                 "accuracy=0x%02x variance=0x%04x prio2=%u steps=%u (ours: prio1=%u)",
+                 srcip, peer.grandmaster_identity, peer.priority1, peer.clock_class,
+                 peer.clock_accuracy, peer.offset_scaled_log_variance, peer.priority2,
+                 peer.steps_removed, own.priority1);
+    }
     if (was_gm != now_gm) {
         LOG_INFO("[PTP] BMCA role -> %s (peer %s gm=%016" PRIx64 " prio1=%u/class=%u; "
                  "ours prio1=%u/class=%u)", now_gm ? "GRANDMASTER" : "SLAVE", srcip,
@@ -621,6 +802,7 @@ static void *ptp_thread_func(void *arg)
         if (gm) {
             if (now - last_announce >= PTP_ANNOUNCE_INTERVAL_NS) {
                 ptp_send_announce(ctx);
+                ptp_send_signaling(ctx);      /* iOS pairs these at 1/s */
                 last_announce = now;
             }
             if (now - last_sync >= PTP_SYNC_INTERVAL_NS) {
@@ -648,6 +830,12 @@ static void *ptp_thread_func(void *arg)
             int msg_type = buf[0] & 0x0F;
             char srcip[INET_ADDRSTRLEN];
             inet_ntop(AF_INET, &src.sin_addr, srcip, sizeof(srcip));
+
+            /* Drop our own messages (multicast loopback / unicast mirror). */
+            uint64_t src_clock = 0;
+            for (int k = 0; k < 8; k++) src_clock = (src_clock << 8) | buf[20 + k];
+            if (src_clock == ctx->clock_id) continue;
+
             switch (msg_type) {
             case PTP_MSG_DELAY_REQ:
                 /* Only the grandmaster answers Delay_Req. */
@@ -665,6 +853,9 @@ static void *ptp_thread_func(void *arg)
                 break;
             case PTP_MSG_FOLLOW_UP:
                 if (!gm) ptp_handle_follow_up(ctx, buf, n);
+                break;
+            case PTP_MSG_SIGNALING:
+                ptp_handle_signaling(ctx, buf, n, &src, srcip);
                 break;
             default:
                 LOG_DEBUG("[PTP] RX msgType=0x%x from %s", msg_type, srcip);
@@ -685,9 +876,17 @@ struct ap2_ptp_ctx *ap2_ptp_create(void)
     ctx->event_sock = -1;
     ctx->general_sock = -1;
     pthread_mutex_init(&ctx->lock, NULL);
-    /* Default to grandmaster until (and unless) a peer wins BMCA, so the
-     * getters return a sane timeline before the engine ever runs. */
+    /* Default to grandmaster and hold it: the sender owns the session timeline
+     * (see the hold_master field note), and the getters return a sane timeline
+     * before the engine ever runs. */
     ctx->is_grandmaster = true;
+    ctx->hold_master = true;
+    /* Apple receivers consume the session clock as UNICAST PTP sent straight
+     * to them (the nqptp model — they never join an open multicast election),
+     * so mirror Announce/Sync/Follow_Up unicast to every timing peer from the
+     * start. Signaling REQUEST_UNICAST_TRANSMISSION is granted as well for
+     * stacks that negotiate explicitly. */
+    ctx->unicast_mirror = true;
     return ctx;
 }
 
@@ -871,8 +1070,9 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
         ctx->clock_id_set = true;
     }
 
-    /* Start as grandmaster of our own clock; BMCA hands the timeline to a peer
-     * only if one announces a strictly better dataset during the session. */
+    /* Start as grandmaster of our own clock. With hold_master (default) we
+     * keep it for the whole session; only with holding disabled can BMCA hand
+     * the timeline to a peer announcing a strictly better dataset. */
     pthread_mutex_lock(&ctx->lock);
     ctx->is_grandmaster = true;
     ctx->master_clock_id = ctx->clock_id;

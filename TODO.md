@@ -6,8 +6,16 @@ server-side integration state, see the provider's `PLAN.md`.
 ## Done (built; device-audio validation still pending where noted)
 
 - [x] **Transient pairing** (`X-Apple-HKP: 4`, SRP-6a) — native AP2 without stored creds; validated on real Sonos (session establishes).
-- [x] **Native AP2 realtime + PTP grandmaster** — two-way PTP validated against a real Sonos; **on-device audio unconfirmed** (the critical open item; see Validation).
-- [x] **PTP BMCA + slave mode** — the engine elects a grandmaster (IEEE-1588 dataset compare) and, when a peer (e.g. a Sonos advertising its own `Announce`) wins, slaves to it (nqptp-style offset from its Sync/Follow_Up) and expresses the media anchor in the elected master's clock domain. Synthetic harness 42/42; **on-device audio unconfirmed**.
+- [x] **Native AP2 realtime + PTP — AUDIBLE on Sonos (Era 100).** The full chain that
+      unlocked it: keyed port parse (audio previously went to the receiver's control
+      port), metadata with `RTP-Info` (Sonos 400s without it and withholds audio),
+      trailing-nonce wire format, hold-grandmaster, **gPTP framing** (`majorSdoId=1` —
+      receivers discard plain-1588 messages outright), the iOS announce
+      dataset/TLVs served unicast to the timing peers, and the anchor semantics
+      (`frame_1 = play_pos + 11035`, `frame_2 = frame_1 + 77175`).
+- [x] **PTP BMCA + slave mode** — election machinery retained behind `hold_master`
+      (the sender always keeps the session timeline; receivers can only follow a clock
+      from the timing-peer list, so surrendering it mutes them). Synthetic harness 45/45.
 - [x] **`--ptp-daemon` + `--ptp-shared` (multi-room)** — one daemon per host owns 319/320 and publishes the elected clock to POSIX shm (`/cliairplay-ptp`, lock-free double-buffer); per-device streams read it with `--ptp-shared` and never bind 319/320, falling back to the in-process engine when no daemon is present. Control channel on `127.0.0.1:9010`. Hardware-free tests pass; **multi-device lock unverified**.
 - [x] **mDNS auto-selection** (`--protocol auto`) — RAOP vs native/compat, transient vs pair-verify, PTP vs NTP, realtime vs buffered, all from the TXT.
 - [x] **24-bit** native ALAC (0x80000/0x200000) via `--bitdepth 24`. Device-unverified.
@@ -17,20 +25,19 @@ server-side integration state, see the provider's `PLAN.md`.
 
 ## Validation (needs real devices — Sonos / JBL MA9100 / Apple TV 4K / WiiM Pro)
 
-The binary is feature-complete for single-device playback; everything below gates on the
-first item, which needs a speaker's ears.
-
-- [ ] **Native AP2 + PTP audible on Sonos** — the critical open item. If silent, the most
-      likely lever is the SETUP `timingPeerInfo.ClockID`: it currently carries the *elected*
-      grandmaster; owntone's convention is the sender's *own* clock (a one-line A/B flip in
-      `ap2_client.c`).
+- [x] **Native AP2 + PTP audible on Sonos** (Era 100 stereo pair, transient pairing,
+      realtime type 96, 2026-07-19). The critical gate is passed.
+- [ ] **RAOP + AP2-compat regression pass** after the native fixes (those paths are
+      untouched raopcl code, so low risk — but confirm by ear).
 - [ ] **Multi-room sync** — start `--ptp-daemon`, run ≥2 streams with `--ptp-shared`, confirm
-      they lock to one grandmaster and are audibly in sync. Exercises best-of-N BMCA when
-      multiple receivers advertise competing datasets (the daemon reuses the engine's pairwise
-      election — may need a min-over-all-live-peers table if it flaps).
-- [ ] Buffered + 24-bit end-to-end; PTP regression on a RAOP-only device.
+      they lock to one grandmaster and are audibly in sync. The daemon predates the gPTP/
+      iOS-recipe changes to the engine TX path — retest its shm/attach flow after them.
+- [ ] Buffered + 24-bit end-to-end; native+PTP on JBL MA9100 / Apple TV 4K / WiiM Pro;
+      PTP regression on a RAOP-only device.
 - [ ] Non-root 319/320 bind path (`--ptp-daemon` returns 2) on Linux/containers — validated by
       inspection only (macOS lets the user bind those ports).
+- [ ] `Pdelay_Req` responder (gPTP peer-delay) — not needed by Sonos (uses E2E
+      `Delay_Req`, which we answer), but other gPTP receivers may probe with it.
 - [ ] See `TEST-PLAN.md` for the full route matrix.
 
 ## Distribution
