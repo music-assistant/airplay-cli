@@ -44,14 +44,16 @@ server-side integration state, see the provider's `PLAN.md`.
 - [x] **Native AP2 + PTP on Apple TV 4K** (2026-07-19) via full HomeKit pair-setup
       (`--pair-setup` → on-screen PIN → stored creds → pair-verify at stream time).
       Audible; clock-locked like Sonos.
-- [ ] **Volume curve** — the native map `vol_db = -30 + (vol/100)*30` (ap2cl_set_volume)
-      is a LINEAR percent→dB map, so it's perceptually very quiet in the low/mid range
-      (vol 25 → -22.5 dB ≈ 7% amplitude; Apple TV needed a big TV-side ramp to be
-      audible). Fix: map percent→dB perceptually (e.g. amplitude-linear: dB = 20*log10(vol/100),
-      floored around -30, or match iOS/owntone's curve) so a mid slider sounds mid.
-      Do it once in a shared helper and apply to BOTH the native AP2 path and the
-      RAOP/compat path (raopcl_float_volume) so all protocols track the same curve;
-      -144 stays mute. Re-verify by ear on Sonos + Apple TV at a few settings.
+- [x] **Volume curve — investigated, kept the AirPlay-standard mapping.** The
+      -30..0 dB linear-in-dB curve is the ecosystem convention (libraop's
+      `raopcl_float_volume`, shairport-sync's default range, iOS senders), so an
+      MA slider position is exactly as loud as an iPhone at the same position;
+      changing it would diverge from every AirPlay implementation and shift
+      loudness for all existing RAOP users. Fixed the real defect instead: the
+      native path duplicated the formula — it now calls `raopcl_float_volume`
+      (one source of truth, both paths identical, mute at 0). If loudness
+      alignment with e.g. Sonos-native is ever wanted, that belongs in MA's
+      per-player volume normalization, not in the protocol curve.
 - [x] **24-bit hi-res — AUDIBLE over REALTIME + PTP on Apple TV** (2026-07-19).
       Correcting an earlier wrong call: 24-bit is NOT buffered-only. The Apple TV
       accepts and plays `audioFormat 0x80000` (ALAC 44100/24) on the realtime path —

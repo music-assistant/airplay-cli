@@ -813,6 +813,9 @@ static void print_usage(const char *name)
     printf("  --volume <0-100>           Initial volume level\n");
     printf("  --latency <ms>             Output buffer duration in ms (default: 1000)\n");
     printf("  --ntpstart <ntp>           Start at NTP timestamp\n");
+    printf("  --start-unix-ms <ms>       Start at unix epoch milliseconds (preferred:\n");
+    printf("                             the caller never handles NTP formats; pass the\n");
+    printf("                             SAME value to every member of a sync group)\n");
     printf("  --wait <ms>                Wait before starting (ms)\n");
     printf("  --dacp <id>                DACP ID\n");
     printf("  --activeremote <id>        Active Remote ID\n");
@@ -907,6 +910,7 @@ int main(int argc, char *argv[])
         {"volume",       required_argument, 0, 'v'},
         {"latency",      required_argument, 0, 'l'},
         {"ntpstart",     required_argument, 0, 'N'},
+        {"start-unix-ms", required_argument, 0, 1014},
         {"wait",         required_argument, 0, 'w'},
         {"dacp",         required_argument, 0, 'D'},
         {"activeremote", required_argument, 0, 'R'},
@@ -963,6 +967,15 @@ int main(int argc, char *argv[])
         case 'v': cfg.volume = atoi(optarg); break;
         case 'l': cfg.latency_ms = atoi(optarg); break;
         case 'N': sscanf(optarg, "%" PRIu64, &cfg.ntp_start); break;
+        case 1014: {
+            /* Group start as plain unix epoch milliseconds; converted to the
+             * NTP fixed-point (unix seconds << 32 | frac) used internally so
+             * callers never handle NTP formats. */
+            uint64_t ms = 0;
+            sscanf(optarg, "%" PRIu64, &ms);
+            cfg.ntp_start = ((ms / 1000) << 32) | (((ms % 1000) << 32) / 1000);
+            break;
+        }
         case 'w': cfg.wait_ms = atoi(optarg); break;
         case 'D': cfg.dacp_id = optarg; break;
         case 'R': cfg.active_remote = optarg; break;

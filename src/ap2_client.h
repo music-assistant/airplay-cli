@@ -80,7 +80,8 @@ uint64_t ap2_txt_flags(const char *txt);
  * :param txt: full _airplay._tcp TXT ("key=value key=value ...") or NULL.
  * :param pw: mDNS pw field ("true" when a device password is required), or NULL.
  * :param have_credentials: stored HAP credentials are available (--auth).
- * :param bit_depth: requested output bit depth (24 requests hi-res).
+ * :param bit_depth: requested output bit depth (informational; hi-res rides
+ *                   the realtime stream and no longer selects buffered).
  * :param force_native: --ap2-native was given (forces the native AP2 flow).
  * :param force_buffered: --buffered was given (forces buffered + native + PTP).
  * :param ptp_forced: --ptp was given (overrides the SupportsPTP auto-detect).

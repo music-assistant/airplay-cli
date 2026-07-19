@@ -425,11 +425,12 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     /* 3. Timing: PTP grandmaster when forced, else the SupportsPTP feature bit. */
     r.ptp = ptp_forced ? ptp_enabled : (AP2_FEAT(r.features, AP2_FEAT_PTP) != 0);
 
-    /* 4. Buffered (type 103): forced by --buffered, or auto when the device
-     * advertises SupportsBufferedAudio and hi-res (24-bit) is requested.
-     * Buffered anchoring needs PTP. */
-    r.buffered = force_buffered ||
-                 (AP2_FEAT(r.features, AP2_FEAT_BUFFERED) && bit_depth > 16);
+    /* 4. Buffered (type 103): only when forced by --buffered. Hi-res (24-bit)
+     * rides the REALTIME stream — verified audible on device — so it must
+     * never steer the route onto the buffered path (whose playback anchoring
+     * is unresolved on Apple TV). Buffered anchoring needs PTP. */
+    (void)bit_depth;
+    r.buffered = force_buffered;
     if (r.buffered) r.ptp = true;
 
     r.reason = transient
@@ -1626,7 +1627,12 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
     if (!p) return false;
     p->volume = volume;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
-        float vol_db = volume <= 0 ? -144.0f : -30.0f + (volume / 100.0f) * 30.0f;
+        /* Same percent->dB mapping as the RAOP path (libraop): linear in dB
+         * over -30..0, mute at 0. This is the AirPlay convention (iOS,
+         * shairport-sync use the same range), so a given slider position is
+         * equally loud on every protocol path and matches other senders. */
+        float vol_db = volume <= 0 ? -144.0f
+                       : raopcl_float_volume(volume > 100 ? 100 : volume);
         char body[32];
         int blen = snprintf(body, sizeof(body), "volume: %.6f\r\n", vol_db);
         uint8_t *resp = NULL; int resp_len = 0;
