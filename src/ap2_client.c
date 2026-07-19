@@ -1019,16 +1019,18 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
     if (!p->rt_anchor_valid) {
         if (p->start_ntp) {
-            /* Group playback: derive the line from the SHARED --ntpstart so
-             * every player maps the same sample to the same wall instant
-             * (playback of the start sample begins latency_ms after it).
-             * Valid because our timeline — in-process GM or the shared daemon
-             * — is host CLOCK_REALTIME, the same clock the ntpstart value
-             * comes from (libraop's NTP fixed-point uses the UNIX epoch:
-             * seconds<<32 | frac, seconds since 1970 — no 1900 offset). */
+            /* Group playback: derive the line from the SHARED start time so
+             * every player maps the same sample to the same wall instant.
+             * Contract (all protocol paths): the first sample is AUDIBLE
+             * exactly at the start time — anchoring one lead early makes the
+             * line's audible point land on it, and mixed RAOP/AP2 groups
+             * align regardless of each member's lead. Valid because our
+             * timeline — in-process GM or the shared daemon — is host
+             * CLOCK_REALTIME, the same clock the start value comes from
+             * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            p->rt_anchor_wall0 = unix_ns;
+            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->latency_ms * 1000000ULL;
             p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
                               + p->rtp_offset;
         } else {
@@ -1602,21 +1604,22 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
          * provide flow control, so accept whenever we are streaming and let
          * backpressure pace us (rather than the realtime latency window). */
         if (p->use_buffered) return true;
-        /* Pace against the ANCHOR DEADLINE, capped to the receiver's buffer:
-         * frame head plays at (head + lead) on the shared frame clock, and a
-         * frame delivered more than the receiver's latencyMax before its
-         * deadline overflows its buffer and is dropped (Sonos: 88200 = 2.0s).
-         * Release frames at most `window` ahead of their deadline — the
-         * reported window when known, else 77175 (1.75s, inside every
-         * AirPlay receiver's standard 2s). This also makes scheduled group
-         * starts (future ntpstart) safe: earliness stays bounded no matter
-         * how far ahead the start lies. */
+        /* Pace against the ANCHOR DEADLINE, capped to the receiver's buffer.
+         * Contract: frame f is AUDIBLE at its frame-clock position (the anchor
+         * line starts one lead early), so f's deadline IS f. A frame delivered
+         * more than the receiver's latencyMax before its deadline overflows
+         * its buffer and is dropped (Sonos: 88200 = 2.0s) — release at most
+         * `window` ahead: the reported window when known, else 77175 (1.75s,
+         * inside every AirPlay receiver's standard 2s). Delivery therefore
+         * runs up to ~window AHEAD of playback from the very first sample —
+         * the receiver's buffer is filled before the scheduled start and the
+         * start cannot underrun — while scheduled group starts stay safe no
+         * matter how far ahead the start lies. */
         uint64_t now_ntp = raopcl_get_ntp(NULL);
         uint64_t now_ts = NTP2TS(now_ntp, p->format.sample_rate);
-        uint64_t latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
         uint64_t window = p->dev_latency_max > 11025
                           ? p->dev_latency_max - 11025 : 77175;
-        return (now_ts + window) >= (p->head_ts + latency_frames);
+        return (now_ts + window) >= p->head_ts;
     }
     if (!p->raopcl) return false;
     return raopcl_accept_frames(p->raopcl);

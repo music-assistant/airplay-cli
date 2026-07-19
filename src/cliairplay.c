@@ -24,6 +24,7 @@
 #include <unistd.h>
 #include <sys/time.h>
 #include <poll.h>
+#include <errno.h>
 
 #include "../libraop/crosstools/src/platform.h"
 #include "../libraop/crosstools/src/cross_thread.h"
@@ -70,12 +71,10 @@ typedef struct {
     char *cmdpipe;
     char *udn;
     uint64_t ntp_start;
-    int wait_ms;
     char *audio_source;  /* filename or "-" for stdin */
 
     /* RAOP-specific */
     bool encrypt;
-    bool alac;         /* force compressed ALAC (default already is compressed) */
     bool raw;          /* force uncompressed audio instead of compressed ALAC */
     char *secret;
     char *password;
@@ -94,7 +93,6 @@ typedef struct {
     char *ap2_txt;    /* mDNS TXT records */
     bool force_native;      /* force native AP2 flow (transient pairing) */
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
-    int64_t ptp_offset_ns;  /* PTP clock offset in nanoseconds */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
     bool buffered;          /* force buffered audio stream (type 103) */
@@ -217,6 +215,96 @@ static int truncate_32to24(const uint8_t *in, int in_bytes, uint8_t *out)
         out[i * 3 + 2] = in[i * 4 + 3];
     }
     return samples * 3;
+}
+
+/* ---- Eager input buffering ---- */
+
+/*
+ * A dedicated reader drains the audio source into this ring as fast as the
+ * source can deliver, decoupled from network pacing. The caller (MA) can
+ * therefore fill the pipeline well before a scheduled group start instead of
+ * being throttled to the send schedule, so playback start cannot underrun on
+ * slow source startup. When the ring is full the reader blocks, which
+ * backpressures the pipe as before.
+ */
+#define INPUT_RING_BYTES (4u * 1024 * 1024)  /* ~10s at 44.1/16, ~5.5s at 48/24 s32 */
+
+static struct {
+    uint8_t *data;
+    size_t rd, wr, fill;
+    bool eof;
+    bool started;
+    int fd;
+    pthread_t thread;
+    pthread_mutex_t lock;
+    pthread_cond_t can_read;
+    pthread_cond_t can_write;
+} g_inring = { .fd = -1, .lock = PTHREAD_MUTEX_INITIALIZER,
+               .can_read = PTHREAD_COND_INITIALIZER,
+               .can_write = PTHREAD_COND_INITIALIZER };
+
+static void *input_ring_thread(void *arg)
+{
+    (void)arg;
+    uint8_t chunk[65536];
+    while (g_running) {
+        ssize_t n = read(g_inring.fd, chunk, sizeof(chunk));
+        if (n < 0 && errno == EINTR) continue;
+        pthread_mutex_lock(&g_inring.lock);
+        if (n <= 0) {
+            g_inring.eof = true;
+            pthread_cond_broadcast(&g_inring.can_read);
+            pthread_mutex_unlock(&g_inring.lock);
+            break;
+        }
+        size_t off = 0;
+        while (off < (size_t)n && g_running) {
+            while (g_inring.fill == INPUT_RING_BYTES && g_running)
+                pthread_cond_wait(&g_inring.can_write, &g_inring.lock);
+            size_t space = INPUT_RING_BYTES - g_inring.fill;
+            size_t chunk_len = (size_t)n - off;
+            if (chunk_len > space) chunk_len = space;
+            size_t to_end = INPUT_RING_BYTES - g_inring.wr;
+            if (chunk_len > to_end) chunk_len = to_end;
+            memcpy(g_inring.data + g_inring.wr, chunk + off, chunk_len);
+            g_inring.wr = (g_inring.wr + chunk_len) % INPUT_RING_BYTES;
+            g_inring.fill += chunk_len;
+            off += chunk_len;
+            pthread_cond_broadcast(&g_inring.can_read);
+        }
+        pthread_mutex_unlock(&g_inring.lock);
+    }
+    return NULL;
+}
+
+static void input_ring_start(int fd)
+{
+    g_inring.data = malloc(INPUT_RING_BYTES);
+    g_inring.fd = fd;
+    g_inring.started = true;
+    pthread_create(&g_inring.thread, NULL, input_ring_thread, NULL);
+}
+
+/* Read up to `want` bytes; blocks until data or EOF. Returns 0 only at EOF. */
+static int input_ring_read(uint8_t *buf, size_t want)
+{
+    pthread_mutex_lock(&g_inring.lock);
+    while (g_inring.fill == 0 && !g_inring.eof && g_running)
+        pthread_cond_wait(&g_inring.can_read, &g_inring.lock);
+    size_t n = g_inring.fill < want ? g_inring.fill : want;
+    size_t got = 0;
+    while (got < n) {
+        size_t to_end = INPUT_RING_BYTES - g_inring.rd;
+        size_t chunk_len = n - got;
+        if (chunk_len > to_end) chunk_len = to_end;
+        memcpy(buf + got, g_inring.data + g_inring.rd, chunk_len);
+        g_inring.rd = (g_inring.rd + chunk_len) % INPUT_RING_BYTES;
+        got += chunk_len;
+    }
+    g_inring.fill -= n;
+    if (n) pthread_cond_broadcast(&g_inring.can_write);
+    pthread_mutex_unlock(&g_inring.lock);
+    return (int)n;
 }
 
 /* ---- Command pipe handler ---- */
@@ -450,7 +538,6 @@ static int run_raop(cli_config_t *cfg, int infile)
      * or when --raw is forced; --alac forces compressed regardless. */
     bool use_alac = true;
     if (cfg->cn && *cfg->cn && !strchr(cfg->cn, '1')) use_alac = false;
-    if (cfg->alac) use_alac = true;
     if (cfg->raw) use_alac = false;
     LOG_INFO("RAOP codec: %s", use_alac ? "ALAC (compressed)" : "ALAC-raw (uncompressed)");
 
@@ -487,12 +574,12 @@ static int run_raop(cli_config_t *cfg, int infile)
     send_initial_metadata(cfg);
 
     /* Schedule start time */
-    if (cfg->ntp_start || cfg->wait_ms) {
-        uint64_t now = raopcl_get_ntp(NULL);
-        uint64_t start_at = (cfg->ntp_start ? cfg->ntp_start : now)
-                            + MS2NTP(cfg->wait_ms)
-                            - TS2NTP(latency, raopcl_sample_rate(g_raopcl));
-        raopcl_start_at(g_raopcl, start_at);
+    if (cfg->ntp_start) {
+        /* Contract: the first sample is AUDIBLE exactly at the requested start
+         * (RAOP renders a frame latency after its frame-clock position, so the
+         * timeline starts latency early). */
+        raopcl_start_at(g_raopcl,
+                        cfg->ntp_start - TS2NTP(latency, raopcl_sample_rate(g_raopcl)));
     }
 
     g_status = STATUS_PLAYING;
@@ -522,7 +609,7 @@ static int run_raop(cli_config_t *cfg, int infile)
 
         /* Send audio chunk */
         if (g_status == STATUS_PLAYING && raopcl_accept_frames(g_raopcl)) {
-            int n = read(infile, buf, DEFAULT_FRAMES_PER_CHUNK * input_bpf);
+            int n = input_ring_read(buf, DEFAULT_FRAMES_PER_CHUNK * input_bpf);
             if (n < 0) {
                 status_error("Error reading from audio source");
                 break;
@@ -631,7 +718,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         ap2cl_start_at(g_ap2cl, cfg->ntp_start);
     } else {
         uint64_t now = raopcl_get_ntp(NULL);
-        uint64_t start_at = now + MS2NTP(cfg->wait_ms > 0 ? cfg->wait_ms : 200);
+        uint64_t start_at = now + MS2NTP(cfg->latency_ms);
         ap2cl_start_at(g_ap2cl, start_at);
     }
 
@@ -667,7 +754,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
 
         /* Send audio chunk */
         if (g_status == STATUS_PLAYING && ap2cl_accept_frames(g_ap2cl)) {
-            int n = read(infile, buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
+            int n = input_ring_read(buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
             if (n < 0) {
                 status_error("Error reading from audio source");
                 break;
@@ -820,12 +907,11 @@ static void print_usage(const char *name)
     printf("Common options:\n");
     printf("  --port <port>              Device port (default: 5000)\n");
     printf("  --volume <0-100>           Initial volume level\n");
-    printf("  --latency <ms>             Output buffer duration in ms (default: 1000)\n");
-    printf("  --ntpstart <ntp>           Start at NTP timestamp\n");
+    printf("  --latency <ms>             Playback lead / buffer in ms (default: 2000,\n");
+    printf("                             clamped into the device-reported window)\n");
     printf("  --start-unix-ms <ms>       Start at unix epoch milliseconds (preferred:\n");
     printf("                             the caller never handles NTP formats; pass the\n");
     printf("                             SAME value to every member of a sync group)\n");
-    printf("  --wait <ms>                Wait before starting (ms)\n");
     printf("  --dacp <id>                DACP ID\n");
     printf("  --activeremote <id>        Active Remote ID\n");
     printf("  --cmdpipe <path>           Named pipe for metadata/commands\n");
@@ -836,14 +922,12 @@ static void print_usage(const char *name)
     printf("  --channels <n>             Channel count (default: 2)\n");
     printf("  --if <ip>                  Local interface IP to bind (multi-homed hosts)\n");
     printf("  --debug <0-9>              Debug level (default: 3)\n");
-    printf("  --ntp                      Print current NTP and exit\n");
     printf("  --check                    Print check info and exit\n");
     printf("  --pair                     Legacy AppleTV RAOP pairing (--secret)\n");
     printf("  --pair-setup               HomeKit pair-setup: the device shows a PIN,\n");
     printf("                             prints --auth credentials on success. Needs\n");
     printf("                             <address>, --port and --dacp\n\n");
     printf("RAOP options:\n");
-    printf("  --alac                     Force compressed ALAC (default)\n");
     printf("  --raw                      Force uncompressed audio (ALAC-raw)\n");
     printf("  --encrypt                  Enable audio payload encryption\n");
     printf("  --secret <secret>          AppleTV pairing secret\n");
@@ -862,7 +946,6 @@ static void print_usage(const char *name)
     printf("  --name <name>              Device name\n");
     printf("  --hostname <hostname>      Device hostname\n");
     printf("  --txt <records>            mDNS TXT records (key=value pairs)\n");
-    printf("  --ptp-offset <ns>          PTP clock offset in nanoseconds\n");
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
     printf("                             SupportsPTP feature bit)\n");
@@ -894,7 +977,7 @@ int main(int argc, char *argv[])
         .proto_pref = AP2_PROTO_AUTO,
         .port = 5000,
         .volume = 0,
-        .latency_ms = 1000,
+        .latency_ms = 2000,
         .debug_level = 3,
         .dacp_id = "1A2B3D4EA1B2C3D4",
         .active_remote = "ap5918800d",
@@ -918,9 +1001,7 @@ int main(int argc, char *argv[])
         {"port",         required_argument, 0, 'p'},
         {"volume",       required_argument, 0, 'v'},
         {"latency",      required_argument, 0, 'l'},
-        {"ntpstart",     required_argument, 0, 'N'},
         {"start-unix-ms", required_argument, 0, 1014},
-        {"wait",         required_argument, 0, 'w'},
         {"dacp",         required_argument, 0, 'D'},
         {"activeremote", required_argument, 0, 'R'},
         {"cmdpipe",      required_argument, 0, 'C'},
@@ -930,7 +1011,6 @@ int main(int argc, char *argv[])
         {"channels",     required_argument, 0, 'c'},
         {"debug",        required_argument, 0, 'd'},
         {"encrypt",      no_argument,       0, 'e'},
-        {"alac",         no_argument,       0, 'a'},
         {"secret",       required_argument, 0, 's'},
         {"password",     required_argument, 0, 'x'},
         {"if",           required_argument, 0, 'I'},
@@ -943,7 +1023,6 @@ int main(int argc, char *argv[])
         {"name",         required_argument, 0, 'n'},
         {"hostname",     required_argument, 0, 'H'},
         {"txt",          required_argument, 0, 't'},
-        {"ptp-offset",   required_argument, 0, 1004},
         {"cn",           required_argument, 0, 1005},
         {"raw",          no_argument,       0, 1006},
         {"ap2-native",   no_argument,       0, 1007},
@@ -952,7 +1031,6 @@ int main(int argc, char *argv[])
         {"buffered",     no_argument,       0, 1010},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
-        {"ntp",          no_argument,       0, 1001},
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
         {"pair-setup",   no_argument,       0, 1013},
@@ -963,7 +1041,7 @@ int main(int argc, char *argv[])
     setvbuf(stderr, NULL, _IONBF, 0);  /* Unbuffered stderr for status output */
 
     int opt;
-    while ((opt = getopt_long(argc, argv, "hP:p:v:l:N:w:D:R:C:U:r:b:c:d:eas:x:I:E:M:A:K:W:T:n:H:t:",
+    while ((opt = getopt_long(argc, argv, "hP:p:v:l:D:R:C:U:r:b:c:d:es:x:I:E:M:A:K:W:T:n:H:t:",
                               long_options, NULL)) != -1) {
         switch (opt) {
         case 'P':
@@ -975,7 +1053,6 @@ int main(int argc, char *argv[])
         case 'p': cfg.port = atoi(optarg); break;
         case 'v': cfg.volume = atoi(optarg); break;
         case 'l': cfg.latency_ms = atoi(optarg); break;
-        case 'N': sscanf(optarg, "%" PRIu64, &cfg.ntp_start); break;
         case 1014: {
             /* Group start as plain unix epoch milliseconds; converted to the
              * NTP fixed-point (unix seconds << 32 | frac) used internally so
@@ -985,7 +1062,6 @@ int main(int argc, char *argv[])
             cfg.ntp_start = ((ms / 1000) << 32) | (((ms % 1000) << 32) / 1000);
             break;
         }
-        case 'w': cfg.wait_ms = atoi(optarg); break;
         case 'D': cfg.dacp_id = optarg; break;
         case 'R': cfg.active_remote = optarg; break;
         case 'C': cfg.cmdpipe = optarg; break;
@@ -995,7 +1071,6 @@ int main(int argc, char *argv[])
         case 'c': cfg.channels = atoi(optarg); break;
         case 'd': cfg.debug_level = atoi(optarg); break;
         case 'e': cfg.encrypt = true; break;
-        case 'a': cfg.alac = true; break;
         case 's': cfg.secret = optarg; break;
         case 'x': cfg.password = optarg; break;
         case 'I': cfg.iface = optarg; break;
@@ -1008,7 +1083,6 @@ int main(int argc, char *argv[])
         case 'n': cfg.ap2_name = optarg; break;
         case 'H': cfg.ap2_hostname = optarg; break;
         case 't': cfg.ap2_txt = optarg; break;
-        case 1004: sscanf(optarg, "%" PRId64, &cfg.ptp_offset_ns); break;
         case 1005: cfg.cn = optarg; break;
         case 1006: cfg.raw = true; break;
         case 1007: cfg.force_native = true; break;
@@ -1018,11 +1092,6 @@ int main(int argc, char *argv[])
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
-        case 1001: {
-            uint64_t ntp = raopcl_get_ntp(NULL);
-            printf("%" PRIu64 "\n", ntp);
-            return 0;
-        }
         case 1002:
             printf("cliairplay v%s check\n", VERSION);
             return 0;
@@ -1149,6 +1218,9 @@ int main(int argc, char *argv[])
         }
         pthread_create(&g_cmdpipe_thread, NULL, cmdpipe_reader_thread, &cfg);
     }
+
+    /* Drain the audio source eagerly from here on (see the input ring note) */
+    input_ring_start(infile);
 
     /* Run the selected protocol */
     int result;
