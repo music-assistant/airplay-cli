@@ -34,11 +34,14 @@ status per route lives in `TEST-PLAN.md`.
       regression pass by ear after the native-AP2 work; and a RAOP-only
       device inside a PTP-active group needs a regression check. See the
       matrix in `TEST-PLAN.md`.
-- [ ] **Apple TV on-screen now-playing (MediaRemote).** The legacy metadata
-      channel (DMAP text, artwork, progress via SET_PARAMETER) is fully
-      implemented on the native flow and the Apple TV 200-accepts all of it,
-      but tvOS does not render its now-playing screen from it — iPhones drive
-      that display via the MediaRemote (MRP) now-playing messages on the
-      AirPlay 2 data channel (protobuf). Speakers are unaffected (Sonos
-      requires and consumes the DMAP metadata). Implementing an MRP sender is
-      a separate, sizeable project.
+- [ ] **Apple TV on-screen now-playing (MediaRemote) — planned follow-up.**
+      The legacy metadata channel (DMAP text, artwork, progress via
+      SET_PARAMETER) is fully implemented on the native flow and the Apple TV
+      200-accepts all of it, but tvOS renders its now-playing screen only from
+      the MediaRemote (MRP) messages on the AirPlay 2 data channel (protobuf),
+      which is how iPhones drive it. Speakers are unaffected (Sonos requires
+      and consumes the DMAP metadata). Beyond fixing the display during audio
+      playback, MRP also unlocks a **metadata-only display mode**: expose an
+      Apple TV as a display target that shows the active playback session of
+      an MA queue without routing audio to it — the same product shape as the
+      cast-displays work in MA.
