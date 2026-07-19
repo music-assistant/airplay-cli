@@ -52,19 +52,24 @@ server-side integration state, see the provider's `PLAN.md`.
       Do it once in a shared helper and apply to BOTH the native AP2 path and the
       RAOP/compat path (raopcl_float_volume) so all protocols track the same curve;
       -144 stays mute. Re-verify by ear on Sonos + Apple TV at a few settings.
-- [ ] **Buffered + 24-bit (parked — needs an iOS→Apple TV capture).** Findings from
-      device /info: 24-bit is a BUFFERED-only format, and among the tested devices
-      only the Apple TV advertises it (`bufferStream` bits 19/21); Sonos/JBL/WiiM are
-      16-bit only. 24-bit audioFormat (0x80000) IS accepted at Stream SETUP. The
-      blocker is buffered playback: the Apple TV never sends Delay_Req on a buffered
-      stream (won't measure our PTP clock), so SETRATEANCHORTIME 400s forever. The
-      TCP frame length-prefix off-by-2 is fixed (verified on a reference receiver).
-      Low priority: realtime already covers every device at lower latency, and 24-bit
-      only helps one endpoint.
-- [ ] **Format negotiation** — parse `supportedAudioFormatsExtended` / `supportedFormats`
-      from `GET /info` and pick the best format the device supports for the chosen
-      stream type; fall back to baseline ALAC 44100/16 when the device omits the table
-      (JBL, WiiM, all classic receivers). Never blind-send a format → 400.
+- [x] **24-bit hi-res — AUDIBLE over REALTIME + PTP on Apple TV** (2026-07-19).
+      Correcting an earlier wrong call: 24-bit is NOT buffered-only. The Apple TV
+      accepts and plays `audioFormat 0x80000` (ALAC 44100/24) on the realtime path —
+      even though its advertised realtime table lists only 16-bit — over the same
+      realtime+PTP path that's already solid. No buffered needed. (Sonos has no
+      24-bit anywhere; that 400 was device-specific, not a stream-type rule.)
+- [ ] **Format negotiation (try-then-fall-back).** Read `supportedAudioFormatsExtended`
+      / `supportedFormats` from `GET /info` as a STARTING GUESS, but treat it as a
+      hint, not a contract — the Apple TV accepts 24-bit realtime it doesn't advertise.
+      Request the best format the source needs; on a Stream SETUP 400, step down
+      (24→16, drop sample rate) and retry. Baseline fallback ALAC 44100/16 for classic
+      receivers (JBL, WiiM) that omit the table.
+- [ ] **Buffered (type 103) — parked, low value.** Its only edge over realtime was
+      hi-res, which realtime now delivers; the remaining niche is lossy-network
+      resilience (TCP retransmit). The TCP length-prefix off-by-2 is fixed (verified on
+      a reference receiver), but the Apple TV won't send Delay_Req on a buffered stream
+      so its SETRATEANCHORTIME never clears — needs an iOS→Apple TV capture if ever
+      revisited.
 - [ ] native+PTP on JBL MA9100 / WiiM Pro (paired + /info read; not ear-tested);
       PTP regression on a RAOP-only device.
 - [ ] Non-root 319/320 bind path (`--ptp-daemon` returns 2) on Linux/containers — validated by
