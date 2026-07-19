@@ -44,8 +44,14 @@ server-side integration state, see the provider's `PLAN.md`.
 - [x] **Native AP2 + PTP on Apple TV 4K** (2026-07-19) via full HomeKit pair-setup
       (`--pair-setup` → on-screen PIN → stored creds → pair-verify at stream time).
       Audible; clock-locked like Sonos.
-- [ ] Volume curve: the -30..0 dB map is quiet on some receivers (Apple TV needed a
-      big TV-side ramp). Widen the usable band / match Apple's mapping.
+- [ ] **Volume curve** — the native map `vol_db = -30 + (vol/100)*30` (ap2cl_set_volume)
+      is a LINEAR percent→dB map, so it's perceptually very quiet in the low/mid range
+      (vol 25 → -22.5 dB ≈ 7% amplitude; Apple TV needed a big TV-side ramp to be
+      audible). Fix: map percent→dB perceptually (e.g. amplitude-linear: dB = 20*log10(vol/100),
+      floored around -30, or match iOS/owntone's curve) so a mid slider sounds mid.
+      Do it once in a shared helper and apply to BOTH the native AP2 path and the
+      RAOP/compat path (raopcl_float_volume) so all protocols track the same curve;
+      -144 stays mute. Re-verify by ear on Sonos + Apple TV at a few settings.
 - [ ] Buffered + 24-bit end-to-end (24-bit currently 400s at Stream SETUP — the
       audioFormat bit is likely wrong for the stream type); native+PTP on JBL MA9100
       / WiiM Pro; PTP regression on a RAOP-only device.
