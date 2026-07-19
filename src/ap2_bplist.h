@@ -48,6 +48,19 @@ uint64_t ap2_bplist_get_int(struct ap2_bplist *bp, const char *key);
 /* Get a data value by key. Returns NULL if not found. Sets *len. Do not free. */
 const uint8_t *ap2_bplist_get_data(struct ap2_bplist *bp, const char *key, size_t *len);
 
+/*
+ * Find an integer value by key anywhere in a raw binary plist (including
+ * nested dictionaries, e.g. streams[0].dataPort) using full offset-table
+ * traversal.
+ *
+ * :param data: raw binary plist bytes.
+ * :param len: length of data.
+ * :param key: ASCII dictionary key to look up.
+ * :param out: receives the value on success.
+ * :returns: 1 when the key was found with an integer value, else 0.
+ */
+int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint64_t *out);
+
 #ifdef __cplusplus
 }
 #endif

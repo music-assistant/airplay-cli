@@ -116,19 +116,21 @@ struct ap2cl_s {
 
 /* ---- Native AP2 RTSP I/O ---- */
 
-static int ap2_rtsp_send(struct ap2cl_s *p, const char *method, const char *uri,
+static int ap2_rtsp_send_ex(struct ap2cl_s *p, const char *method, const char *uri,
                           const uint8_t *body, int body_len, const char *ct,
+                          const char *extra_hdr,
                           uint8_t **resp_body, int *resp_len)
 {
     char hdr[1024];
     int hdr_len = snprintf(hdr, sizeof(hdr),
         "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: AirPlay/670.6.2\r\n"
-        "DACP-ID: %s\r\nActive-Remote: %s\r\n%s%s%s"
+        "DACP-ID: %s\r\nActive-Remote: %s\r\n%s%s%s%s"
         "Content-Length: %d\r\n\r\n",
         method, uri, p->cseq++,
         p->dacp_id ? p->dacp_id : "0",
         p->active_remote ? p->active_remote : "0",
         ct ? "Content-Type: " : "", ct ? ct : "", ct ? "\r\n" : "",
+        extra_hdr ? extra_hdr : "",
         body_len);
 
     uint8_t *msg = NULL;
@@ -249,6 +251,15 @@ static int ap2_rtsp_send(struct ap2cl_s *p, const char *method, const char *uri,
     }
     *resp_body = NULL; *resp_len = 0;
     return 0;
+}
+
+/* Convenience wrapper: send an RTSP request with no extra headers. */
+static int ap2_rtsp_send(struct ap2cl_s *p, const char *method, const char *uri,
+                         const uint8_t *body, int body_len, const char *ct,
+                         uint8_t **resp_body, int *resp_len)
+{
+    return ap2_rtsp_send_ex(p, method, uri, body, body_len, ct, NULL,
+                            resp_body, resp_len);
 }
 
 /* ---- Native AP2 connect helpers ---- */
@@ -603,9 +614,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_gen_uuid(group_uuid);
         const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
 
-        /* Advertise the ELECTED grandmaster's clock as the timeline: our own
-         * clockID when we win BMCA, else the receiver's grandmasterIdentity.
-         * The media anchor is expressed against this same clock domain below. */
+        /* Advertise OUR clock as the session timeline (the engine holds
+         * grandmaster): receivers only follow masters from the timing-peer
+         * list — us — and cannot anchor to their own clock. The media anchor
+         * below is expressed against this same clock domain. */
         uint64_t timeline_id = ap2_ptp_master_clock_id(p->ptp);
 
         ap2_pl_node *root = ap2_pl_dict();
@@ -648,25 +660,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     }
     LOG_INFO("[AP2] Session SETUP OK (%s timing)", p->use_ptp ? "PTP" : "NTP");
 
-    /* Extract eventPort from session response */
+    /* Extract eventPort from the session response (by key, real traversal) */
     int event_port = 0;
     if (resp && resp_len > 0) {
-        for (int i = 0; i < resp_len - 10; i++) {
-            if (i >= 9 && memcmp(resp + i, "eventPort", 9) == 0) {
-                for (int j = i; j < resp_len - 3 && j < i + 50; j++) {
-                    uint8_t marker = resp[j];
-                    if (marker == 0x11 && j + 2 < resp_len) {
-                        int val = (resp[j+1] << 8) | resp[j+2];
-                        if (val >= 1024 && val <= 65535) { event_port = val; break; }
-                    } else if (marker == 0x12 && j + 4 < resp_len) {
-                        int val = (resp[j+1] << 24) | (resp[j+2] << 16) |
-                                  (resp[j+3] << 8) | resp[j+4];
-                        if (val >= 1024 && val <= 65535) { event_port = val; break; }
-                    }
-                }
-                break;
-            }
-        }
+        uint64_t v;
+        if (ap2_bplist_find_uint(resp, (size_t)resp_len, "eventPort", &v) &&
+            v >= 1024 && v <= 65535)
+            event_port = (int)v;
     }
     free(resp);
 
@@ -769,77 +769,22 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         return false;
     }
 
-    /* Parse response for remote ports.
-     * The response is a nested binary plist: {"streams": [{"dataPort": N, "controlPort": N}]}
-     * We scan the raw bytes for the known ASCII key names followed by
-     * integer object markers (0x10=1B, 0x11=2B, 0x12=4B, 0x13=8B).
-     * This is a pragmatic parse that doesn't require a full plist library. */
+    /* Parse the remote ports from the response plist,
+     * {"streams": [{"dataPort": N, "controlPort": N, ...}]}, by KEY with real
+     * offset-table traversal. Positional guessing must never be used here: a
+     * receiver's plist writer typically serializes controlPort before dataPort
+     * (alphabetical), so "first port found = data" sends the audio to the
+     * receiver's control port and mutes it. */
     if (resp && resp_len > 0) {
         int remote_data = 0, remote_ctrl = 0;
-
-        /* The plist format stores each string key and each int value as separate
-         * objects at offsets given in an offset table at the end of the plist.
-         * Values are then referenced by index from within their parent container.
-         * Since the integers we want (dataPort, controlPort) are stored somewhere
-         * in the plist as objects of form (0x10..0x13)(value), we search for
-         * the key strings and then check nearby integer objects.
-         * A simpler and more reliable approach: scan all integer objects in
-         * the plist for values in the valid port range (1024-65535) where the
-         * preceding bytes spell "dataPort"/"controlPort". */
-
-        /*
-         * In binary plists, strings and integers are stored in separate
-         * object areas. Instead of trying to scan contextually, we scan
-         * the entire response body for all integer objects (0x11/0x12
-         * markers) in port range and heuristically match them to keys
-         * based on the order they appear alongside "dataPort"/"controlPort"
-         * string markers.
-         *
-         * Pragmatic approach: find the positions of "dataPort" and "controlPort"
-         * strings, then find the integer values at roughly the correct
-         * offsets. The plist offset table correlates them.
-         *
-         * Even simpler: collect all unique valid port integers and the
-         * positions of our key strings, then use the response port that
-         * the device assigned. For now we just ensure both data and ctrl
-         * ports differ by preferring integers that haven't been used yet.
-         */
-        int found_ports[8] = {0};
-        int num_ports = 0;
-        for (int i = 0; i < resp_len - 4; i++) {
-            uint8_t marker = resp[i];
-            int val = 0;
-            if (marker == 0x11 && i + 2 < resp_len) {
-                val = (resp[i+1] << 8) | resp[i+2];
-            } else if (marker == 0x12 && i + 4 < resp_len) {
-                val = (resp[i+1] << 24) | (resp[i+2] << 16) |
-                      (resp[i+3] << 8) | resp[i+4];
-            }
-            if (val >= 1024 && val <= 65535 && num_ports < 8) {
-                /* Check if already found */
-                bool dup = false;
-                for (int k = 0; k < num_ports; k++) {
-                    if (found_ports[k] == val) { dup = true; break; }
-                }
-                if (!dup) found_ports[num_ports++] = val;
-            }
-        }
-
-        LOG_DEBUG("[AP2] Found %d unique ports in response", num_ports);
-        /* Device returned dataPort and controlPort are typically in the response.
-         * Pick the first two valid ports that aren't our local ports. */
-        for (int i = 0; i < num_ports; i++) {
-            if (found_ports[i] != local_data_port &&
-                found_ports[i] != local_ctrl_port &&
-                found_ports[i] != ap2_ptp_get_timing_port(p->ptp)) {
-                if (remote_data == 0) {
-                    remote_data = found_ports[i];
-                } else if (remote_ctrl == 0 && found_ports[i] != remote_data) {
-                    remote_ctrl = found_ports[i];
-                    break;
-                }
-            }
-        }
+        uint64_t v;
+        if (ap2_bplist_find_uint(resp, (size_t)resp_len, "dataPort", &v) &&
+            v >= 1024 && v <= 65535)
+            remote_data = (int)v;
+        if (ap2_bplist_find_uint(resp, (size_t)resp_len, "controlPort", &v) &&
+            v >= 1024 && v <= 65535)
+            remote_ctrl = (int)v;
+        LOG_DEBUG("[AP2] Stream response ports: data=%d control=%d", remote_data, remote_ctrl);
 
         if (remote_data > 0) {
             memset(&p->data_addr, 0, sizeof(p->data_addr));
@@ -1001,11 +946,18 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     pkt[2] = 0x00;
     pkt[3] = 0x06;
 
-    uint32_t cur_pos = p->rtp_timestamp;
+    /* Anchor semantics (from shairport-sync's receiver math): the receiver
+     * schedules playback as "frame_1 - 11035 plays at the packet timestamp"
+     * and derives its buffer latency from frame_2 - frame_1 (Apple senders:
+     * 77175). Our send head runs latency_ms AHEAD of realtime, so the frame
+     * playing NOW is (head - latency); anchoring the head itself would place
+     * all audio in the receiver's future and mute it. */
     uint32_t latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
-    uint32_t pos_lat = cur_pos >= latency_frames ? cur_pos - latency_frames : 0;
+    uint32_t play_pos = p->rtp_timestamp - latency_frames;
+    uint32_t frame_1 = play_pos + 11035;
+    uint32_t frame_2 = frame_1 + 77175;
 
-    uint32_t be = htonl(cur_pos);
+    uint32_t be = htonl(frame_1);
     memcpy(pkt + 4, &be, 4);
 
     uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
@@ -1014,7 +966,7 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     memcpy(pkt + 8, &wall_hi, 4);
     memcpy(pkt + 12, &wall_lo, 4);
 
-    be = htonl(pos_lat);
+    be = htonl(frame_2);
     memcpy(pkt + 16, &be, 4);
 
     uint64_t cid = ap2_ptp_master_clock_id(p->ptp);
@@ -1025,8 +977,8 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
 
     sendto(p->ctrl_sock, pkt, sizeof(pkt), 0,
            (struct sockaddr *)&p->ctrl_addr, sizeof(p->ctrl_addr));
-    LOG_DEBUG("[AP2] TX PTP sync %s pos=%u wall=%" PRIu64 "ns", first ? "(initial)" : "",
-              cur_pos, wall);
+    LOG_DEBUG("[AP2] TX PTP sync %s play_pos=%u wall=%" PRIu64 "ns",
+              first ? "(initial)" : "", play_pos, wall);
 }
 
 /* ---- Native AP2 buffered audio (type 103) ---- */
@@ -1214,15 +1166,13 @@ static bool ap2_native_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames
     memcpy(rtp_hdr + 8, &ssrc_be, 4);
     p->first_packet = false;
 
-    /* Encrypt ALAC payload with ChaCha20-Poly1305 (AP2 audio format).
-     * Key:   First 32 bytes of X25519 shared_secret from pair-verify.
-     * Nonce: 4 zero bytes + 2-byte sequence number (network byte order from RTP hdr) + 6 zero bytes.
-     *        Note: owntone copies seqnum as raw bytes, which matches the network-order seqnum
-     *        already in the RTP header.
-     * AAD:   8 bytes from RTP header (timestamp + SSRC, bytes 4-11).
-     * Output appends: encrypted payload + 16-byte tag.
-     * Note: the trailing seqnum suffix some docs mention is NOT appended in the actual wire format.
-     */
+    /* Encrypt the ALAC payload with ChaCha20-Poly1305 (AP2 realtime audio).
+     * Key:   the 32-byte pairing audio key (shk) — the raw X25519 secret for
+     *        pair-verify, SHA512(S)[:32] for transient pairing.
+     * Nonce: 12 bytes, all zero except the 2-byte sequence number at [4..5].
+     * AAD:   RTP header bytes 4..11 (timestamp + SSRC).
+     * Wire:  [12B RTP hdr][ciphertext][16B tag][8B nonce]; the trailing 8 bytes
+     *        are the low 8 nonce bytes so the receiver can reconstruct it. */
     const uint8_t *audio_key = ap2_hap_get_shared_secret(p->hap);
     if (!audio_key) {
         LOG_ERROR("[AP2] No shared secret for audio encryption");
@@ -1232,11 +1182,12 @@ static bool ap2_native_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames
 
     uint8_t nonce[12];
     memset(nonce, 0, 12);
-    /* Copy 2-byte network-order seqnum to offset 4 (as owntone does) */
-    nonce[4] = rtp_hdr[2];
-    nonce[5] = rtp_hdr[3];
+    /* seqnum at offset 4 in native (little-endian) byte order, matching owntone
+     * (memcpy(nonce+4, &seqnum, 2)). The same bytes are appended to the wire. */
+    uint16_t seq16 = (uint16_t)p->seq_number;
+    memcpy(nonce + 4, &seq16, 2);
 
-    int pkt_size = 12 + enc_size + AP2_CHACHA_TAG_SIZE;
+    int pkt_size = 12 + enc_size + AP2_CHACHA_TAG_SIZE + 8;
     uint8_t *pkt = malloc(pkt_size);
     memcpy(pkt, rtp_hdr, 12);
 
@@ -1254,7 +1205,12 @@ static bool ap2_native_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames
     EVP_CIPHER_CTX_free(ctx);
     free(encoded);
 
-    int actual_pkt_size = 12 + ct_len + AP2_CHACHA_TAG_SIZE;
+    /* Append the 8-byte per-packet nonce (the low 8 bytes of the 12-byte nonce)
+     * so the receiver can reconstruct it. AP2 realtime wire format is
+     * [12B RTP hdr][ciphertext][16B tag][8B nonce]; without the suffix every
+     * packet fails its auth tag and is silently dropped. */
+    memcpy(pkt + 12 + ct_len + AP2_CHACHA_TAG_SIZE, nonce + 4, 8);
+    int actual_pkt_size = 12 + ct_len + AP2_CHACHA_TAG_SIZE + 8;
     ssize_t sent = sendto(p->data_sock, pkt, actual_pkt_size, 0,
                            (struct sockaddr *)&p->data_addr, sizeof(p->data_addr));
     free(pkt);
@@ -1560,8 +1516,9 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
         char body[32];
         int blen = snprintf(body, sizeof(body), "volume: %.6f\r\n", vol_db);
         uint8_t *resp = NULL; int resp_len = 0;
-        ap2_rtsp_send(p, "SET_PARAMETER", p->session_url,
+        int status = ap2_rtsp_send(p, "SET_PARAMETER", p->session_url,
                        (uint8_t *)body, blen, "text/parameters", &resp, &resp_len);
+        LOG_INFO("[AP2] native volume -> %.2f dB (SET_PARAMETER status %d)", vol_db, status);
         free(resp);
         return true;
     }
@@ -1569,10 +1526,65 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
     return false;
 }
 
+/* Build a DMAP "mlit" metadata blob (libraop's rtspcl_set_daap wire format) and
+ * push it over the native encrypted RTSP channel. Sonos withholds audio until it
+ * receives track metadata, so the native flow must send this to become audible
+ * (the RAOP-compat flow gets it for free via raopcl). */
+static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
+                                     const char *artist, const char *album)
+{
+    if (!p || p->sock_fd < 0) return false;
+    if (!title)  title  = "";
+    if (!artist) artist = "";
+    if (!album)  album  = "";
+
+    size_t need = 8 + 9 + (8 + strlen(title)) + (8 + strlen(artist))
+                + (8 + strlen(album)) + 10;
+    uint8_t *buf = malloc(need);
+    if (!buf) return false;
+    uint8_t *q = buf;
+
+    memcpy(q, "mlit", 4); q += 8;                        /* size backfilled below */
+    memcpy(q, "mikd", 4); q += 4;
+    *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 1; *q++ = 2;    /* mikd: len 1, value 2 */
+
+    const char *tags[3] = { "minm", "asar", "asal" };
+    const char *vals[3] = { title, artist, album };
+    for (int i = 0; i < 3; i++) {
+        uint32_t n = (uint32_t)strlen(vals[i]);
+        memcpy(q, tags[i], 4); q += 4;
+        for (int b = 0; b < 4; b++) *q++ = (n >> (24 - 8 * b)) & 0xff;
+        memcpy(q, vals[i], n); q += n;
+    }
+    memcpy(q, "astn", 4); q += 4;                        /* track number = 1 (int16) */
+    *q++ = 0; *q++ = 0; *q++ = 0; *q++ = 2; *q++ = 0; *q++ = 1;
+
+    uint32_t sz = (uint32_t)(q - buf - 8);               /* mlit payload size */
+    for (int b = 0; b < 4; b++) buf[4 + b] = (sz >> (24 - 8 * b)) & 0xff;
+
+    /* Anchor the metadata to the current RTP position; the RAOP-compat path
+     * sends this via RTP-Info and Sonos 400s a metadata request without it. */
+    char rtpinfo[48];
+    snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
+
+    uint8_t *resp = NULL; int resp_len = 0;
+    int status = ap2_rtsp_send_ex(p, "SET_PARAMETER", p->session_url,
+                            buf, (int)(q - buf), "application/x-dmap-tagged",
+                            rtpinfo, &resp, &resp_len);
+    LOG_INFO("[AP2] native metadata SET_PARAMETER -> status %d (%d bytes)",
+             status, (int)(q - buf));
+    free(resp);
+    free(buf);
+    return status >= 200 && status < 300;
+}
+
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
                         const char *album, int duration)
 {
+    (void)duration;
     if (!p) return false;
+    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
+        return ap2_native_send_metadata(p, title, artist, album);
     if (p->raopcl)
         return raopcl_set_daap(p->raopcl, 4, "minm", 's', title,
                                 "asar", 's', artist, "asal", 's', album, "astn", 'i', 1);
