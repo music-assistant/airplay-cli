@@ -6,13 +6,17 @@ server-side integration state, see the provider's `PLAN.md`.
 ## Done (built; device-audio validation still pending where noted)
 
 - [x] **Transient pairing** (`X-Apple-HKP: 4`, SRP-6a) — native AP2 without stored creds; validated on real Sonos (session establishes).
-- [x] **Native AP2 realtime + PTP — AUDIBLE on Sonos (Era 100).** The full chain that
-      unlocked it: keyed port parse (audio previously went to the receiver's control
-      port), metadata with `RTP-Info` (Sonos 400s without it and withholds audio),
-      trailing-nonce wire format, hold-grandmaster, **gPTP framing** (`majorSdoId=1` —
-      receivers discard plain-1588 messages outright), the iOS announce
-      dataset/TLVs served unicast to the timing peers, and the anchor semantics
-      (`frame_1 = play_pos + 11035`, `frame_2 = frame_1 + 77175`).
+- [x] **Native AP2 realtime + PTP — CONTINUOUS AUDIO on Sonos (Era 100, full 20s
+      test tone).** The full chain that unlocked it: keyed port parse (audio
+      previously went to the receiver's control port), metadata with `RTP-Info`
+      (Sonos 400s without it and withholds audio), trailing-nonce wire format,
+      hold-grandmaster, **gPTP framing** (`majorSdoId=1` — receivers discard
+      plain-1588 messages outright), the iOS announce dataset/TLVs served unicast
+      to the timing peers, the anchor semantics (`frame_1 = play_pos + 11035`,
+      `frame_2 = frame_1 + 77175`), and a **frozen anchor line** (the mapping is
+      fixed at stream start and every time-announce extrapolates along it —
+      per-packet re-derivation from the send head made the receiver re-seat its
+      timeline and drop its buffer).
 - [x] **PTP BMCA + slave mode** — election machinery retained behind `hold_master`
       (the sender always keeps the session timeline; receivers can only follow a clock
       from the timing-peer list, so surrendering it mutes them). Synthetic harness 45/45.
@@ -25,8 +29,9 @@ server-side integration state, see the provider's `PLAN.md`.
 
 ## Validation (needs real devices — Sonos / JBL MA9100 / Apple TV 4K / WiiM Pro)
 
-- [x] **Native AP2 + PTP audible on Sonos** (Era 100 stereo pair, transient pairing,
-      realtime type 96, 2026-07-19). The critical gate is passed.
+- [x] **Native AP2 + PTP continuous audio on Sonos** (Era 100 stereo pair, transient
+      pairing, realtime type 96, full-duration test tone, 2026-07-19). The critical
+      gate is passed.
 - [ ] **RAOP + AP2-compat regression pass** after the native fixes (those paths are
       untouched raopcl code, so low risk — but confirm by ear).
 - [ ] **Multi-room sync** — start `--ptp-daemon`, run ≥2 streams with `--ptp-shared`, confirm
