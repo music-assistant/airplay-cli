@@ -20,6 +20,7 @@
 #include <netinet/in.h>
 
 #include "ap2_io.h"
+#include "ap2_mrp.h"
 
 struct ap2cl_s;
 
@@ -172,8 +173,16 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
                         const char *album, int duration);
 
-/* Set artwork. */
-bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, const char *data);
+/*
+ * Set artwork on the existing DMAP path and, when applicable, stage it for
+ * MediaRemote. DMAP receives the original detected image type and bytes even
+ * when strict MRP validation rejects them.
+ */
+bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
+                       const char *data, ap2_mrp_artwork_info_t *mrp_info);
+
+/* Clear only the MediaRemote artwork state. Returns false when MRP is inactive. */
+bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p);
 
 /* Set playback progress. */
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);

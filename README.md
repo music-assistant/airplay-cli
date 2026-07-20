@@ -194,6 +194,12 @@ Metadata strings are encoded as Unicode binary-plist strings; artwork is
 signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
 
+The DMAP path receives the detected image type and original bytes. MediaRemote
+artwork has a stricter Apple TV compatibility contract: an 8-bit,
+three-component baseline JPEG, no larger than 600x600 or 65,536 bytes. Invalid
+MRP artwork is omitted without withholding it from DMAP, and is reported as
+`[STATUS] mrp artwork=rejected reason=...`.
+
 ## Building
 
 ```bash
@@ -202,6 +208,9 @@ make STATIC=1
 
 # Linux cross-compile (example)
 make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
+
+# Focused native regression tests
+make test STATIC=1
 ```
 
 Requires the libraop submodule with pre-built static libraries (OpenSSL,

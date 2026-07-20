@@ -188,6 +188,28 @@ static void mrp_status_report(int status)
     fflush(stdout);
 }
 
+static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info)
+{
+    if (!info || info->result == AP2_MRP_ARTWORK_NOT_APPLICABLE) return;
+    if (info->result == AP2_MRP_ARTWORK_ACCEPTED) {
+        status_print("[STATUS] mrp artwork=accepted bytes=%zu width=%u height=%u",
+                     info->bytes, info->width, info->height);
+        return;
+    }
+    status_print("[STATUS] mrp artwork=rejected reason=%s bytes=%zu "
+                 "width=%u height=%u max_bytes=%d max_width=%d max_height=%d",
+                 ap2_mrp_artwork_result_name(info->result), info->bytes,
+                 info->width, info->height, AP2_MRP_ARTWORK_MAX_BYTES,
+                 AP2_MRP_ARTWORK_MAX_WIDTH, AP2_MRP_ARTWORK_MAX_HEIGHT);
+}
+
+static void mrp_artwork_reject_local(const char *reason)
+{
+    if (!g_ap2cl || !ap2cl_clear_mrp_artwork(g_ap2cl)) return;
+    status_print("[STATUS] mrp artwork=rejected reason=%s", reason);
+    mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+}
+
 /* Also emit the older human-readable status line; the [STATUS] lines from
  * status_connected/status_playing are what the MA provider parses. */
 static void status_connected_legacy(const char *host, int port, int latency_ms)
@@ -415,14 +437,22 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                                    error, sizeof(error));
         if (!loaded) {
             LOG_WARN("Cannot load artwork: %s", error);
+            if (cfg->protocol == PROTO_AIRPLAY2)
+                mrp_artwork_reject_local("invalid_artwork");
         } else {
             LOG_INFO("Loaded artwork (%zu bytes, %s)", image_size, content_type);
             if (cfg->protocol == PROTO_RAOP && g_raopcl) {
                 raopcl_set_artwork(g_raopcl, content_type,
                                    (int)image_size, (char *)image);
             } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-                ap2cl_set_artwork(g_ap2cl, content_type,
-                                  (int)image_size, (const char *)image);
+                ap2_mrp_artwork_info_t mrp_info;
+                bool dmap_ok = ap2cl_set_artwork(
+                    g_ap2cl, content_type, (int)image_size,
+                    (const char *)image, &mrp_info);
+                if (!dmap_ok)
+                    LOG_WARN("Receiver rejected DMAP artwork (%zu bytes, %s)",
+                             image_size, content_type);
+                mrp_artwork_status_report(&mrp_info);
                 mrp_status_report(ap2cl_mrp_push(g_ap2cl));
             }
             free(image);

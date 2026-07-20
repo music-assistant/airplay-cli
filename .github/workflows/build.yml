@@ -50,6 +50,7 @@ jobs:
           bin="bin/cliairplay-linux-${{ matrix.platform }}"
           test -f "$bin"
           if [ "${{ matrix.platform }}" = "x86_64" ]; then
+            make test STATIC=1 CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
             # Native: run the self-check (should print "cliairplay check").
             "./$bin" --check | grep -qE "cliairplay.*check"
             make test CC=${{ matrix.cc }}
@@ -98,6 +99,7 @@ jobs:
           bin="bin/cliairplay-macos-${{ matrix.platform }}"
           test -f "$bin"
           if [ "${{ matrix.platform }}" = "arm64" ]; then
+            make test STATIC=1 CC=clang CXX=clang++
             "./$bin" --check | grep -qE "cliairplay.*check"
             make test CC=clang
           else

@@ -20,6 +20,7 @@
 #define __AP2_MRP_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 struct ap2_mrp_ctx;
@@ -29,6 +30,37 @@ typedef enum {
     AP2_MRP_PLAYBACK_PAUSED = 2,
     AP2_MRP_PLAYBACK_STOPPED = 3,
 } ap2_mrp_playback_state_t;
+
+/*
+ * Apple MediaRemote artwork compatibility contract.
+ *
+ * AirPlaySender requests 600x600 artwork from MediaRemote and captured iPhone
+ * payloads are compact baseline JPEGs. Apple TV silently omits substantially
+ * larger command artwork even when POST /command returns 2xx, so keep the
+ * image itself within one 64 KiB compatibility envelope.
+ */
+#define AP2_MRP_ARTWORK_MAX_BYTES  (64 * 1024)
+#define AP2_MRP_ARTWORK_MAX_WIDTH  600
+#define AP2_MRP_ARTWORK_MAX_HEIGHT 600
+
+typedef enum {
+    AP2_MRP_ARTWORK_NOT_APPLICABLE = 0,
+    AP2_MRP_ARTWORK_ACCEPTED,
+    AP2_MRP_ARTWORK_INVALID_ARGUMENT,
+    AP2_MRP_ARTWORK_UNSUPPORTED_TYPE,
+    AP2_MRP_ARTWORK_TOO_LARGE,
+    AP2_MRP_ARTWORK_INVALID_JPEG,
+    AP2_MRP_ARTWORK_NOT_BASELINE,
+    AP2_MRP_ARTWORK_INVALID_DIMENSIONS,
+    AP2_MRP_ARTWORK_NO_MEMORY,
+} ap2_mrp_artwork_result_t;
+
+typedef struct {
+    ap2_mrp_artwork_result_t result;
+    size_t bytes;
+    uint16_t width;
+    uint16_t height;
+} ap2_mrp_artwork_info_t;
 
 /* Remote-control (MRP) data-channel stream SETUP constants (DESIGN.md §8,
  * pyatv ap2_session.py _setup_data_channel). The audio session issues a SETUP
@@ -122,12 +154,29 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
 /*
  * Set the now-playing artwork.
  *
- * :param mime: image MIME type (e.g. "image/jpeg").
+ * MediaRemote accepts only a structurally valid, 8-bit, three-component
+ * baseline JPEG within AP2_MRP_ARTWORK_MAX_*; invalid input clears any prior
+ * MRP artwork so a new track cannot retain stale cover art.
+ *
+ * :param mime: image MIME type; must be "image/jpeg".
  * :param data: image bytes (copied).
  * :param len: image byte count.
+ * :param info: optional validation details.
  */
 bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
-                         const uint8_t *data, int len);
+                         const uint8_t *data, int len,
+                         ap2_mrp_artwork_info_t *info);
+
+/* Clear retained artwork (used when a replacement local file cannot load). */
+void ap2_mrp_clear_artwork(struct ap2_mrp_ctx *m);
+
+/* Validate artwork without mutating an MRP context. */
+ap2_mrp_artwork_result_t
+ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
+                         ap2_mrp_artwork_info_t *info);
+
+/* Stable diagnostic token for an artwork result. */
+const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result);
 
 /*
  * Set playback progress and state.

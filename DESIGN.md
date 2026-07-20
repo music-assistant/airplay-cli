@@ -339,10 +339,26 @@ Inner keys: `Title`, `Artist`, `Album`, `Duration`, `ElapsedTime`,
 track's progress pushes), `ArtworkData` (JPEG bytes), `ArtworkMIMEType`,
 `ArtworkIdentifier`.
 
-**Artwork — send-once.** The JPEG bytes ride only the *first* push for a given
-image, tagged with a fresh `ArtworkIdentifier`; later pushes carry the
-identifier without the bytes, so a ~40 KB image is not re-sent on every
-progress tick over the shared RTSP channel.
+**Artwork contract and send-once behavior.** AirPlaySender requests 600x600
+artwork from MediaRemote, and the captured iPhone command used a 600x600,
+three-component baseline JPEG of about 43 KB. Current Apple TV software returns
+2xx for much larger command payloads but silently omits their artwork. The
+compatibility boundary is therefore explicit: `image/jpeg`, SOF0 baseline,
+8-bit, three components, at most 600x600 and **65,536 bytes**. The caller may
+use smaller dimensions (MA currently uses a no-upscale 512px thumbnail), but
+must encode the cached file down to that byte cap.
+
+The local-file handler signature-detects JPEG/PNG/GIF/WebP and preserves the
+original bytes and correct MIME type for DMAP/Sonos. Only the MRP copy is
+rejected when it violates the stricter contract; rejection clears any previous
+MRP artwork and emits
+`[STATUS] mrp artwork=rejected reason=... bytes=... width=... height=...`,
+so an oversized replacement cannot silently leave stale cover art. No image
+encoder is embedded in the binary.
+
+Accepted JPEG bytes ride only the *first* push for a given image, tagged with a
+fresh `ArtworkIdentifier`; later pushes carry the identifier without the bytes,
+so artwork is not re-sent on every progress tick over the shared RTSP channel.
 
 **`updateMRSupportedCommands`** body:
 `{params:{mrSupportedCommandsFromSender:[<command-info>, ...]}}`, each element a
