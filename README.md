@@ -229,6 +229,35 @@ src/alac_ext.cpp      ALAC encoder override with proper 24-bit support
 libraop/              Upstream philippe44/libraop (RAOP protocol + crypto)
 ```
 
+## Credits and references
+
+**Built on**
+
+- **[philippe44/libraop](https://github.com/philippe44/libraop)** — bundled as a
+  submodule and the foundation of the RAOP/AirPlay 1 path: the `raopcl` client,
+  the cross-platform helpers, the binary-plist code, and the ALAC codec. The
+  `cliairplay` entry point derives from libraop's `cliraop` tool (© Philippe44;
+  the original RAOP work © 2004 Shiro Ninomiya).
+- **Apple Lossless (ALAC)** — audio codec, via libraop's bundled encoder.
+
+**Referenced** for the AirPlay 2 / HAP / MediaRemote work — studied for wire
+formats and receiver behaviour to build our own implementation; no source was
+copied:
+
+- **[OwnTone](https://github.com/owntone/owntone-server)** — AirPlay 2 / HAP
+  reference; specifically the RTP sync-packet layout (`rtp_common.c`) and the
+  gPTP grandmaster dataset that iOS senders announce (`libairptp`).
+- **[pyatv](https://github.com/postlund/pyatv)** — the MediaRemote / DataStream
+  remote-control channel and the protobuf message/field numbers, plus AirPlay 2
+  protocol detail ([pyatv.dev](https://pyatv.dev/documentation/protocols/)).
+- **[openairplay/airplay2-receiver](https://github.com/openairplay/airplay2-receiver)**
+  — AirPlay 2 receiver-side reverse engineering, and the basis for the local
+  MediaRemote capture rig used to derive the real now-playing sequence.
+- **[shairport-sync](https://github.com/mikebrady/shairport-sync)** —
+  receiver-side anchor/timing math, used to get the realtime start anchor right.
+- **[Emanuele Cozzi's AirPlay 2 notes](https://emanuelecozzi.net/docs/airplay2/)**
+  — AirPlay 2 protocol documentation (stream types, channel setup, pairing).
+
 ## License
 
 See LICENSE files in respective directories.
