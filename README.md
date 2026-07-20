@@ -195,10 +195,15 @@ signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
 
 The DMAP path receives the detected image type and original bytes. MediaRemote
-artwork has a stricter Apple TV compatibility contract: an 8-bit,
-three-component baseline JPEG, no larger than 600x600 or 65,536 bytes. Invalid
-MRP artwork is omitted without withholding it from DMAP, and is reported as
-`[STATUS] mrp artwork=rejected reason=...`.
+requires a structurally parsed JPEG, but no Apple TV byte or profile cutoff is
+assumed. Baseline/progressive and grayscale/color cases are logged with exact
+bytes, dimensions, SOF marker, component count, and `/command` response. A
+1 MiB local safety limit bounds retained input and plist construction; it is
+not a receiver capability claim. Invalid MRP artwork is omitted without
+withholding it from DMAP and clears stale MRP state.
+
+`tests/mrp_artwork_matrix.py` generates the controlled Apple TV size/profile
+matrix and sends one case to a running command pipe; see `DESIGN.md` §8.
 
 ## Building
 

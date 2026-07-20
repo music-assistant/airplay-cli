@@ -193,6 +193,9 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
  * failure, or -1 when the push does not apply to this session. */
 int ap2cl_mrp_push(struct ap2cl_s *p);
 
+/* Exact HTTP status from updateMRNowPlayingInfo in the most recent push. */
+int ap2cl_mrp_last_nowplaying_status(struct ap2cl_s *p);
+
 /* Status of the type-130 MRP data channel (path B) for the [STATUS] mrp line:
  * -1 = not attempted (non-Apple / not pair-verified), 0 = attempted but not up,
  * 1 = channel established. */

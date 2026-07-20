@@ -339,26 +339,65 @@ Inner keys: `Title`, `Artist`, `Album`, `Duration`, `ElapsedTime`,
 track's progress pushes), `ArtworkData` (JPEG bytes), `ArtworkMIMEType`,
 `ArtworkIdentifier`.
 
-**Artwork contract and send-once behavior.** AirPlaySender requests 600x600
-artwork from MediaRemote, and the captured iPhone command used a 600x600,
-three-component baseline JPEG of about 43 KB. Current Apple TV software returns
-2xx for much larger command payloads but silently omits their artwork. The
-compatibility boundary is therefore explicit: `image/jpeg`, SOF0 baseline,
-8-bit, three components, at most 600x600 and **65,536 bytes**. The caller may
-use smaller dimensions (MA currently uses a no-upscale 512px thumbnail), but
-must encode the cached file down to that byte cap.
+**Artwork evidence, validation, and send-once behavior.** AirPlaySender requests
+600x600 artwork from MediaRemote, and the captured iPhone command used a
+600x600, three-component baseline JPEG of about 43 KB. These establish a known
+sender shape, not a receiver maximum. No Apple source or hardware measurement
+currently establishes a 64 KiB byte cutoff, a 600px rejection threshold, or a
+baseline/color-only rule.
 
 The local-file handler signature-detects JPEG/PNG/GIF/WebP and preserves the
-original bytes and correct MIME type for DMAP/Sonos. Only the MRP copy is
-rejected when it violates the stricter contract; rejection clears any previous
-MRP artwork and emits
-`[STATUS] mrp artwork=rejected reason=... bytes=... width=... height=...`,
-so an oversized replacement cannot silently leave stale cover art. No image
-encoder is embedded in the binary.
+original bytes and correct MIME type for DMAP/Sonos. MRP performs bounded,
+structural JPEG parsing before retaining data: complete SOI/EOI, valid segment
+lengths, quantization/Huffman tables, SOF0 baseline or SOF2 progressive,
+nonzero dimensions, 8-bit precision, and 1-4 components. The parser reports
+the observed profile; those accepted profiles are not claims about what tvOS
+will render. A 1 MiB local allocation/plist safety limit leaves room for the
+hardware matrix below and is explicitly not a receiver limit. Rejection clears
+previous MRP artwork, preventing stale cover art. No image encoder is embedded
+in production code.
 
-Accepted JPEG bytes ride only the *first* push for a given image, tagged with a
+Staged JPEG bytes ride only the *first* push for a given image, tagged with a
 fresh `ArtworkIdentifier`; later pushes carry the identifier without the bytes,
 so artwork is not re-sent on every progress tick over the shared RTSP channel.
+Every artwork attempt emits a non-deduplicated result with the exact source
+properties and command response:
+
+```
+[STATUS] mrp artwork=posted status=200 bytes=65536 width=600 height=600 \
+precision=8 sof=0xc0 components=3 progressive=0 safety_max_bytes=1048576
+```
+
+**Controlled Apple TV matrix.** The test-only generator creates deterministic
+600x600 JPEGs and pads them with legal COM segments, so the RGB-baseline size
+cases have identical image/encoding bytes aside from padding:
+
+| Variable | Cases |
+|---|---|
+| Byte size, RGB baseline | 44,032; 61,440; 65,535; 65,536; 66,560; 102,400; 153,600 |
+| Encoding at 65,536 bytes | SOF0 baseline; SOF2 progressive |
+| Components at 65,536 bytes | 3-component color; 1-component grayscale |
+
+Generate, inspect, and send a case:
+
+```bash
+python3 -m venv /tmp/cliairplay-mrp-venv
+/tmp/cliairplay-mrp-venv/bin/pip install Pillow
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py \
+  generate --output /tmp/cliairplay-mrp-matrix
+make test STATIC=1
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py inspect \
+  /tmp/cliairplay-mrp-matrix/*.jpg
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py send \
+  --cmdpipe /path/to/cliairplay.fifo \
+  --artwork /tmp/cliairplay-mrp-matrix/rgb-baseline-65536.jpg
+```
+
+For each case, record the artwork-specific status/HTTP response and whether the
+Apple TV Now Playing UI renders the image. Run byte cases in ascending order,
+then compare the progressive and grayscale controls at 65,536 bytes. Do not
+declare a receiver cap until a repeatable visible-artwork transition is
+measured independently of profile.
 
 **`updateMRSupportedCommands`** body:
 `{params:{mrSupportedCommandsFromSender:[<command-info>, ...]}}`, each element a

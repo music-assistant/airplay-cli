@@ -167,6 +167,7 @@ test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 	$(IO_TEST)
 	$(CLIENT_TEST)
 	$(TEST_EXECUTABLE)
+	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

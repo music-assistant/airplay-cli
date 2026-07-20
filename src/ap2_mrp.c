@@ -212,16 +212,20 @@ struct ap2_mrp_ctx {
     bool state_include_artwork;
 };
 
-static void mrp_artwork_info_set(ap2_mrp_artwork_info_t *info,
-                                 ap2_mrp_artwork_result_t result,
-                                 size_t bytes, uint16_t width,
-                                 uint16_t height)
+static void mrp_artwork_info_init(ap2_mrp_artwork_info_t *info, size_t bytes)
 {
     if (!info) return;
-    info->result = result;
+    memset(info, 0, sizeof(*info));
+    info->result = AP2_MRP_ARTWORK_INVALID_ARGUMENT;
     info->bytes = bytes;
-    info->width = width;
-    info->height = height;
+}
+
+static ap2_mrp_artwork_result_t
+mrp_artwork_result(ap2_mrp_artwork_info_t *info,
+                   ap2_mrp_artwork_result_t result)
+{
+    if (info) info->result = result;
+    return result;
 }
 
 const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result)
@@ -231,10 +235,10 @@ const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result)
     case AP2_MRP_ARTWORK_ACCEPTED:          return "accepted";
     case AP2_MRP_ARTWORK_INVALID_ARGUMENT:  return "invalid_argument";
     case AP2_MRP_ARTWORK_UNSUPPORTED_TYPE:  return "unsupported_type";
-    case AP2_MRP_ARTWORK_TOO_LARGE:         return "too_large";
+    case AP2_MRP_ARTWORK_SAFETY_LIMIT:      return "safety_limit";
     case AP2_MRP_ARTWORK_INVALID_JPEG:      return "invalid_jpeg";
-    case AP2_MRP_ARTWORK_NOT_BASELINE:      return "not_baseline";
-    case AP2_MRP_ARTWORK_INVALID_DIMENSIONS:return "invalid_dimensions";
+    case AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE:
+        return "unsupported_jpeg_profile";
     case AP2_MRP_ARTWORK_NO_MEMORY:         return "no_memory";
     }
     return "unknown";
@@ -257,93 +261,69 @@ ap2_mrp_artwork_result_t
 ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
                          ap2_mrp_artwork_info_t *info)
 {
-    uint16_t width = 0;
-    uint16_t height = 0;
-    mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_ARGUMENT,
-                         len, width, height);
+    ap2_mrp_artwork_info_t local_info;
+    if (!info) info = &local_info;
+    mrp_artwork_info_init(info, len);
     if (!mime || !data || len == 0)
         return AP2_MRP_ARTWORK_INVALID_ARGUMENT;
-    if (strcmp(mime, "image/jpeg") != 0) {
-        mrp_artwork_info_set(info, AP2_MRP_ARTWORK_UNSUPPORTED_TYPE,
-                             len, width, height);
-        return AP2_MRP_ARTWORK_UNSUPPORTED_TYPE;
-    }
-    if (len > AP2_MRP_ARTWORK_MAX_BYTES) {
-        mrp_artwork_info_set(info, AP2_MRP_ARTWORK_TOO_LARGE,
-                             len, width, height);
-        return AP2_MRP_ARTWORK_TOO_LARGE;
-    }
+    if (strcmp(mime, "image/jpeg") != 0)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_UNSUPPORTED_TYPE);
+    if (len > AP2_MRP_ARTWORK_SAFETY_MAX_BYTES)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_SAFETY_LIMIT);
     if (len < 6 || data[0] != 0xFF || data[1] != 0xD8 ||
         data[len - 2] != 0xFF || data[len - 1] != 0xD9) {
-        mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_JPEG,
-                             len, width, height);
-        return AP2_MRP_ARTWORK_INVALID_JPEG;
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
     }
 
-    bool saw_baseline_sof = false;
+    bool saw_sof = false;
     bool saw_quantization_table = false;
     bool saw_huffman_table = false;
     size_t pos = 2;
     while (pos + 1 < len) {
-        if (data[pos++] != 0xFF) {
-            mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_JPEG,
-                                 len, width, height);
-            return AP2_MRP_ARTWORK_INVALID_JPEG;
-        }
+        if (data[pos++] != 0xFF)
+            return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
         while (pos < len && data[pos] == 0xFF) pos++;
         if (pos >= len) break;
         uint8_t marker = data[pos++];
 
         if (marker == 0xD9) break;
-        if (marker == 0x00 || marker == 0xD8) {
-            mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_JPEG,
-                                 len, width, height);
-            return AP2_MRP_ARTWORK_INVALID_JPEG;
-        }
+        if (marker == 0x00 || marker == 0xD8)
+            return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
         if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
             continue;
         if (pos + 2 > len) break;
 
         size_t segment_len = ((size_t)data[pos] << 8) | data[pos + 1];
-        if (segment_len < 2 || segment_len > len - pos) {
-            mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_JPEG,
-                                 len, width, height);
-            return AP2_MRP_ARTWORK_INVALID_JPEG;
-        }
+        if (segment_len < 2 || segment_len > len - pos)
+            return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
 
         if (mrp_jpeg_is_sof(marker)) {
-            if (marker != 0xC0 || saw_baseline_sof) {
-                mrp_artwork_info_set(info, AP2_MRP_ARTWORK_NOT_BASELINE,
-                                     len, width, height);
-                return AP2_MRP_ARTWORK_NOT_BASELINE;
-            }
-            if (segment_len < 8) {
-                mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_JPEG,
-                                     len, width, height);
-                return AP2_MRP_ARTWORK_INVALID_JPEG;
-            }
+            if (saw_sof)
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+            if (marker != 0xC0 && marker != 0xC2)
+                return mrp_artwork_result(
+                    info, AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE);
+            if (segment_len < 8)
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
             const uint8_t *sof = data + pos + 2;
             uint8_t components = sof[5];
-            height = ((uint16_t)sof[1] << 8) | sof[2];
-            width = ((uint16_t)sof[3] << 8) | sof[4];
-            if (segment_len != (size_t)(8 + 3 * components)) {
-                mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_JPEG,
-                                     len, width, height);
-                return AP2_MRP_ARTWORK_INVALID_JPEG;
+            if (segment_len != (size_t)(8 + 3 * components))
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+            if (sof[0] != 8 || components < 1 || components > 4)
+                return mrp_artwork_result(
+                    info, AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE);
+            if (info) {
+                info->precision = sof[0];
+                info->height = ((uint16_t)sof[1] << 8) | sof[2];
+                info->width = ((uint16_t)sof[3] << 8) | sof[4];
+                info->components = components;
+                info->sof_marker = marker;
+                info->progressive = marker == 0xC2;
+                if (info->width == 0 || info->height == 0)
+                    return mrp_artwork_result(
+                        info, AP2_MRP_ARTWORK_INVALID_JPEG);
             }
-            if (sof[0] != 8 || components != 3) {
-                mrp_artwork_info_set(info, AP2_MRP_ARTWORK_NOT_BASELINE,
-                                     len, width, height);
-                return AP2_MRP_ARTWORK_NOT_BASELINE;
-            }
-            if (width == 0 || height == 0 ||
-                width > AP2_MRP_ARTWORK_MAX_WIDTH ||
-                height > AP2_MRP_ARTWORK_MAX_HEIGHT) {
-                mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_DIMENSIONS,
-                                     len, width, height);
-                return AP2_MRP_ARTWORK_INVALID_DIMENSIONS;
-            }
-            saw_baseline_sof = true;
+            saw_sof = true;
         }
 
         if (marker == 0xDB) saw_quantization_table = true;
@@ -351,27 +331,28 @@ ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
         if (marker == 0xDA) {
             const uint8_t *sos = data + pos + 2;
             uint8_t components = segment_len >= 3 ? sos[0] : 0;
-            size_t baseline_fields = 1 + 2 * (size_t)components;
+            size_t scan_fields = 1 + 2 * (size_t)components;
             bool valid_scan =
                 segment_len == 6 + 2 * (size_t)components &&
-                components == 3 &&
-                sos[baseline_fields] == 0 &&
-                sos[baseline_fields + 1] == 63 &&
-                sos[baseline_fields + 2] == 0;
+                components >= 1 &&
+                (!info || components <= info->components);
+            if (valid_scan && info && !info->progressive) {
+                valid_scan =
+                    sos[scan_fields] == 0 &&
+                    sos[scan_fields + 1] == 63 &&
+                    sos[scan_fields + 2] == 0;
+            }
             ap2_mrp_artwork_result_t result =
-                saw_baseline_sof && saw_quantization_table &&
+                saw_sof && saw_quantization_table &&
                 saw_huffman_table && valid_scan
                     ? AP2_MRP_ARTWORK_ACCEPTED
                     : AP2_MRP_ARTWORK_INVALID_JPEG;
-            mrp_artwork_info_set(info, result, len, width, height);
-            return result;
+            return mrp_artwork_result(info, result);
         }
         pos += segment_len;
     }
 
-    mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_JPEG,
-                         len, width, height);
-    return AP2_MRP_ARTWORK_INVALID_JPEG;
+    return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
 }
 
 static void mrp_reset_artwork(struct ap2_mrp_ctx *m)
@@ -1535,8 +1516,7 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     ap2_mrp_artwork_info_t local_info;
     if (!info) info = &local_info;
     if (!m) {
-        mrp_artwork_info_set(info, AP2_MRP_ARTWORK_INVALID_ARGUMENT,
-                             len > 0 ? (size_t)len : 0, 0, 0);
+        mrp_artwork_info_init(info, len > 0 ? (size_t)len : 0);
         return false;
     }
     ap2_mrp_artwork_result_t result =
@@ -1544,11 +1524,10 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     if (result != AP2_MRP_ARTWORK_ACCEPTED) {
         mrp_reset_artwork(m);
         LOG_WARN("[MRP] artwork rejected: reason=%s bytes=%d width=%u height=%u "
-                 "limits=%d/%dx%d",
+                 "sof=0x%02x components=%u progressive=%d safety_max_bytes=%d",
                  ap2_mrp_artwork_result_name(result), len,
-                 info->width, info->height,
-                 AP2_MRP_ARTWORK_MAX_BYTES, AP2_MRP_ARTWORK_MAX_WIDTH,
-                 AP2_MRP_ARTWORK_MAX_HEIGHT);
+                 info->width, info->height, info->sof_marker, info->components,
+                 info->progressive, AP2_MRP_ARTWORK_SAFETY_MAX_BYTES);
         return false;
     }
 
@@ -1558,8 +1537,7 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
         free(copy);
         free(mime_copy);
         mrp_reset_artwork(m);
-        mrp_artwork_info_set(info, AP2_MRP_ARTWORK_NO_MEMORY,
-                             (size_t)len, info->width, info->height);
+        info->result = AP2_MRP_ARTWORK_NO_MEMORY;
         LOG_ERROR("[MRP] cannot retain artwork: out of memory");
         return false;
     }
