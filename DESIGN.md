@@ -387,6 +387,10 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 - **Socket timeouts** — the RTSP socket, events socket, and the buffered TCP
   socket are receive/send-timeout bounded; a receiver that stops draining
   can never hang the process.
+- **Reverse event channel** — pair-verified sessions derive independent
+  `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
+  `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
+  to tear down a MediaRemote-active stream after roughly 30 seconds.
 - **Eager input ring** — a dedicated reader drains stdin into a 4 MB ring as
   fast as the source delivers, decoupled from network pacing: the pipeline
   fills before a scheduled start, while a full ring backpressures the pipe.
@@ -396,9 +400,17 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
   without it).
-- **MediaRemote now-playing** — pair-verified Apple sessions additionally push
-  now-playing over `POST /command` on the same cadence as `/feedback` (§8);
-  best-effort, audio never gates on it.
+- **Apple MediaRemote metadata** — pair-verified native sessions register a
+  DEVICE_INFO origin, then send `updateMRNowPlayingInfo` followed by supported
+  commands, explicit playback state, and a serialized NowPlayingClient.
+  Start/pause/resume/stop transitions stay synchronized with the audio state.
+  This path is enabled by default (`CLIAIRPLAY_MRP=0` is the diagnostic opt-out);
+  best-effort, audio never gates on it (§8).
+- **Metadata inputs** — UTF-8 strings become UTF-16BE binary-plist strings when
+  needed. `ARTWORK` accepts local files and MA's local HTTP imageproxy URLs;
+  imageproxy requests are normalized to supported `size=512&fmt=jpeg` values,
+  and fetches have a 5-second overall deadline so metadata I/O cannot starve
+  the feedback/event keepalive loop.
 
 ## 11. Device-behavior findings
 

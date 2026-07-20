@@ -36,6 +36,7 @@
 #include "ap2_client.h"
 #include "ap2_ptp.h"
 #include "ap2_hap.h"
+#include "artwork.h"
 
 #define VERSION "0.1.0"
 #define AP2_FRAMES_PER_CHUNK 352
@@ -348,26 +349,31 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             mrp_status_report(ap2cl_mrp_push(g_ap2cl));
         }
     } else if (strcmp(key, "ARTWORK") == 0) {
-        if (access(value, F_OK) == 0) {
-            /* Local file artwork */
-            FILE *artfile = fopen(value, "r");
-            if (artfile) {
-                fseek(artfile, 0L, SEEK_END);
-                long numbytes = ftell(artfile);
-                fseek(artfile, 0L, SEEK_SET);
-                char *buffer = (char *)calloc(numbytes, sizeof(char));
-                fread(buffer, sizeof(char), numbytes, artfile);
-                fclose(artfile);
-                if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-                    raopcl_set_artwork(g_raopcl, "image/jpg", numbytes, buffer);
-                } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-                    ap2cl_set_artwork(g_ap2cl, "image/jpeg", numbytes, buffer);
-                    mrp_status_report(ap2cl_mrp_push(g_ap2cl));
-                }
-                free(buffer);
-            }
+        uint8_t *image = NULL;
+        size_t image_size = 0;
+        char content_type[32];
+        char error[160];
+        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
+            ap2cl_is_connected(g_ap2cl))
+            ap2cl_feedback(g_ap2cl);
+        bool loaded = artwork_load(value, &image, &image_size, content_type,
+                                   error, sizeof(error));
+        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
+            ap2cl_is_connected(g_ap2cl))
+            ap2cl_feedback(g_ap2cl);
+        if (!loaded) {
+            LOG_WARN("Cannot load artwork: %s", error);
         } else {
-            LOG_DEBUG("Artwork URL not supported in binary, skipping: %s", value);
+            LOG_INFO("Loaded artwork (%zu bytes, %s)", image_size, content_type);
+            if (cfg->protocol == PROTO_RAOP && g_raopcl) {
+                raopcl_set_artwork(g_raopcl, content_type,
+                                   (int)image_size, (char *)image);
+            } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+                ap2cl_set_artwork(g_ap2cl, content_type,
+                                  (int)image_size, (const char *)image);
+                mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+            }
+            free(image);
         }
     } else if (strcmp(key, "VOLUME") == 0) {
         int vol = atoi(value);
@@ -581,8 +587,6 @@ static int run_raop(cli_config_t *cfg, int infile)
     LOG_INFO("Connecting to %s:%d via RAOP", inet_ntoa(player_addr), cfg->port);
     if (!raopcl_connect(g_raopcl, player_addr, cfg->port, cfg->volume > 0)) {
         status_error("Cannot connect to AirPlay device");
-        raopcl_destroy(g_raopcl);
-        g_raopcl = NULL;
         return 1;
     }
 
@@ -658,9 +662,6 @@ static int run_raop(cli_config_t *cfg, int infile)
     g_running = false;
     free(buf);
     free(alac_buf);
-    raopcl_disconnect(g_raopcl);
-    raopcl_destroy(g_raopcl);
-    g_raopcl = NULL;
     return 0;
 }
 
@@ -707,8 +708,6 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
     if (!ap2cl_connect(g_ap2cl)) {
         status_error("Cannot connect to AirPlay 2 device");
-        ap2cl_destroy(g_ap2cl);
-        g_ap2cl = NULL;
         return 1;
     }
 
@@ -825,8 +824,6 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     g_running = false;
     free(buf);
     free(ap2_alac_buf);
-    ap2cl_destroy(g_ap2cl);
-    g_ap2cl = NULL;
     return 0;
 }
 
@@ -1288,6 +1285,16 @@ int main(int argc, char *argv[])
         pthread_join(g_cmdpipe_thread, NULL);
         if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
         unlink(cfg.cmdpipe);
+    }
+    /* The command thread owns metadata/feedback/event-channel calls. Destroy
+     * protocol clients only after it is fully quiesced. */
+    if (g_ap2cl) {
+        ap2cl_destroy(g_ap2cl);
+        g_ap2cl = NULL;
+    }
+    if (g_raopcl) {
+        raopcl_destroy(g_raopcl);
+        g_raopcl = NULL;
     }
     if (infile >= 0 && infile != fileno(stdin)) close(infile);
     netsock_close();

@@ -561,6 +561,12 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
                                 p->session_uuid, p->group_uuid,
                                 ap2_hap_get_shared_secret(p->hap));
     if (!p->mrp) return;
+    if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
+        LOG_WARN("[MRP] event-channel attach failed; degrading to no-MRP");
+        ap2_mrp_destroy(p->mrp);
+        p->mrp = NULL;
+        return;
+    }
 
     if (!ap2_mrp_attach(p->mrp, data_port, seed)) {
         LOG_WARN("[MRP] data-channel attach failed; degrading to no-MRP");
@@ -826,10 +832,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
             inet_pton(AF_INET, p->device.address, &ev_addr.sin_addr);
             struct timeval etv = {.tv_sec = 3};
             setsockopt(events_sock, SOL_SOCKET, SO_RCVTIMEO, &etv, sizeof(etv));
+            setsockopt(events_sock, SOL_SOCKET, SO_SNDTIMEO, &etv, sizeof(etv));
             if (connect(events_sock, (struct sockaddr *)&ev_addr, sizeof(ev_addr)) == 0) {
                 LOG_INFO("[AP2] Events connection OK");
-                /* Keep the socket open - we don't need to read from it, just
-                 * keep it alive; closed again on disconnect/destroy. */
+                int one = 1;
+                setsockopt(events_sock, IPPROTO_TCP, TCP_NODELAY,
+                           &one, sizeof(one));
                 p->events_sock = events_sock;
             } else {
                 LOG_WARN("[AP2] Events connect failed");
@@ -1845,10 +1853,8 @@ bool ap2cl_feedback(struct ap2cl_s *p)
      * is raopcl_keepalive(). The response body carries stream status we do
      * not need; the POST itself is what resets the receiver's idle timer. */
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return false;
-    /* Ride the same 2s cadence for the MRP data channel (DESIGN.md §8):
-     * drain inbound frames (answer sync keep-alives) and re-push SET_STATE
-     * periodically to hold the now-playing session open. Separate socket from
-     * the RTSP /feedback POST; best-effort, harmless when no channel is up. */
+    /* Ride the same 2s cadence to answer encrypted reverse event requests and,
+     * when enabled, drain the type-130 channel. */
     if (p->mrp) ap2_mrp_tick(p->mrp);
     uint8_t *resp = NULL; int resp_len = 0;
     int status = ap2_rtsp_send(p, "POST", "/feedback", NULL, 0, NULL, &resp, &resp_len);
@@ -1933,15 +1939,14 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
     return status >= 200 && status < 300;
 }
 
-/* Lazily create the MediaRemote state carrier for pair-verified native
- * sessions. With no shared secret it only drives the source-side /command
- * metadata path; the optional type-130 channel supplies the secret itself.
+/* Lazily create MediaRemote for pair-verified native sessions and attach the
+ * encrypted reverse event channel before advertising any controllable state.
  * Transient-paired third-party speakers never receive these Apple-specific
  * messages. Set CLIAIRPLAY_MRP=0 to disable the path for diagnosis. */
 static void ap2_mrp_ready(struct ap2cl_s *p)
 {
     if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
-        p->sock_fd < 0 || !p->session_uuid[0])
+        p->sock_fd < 0 || p->events_sock < 0 || !p->session_uuid[0])
         return;
     const char *setting = getenv("CLIAIRPLAY_MRP");
     if (setting && (!strcmp(setting, "0") || !strcmp(setting, "false") ||
@@ -1949,9 +1954,16 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
         return;
     p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
                             p->dacp_id, p->device.name,
-                            p->session_uuid, p->group_uuid, NULL);
-    if (p->mrp)
-        ap2_mrp_set_playing(p->mrp, p->state == AP2_STREAMING);
+                            p->session_uuid, p->group_uuid,
+                            ap2_hap_get_shared_secret(p->hap));
+    if (!p->mrp) return;
+    if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
+        LOG_WARN("[MRP] event-channel attach failed; MediaRemote disabled");
+        ap2_mrp_destroy(p->mrp);
+        p->mrp = NULL;
+        return;
+    }
+    ap2_mrp_set_playing(p->mrp, p->state == AP2_STREAMING);
 }
 
 /* Log an RTSP response body for diagnosis: a printable-text view (control bytes

@@ -92,6 +92,13 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
 bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
 
 /*
+ * Attach the session event socket. The socket stays owned by ap2_client; this
+ * derives the independent Events-Salt keys and services encrypted reverse HTTP
+ * requests with 200 responses from ap2_mrp_tick().
+ */
+bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
+
+/*
  * Bootstrap a standalone remote-control-only session (sidecar model, for the
  * metadata-only display mode): own TCP connection, pair-verify, session SETUP
  * with isRemoteControlOnly=true, event channel, RECORD, type-130 data channel.
@@ -147,10 +154,10 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing);
 bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m);
 
 /*
- * Keep-alive tick: drain any incoming frames (answering sync/heartbeat
- * requests) and re-push the current now-playing state to hold the system
- * now-playing session open (standby prevention). Call about every 2 s from the
- * caller's existing loop; harmless when not connected.
+ * Keep-alive tick: answer encrypted event-channel HTTP requests, drain any
+ * type-130 frames (answering sync/heartbeat requests), and re-push the current
+ * type-130 state when applicable. Call about every 2 s from the caller's
+ * existing loop.
  */
 void ap2_mrp_tick(struct ap2_mrp_ctx *m);
 

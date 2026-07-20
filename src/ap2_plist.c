@@ -12,6 +12,7 @@
  *   0x1 = int (low nibble = log2(byte count): 0=1B, 1=2B, 2=4B, 3=8B)
  *   0x4 = data (low nibble = length, or 0xF + int length)
  *   0x5 = string (ASCII, low nibble = length, or 0xF + int length)
+ *   0x6 = string (UTF-16BE, count is UTF-16 code units)
  *   0xa = array (low nibble = count, or 0xF + int count)
  *   0xd = dict (low nibble = count, or 0xF + int count)
  *
@@ -193,6 +194,90 @@ static void write_size(buf_t *b, uint8_t type_nibble, size_t count) {
     }
 }
 
+/* Binary plist's 0x5 string is strictly ASCII. Encode non-ASCII UTF-8 as
+ * UTF-16BE (0x6); writing raw UTF-8 under an ASCII marker produces mojibake on
+ * tvOS (for example U+2019 becomes "â..."). Invalid UTF-8 is replaced with
+ * U+FFFD so the plist itself remains valid. */
+static uint32_t decode_utf8(const uint8_t *src, size_t len, size_t *consumed)
+{
+    uint8_t c = src[0];
+    *consumed = 1;
+    if (c < 0x80) return c;
+    if (c >= 0xC2 && c <= 0xDF && len >= 2 &&
+        (src[1] & 0xC0) == 0x80) {
+        *consumed = 2;
+        return ((uint32_t)(c & 0x1F) << 6) |
+               (uint32_t)(src[1] & 0x3F);
+    }
+    if (c >= 0xE0 && c <= 0xEF && len >= 3 &&
+        (src[1] & 0xC0) == 0x80 && (src[2] & 0xC0) == 0x80 &&
+        !(c == 0xE0 && src[1] < 0xA0) &&
+        !(c == 0xED && src[1] >= 0xA0)) {
+        *consumed = 3;
+        return ((uint32_t)(c & 0x0F) << 12) |
+               ((uint32_t)(src[1] & 0x3F) << 6) |
+               (uint32_t)(src[2] & 0x3F);
+    }
+    if (c >= 0xF0 && c <= 0xF4 && len >= 4 &&
+        (src[1] & 0xC0) == 0x80 && (src[2] & 0xC0) == 0x80 &&
+        (src[3] & 0xC0) == 0x80 &&
+        !(c == 0xF0 && src[1] < 0x90) &&
+        !(c == 0xF4 && src[1] >= 0x90)) {
+        *consumed = 4;
+        return ((uint32_t)(c & 0x07) << 18) |
+               ((uint32_t)(src[1] & 0x3F) << 12) |
+               ((uint32_t)(src[2] & 0x3F) << 6) |
+               (uint32_t)(src[3] & 0x3F);
+    }
+    return 0xFFFD;
+}
+
+static void write_plist_string(buf_t *b, const char *str)
+{
+    const uint8_t *src = (const uint8_t *)(str ? str : "");
+    size_t src_len = strlen((const char *)src);
+    bool ascii = true;
+    for (size_t i = 0; i < src_len; i++) {
+        if (src[i] & 0x80) {
+            ascii = false;
+            break;
+        }
+    }
+    if (ascii) {
+        write_size(b, 0x50, src_len);
+        buf_append(b, src, (int)src_len);
+        return;
+    }
+
+    size_t in = 0, units = 0;
+    while (in < src_len) {
+        size_t consumed;
+        uint32_t cp = decode_utf8(src + in, src_len - in, &consumed);
+        in += consumed;
+        units += cp <= 0xFFFF ? 1 : 2;
+    }
+    write_size(b, 0x60, units);
+
+    in = 0;
+    while (in < src_len) {
+        size_t consumed;
+        uint32_t cp = decode_utf8(src + in, src_len - in, &consumed);
+        in += consumed;
+        if (cp <= 0xFFFF) {
+            buf_append_byte(b, (uint8_t)(cp >> 8));
+            buf_append_byte(b, (uint8_t)cp);
+        } else {
+            cp -= 0x10000;
+            uint16_t high = 0xD800 | (uint16_t)(cp >> 10);
+            uint16_t low = 0xDC00 | (uint16_t)(cp & 0x3FF);
+            buf_append_byte(b, (uint8_t)(high >> 8));
+            buf_append_byte(b, (uint8_t)high);
+            buf_append_byte(b, (uint8_t)(low >> 8));
+            buf_append_byte(b, (uint8_t)low);
+        }
+    }
+}
+
 static void write_int_value(buf_t *b, int64_t val) {
     if (val >= 0 && val <= 0xFF) {
         buf_append_byte(b, 0x10); buf_append_byte(b, (uint8_t)val);
@@ -281,8 +366,7 @@ int ap2_plist_serialize(struct ap2_plist *p, uint8_t **out)
         offsets[key_idx + i] = objs.len;
         objs.data[root_keys_pos + i] = key_idx + i;
         const char *key = p->root_entries[i].key;
-        write_size(&objs, 0x50, strlen(key));
-        buf_append(&objs, key, strlen(key));
+        write_plist_string(&objs, key);
 
         /* Value */
         offsets[val_idx + i] = objs.len;
@@ -290,8 +374,7 @@ int ap2_plist_serialize(struct ap2_plist *p, uint8_t **out)
         object_t *vo = &p->objects[p->root_entries[i].val_obj];
         switch (vo->type) {
             case OBJ_STRING:
-                write_size(&objs, 0x50, strlen(vo->string.val));
-                buf_append(&objs, vo->string.val, strlen(vo->string.val));
+                write_plist_string(&objs, vo->string.val);
                 break;
             case OBJ_INT:
                 write_int_value(&objs, vo->integer.val);
@@ -341,8 +424,7 @@ int ap2_plist_serialize(struct ap2_plist *p, uint8_t **out)
             offsets[skey_start + i] = objs.len;
             objs.data[sdict_keys_pos + i] = skey_start + i;
             const char *key = p->stream_entries[i].key;
-            write_size(&objs, 0x50, strlen(key));
-            buf_append(&objs, key, strlen(key));
+            write_plist_string(&objs, key);
 
             /* Value */
             offsets[sval_start + i] = objs.len;
@@ -350,8 +432,7 @@ int ap2_plist_serialize(struct ap2_plist *p, uint8_t **out)
             object_t *vo = &p->objects[p->stream_entries[i].val_obj];
             switch (vo->type) {
                 case OBJ_STRING:
-                    write_size(&objs, 0x50, strlen(vo->string.val));
-                    buf_append(&objs, vo->string.val, strlen(vo->string.val));
+                    write_plist_string(&objs, vo->string.val);
                     break;
                 case OBJ_INT:
                     write_int_value(&objs, vo->integer.val);
@@ -574,8 +655,7 @@ int ap2_pl_serialize(const ap2_pl_node *root, uint8_t **out)
             for (int k = 0; k < n->n; k++) write_ref(&objs, n->vals[k]->index, ref_size);
             break;
         case PLN_STRING:
-            write_size(&objs, 0x50, strlen(n->str));
-            buf_append(&objs, n->str, strlen(n->str));
+            write_plist_string(&objs, n->str);
             break;
         case PLN_INT:
             write_int_value(&objs, n->ival);

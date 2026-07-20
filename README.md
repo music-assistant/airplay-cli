@@ -178,7 +178,7 @@ running stream:
 - `VOLUME=<0-100>`
 - `ACTION=PLAY|PAUSE|STOP`
 - Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
-  `ARTWORK=<local file path>` (URLs are ignored), followed by
+  `ARTWORK=<local file path or http:// imageproxy URL>`, followed by
   `ACTION=SENDMETA` to push the set.
 
 Some receivers (notably Sonos) do not emit audio until they have received
@@ -187,6 +187,9 @@ audio starts regardless of whether the caller ever sends `SENDMETA`.
 Pair-verified native Apple sessions additionally mirror these updates over
 MediaRemote `POST /command`, including explicit play/pause/stop state. Set
 `CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
+Metadata strings are encoded as Unicode binary-plist strings; artwork is
+signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
+supported `size=512&fmt=jpeg` request.
 
 ## Building
 

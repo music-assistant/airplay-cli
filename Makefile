@@ -95,7 +95,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
-	cliairplay.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c artwork.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
