@@ -9,10 +9,6 @@ Genuinely open work only. Completed work lives in git history.
       does. Artwork is embedded as JPEG bytes in the now-playing push, so the
       failure needs an on-device capture to localise (MA render vs. embed vs.
       the receiver rejecting the payload).
-- [ ] **Apple TV standby prevention.** Verify a pair-verified MediaRemote
-      session keeps the Apple TV awake past its sleep timeout; repeat with
-      `CLIAIRPLAY_MRP=0` as the control to confirm the session (not the audio
-      keepalive) is what holds standby off.
 - [ ] **MediaRemote follow-ups.** Metadata-only display mode (an Apple TV as a
       now-playing screen for audio playing elsewhere) and Companion-protocol
       wake/power tracking.
@@ -38,9 +34,5 @@ Genuinely open work only. Completed work lives in git history.
 - [ ] **First release tag + MA container fetch.** The `v*` release job
       (binaries + `SHA256SUMS`) exists but has never run. Cut a first versioned
       release, then make the MA container build fetch the pinned release
-      binaries instead of committing a prebuilt binary into the provider `bin/`
+      binaries instead of committing prebuilt binaries into the provider `bin/`
       dir (the committed binaries are for local testing only).
-- [ ] **Remaining ear-tests.** The JBL and WiiM units are session-verified
-      (paired, /info read) but not ear-tested; RAOP / RAOP-compat want a
-      regression pass by ear after the native-AP2 work; and a RAOP-only device
-      inside a PTP-active group needs a regression check.
