@@ -176,6 +176,11 @@ int ap2cl_mrp_push(struct ap2cl_s *p);
  * 1 = channel established. */
 int ap2cl_mrp_channel_status(struct ap2cl_s *p);
 
+/* Perform the /command origin registration (DEVICE_INFO + supportedCommands) a
+ * real iPhone sends before now-playing. Call once after connect, before the
+ * first now-playing push. Returns 1 (both 2xx), 0, or -1 (not applicable). */
+int ap2cl_mrp_register(struct ap2cl_s *p);
+
 /* Set RAOP-compatible properties (mDNS fields, interface, credentials).
  * Must be called before ap2cl_connect(). */
 void ap2cl_set_raop_props(struct ap2cl_s *p,

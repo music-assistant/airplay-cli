@@ -359,7 +359,7 @@ static bool build_device_info(struct ap2_mrp_ctx *m, mbuf *out)
     ok &= pb_put_string_field(&inner, 4, "21F90");              /* systemBuildVersion */
     ok &= pb_put_string_field(&inner, 5, "com.apple.Music");    /* applicationBundleIdentifier */
     ok &= pb_put_varint_field(&inner, 7, 1);                    /* protocolVersion */
-    ok &= pb_put_varint_field(&inner, 8, 108);                  /* lastSupportedMessageType */
+    ok &= pb_put_varint_field(&inner, 8, 139);                  /* lastSupportedMessageType (captured from a real iPhone) */
     ok &= pb_put_bool_field(&inner, 9, true);                   /* supportsSystemPairing */
     ok &= pb_put_bool_field(&inner, 10, true);                  /* allowsPairing */
     ok &= pb_put_bool_field(&inner, 13, true);                  /* supportsACL */
@@ -1140,6 +1140,112 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     ap2_pl_dict_set(root, "type", ap2_pl_string("updateMRNowPlayingInfo"));
     ap2_pl_dict_set(root, "params", params);
 
+    int len = ap2_pl_serialize(root, out);
+    ap2_pl_free(root);
+    if (len <= 0) return false;
+    *out_len = len;
+    return true;
+}
+
+/* Wrap a serialized protobuf as the bplist {"params": {"data": <varint length +
+ * protobuf>}} that carries MRP messages — over the type-130 channel normally,
+ * or over POST /command when that channel is unavailable (a real iPhone falls
+ * back to /command when its type-130 SETUP does not complete). Caller frees
+ * *out. */
+static bool mrp_wrap_params_data(const mbuf *msg, uint8_t **out, int *out_len)
+{
+    mbuf blob = {0};
+    bool ok = pb_put_varint(&blob, msg->len) && mbuf_put(&blob, msg->p, msg->len);
+    if (!ok) { mbuf_free(&blob); return false; }
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "data", ap2_pl_data(blob.p, blob.len));
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "params", params);
+    int len = ap2_pl_serialize(root, out);
+    ap2_pl_free(root);
+    mbuf_free(&blob);
+    if (len <= 0) return false;
+    *out_len = len;
+    return true;
+}
+
+bool ap2_mrp_build_deviceinfo_command(struct ap2_mrp_ctx *m,
+                                      uint8_t **out, int *out_len)
+{
+    if (!m || !out || !out_len) return false;
+    /* Register as a now-playing origin: the DeviceInfoMessage protobuf (same as
+     * the channel handshake) wrapped as {params:{data:...}} and POSTed to
+     * /command. A real iPhone sends exactly this (describing itself, deviceClass
+     * iPhone, com.apple.Music) before pushing now-playing (MRP-DESIGN.md §10). */
+    mbuf msg = {0};
+    bool ok = build_device_info(m, &msg);
+    ok = ok && mrp_wrap_params_data(&msg, out, out_len);
+    mbuf_free(&msg);
+    return ok;
+}
+
+/* One serialized MRSupportedCommand: a standalone bplist of
+ * {kCommandInfoCommandKey, kCommandInfoEnabledKey, [kCommandInfoOptionsKey]}
+ * returned as a data node for the mrSupportedCommandsFromSender array (each
+ * element is itself an archived plist, exactly as captured). `options` is owned
+ * (freed with the temp dict). Returns NULL on failure. */
+static ap2_pl_node *mrp_cmd_info_blob(int cmd, bool enabled, ap2_pl_node *options)
+{
+    ap2_pl_node *d = ap2_pl_dict();
+    ap2_pl_dict_set(d, "kCommandInfoCommandKey", ap2_pl_int(cmd));
+    ap2_pl_dict_set(d, "kCommandInfoEnabledKey", ap2_pl_bool(enabled));
+    if (options) ap2_pl_dict_set(d, "kCommandInfoOptionsKey", options);
+    uint8_t *b = NULL;
+    int bl = ap2_pl_serialize(d, &b);
+    ap2_pl_free(d);
+    ap2_pl_node *data = (bl > 0 && b) ? ap2_pl_data(b, (size_t)bl) : NULL;
+    free(b);
+    return data;
+}
+
+bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
+                                             uint8_t **out, int *out_len)
+{
+    (void)m;
+    if (!out || !out_len) return false;
+    /* Command list, options and MRMediaRemoteCommand numbering captured VERBATIM
+     * from a real iPhone sender (MRP-DESIGN.md §10). Order preserved. Note this
+     * is MRMediaRemoteCommand numbering (Play=0, Pause=1, ...), distinct from
+     * the pyatv protobuf Command enum used in the type-130 SET_STATE path. */
+    ap2_pl_node *arr = ap2_pl_array();
+
+    ap2_pl_node *o26 = ap2_pl_dict();
+    ap2_pl_dict_set(o26, "kMRMediaRemoteCommandInfoShuffleMode", ap2_pl_int(1));
+    ap2_pl_array_append(arr, mrp_cmd_info_blob(26, true, o26));
+
+    ap2_pl_node *o25 = ap2_pl_dict();
+    ap2_pl_dict_set(o25, "kMRMediaRemoteCommandInfoRepeatMode", ap2_pl_int(1));
+    ap2_pl_array_append(arr, mrp_cmd_info_blob(25, true, o25));
+
+    ap2_pl_node *o24 = ap2_pl_dict();
+    ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey",
+                    ap2_pl_bool(false));
+    ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoSupportsReferencePosition",
+                    ap2_pl_bool(false));
+    ap2_pl_array_append(arr, mrp_cmd_info_blob(24, true, o24));
+
+    ap2_pl_node *o18 = ap2_pl_dict();
+    ap2_pl_dict_set(o18, "kMRMediaRemoteCommandInfoPreferredIntervalsKey", ap2_pl_array());
+    ap2_pl_array_append(arr, mrp_cmd_info_blob(18, false, o18));
+
+    ap2_pl_node *o17 = ap2_pl_dict();
+    ap2_pl_dict_set(o17, "kMRMediaRemoteCommandInfoPreferredIntervalsKey", ap2_pl_array());
+    ap2_pl_array_append(arr, mrp_cmd_info_blob(17, false, o17));
+
+    static const int simple[] = { 10, 11, 8, 9, 5, 4, 3, 2, 1, 0 };
+    for (size_t i = 0; i < sizeof(simple) / sizeof(simple[0]); i++)
+        ap2_pl_array_append(arr, mrp_cmd_info_blob(simple[i], true, NULL));
+
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "mrSupportedCommandsFromSender", arr);
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("updateMRSupportedCommands"));
+    ap2_pl_dict_set(root, "params", params);
     int len = ap2_pl_serialize(root, out);
     ap2_pl_free(root);
     if (len <= 0) return false;

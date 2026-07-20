@@ -715,8 +715,8 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     status_connected();
 
     /* Report the MRP now-playing path so MA can log which one is active. The
-     * type-130 data channel (path B) is set up during connect; -1 means the
-     * session is not an Apple/pair-verified target and MRP does not apply. */
+     * type-130 data channel (path B) is opt-in; -1 means it was not attempted
+     * (default) or the session is not an Apple/pair-verified target. */
     {
         int mrp_ch = ap2cl_mrp_channel_status(g_ap2cl);
         if (mrp_ch >= 0) {
@@ -724,6 +724,11 @@ static int run_airplay2(cli_config_t *cfg, int infile)
             fflush(stdout);
         }
     }
+
+    /* Register as a now-playing origin over /command (DEVICE_INFO +
+     * updateMRSupportedCommands) BEFORE the first now-playing push, matching the
+     * captured real-sender order (MRP-DESIGN.md §10). */
+    ap2cl_mrp_register(g_ap2cl);
 
     /* Surface the effective lead and the receiver-reported buffering window so
      * the caller (MA) can plan group starts from real device capabilities. */

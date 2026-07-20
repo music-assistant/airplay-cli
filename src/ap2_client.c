@@ -1054,11 +1054,15 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                  inet_ntoa(p->data_addr.sin_addr), ntohs(p->data_addr.sin_port));
     }
 
-    /* 6d. MRP now-playing: issue the type-130 remote-control data channel on
-     * this verified session so tvOS renders the on-screen now-playing UI and
-     * holds off standby (MRP-DESIGN.md §2/§5). Best-effort; audio is up
-     * regardless. Non-Apple/transient sessions skip it inside the helper. */
-    ap2_native_setup_mrp(p);
+    /* 6d. MRP now-playing. Ground-truth capture (MRP-DESIGN.md §10) shows a real
+     * sender delivers now-playing over POST /command, NOT the type-130 channel
+     * (its type-130 SETUPs never completed a data connection), and pushing state
+     * over type-130 competes with /command. So the type-130 channel is OFF by
+     * default; now-playing rides /command (ap2cl_mrp_register + ap2cl_mrp_push).
+     * Set CLIAIRPLAY_MRP_TYPE130=1 to re-enable the channel (future remote-
+     * control RX). Best-effort; audio is up regardless. */
+    if (getenv("CLIAIRPLAY_MRP_TYPE130"))
+        ap2_native_setup_mrp(p);
 
     /* Create ALAC encoder */
     p->alac = alac_create_encoder(AP2_FRAMES_PER_CHUNK,
@@ -1959,7 +1963,46 @@ int ap2cl_mrp_push(struct ap2cl_s *p)
 int ap2cl_mrp_channel_status(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return -1;
+    /* The type-130 channel is opt-in (see ap2_native_connect §6d); when it is
+     * not attempted, report "not applicable" so the [STATUS] path=channel line
+     * is suppressed and only path=command (the active now-playing path) shows. */
+    if (!getenv("CLIAIRPLAY_MRP_TYPE130")) return -1;
     return (p->mrp && ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
+}
+
+/* Registration a real iPhone performs over /command before now-playing
+ * (MRP-DESIGN.md §10): DEVICE_INFO (origin) then updateMRSupportedCommands
+ * (transport capabilities). Best-effort; response bodies logged on non-2xx.
+ * Returns 1 if both 2xx, 0 otherwise, -1 when not applicable. */
+int ap2cl_mrp_register(struct ap2cl_s *p)
+{
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
+    ap2_mrp_ready(p);
+    if (!p->mrp) return -1;
+
+    uint8_t *body = NULL; int body_len = 0;
+    uint8_t *resp = NULL; int resp_len = 0;
+    int st_dev = -1, st_cmd = -1;
+
+    if (ap2_mrp_build_deviceinfo_command(p->mrp, &body, &body_len)) {
+        st_dev = ap2_rtsp_send(p, "POST", "/command", body, body_len,
+                               "application/x-apple-binary-plist", &resp, &resp_len);
+        free(body); body = NULL;
+        if (st_dev < 200 || st_dev >= 300)
+            ap2_log_response_body("[MRP] /command DEVICE_INFO", resp, resp_len);
+        free(resp); resp = NULL;
+    }
+    if (ap2_mrp_build_supportedcommands_command(p->mrp, &body, &body_len)) {
+        st_cmd = ap2_rtsp_send(p, "POST", "/command", body, body_len,
+                               "application/x-apple-binary-plist", &resp, &resp_len);
+        free(body); body = NULL;
+        if (st_cmd < 200 || st_cmd >= 300)
+            ap2_log_response_body("[MRP] /command supportedCommands", resp, resp_len);
+        free(resp); resp = NULL;
+    }
+    LOG_INFO("[MRP] /command registration: DEVICE_INFO -> %d, supportedCommands -> %d",
+             st_dev, st_cmd);
+    return (st_dev >= 200 && st_dev < 300 && st_cmd >= 200 && st_cmd < 300) ? 1 : 0;
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,

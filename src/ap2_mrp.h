@@ -158,4 +158,18 @@ bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
+/*
+ * Build the origin-registration bodies a real iPhone POSTs to /command before
+ * pushing now-playing (MRP-DESIGN.md §10), for the same encrypted RTSP channel:
+ *   - deviceinfo: {params:{data: <MRP DEVICE_INFO protobuf>}} — registers us as
+ *     a now-playing origin.
+ *   - supportedcommands: {type:"updateMRSupportedCommands", params:{...}} —
+ *     declares the transport commands we accept (MRMediaRemoteCommand numbering).
+ * Caller frees *out.
+ */
+bool ap2_mrp_build_deviceinfo_command(struct ap2_mrp_ctx *m,
+                                      uint8_t **out, int *out_len);
+bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
+                                             uint8_t **out, int *out_len);
+
 #endif /* __AP2_MRP_H_ */

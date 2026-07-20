@@ -9,20 +9,20 @@ Apple TV holds off standby mid-stream, and (c) an Apple TV can later act as a
 sender lives in `src/ap2_mrp.{h,c}`, is in the build, and is now wired into the
 native audio flow via `ap2_native_setup_mrp()` in `ap2_client.c` (§8, §11).
 
-Status: **a ground-truth capture of a real iPhone sender (2026-07-20, §10.2c)
-settled the mechanism: now-playing is pushed as `POST /command` with type
-`"updateMRNowPlayingInfo"`** (NOT the type-130 data channel, and NOT our
-fabricated `"updateNowPlayingInfo"`, which is why path A 400'd). The type-130
-channel the iPhone opens carries the remote-control **relay** (MediaRemote
-DEVICE_INFO of now-playing origins), not the sender's own now-playing state.
-Implemented this pass: `ap2_mrp_build_nowplaying_command` rewritten to the
-captured `updateMRNowPlayingInfo` envelope (npi-text / mergePolicy / nested
-`params`, CFDate `Timestamp`, full key set), a `date` type added to the plist
-writer, and path A re-enabled as the primary now-playing push. Emitter verified
-against the capture (plistlib + the rig's biplist decode our body to the iPhone
-shape). Path B (type-130 SET_STATE) stays wired best-effort but is NOT the
-display path (it came up `status=1` on the ATV yet never rendered). Awaiting the
-developer's on-TV test that the corrected path A renders now-playing.
+Status: now-playing is delivered over **`POST /command`**, not the type-130
+channel (ground-truth capture, §10.2c-d). The corrected `updateMRNowPlayingInfo`
+envelope is now **accepted (HTTP 200)** by the Apple TV but did **not render
+alone** — so this pass replicates the real sender's full `/command` registration
+sequence, in the captured order: **(1) `DEVICE_INFO` (origin self-registration,
+as `{params:{data:<protobuf>}}`) → (2) `updateMRSupportedCommands` (transport
+caps, MRMediaRemoteCommand numbering) → (3) `updateMRNowPlayingInfo` (metadata,
+on change)**. The type-130 channel (path B) is now **off by default**
+(`CLIAIRPLAY_MRP_TYPE130=1` to re-enable): the real sender's type-130 SETUPs
+never completed a data connection and never carried now-playing, and our
+pushing SET_STATE there competed with `/command` — so `/command` is the sole
+now-playing source. All three bodies are validated against the rig's own
+biplist/protobuf parsers (including the per-element re-parse `handle_command`
+does). Awaiting the developer's on-TV test that the full sequence renders.
 
 ---
 
@@ -531,9 +531,48 @@ covers both observations in one test).
    Verified: plistlib AND the rig's biplist decode our emitted body to the
    identical iPhone shape (Timestamp → datetime, artwork → JPEG), and the
    send-once/reference artwork behavior confirmed across two pushes.
-   Open: whether inbound handling is needed (the iPhone answered nothing inbound
-   in this trace; the relay `type=None` posts and type-130 are receiver→sender
-   control, not required for our sender→receiver display push).
+
+2d. **On-TV: envelope ACCEPTED (200) but did not render alone → full `/command`
+   registration sequence implemented.** Re-reading the capture, the real iPhone
+   performs a registration handshake over `/command` before/around now-playing,
+   in this order (from the timestamps):
+
+   | # | `/command` post | Content (captured) |
+   |---|---|---|
+   | 1 | `type=None` → `{params:{data:<protobuf>}}` | **DEVICE_INFO of ITSELF** — deviceClass iPhone(1), model iPhone17,1, name "iPhone van Marcel", `com.apple.Music`, lastSupportedMessageType 139. Registers the now-playing origin. |
+   | 2 | `type=updateMRSupportedCommands` | `mrSupportedCommandsFromSender` = array of archived command-info plists; commands 26,25,24,18,17,10,11,8,9,5,4,3,2,1,0 (MRMediaRemoteCommand numbering) with options (Shuffle/Repeat mode, scrub flags, empty preferred-intervals). |
+   | 3 | `type=updateMRNowPlayingInfo` | the metadata push (§10.2c). |
+
+   Note: the iPhone ALSO sent `type=None` DEVICE_INFO posts describing *other*
+   devices (e.g. "Apple TV Poolhouse", deviceClass 4) — that is topology
+   **relay**, not origin registration, and is NOT reproduced (we have no other
+   origins to relay; sending a phantom device to the ATV would be wrong).
+
+   **Path-B decision:** the iPhone's type-130 SETUPs used `seed=0` and **never
+   completed a TCP data connection** (0 frames), and it pushed **no** now-playing
+   over type-130 — all now-playing went over `/command`. We were ALSO pushing
+   SET_STATE now-playing over our (working) type-130 channel, i.e. two competing
+   now-playing sources. So type-130 is now **off by default**
+   (`CLIAIRPLAY_MRP_TYPE130=1` re-enables it for future remote-control RX);
+   `/command` is the sole now-playing source, matching the sender's effective
+   behavior.
+
+   **Implemented (`src/ap2_mrp.{c,h}`, `src/ap2_client.{c,h}`, `cliairplay.c`):**
+   `ap2_mrp_build_deviceinfo_command` (DEVICE_INFO protobuf wrapped as
+   `{params:{data:...}}`; `lastSupportedMessageType` bumped 108→139 per capture)
+   and `ap2_mrp_build_supportedcommands_command` (the exact captured command
+   list/order/options; each element a serialized command-info bplist as the
+   receiver re-parses it). New `ap2cl_mrp_register()` POSTs DEVICE_INFO then
+   updateMRSupportedCommands once, right after connect and BEFORE the first
+   now-playing push (`cliairplay.c`). type-130 SETUP gated off by default.
+   **Validated:** all three bodies decode via the rig's biplist + the per-element
+   re-parse `handle_command` performs + the protobuf decoder — command
+   list/order/options and DEVICE_INFO fields match the captured iPhone exactly.
+   **Not reproduced / open (not invented):** the iPhone DEVICE_INFO's
+   device-specific extras (macAddress field 20, extra app-bundle fields 12/31/43,
+   group UUIDs, model field 39) — omitted rather than fabricated; enrich only if
+   the on-TV test shows they are required. No inbound handling is implemented
+   (the sender→receiver display push needs none in this trace).
 3. **Type-130 SETUP alongside an audio stream in one session — CONFIRMED OK
    (tvOS 26.x).** The Apple TV accepts the extra type-130 stream SETUP issued
    after SETPEERS on a live audio session (200 + `dataPort`), the channel
