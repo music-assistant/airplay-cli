@@ -9,20 +9,29 @@ Apple TV holds off standby mid-stream, and (c) an Apple TV can later act as a
 sender lives in `src/ap2_mrp.{h,c}`, is in the build, and is now wired into the
 native audio flow via `ap2_native_setup_mrp()` in `ap2_client.c` (§8, §11).
 
-Status: now-playing is delivered over **`POST /command`**, not the type-130
-channel (ground-truth capture, §10.2c-d). The corrected `updateMRNowPlayingInfo`
-envelope is now **accepted (HTTP 200)** by the Apple TV but did **not render
-alone** — so this pass replicates the real sender's full `/command` registration
-sequence, in the captured order: **(1) `DEVICE_INFO` (origin self-registration,
-as `{params:{data:<protobuf>}}`) → (2) `updateMRSupportedCommands` (transport
-caps, MRMediaRemoteCommand numbering) → (3) `updateMRNowPlayingInfo` (metadata,
-on change)**. The type-130 channel (path B) is now **off by default**
-(`CLIAIRPLAY_MRP_TYPE130=1` to re-enable): the real sender's type-130 SETUPs
-never completed a data connection and never carried now-playing, and our
-pushing SET_STATE there competed with `/command` — so `/command` is the sole
-now-playing source. All three bodies are validated against the rig's own
-biplist/protobuf parsers (including the per-element re-parse `handle_command`
-does). Awaiting the developer's on-TV test that the full sequence renders.
+Status: **PARKED — known limitation (2026-07-20).** now-playing is delivered
+over **`POST /command`**, not the type-130 channel (ground-truth capture,
+§10.2c-d). We replicate a real iOS sender's full `/command` sequence, in the
+captured order — **(1) `DEVICE_INFO` (origin self-registration, as
+`{params:{data:<protobuf>}}`) → (2) `updateMRSupportedCommands` (transport caps,
+MRMediaRemoteCommand numbering) → (3) `updateMRNowPlayingInfo` (metadata, on
+change)** — and the Apple TV **accepts every message (HTTP 200)** but **still
+renders nothing on screen** (verified on a real Apple TV 4K, tvOS 26.x). Driving
+a *screened* receiver's now-playing UI as a third-party sender is unsolved: our
+capture is iPhone→*headless* rig, so it proves what a sender transmits but not
+what a screened receiver demands to draw the UI. The whole MRP path is therefore
+**dormant by default** (`CLIAIRPLAY_MRP=1` to enable the `/command` sequence;
+`CLIAIRPLAY_MRP_TYPE130=1` additionally re-enables the type-130 channel). The
+implementation is preserved as the foundation for the follow-up.
+
+Next steps when resumed (ranked): (a) capture a real sender against a receiver
+that actually *displays* (not the headless rig) to see the screened-receiver
+handshake; (b) complete the `DEVICE_INFO` identity the iPhone sent that we did
+not fabricate — `macAddress` (field 20, derivable from our DACP id), model
+string (39), app-bundle fields (12/31/43), group UUIDs (41/42); (c) separately,
+test whether enabling `CLIAIRPLAY_MRP` prevents Apple TV standby mid-stream
+(an independent potential win that does not depend on rendering). All bodies are
+validated against the rig's own biplist/protobuf parsers.
 
 ---
 

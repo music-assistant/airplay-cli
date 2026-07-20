@@ -1906,6 +1906,13 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
 static void ap2_mrp_ready(struct ap2cl_s *p)
 {
     if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return;
+    /* MRP now-playing is dormant by default: replicating a real iOS sender's
+     * full /command registration + now-playing sequence is accepted by the
+     * Apple TV (HTTP 200) but does not render on screen — driving a screened
+     * receiver's now-playing UI as a sender is unsolved (see MRP-DESIGN.md).
+     * The implementation is preserved; set CLIAIRPLAY_MRP=1 to enable it (also
+     * the way to test whether the session prevents Apple TV standby). */
+    if (!getenv("CLIAIRPLAY_MRP")) return;
     p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
                             p->dacp_id, p->device.name, NULL);
 }
