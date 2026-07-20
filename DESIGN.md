@@ -1,8 +1,9 @@
 # cliairplay — protocol & architecture reference
 
 How the unified AirPlay binary works: route selection, the streaming flows,
-the PTP engine, the timing/anchor model, and the wire formats. The code is the
-source of truth; this document explains it. Open work lives in `TODO.md`.
+the PTP engine, the timing/anchor model, the wire formats, and the MediaRemote
+now-playing path. The code is the source of truth; this document explains it.
+Open work lives in `TODO.md`.
 
 ---
 
@@ -18,7 +19,7 @@ One binary, three streaming paths plus utility modes:
 
 Native AP2 with PTP-timed realtime streaming is the primary path: it carries
 16- and 24-bit ALAC, sample-aligned multi-room, and scheduled group starts.
-The buffered stream (type 103) is implemented but parked (§8).
+The buffered stream (type 103) is implemented but parked (§9).
 
 Utility modes: `--pair` (legacy RAOP secret), `--pair-setup` (HomeKit PIN
 pairing producing `--auth` credentials), `--ptp-daemon` (shared clock,
@@ -152,7 +153,7 @@ authority. The engine (`ap2_ptp.c`) implements:
   mutes them. The BMCA/slave path remains for diagnostics and the synthetic
   harness.
 
-### 5. Shared clock daemon (multi-room)
+## 5. Shared clock daemon (multi-room)
 
 Only one process per host can bind UDP 319/320, and one sync group needs one
 grandmaster — but MA spawns one cliairplay per device. The split
@@ -182,20 +183,19 @@ grandmaster — but MA spawns one cliairplay per device. The split
 
 **Contract: `--start-unix-ms T` means the first sample is AUDIBLE at exactly
 T, on every protocol path.** Group members — including mixed RAOP + native-AP2
-groups — are handed the same T and align by construction; cross-protocol
-sample alignment is verified by ear on real devices.
+groups — are handed the same T and align by construction.
 
-**Downstream render-latency compensation.** A receiver whose audible output
-sits behind an external pipeline reports the delay in its stream-SETUP reply
-as `arrivalToRenderLatencyMs` (Apple TV: ~107 ms for its decode + HDMI + TV
-chain; Sonos omits the key and self-compensates). Members reporting it are
-scheduled that much earlier — the anchor line shifts by the value — so their
-ACOUSTIC output lands on T with the rest of the group. This is the same
-mechanism Apple senders use, which is why an iPhone keeps an Apple TV and a
-Sonos in sync. Verified by ear: a three-way group (a Sonos stereo pair
-AP2+PTP, a second Sonos RAOP, an Apple TV AP2 pair-verify through a TV) plays
-in sync with the compensation and lags without it. Manual per-player offsets
-remain a caller-side override for gear that misreports.
+**Downstream render-latency is informational, not applied.** A receiver whose
+audible output sits behind an external pipeline reports that delay in its
+stream-SETUP reply as `arrivalToRenderLatencyMs` (Apple TV: ~100 ms for its
+decode + HDMI + TV chain; Sonos omits the key). The value is parsed for
+information only and surfaced to the caller on the `[STATUS]` line
+(`device_render_ms=`); it is **not** added to the schedule. Receivers already
+self-compensate their own render latency, so applying the reported value
+over-compensates and makes those devices play early. Real downstream latency
+(a TV, AV receiver, or amplifier behind the device) is per-household and
+belongs in the caller's manual per-player latency adjustment, not in the
+anchor.
 
 Per path:
 
@@ -240,7 +240,7 @@ untouched.
 **Lead**: `--latency` defaults to 2000 ms and is clamped into the
 device-reported `latencyMin..latencyMax` from stream SETUP. The effective
 lead and the raw window are surfaced on stdout
-(`[STATUS] latency lead_ms=... device_min_frames=... device_max_frames=...`)
+(`[STATUS] latency lead_ms=... device_min_frames=... device_max_frames=... device_render_ms=...`)
 so the caller plans group starts from device reality. The SETUP echo of the
 window is receiver-optional (Sonos omits it — then the 1.75 s default
 applies); parsing `audioLatencies` from GET /info is an open item.
@@ -287,7 +287,82 @@ equally loud on every protocol path and matches other senders. 0 mutes
 alignment against non-AirPlay ecosystems belongs in the caller's per-player
 normalization, not in the protocol curve.
 
-## 8. Buffered audio (type 103) — parked
+## 8. MediaRemote (Apple TV now-playing)
+
+tvOS draws its on-screen now-playing UI only from **MediaRemote** state, not
+from the DMAP metadata that speakers consume over RTSP `SET_PARAMETER` (the
+Apple TV 200-accepts that metadata but never renders it; the DMAP path stays,
+because Sonos-class speakers require and consume it). Pair-verified native
+sessions therefore additionally push MediaRemote now-playing, so an Apple TV
+renders our stream the way it renders an iPhone sender. Maintaining that
+session also keeps tvOS awake mid-stream: tvOS treats the MediaRemote
+now-playing session, not raw RTP flow, as playback activity. The path is gated
+to pair-verified native sessions — Apple devices in practice — since
+transient-paired and third-party receivers neither need nor render it.
+`CLIAIRPLAY_MRP=0` disables the whole path (diagnostic opt-out).
+
+**Transport — `POST /command`** on the main encrypted RTSP channel (same
+channel and HAP framing as `/feedback`), `Content-Type:
+application/x-apple-binary-plist`. This is the transport real Apple senders use
+for now-playing; the type-130 data channel below is *not* used for it. On
+connect the sender emits the initial sequence from AirPlaySender's
+`metadataSender_sendInitialMetadataInternal`:
+
+1. **DEVICE_INFO** — `type=None`, body `{params:{data:<protobuf>}}` carrying an
+   MRP DEVICE_INFO protobuf that registers the now-playing origin
+   (`lastSupportedMessageType=139`; a Music/iPhone identity profile; the active
+   audio SETUP's session and group UUIDs in fields 41/42). Posted first.
+2. **`updateMRNowPlayingInfo`** — the now-playing metadata (envelope below).
+3. **`updateMRSupportedCommands`** — the transport controls advertised.
+4. **`updateMRPlaybackState`** — explicit Playing / Paused / Stopped.
+5. **`updateMRNowPlayingClient`** — the serialized `NowPlayingClient` external
+   representation the receiver expects.
+
+Playback state is re-sent on every start/pause/resume/stop; now-playing on
+every metadata/progress/artwork change, plus a defensive re-push every ~15 s.
+Progress itself is never streamed — the receiver extrapolates position from
+`ElapsedTime` + `Timestamp` + `PlaybackRate`, so a steady state needs no push.
+
+**`updateMRNowPlayingInfo` envelope.** The `npi-text` / `mergePolicy` wrapper
+is mandatory; a bare or fabricated outer type string is rejected with HTTP 400:
+
+```
+{ type: "updateMRNowPlayingInfo",
+  params: { type: "npi-text", mergePolicy: "replace",
+            params: { <kMRMediaRemoteNowPlayingInfo* keys> } } }
+```
+
+Inner keys: `Title`, `Artist`, `Album`, `Duration`, `ElapsedTime`,
+`PlaybackRate`, `DefaultPlaybackRate` (reals, seconds), `Timestamp` (a
+**CFDate** — bplist date marker `0x33`), `MediaType`
+(`MRMediaRemoteMediaTypeMusic`), `UniqueIdentifier` (uint64, stable across a
+track's progress pushes), `ArtworkData` (JPEG bytes), `ArtworkMIMEType`,
+`ArtworkIdentifier`.
+
+**Artwork — send-once.** The JPEG bytes ride only the *first* push for a given
+image, tagged with a fresh `ArtworkIdentifier`; later pushes carry the
+identifier without the bytes, so a ~40 KB image is not re-sent on every
+progress tick over the shared RTSP channel.
+
+**`updateMRSupportedCommands`** body:
+`{params:{mrSupportedCommandsFromSender:[<command-info>, ...]}}`, each element a
+serialized command-info bplist (`kCommandInfoCommandKey` / `EnabledKey` /
+`OptionsKey`, with shuffle/repeat mode and scrub options). **The command
+identifiers use MRMediaRemoteCommand numbering, which is not pyatv's `Command`
+enum** — the two enumerations disagree, so the wire values here
+(0,1,2,3,4,5,8,9,10,11,17,18,24,25,26) are Apple's, not pyatv's.
+
+**Type-130 remote-control channel — off by default.** A dedicated
+length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
+DataStream keys derived from the pair-verify shared secret) exists for *inbound*
+remote control (Siri-remote play/pause). It carries no now-playing state — the
+real sender pushes now-playing only over `/command` — and is off by default;
+`CLIAIRPLAY_MRP_TYPE130=1` enables the channel. `src/ap2_mrp.c` hand-rolls the
+proto2 emitters, the `/command` builders, the bplist `params.data` wrapper, the
+DataStream key derivation and channel framing, and answers inbound `sync`
+frames with `rply`.
+
+## 9. Buffered audio (type 103) — parked
 
 Implemented end-to-end: SETUP type 103, TCP push with correct length-prefix
 framing (verified against a reference receiver), PTP-anchored start with
@@ -301,7 +376,7 @@ accepts the anchor but has no hi-res; its buffered ALAC SETUP is accepted but
 not rendered — iOS buffered streams carry AAC). Reachable only via
 `--buffered`; nothing auto-selects it.
 
-## 9. Session robustness
+## 10. Session robustness
 
 - **Keepalive** — native AP2 sessions POST `/feedback` every ~2 s (real
   senders do; receivers idle-time-out long sessions without it). RAOP paths
@@ -321,14 +396,11 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
   without it).
-- **Apple MediaRemote metadata** — pair-verified native sessions register a
-  DEVICE_INFO origin, then send `updateMRNowPlayingInfo` followed by supported
-  commands, explicit playback state, and a serialized NowPlayingClient.
-  Start/pause/resume/stop transitions stay synchronized with the audio state.
-  This path is enabled by default (`CLIAIRPLAY_MRP=0` is the diagnostic opt-out);
-  see `MRP-DESIGN.md` for the wire formats and hardware acceptance status.
+- **MediaRemote now-playing** — pair-verified Apple sessions additionally push
+  now-playing over `POST /command` on the same cadence as `/feedback` (§8);
+  best-effort, audio never gates on it.
 
-## 10. Device-behavior findings
+## 11. Device-behavior findings
 
 Facts observed on real hardware that shape the implementation and its
 callers:
@@ -355,6 +427,6 @@ callers:
 - **Pairing posture differs by vendor**: Sonos/JBL/WiiM accept transient
   pairing (no PIN); Apple TV/HomePod require stored credentials from a PIN
   pair-setup (transient returns 200 + an in-band TLV error and silence).
-- **Sonos withholds audio until metadata arrives** (§9).
+- **Sonos withholds audio until metadata arrives** (§10).
 - **Cross-VLAN**: HomeKit pairing and PTP do not survive subnet boundaries;
   same-L2 is assumed.

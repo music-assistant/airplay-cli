@@ -34,7 +34,6 @@
 #include "cross_util.h"
 #include "cross_log.h"
 #include "ap2_client.h"
-#include "ap2_rtsp.h"
 #include "ap2_ptp.h"
 #include "ap2_hap.h"
 
@@ -188,7 +187,8 @@ static void mrp_status_report(int status)
     fflush(stdout);
 }
 
-/* Also emit legacy format for backward compatibility during transition */
+/* Also emit the older human-readable status line; the [STATUS] lines from
+ * status_connected/status_playing are what the MA provider parses. */
 static void status_connected_legacy(const char *host, int port, int latency_ms)
 {
     LOG_INFO("connected to %s on port %d, player latency is %d ms", host, port, latency_ms);

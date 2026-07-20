@@ -220,6 +220,8 @@ src/ap2_hap.c         HAP pair-verify, transient and PIN pair-setup, encrypted
                       RTSP framing (ChaCha20-Poly1305)
 src/ap2_rtsp.c        RTSP request/response over the (optionally encrypted) channel
 src/ap2_session.c     Native AP2 RTSP session helpers (encrypted channel)
+src/ap2_mrp.c         MediaRemote now-playing sender: /command builders,
+                      proto2 + bplist emitters, type-130 DataStream channel
 src/ap2_plist.c       Binary plist writer (nested streams array)
 src/ap2_bplist.cpp    Binary plist reader (keyed offset-table traversal)
 src/ap2_ptp.c         NTP responder + PTP engine (gPTP dialect, BMCA,

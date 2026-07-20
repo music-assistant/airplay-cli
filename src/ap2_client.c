@@ -93,7 +93,7 @@ struct ap2cl_s {
     pthread_mutex_t rtsp_lock;
     struct ap2_hap_ctx *hap;      /* HAP encryption context */
     struct ap2_ptp_ctx *ptp;      /* Timing */
-    /* MRP now-playing over POST /command (path A, see MRP-DESIGN.md §4):
+    /* MRP now-playing over POST /command (path A, see DESIGN.md §8):
      * state carrier + body builder; only on pair-verified native sessions. */
     struct ap2_mrp_ctx *mrp;
     bool mrp_device_registered;
@@ -491,7 +491,7 @@ static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, cons
 
 /* Issue the type-130 remote-control (MRP) data-channel stream SETUP on the
  * already-verified RTSP session, then attach the MRP sender to the returned
- * dataPort (MRP-DESIGN.md §2/§5, the "combined/piggyback" model). This is
+ * dataPort (DESIGN.md §8, the "combined/piggyback" model). This is
  * best-effort decoration: any failure (SETUP non-200, no dataPort, connect or
  * handshake failure) logs and leaves p->mrp NULL / audio untouched. Reachable
  * only on a pair-verified session (Apple devices) — the DataStream keys derive
@@ -1066,7 +1066,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                  inet_ntoa(p->data_addr.sin_addr), ntohs(p->data_addr.sin_port));
     }
 
-    /* 6d. MRP now-playing. Ground-truth capture (MRP-DESIGN.md §10) shows a real
+    /* 6d. MRP now-playing. Ground-truth capture (DESIGN.md §8) shows a real
      * sender delivers now-playing over POST /command, NOT the type-130 channel
      * (its type-130 SETUPs never completed a data connection), and pushing state
      * over type-130 competes with /command. So the type-130 channel is OFF by
@@ -1845,7 +1845,7 @@ bool ap2cl_feedback(struct ap2cl_s *p)
      * is raopcl_keepalive(). The response body carries stream status we do
      * not need; the POST itself is what resets the receiver's idle timer. */
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return false;
-    /* Ride the same 2s cadence for the MRP data channel (MRP-DESIGN.md §5):
+    /* Ride the same 2s cadence for the MRP data channel (DESIGN.md §8):
      * drain inbound frames (answer sync keep-alives) and re-push SET_STATE
      * periodically to hold the now-playing session open. Separate socket from
      * the RTSP /feedback POST; best-effort, harmless when no channel is up. */

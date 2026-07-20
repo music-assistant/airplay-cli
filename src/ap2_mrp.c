@@ -5,8 +5,7 @@
  * remote-control data channel (stream type 130): hand-rolled protobuf
  * ProtocolMessage encoding, 32-byte data-frame header, binary-plist payload
  * wrapper, and ChaCha20-Poly1305 channel encryption with HKDF-derived
- * DataStream keys. Protocol references and the wiring plan live in
- * MRP-DESIGN.md.
+ * DataStream keys. Protocol references live in DESIGN.md §8.
  *
  * The `/command` path carries sender now-playing state. The optional type-130
  * channel provides remote-control transport and is kept for future inbound
@@ -42,7 +41,7 @@
 
 extern log_level *loglevel;
 
-/* ---- Wire constants (sources cited in MRP-DESIGN.md) ---- */
+/* ---- Wire constants (sources cited in DESIGN.md §8) ---- */
 
 /* HKDF-SHA512 salt/info strings for the AirPlay 2 logical channels
  * (pyatv pyatv/protocols/airplay/ap2_session.py). The DataStream salt is the
@@ -124,7 +123,7 @@ enum mrp_ext_field {
  * TogglePlayPause=3, Stop=4, NextTrack=5, PreviousTrack=6). Advertised in
  * SetStateMessage.supportedCommands so the receiver knows we are a controllable
  * now-playing origin — a candidate precondition for tvOS rendering the UI
- * (MRP-DESIGN.md §10.1). */
+ * (DESIGN.md §8). */
 #define MRP_CMD_PLAY               1
 #define MRP_CMD_PAUSE              2
 #define MRP_CMD_TOGGLE_PLAY_PAUSE  3
@@ -368,7 +367,7 @@ static bool mrp_envelope(mbuf *out, enum mrp_msg_type type,
 /* DEVICE_INFO_MESSAGE (ext 20). Must be the FIRST message on the channel or
  * the receiver will not respond (pyatv protocol.py). Values mirror what a
  * real sender advertises; com.apple.Music vs com.apple.TVRemote is a live
- * validation item (MRP-DESIGN.md §10). */
+ * validation item (DESIGN.md §8). */
 static bool build_device_info(struct ap2_mrp_ctx *m, mbuf *out)
 {
     bool ok = true;
@@ -816,9 +815,9 @@ static void mrp_drain_encrypted(struct ap2_mrp_ctx *m)
 }
 
 /* Consume complete 32-byte-header data frames from rx_msg. Incoming protobufs
- * are only counted for now; dispatching them (SendCommand transport controls
- * from the receiver: play/pause/next from the Siri remote) is a wiring-pass
- * item (MRP-DESIGN.md §8). */
+ * are counted but not dispatched: acting on them (SendCommand transport
+ * controls from the receiver: play/pause/next from the Siri remote) is not
+ * implemented (DESIGN.md §8). */
 static void mrp_process_frames(struct ap2_mrp_ctx *m)
 {
     int off = 0;
@@ -994,8 +993,7 @@ bool ap2_mrp_start(struct ap2_mrp_ctx *m)
      * identity from dacp_id), session SETUP with isRemoteControlOnly=true and
      * timingProtocol="None", event channel attach, RECORD, then the type-130
      * data channel SETUP and ap2_mrp_attach() on its result. Needs the RTSP +
-     * HAP plumbing from ap2_client.c/ap2_hap.c — wiring pass, see
-     * MRP-DESIGN.md §9. */
+     * HAP plumbing from ap2_client.c/ap2_hap.c. */
     LOG_WARN("[MRP] standalone remote-control session not implemented yet "
              "(metadata-only mode); use ap2_mrp_attach from an audio session");
     return false;
@@ -1129,7 +1127,7 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
     }
 
     /* Defensive periodic re-push: keeps the system now-playing session warm
-     * (standby prevention hinges on it, MRP-DESIGN.md §6). */
+     * (standby prevention hinges on it, DESIGN.md §8). */
     if (m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
         time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S)
         mrp_push_state(m, false);
@@ -1147,7 +1145,7 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
 
     /* Push path A: POST /command carrying MediaRemote now-playing info. Shape
      * captured VERBATIM from a real iPhone -> AirPlay 2 receiver session
-     * (2026-07-20, MRP-DESIGN.md §10): a triple-nested bplist
+     * (2026-07-20, DESIGN.md §8): a triple-nested bplist
      *   { "type": "updateMRNowPlayingInfo",
      *     "params": { "type": "npi-text", "mergePolicy": "replace",
      *                 "params": { kMRMediaRemoteNowPlayingInfo* ... } } }
@@ -1245,7 +1243,7 @@ bool ap2_mrp_build_deviceinfo_command(struct ap2_mrp_ctx *m,
     /* Register as a now-playing origin: the DeviceInfoMessage protobuf (same as
      * the channel handshake) wrapped as {params:{data:...}} and POSTed to
      * /command. A real iPhone sends exactly this (describing itself, deviceClass
-     * iPhone, com.apple.Music) before pushing now-playing (MRP-DESIGN.md §10). */
+     * iPhone, com.apple.Music) before pushing now-playing (DESIGN.md §8). */
     mbuf msg = {0};
     bool ok = build_device_info(m, &msg);
     ok = ok && mrp_wrap_params_data(&msg, out, out_len);
@@ -1278,7 +1276,7 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
     (void)m;
     if (!out || !out_len) return false;
     /* Command list, options and MRMediaRemoteCommand numbering captured VERBATIM
-     * from a real iPhone sender (MRP-DESIGN.md §10). Order preserved. Note this
+     * from a real iPhone sender (DESIGN.md §8). Order preserved. Note this
      * is MRMediaRemoteCommand numbering (Play=0, Pause=1, ...), distinct from
      * the pyatv protobuf Command enum used in the type-130 SET_STATE path. */
     ap2_pl_node *arr = ap2_pl_array();

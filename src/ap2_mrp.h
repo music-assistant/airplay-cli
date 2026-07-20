@@ -10,7 +10,7 @@
  *   2. keep the system now-playing session alive so tvOS does not drop to
  *      standby mid-stream.
  *
- * Design and protocol notes live in MRP-DESIGN.md.
+ * Design and protocol notes live in DESIGN.md §8.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * See LICENSE
@@ -30,7 +30,7 @@ typedef enum {
     AP2_MRP_PLAYBACK_STOPPED = 3,
 } ap2_mrp_playback_state_t;
 
-/* Remote-control (MRP) data-channel stream SETUP constants (MRP-DESIGN.md §2,
+/* Remote-control (MRP) data-channel stream SETUP constants (DESIGN.md §8,
  * pyatv ap2_session.py _setup_data_channel). The audio session issues a SETUP
  * carrying a stream of this type on its pair-verified RTSP channel; the
  * receiver answers with a dataPort for ap2_mrp_attach(). Shared here so the
@@ -42,7 +42,7 @@ typedef enum {
 /*
  * Create an MRP sender context.
  *
- * Two attachment models (MRP-DESIGN.md §5):
+ * Two attachment models (DESIGN.md §8):
  *  - piggyback: the audio session (ap2_client.c) issues the extra stream SETUP
  *    (type 130) on its already-verified RTSP channel and hands the returned
  *    dataPort to ap2_mrp_attach(). The channel keys derive from THAT session's
@@ -56,7 +56,7 @@ typedef enum {
  * :param auth_credentials: HAP credentials hex (192 chars), same value as the
  *                          audio session's --auth. tvOS requires verified
  *                          credentials; transient PIN-3939 pairing is not
- *                          accepted by Apple TV (MRP-DESIGN.md §7).
+ *                          accepted by Apple TV (DESIGN.md §8).
  * :param dacp_id: DACP identifier; doubles as our stable MRP device identifier
  *                 and (sidecar model) the pair-verify client identity.
  * :param device_name: sender display name to advertise (DEVICE_INFO).
@@ -95,7 +95,7 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
  * Bootstrap a standalone remote-control-only session (sidecar model, for the
  * metadata-only display mode): own TCP connection, pair-verify, session SETUP
  * with isRemoteControlOnly=true, event channel, RECORD, type-130 data channel.
- * Not implemented yet — returns false; see MRP-DESIGN.md §9.
+ * Not implemented yet — returns false.
  */
 bool ap2_mrp_start(struct ap2_mrp_ctx *m);
 
@@ -159,9 +159,8 @@ bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
 
 /*
  * Build a binary-plist body for POST /command on the MAIN encrypted RTSP
- * channel (push path A in MRP-DESIGN.md §4: real iOS senders push MediaRemote
- * now-playing state this way; the envelope needs capture confirmation before
- * the wiring pass). Uses the current metadata/artwork/progress state.
+ * channel (push path A in DESIGN.md §8: real iOS senders push MediaRemote
+ * now-playing state this way). Uses the current metadata/artwork/progress state.
  *
  * :param out: receives the serialized plist (caller frees).
  * :param out_len: receives the byte count.
@@ -175,7 +174,7 @@ void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
 
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before
- * pushing now-playing (MRP-DESIGN.md §10), for the same encrypted RTSP channel:
+ * pushing now-playing (DESIGN.md §8), for the same encrypted RTSP channel:
  *   - deviceinfo: {params:{data: <MRP DEVICE_INFO protobuf>}} — registers us as
  *     a now-playing origin.
  *   - supportedcommands: {type:"updateMRSupportedCommands", params:{...}} —
