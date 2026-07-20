@@ -94,6 +94,9 @@ every receiver in a sync group must lock to the same grandmaster:
 # One per host (root, or CAP_NET_BIND_SERVICE on Linux):
 cliairplay --ptp-daemon [--if <ip>] &
 
+# Grant only the privileged-port capability instead of running as root:
+sudo setcap cap_net_bind_service=+ep /path/to/cliairplay
+
 # Per device, each with --ptp-shared and the SAME start time:
 cliairplay --protocol airplay2 --ptp-shared --start-unix-ms <T> ... <ip1> -
 cliairplay --protocol airplay2 --ptp-shared --start-unix-ms <T> ... <ip2> -

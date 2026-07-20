@@ -12,7 +12,8 @@ permissions:
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    # Keep release binaries on a stable libc baseline that runs on Debian 12+.
+    runs-on: ubuntu-22.04
     strategy:
       fail-fast: false
       matrix:

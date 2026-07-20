@@ -27,10 +27,6 @@ Genuinely open work only. Completed work lives in git history.
       advertised table understates on Apple TV, and a SETUP 200 can lie — Sonos
       silently renders nothing on 48/24). A try-then-fall-back negotiation
       would let opt-in hi-res degrade gracefully.
-- [ ] **Non-root 319/320 on Linux.** The `--ptp-daemon` bind-failure path
-      (exit code 2) is validated by inspection only; verify on a real
-      Linux/container host and document the `CAP_NET_BIND_SERVICE` setup for the
-      Music Assistant deployment.
 - [ ] **First release tag + MA container fetch.** The `v*` release job
       (binaries + `SHA256SUMS`) exists but has never run. Cut a first versioned
       release, then make the MA container build fetch the pinned release
