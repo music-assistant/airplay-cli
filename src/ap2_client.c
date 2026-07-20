@@ -929,15 +929,18 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         LOG_DEBUG("[AP2] Stream response ports: data=%d control=%d", remote_data, remote_ctrl);
 
         /* Downstream pipeline delay the device itself reports (Apple TV: its
-         * decode+HDMI+display chain, ~100ms). Members with a reported render
-         * latency are scheduled that much earlier so their ACOUSTIC output
-         * aligns with the rest of the group; devices that self-compensate
-         * (Sonos) omit the key and get no shift. */
+         * decode+HDMI+display chain, ~100ms). Parsed for information only and
+         * surfaced to the caller (MA); NOT applied to scheduling. Receivers
+         * already self-compensate their own render latency, so applying the
+         * reported value over-compensates and makes those devices play early.
+         * Real downstream latency (TV / AV receiver / amplifier) is per-
+         * household and set manually via the player's latency adjustment. */
         if (ap2_bplist_find_uint(resp, (size_t)resp_len, "arrivalToRenderLatencyMs", &v) &&
             v <= 2000) {
             p->dev_render_ms = (int)v;
-            LOG_INFO("[AP2] Device reports arrival->render latency %dms; "
-                     "compensating the timeline", p->dev_render_ms);
+            LOG_INFO("[AP2] Device reports arrival->render latency %dms "
+                     "(informational; not applied - downstream TV/AV latency is "
+                     "set via the player's latency adjustment)", p->dev_render_ms);
         }
 
         /* The receiver reports its buffering window (frames). Clamp our lead
@@ -1157,8 +1160,7 @@ static void ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->latency_ms * 1000000ULL
-                               - (uint64_t)p->dev_render_ms * 1000000ULL;
+            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->latency_ms * 1000000ULL;
             p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
                               + p->rtp_offset;
         } else {
