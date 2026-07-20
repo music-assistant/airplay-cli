@@ -10,11 +10,17 @@ sender lives in `src/ap2_mrp.{h,c}`, is in the build, and is now wired into the
 native audio flow via `ap2_native_setup_mrp()` in `ap2_client.c` (§8, §11).
 
 Status: path A (`POST /command`) was wired and tested against a real Apple TV
-4K — it returns **HTTP 400 on every push** (§4, §10.2), so it is disabled by
-default. Path B (the type-130 data channel) is now **wired end to end** into
-the native audio flow (§5, §8) and builds clean; it has not yet been confirmed
-on-screen against the Apple TV (deferred: see §10). §10 ranks the remaining
-unknowns with a validation step for each.
+4K — HTTP 400 on every push (§4, §10.2) — and is disabled by default. Path B
+(the type-130 data channel) is wired end to end and **live-verified against
+the Apple TV 4K (tvOS 26.x): the SETUP is accepted alongside the audio stream,
+the channel and handshake come up and SET_STATE pushes flow (`[STATUS] mrp
+path=channel status=1` on consecutive streams)** — but tvOS renders **no
+now-playing UI** from these bare sender pushes (§10.1). Leading hypothesis: the
+origin must advertise which transport commands it accepts — so SET_STATE now
+also carries `supportedCommands` (§10.1a, source-backed from pyatv protos), as
+yet unverified on screen. The decider is a capture of a real iPhone sender's
+MRP traffic against a fake receiver: the rig is built and ready in
+`../airplay2-receiver` (§10.2b). §10 ranks the remaining unknowns.
 
 ---
 
@@ -418,22 +424,25 @@ covers both observations in one test).
 ## 10. Risks and unknowns, ranked (validation on a recent Apple TV 4K, tvOS 15+)
 
 1. **Does sender-pushed path-B SET_STATE render the tvOS now-playing UI?**
-   [NOW THE TOP OPEN QUESTION — path B is wired but not yet screen-confirmed.]
-   The channel establishment/crypto/framing are pyatv-proven; whether a
-   *sender* pushing SET_STATE (rather than a controller subscribing) drives the
-   on-screen UI is not. *Validate:* stream to the live ATV with `--debug 10`;
-   confirm `[MRP] remote-control data channel established` and `SET_STATE push
-   -> sent`, then look at the ATV screen + Control Center. If the channel is up
-   but nothing renders, the likely missing piece is item (1a). If it renders,
-   this whole feature is proven.
-   - **(1a) `mrSupportedCommandsFromSender` as a precondition.** A real sender
-     advertises supported transport commands (the attested `/command`
-     `updateMRSupportedCommands` post, §4) *before* now-playing shows. tvOS may
-     gate SET_STATE display on the client having advertised commands. If (1)
-     fails, the evidence-backed next step is to send `SET_STATE` plus either an
-     MRP command-registration message on the type-130 channel, or the
-     `updateMRSupportedCommands` `/command` post — **not** more `/command`
-     now-playing variants.
+   **CONFIRMED INSUFFICIENT (Apple TV 4K, tvOS 26.x, 2026-07-20).** The channel
+   comes up on consecutive streams (`[STATUS] mrp path=channel status=1`), the
+   DEVICE_INFO-first handshake completes, and periodic SET_STATE pushes carry
+   metadata/artwork/progress — but tvOS renders **no** now-playing UI from these
+   bare sender pushes. So establishing the channel and pushing state is
+   necessary but not sufficient; something a real sender does is missing. The
+   decider is a capture of a real iPhone sender (§10.2).
+   - **(1a) supported-commands advertisement as a precondition.** Leading
+     hypothesis: tvOS only surfaces a now-playing origin that advertises which
+     transport commands it accepts. Two mechanisms exist — MRP
+     `SetStateMessage.supportedCommands` (protobuf, same channel) and the
+     `/command` `updateMRSupportedCommands` post (§4). **Refinement shipped
+     this pass:** every SET_STATE now carries `supportedCommands` (field 2) =
+     Play/Pause/TogglePlayPause/NextTrack/PreviousTrack, each `enabled`
+     (field numbers from pyatv `SetStateMessage.proto`/`SupportedCommands.proto`/
+     `CommandInfo.proto`). Whether that alone flips rendering is unverified;
+     the capture will show what else a real sender sends (e.g. GET_STATE
+     answers, a NowPlayingClient identity, inbound-command handling) — do NOT
+     add blind `/command` now-playing variants.
 2. **Path A envelope — RESOLVED (path A abandoned for now-playing).** Live
    result: `POST /command` with `type:"updateNowPlayingInfo"` returns **HTTP
    400 on every push**. Source review (openairplay `handle_command`, pyatv,
@@ -449,15 +458,28 @@ covers both observations in one test).
    wire (the developer's live run predates the body-logging patch); enabling
    the env var on the next session will record it, though the diagnosis does
    not depend on it.
-3. **Type-130 SETUP alongside an audio stream in one session** (pyatv only
-   does RC-only sessions). *Validate:* live test — send the extra SETUP after
-   SETPEERS on a playing session; expect 200 + `dataPort`; watch for audio
-   disturbance.
-4. **Does sender-pushed SET_STATE drive the tvOS UI?** pyatv proves the
-   channel, not this direction. *Validate:* attach + push on the live ATV;
-   observe screen and Control Center. If nothing renders, capture an
-   iPhone→fake-receiver session and diff our protobufs against the iPhone's
-   (the fake receiver logs raw data-channel frames).
+2b. **Capture rig for the decider — BUILT AND READY.** A patched clone of
+   `openairplay/airplay2-receiver` lives at `../airplay2-receiver` (own
+   `.venv`, Python 3.12). It runs NTP-only style with `-npm` and was verified
+   NOT to bind PTP 319/320 (lsof-checked; those stay owned by the live MA
+   daemon) and to advertise `_airplay._tcp` as "MRP Capture" on
+   192.168.1.47. Patches (all local to that scratch clone): `av`/`pyaudio`
+   made optional + audio drain-only (no decode/playback); `handle_command`
+   dumps the full `/command` envelope (the real sender's `type` + now-playing
+   keys); a new `ap2/connections/mrp_capture.py` implements the **type-130
+   receiver side** (DataStream HKDF keys, ChaCha20 frame decrypt, 32-byte data
+   headers, bplist `params.data`, protobuf decode, `sync`→`rply`) and dumps
+   every message; a configurable `MRP_PORT` lets it coexist with another
+   receiver on 7000. The decrypt/parse pipeline was self-tested offline against
+   a synthetic frame. Run `../airplay2-receiver/capture.sh`, AirPlay from an
+   iPhone, diff the log against our sender.
+3. **Type-130 SETUP alongside an audio stream in one session — CONFIRMED OK
+   (tvOS 26.x).** The Apple TV accepts the extra type-130 stream SETUP issued
+   after SETPEERS on a live audio session (200 + `dataPort`), the channel
+   attaches, and audio is undisturbed. pyatv's RC-only-session limitation does
+   not apply to this receiver; the combined/piggyback model works.
+4. **Does sender-pushed SET_STATE drive the tvOS UI?** Merged into item 1
+   (confirmed: not on its own).
 5. **DEVICE_INFO / NowPlayingClient identity values** (bundle
    `com.apple.Music` vs `com.apple.TVRemote`, deviceClass iPhone,
    `lastSupportedMessageType`). Wrong identity may demote or hide the client.

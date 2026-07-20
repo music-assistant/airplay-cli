@@ -123,6 +123,17 @@ enum mrp_ext_field {
 #define MRP_MEDIA_TYPE_AUDIO               1   /* ContentItemMetadata */
 #define MRP_MEDIA_SUBTYPE_MUSIC            1
 
+/* Command enum values (pyatv protobuf/CommandInfo.proto: Play=1, Pause=2,
+ * TogglePlayPause=3, Stop=4, NextTrack=5, PreviousTrack=6). Advertised in
+ * SetStateMessage.supportedCommands so the receiver knows we are a controllable
+ * now-playing origin — a candidate precondition for tvOS rendering the UI
+ * (MRP-DESIGN.md §10.1). */
+#define MRP_CMD_PLAY               1
+#define MRP_CMD_PAUSE              2
+#define MRP_CMD_TOGGLE_PLAY_PAUSE  3
+#define MRP_CMD_NEXT_TRACK         5
+#define MRP_CMD_PREVIOUS_TRACK     6
+
 /* Apple epoch (CFAbsoluteTime): seconds between 1970-01-01 and 2001-01-01.
  * MRP timestamps are doubles on this timebase. */
 #define MRP_APPLE_EPOCH_OFFSET 978307200.0
@@ -431,6 +442,27 @@ static bool build_content_item_metadata(struct ap2_mrp_ctx *m, mbuf *meta)
     return ok;
 }
 
+/* SupportedCommands submessage (pyatv SupportedCommands.proto: field 1 is a
+ * repeated CommandInfo; CommandInfo.proto: command = field 1, enabled = field
+ * 2). Advertises the transport controls we accept, so the receiver treats us as
+ * a controllable now-playing client. */
+static bool build_supported_commands(mbuf *sc)
+{
+    static const uint32_t cmds[] = {
+        MRP_CMD_PLAY, MRP_CMD_PAUSE, MRP_CMD_TOGGLE_PLAY_PAUSE,
+        MRP_CMD_NEXT_TRACK, MRP_CMD_PREVIOUS_TRACK,
+    };
+    bool ok = true;
+    for (size_t i = 0; i < sizeof(cmds) / sizeof(cmds[0]); i++) {
+        mbuf ci = {0};
+        ok &= pb_put_varint_field(&ci, 1, cmds[i]);   /* command (enum) */
+        ok &= pb_put_bool_field(&ci, 2, true);        /* enabled */
+        ok = ok && pb_put_msg_field(sc, 1, &ci);      /* repeated supportedCommands */
+        mbuf_free(&ci);
+    }
+    return ok;
+}
+
 /* SET_STATE_MESSAGE (ext 9) carrying the full now-playing picture:
  * SetStateMessage { nowPlayingInfo=1, playbackQueue=3, displayName=5,
  * playbackState=6, playbackStateTimestamp=11 }; the queue holds one
@@ -439,7 +471,7 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
                             mbuf *out)
 {
     bool ok = true;
-    mbuf npi = {0}, meta = {0}, item = {0}, queue = {0}, inner = {0};
+    mbuf npi = {0}, meta = {0}, item = {0}, queue = {0}, sc = {0}, inner = {0};
     double now_cf = mrp_cf_now();
 
     /* NowPlayingInfo (field numbers from NowPlayingInfo.proto) */
@@ -463,8 +495,11 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
     ok &= pb_put_varint_field(&queue, 1, 0);                          /* location */
     ok = ok && pb_put_msg_field(&queue, 2, &item);                    /* contentItems */
 
-    /* SetStateMessage */
+    /* SetStateMessage { nowPlayingInfo=1, supportedCommands=2, playbackQueue=3,
+     * displayName=5, playbackState=6, playbackStateTimestamp=11 } */
+    ok = ok && build_supported_commands(&sc);
     ok = ok && pb_put_msg_field(&inner, 1, &npi);
+    ok = ok && pb_put_msg_field(&inner, 2, &sc);                      /* supportedCommands */
     ok = ok && pb_put_msg_field(&inner, 3, &queue);
     ok &= pb_put_string_field(&inner, 5, m->name);                    /* displayName */
     ok &= pb_put_varint_field(&inner, 6, m->playing ?                 /* playbackState */
@@ -477,6 +512,7 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
     mbuf_free(&meta);
     mbuf_free(&item);
     mbuf_free(&queue);
+    mbuf_free(&sc);
     mbuf_free(&inner);
     return ok;
 }
