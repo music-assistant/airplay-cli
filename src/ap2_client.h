@@ -137,6 +137,10 @@ bool ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames);
 /* Check if the client is ready to accept more audio frames. */
 bool ap2cl_accept_frames(struct ap2cl_s *p);
 
+/* If PCM starvation exhausted the receiver lead, move the realtime deadline
+ * and PTP anchor forward so resumed samples are not permanently late. */
+bool ap2cl_recover_input_gap(struct ap2cl_s *p);
+
 /* Pause playback. */
 void ap2cl_pause(struct ap2cl_s *p);
 
@@ -151,6 +155,17 @@ void ap2cl_stop(struct ap2cl_s *p);
  * idle timeouts). Native AP2 flow only; a no-op returning false otherwise.
  * Returns true when the receiver answered 200. */
 bool ap2cl_feedback(struct ap2cl_s *p);
+
+/* Service non-RTSP session channels without blocking on a feedback request.
+ * Call regularly (about once per second) for native AP2 sessions. */
+void ap2cl_tick(struct ap2cl_s *p);
+
+/* False when the encrypted RTSP channel is unusable or feedback repeatedly
+ * fails. The caller should terminate so its supervisor can reconnect. */
+bool ap2cl_control_healthy(struct ap2cl_s *p);
+
+/* Emit a debug-level snapshot of RTP pacing/timeline/send health. */
+void ap2cl_log_diagnostics(struct ap2cl_s *p);
 
 /* Set volume (0-100). */
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);

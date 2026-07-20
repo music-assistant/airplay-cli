@@ -191,6 +191,11 @@ Metadata strings are encoded as Unicode binary-plist strings; artwork is
 signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
 
+For a native-AP2 stall capture, run with `--debug 10` and retain the final
+minute before/after the failure. `[CLIDIAG]` reports PCM ring fill,
+`[AP2DIAG]` reports pacing/PTP anchors and RTP drop counters, and the RTSP/MRP
+lines report feedback status, request duration, and reverse-event replies.
+
 ## Building
 
 ```bash
@@ -199,6 +204,9 @@ make STATIC=1
 
 # Linux cross-compile (example)
 make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
+
+# Focused timeline/event-channel tests
+make test
 ```
 
 Requires the libraop submodule with pre-built static libraries (OpenSSL,

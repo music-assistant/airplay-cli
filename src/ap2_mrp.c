@@ -20,6 +20,7 @@
 #include <string.h>
 #include <strings.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -177,7 +178,7 @@ struct ap2_mrp_ctx {
      * from both RTSP control and the optional type-130 data channel. The socket
      * remains owned by ap2_client. */
     int event_sock;
-    bool event_connected;
+    _Atomic bool event_connected;
     uint8_t event_out_key[MRP_KEY_SIZE]; /* Events-Read-Encryption-Key */
     uint8_t event_in_key[MRP_KEY_SIZE];  /* Events-Write-Encryption-Key */
     uint64_t event_out_counter;
@@ -1044,7 +1045,7 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
 
 static void mrp_tick_events(struct ap2_mrp_ctx *m)
 {
-    if (!m->event_connected || m->event_sock < 0) return;
+    if (!atomic_load(&m->event_connected) || m->event_sock < 0) return;
 
     struct pollfd pfd = {
         .fd = m->event_sock,
@@ -1053,13 +1054,13 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
     while (poll(&pfd, 1, 0) > 0) {
         if (pfd.revents & (POLLERR | POLLNVAL)) {
             LOG_WARN("[MRP] event channel socket error");
-            m->event_connected = false;
+            atomic_store(&m->event_connected, false);
             return;
         }
         if (!(pfd.revents & POLLIN)) {
             if (pfd.revents & POLLHUP) {
                 LOG_WARN("[MRP] event channel closed by receiver");
-                m->event_connected = false;
+                atomic_store(&m->event_connected, false);
             }
             return;
         }
@@ -1067,7 +1068,7 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
         int space = (int)sizeof(m->event_rx_enc) - m->event_rx_enc_len;
         if (space <= 0) {
             LOG_ERROR("[MRP] event encrypted buffer full");
-            m->event_connected = false;
+            atomic_store(&m->event_connected, false);
             return;
         }
         ssize_t n = read(m->event_sock,
@@ -1076,7 +1077,7 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (n <= 0) {
             LOG_WARN("[MRP] event channel closed by receiver");
-            m->event_connected = false;
+            atomic_store(&m->event_connected, false);
             return;
         }
         m->event_rx_enc_len += (int)n;
@@ -1086,7 +1087,7 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
                 (int)sizeof(m->event_plain),
                 m->event_in_key, &m->event_in_counter, "event channel") ||
             !mrp_process_event_requests(m)) {
-            m->event_connected = false;
+            atomic_store(&m->event_connected, false);
             return;
         }
         pfd.revents = 0;
@@ -1178,7 +1179,7 @@ bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
         return false;
     }
     m->event_sock = event_sock;
-    m->event_connected = true;
+    atomic_store(&m->event_connected, true);
     m->event_out_counter = 0;
     m->event_in_counter = 0;
     m->event_rx_enc_len = 0;
@@ -1287,7 +1288,7 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
         close(m->sock);
         m->sock = -1;
     }
-    m->event_connected = false;
+    atomic_store(&m->event_connected, false);
     m->event_sock = -1;
     m->rx_enc_len = 0;
     m->rx_msg_len = 0;
@@ -1416,6 +1417,12 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
 bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m)
 {
     return m && m->connected;
+}
+
+int ap2_mrp_event_status(struct ap2_mrp_ctx *m)
+{
+    if (!m || m->event_sock < 0) return -1;
+    return atomic_load(&m->event_connected) ? 1 : 0;
 }
 
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,

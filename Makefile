@@ -41,6 +41,8 @@ BINDIR      = bin
 
 # Output binary
 EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
+TIMELINE_TEST = $(BUILDDIR)/test-ap2-timeline
+EVENT_TEST = $(BUILDDIR)/test-ap2-event
 
 # Compiler flags
 DEFINES  = -DNDEBUG -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED
@@ -121,6 +123,10 @@ OBJECTS_ALL = $(OBJECTS_RAOP) $(OBJECTS_AP2) $(OBJECTS_CLI)
 
 all: directory $(EXECUTABLE)
 
+test: directory $(TIMELINE_TEST) $(EVENT_TEST)
+	$(TIMELINE_TEST)
+	$(EVENT_TEST)
+
 directory:
 	@mkdir -p $(BUILDDIR)
 	@mkdir -p $(BINDIR)
@@ -139,7 +145,16 @@ $(BUILDDIR)/%.o: %.c
 $(BUILDDIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
+$(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
+	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) -Isrc $< -o $@
+
+$(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
+		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/cross_log.o Makefile
+	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(INCLUDE) \
+		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_plist.o \
+		$(BUILDDIR)/cross_log.o $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED)
 
-.PHONY: all directory clean
+.PHONY: all test directory clean

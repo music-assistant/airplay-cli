@@ -164,6 +164,9 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m);
 /* True once the data channel is established. */
 bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
 
+/* Reverse event-channel status: -1 unattached, 0 closed/failed, 1 active. */
+int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
+
 /*
  * Build a binary-plist body for POST /command on the MAIN encrypted RTSP
  * channel (push path A in DESIGN.md §8: real iOS senders push MediaRemote

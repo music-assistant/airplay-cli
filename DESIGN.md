@@ -384,6 +384,11 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 - **RTSP serialization** — one mutex serializes the RTSP channel, so the
   keepalive thread and the streaming path can never interleave frames on the
   encrypted channel.
+- **RTSP fail-closed liveness** — reads and writes are bounded to 8 s. A
+  zero-status request shuts down the TCP/HAP stream because a late encrypted
+  response would otherwise be attributed to the next request and desynchronize
+  nonce counters; the process exits with an error so its supervisor can
+  reconnect instead of leaving a zombie UDP sender.
 - **Socket timeouts** — the RTSP socket, events socket, and the buffered TCP
   socket are receive/send-timeout bounded; a receiver that stops draining
   can never hang the process.
@@ -391,6 +396,12 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
   to tear down a MediaRemote-active stream after roughly 30 seconds.
+- **Realtime send loop** — RTP data/control UDP sockets are non-blocking and
+  account for dropped datagrams, so local network backpressure cannot freeze
+  elapsed-status output. A PCM starvation gap that exhausts the receiver lead
+  shifts the pacing deadline and PTP anchor forward while keeping audio RTP
+  timestamps contiguous, allowing resumed content to render instead of staying
+  permanently late.
 - **Eager input ring** — a dedicated reader drains stdin into a 4 MB ring as
   fast as the source delivers, decoupled from network pacing: the pipeline
   fills before a scheduled start, while a full ring backpressures the pipe.
@@ -409,8 +420,11 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 - **Metadata inputs** — UTF-8 strings become UTF-16BE binary-plist strings when
   needed. `ARTWORK` accepts local files and MA's local HTTP imageproxy URLs;
   imageproxy requests are normalized to supported `size=512&fmt=jpeg` values,
-  and fetches have a 5-second overall deadline so metadata I/O cannot starve
-  the feedback/event keepalive loop.
+  and fetches have a 5-second overall deadline while pumping reverse-event
+  replies every 250 ms, so metadata I/O cannot starve session maintenance.
+- **Diagnostics** — `--debug 10` emits `[CLIDIAG]` ring-buffer snapshots,
+  `[AP2DIAG]` RTP/PTP pacing and packet counters, RTSP request durations,
+  feedback failures, event-channel requests, and starvation/re-anchor events.
 
 ## 11. Device-behavior findings
 

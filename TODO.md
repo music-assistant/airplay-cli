@@ -2,6 +2,12 @@
 
 Genuinely open work only. Completed work lives in git history.
 
+- [ ] **Apple TV native-AP2 stall soak.** Run a 30+ minute `--debug 10` stream
+      on real hardware and retain the final minute around any failure. Confirm
+      reverse-event replies continue, `/feedback` stays 200, `audio_dropped` and
+      `sync_dropped` remain zero, and `[CLIDIAG]` distinguishes PCM starvation
+      from PTP pacing. The deterministic event/timeline tests cover sender
+      behavior, but cannot reproduce tvOS teardown locally.
 - [ ] **Apple TV artwork for non-public images.** Now-playing text and artwork
       render on the Apple TV via MediaRemote, but cover art that is only
       reachable through Music Assistant's imageproxy (e.g. filesystem-provider

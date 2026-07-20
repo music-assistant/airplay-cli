@@ -34,6 +34,9 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
       - name: Build
         run: make STATIC=1 CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+      - name: Test
+        if: matrix.platform == 'x86_64'
+        run: make test STATIC=1 CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
       - name: Validate
         run: |
           bin="bin/cliairplay-linux-${{ matrix.platform }}"
@@ -71,6 +74,9 @@ jobs:
           else
             make STATIC=1 CC=clang CXX=clang++
           fi
+      - name: Test
+        if: matrix.platform == 'arm64'
+        run: make test STATIC=1 CC=clang CXX=clang++
       - name: Validate
         run: |
           bin="bin/cliairplay-macos-${{ matrix.platform }}"

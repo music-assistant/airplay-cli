@@ -23,6 +23,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 #include <sys/time.h>
+#include <time.h>
 #include <poll.h>
 #include <errno.h>
 
@@ -233,6 +234,8 @@ static int truncate_32to24(const uint8_t *in, int in_bytes, uint8_t *out)
  * backpressures the pipe as before.
  */
 #define INPUT_RING_BYTES (4u * 1024 * 1024)  /* allocation; admission is capped by playtime */
+#define INPUT_RING_WAIT (-2)
+#define INPUT_RING_WAIT_MS 250
 
 static struct {
     uint8_t *data;
@@ -302,8 +305,26 @@ static void input_ring_start(int fd, unsigned byte_rate, int cap_ms)
 static int input_ring_read(uint8_t *buf, size_t want)
 {
     pthread_mutex_lock(&g_inring.lock);
-    while (g_inring.fill == 0 && !g_inring.eof && g_running)
-        pthread_cond_wait(&g_inring.can_read, &g_inring.lock);
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_nsec += INPUT_RING_WAIT_MS * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    while (g_inring.fill == 0 && !g_inring.eof && g_running) {
+        int status = pthread_cond_timedwait(&g_inring.can_read,
+                                            &g_inring.lock, &deadline);
+        if (status == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_inring.lock);
+            return INPUT_RING_WAIT;
+        }
+        if (status != 0) {
+            pthread_mutex_unlock(&g_inring.lock);
+            errno = status;
+            return -1;
+        }
+    }
     size_t n = g_inring.fill < want ? g_inring.fill : want;
     size_t got = 0;
     while (got < n) {
@@ -320,6 +341,15 @@ static int input_ring_read(uint8_t *buf, size_t want)
     return (int)n;
 }
 
+static void input_ring_stats(size_t *fill, size_t *capacity, bool *eof)
+{
+    pthread_mutex_lock(&g_inring.lock);
+    if (fill) *fill = g_inring.fill;
+    if (capacity) *capacity = g_inring.max_fill;
+    if (eof) *eof = g_inring.eof;
+    pthread_mutex_unlock(&g_inring.lock);
+}
+
 /* ---- Command pipe handler ---- */
 
 static struct {
@@ -329,6 +359,11 @@ static struct {
     int duration;
     int progress;
 } g_metadata = {"", "", "", 0, 0};
+
+static void artwork_pump_events(void *arg)
+{
+    ap2cl_tick((struct ap2cl_s *)arg);
+}
 
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
@@ -356,8 +391,10 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
             ap2cl_is_connected(g_ap2cl))
             ap2cl_feedback(g_ap2cl);
+        artwork_pump_cb pump =
+            cfg->protocol == PROTO_AIRPLAY2 ? artwork_pump_events : NULL;
         bool loaded = artwork_load(value, &image, &image_size, content_type,
-                                   error, sizeof(error));
+                                   pump, g_ap2cl, error, sizeof(error));
         if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
             ap2cl_is_connected(g_ap2cl))
             ap2cl_feedback(g_ap2cl);
@@ -471,6 +508,9 @@ static void *cmdpipe_reader_thread(void *arg)
             raopcl_keepalive(g_raopcl);
             last_keepalive = now;
         }
+        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
+            ap2cl_is_connected(g_ap2cl))
+            ap2cl_tick(g_ap2cl);
         /* Native AP2 keepalive: real senders POST /feedback about every 2 s
          * and long sessions can hit receiver-side idle timeouts without it
          * (no-op for the RAOP-compat flow, which libraop keeps alive). */
@@ -632,7 +672,9 @@ static int run_raop(cli_config_t *cfg, int infile)
         /* Send audio chunk */
         if (g_status == STATUS_PLAYING && raopcl_accept_frames(g_raopcl)) {
             int n = input_ring_read(buf, DEFAULT_FRAMES_PER_CHUNK * input_bpf);
-            if (n < 0) {
+            if (n == INPUT_RING_WAIT) {
+                continue;
+            } else if (n < 0) {
                 status_error("Error reading from audio source");
                 break;
             } else if (n == 0) {
@@ -768,12 +810,21 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     uint8_t *buf = malloc(AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
     uint8_t *ap2_alac_buf = (cfg->bit_depth > 16) ? malloc(AP2_FRAMES_PER_CHUNK * ap2_alac_bpf) : NULL;
     bool got_eof = false;
+    bool failed = false;
 
     uint64_t eof_time = 0;
+    uint64_t last_diag = 0;
+    uint64_t input_wait_since = 0;
+    uint64_t last_input_warn = 0;
 
     /* Main audio loop */
     while (g_status != STATUS_STOPPED && (!got_eof || ap2cl_is_playing(g_ap2cl))) {
         uint64_t now = raopcl_get_ntp(NULL);
+        if (!ap2cl_control_healthy(g_ap2cl)) {
+            status_error("AirPlay control channel lost");
+            failed = true;
+            break;
+        }
 
         /* After EOF, drain for at most latency + 2 seconds then stop */
         if (got_eof && eof_time && now - eof_time > MS2NTP(cfg->latency_ms + 2000)) {
@@ -791,12 +842,40 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 status_playing(elapsed);
             }
         }
+        if (now - last_diag >= MS2NTP(5000)) {
+            size_t ring_fill, ring_capacity;
+            bool ring_eof;
+            last_diag = now;
+            input_ring_stats(&ring_fill, &ring_capacity, &ring_eof);
+            LOG_SDEBUG("[CLIDIAG] frames=%" PRIu64
+                       " ring_fill=%zu ring_capacity=%zu ring_eof=%d "
+                       "status=%d got_eof=%d",
+                       frames, ring_fill, ring_capacity, ring_eof,
+                       g_status, got_eof);
+            ap2cl_log_diagnostics(g_ap2cl);
+        }
 
         /* Send audio chunk */
         if (g_status == STATUS_PLAYING && ap2cl_accept_frames(g_ap2cl)) {
             int n = input_ring_read(buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
-            if (n < 0) {
+            if (n == INPUT_RING_WAIT) {
+                uint64_t wait_now = raopcl_get_ntp(NULL);
+                if (!input_wait_since) input_wait_since = wait_now;
+                uint64_t wait_ms = NTP2MS(wait_now - input_wait_since);
+                if (wait_ms >= 2000 &&
+                    wait_now - last_input_warn >= MS2NTP(5000)) {
+                    size_t ring_fill, ring_capacity;
+                    bool ring_eof;
+                    last_input_warn = wait_now;
+                    input_ring_stats(&ring_fill, &ring_capacity, &ring_eof);
+                    LOG_WARN("[AP2DIAG] PCM input starved for %" PRIu64
+                             "ms (fill=%zu/%zu eof=%d)",
+                             wait_ms, ring_fill, ring_capacity, ring_eof);
+                }
+                continue;
+            } else if (n < 0) {
                 status_error("Error reading from audio source");
+                failed = true;
                 break;
             } else if (n == 0) {
                 if (!got_eof) {
@@ -805,6 +884,15 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                     eof_time = raopcl_get_ntp(NULL);
                 }
                 continue;
+            }
+            if (input_wait_since) {
+                uint64_t waited_ms = NTP2MS(raopcl_get_ntp(NULL) -
+                                            input_wait_since);
+                ap2cl_recover_input_gap(g_ap2cl);
+                if (waited_ms >= 2000)
+                    LOG_INFO("[AP2DIAG] PCM input recovered after %" PRIu64
+                             "ms", waited_ms);
+                input_wait_since = 0;
             }
 
             int af = n / ap2_input_bpf;
@@ -820,11 +908,11 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         }
     }
 
-    status_eof();
+    if (!failed) status_eof();
     g_running = false;
     free(buf);
     free(ap2_alac_buf);
-    return 0;
+    return failed ? 1 : 0;
 }
 
 
