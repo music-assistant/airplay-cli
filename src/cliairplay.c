@@ -220,11 +220,12 @@ static int truncate_32to24(const uint8_t *in, int in_bytes, uint8_t *out)
  * slow source startup. When the ring is full the reader blocks, which
  * backpressures the pipe as before.
  */
-#define INPUT_RING_BYTES (4u * 1024 * 1024)  /* ~10s at 44.1/16, ~5.5s at 48/24 s32 */
+#define INPUT_RING_BYTES (4u * 1024 * 1024)  /* allocation; admission is capped by playtime */
 
 static struct {
     uint8_t *data;
     size_t rd, wr, fill;
+    size_t max_fill;
     bool eof;
     bool started;
     int fd;
@@ -252,9 +253,9 @@ static void *input_ring_thread(void *arg)
         }
         size_t off = 0;
         while (off < (size_t)n && g_running) {
-            while (g_inring.fill == INPUT_RING_BYTES && g_running)
+            while (g_inring.fill >= g_inring.max_fill && g_running)
                 pthread_cond_wait(&g_inring.can_write, &g_inring.lock);
-            size_t space = INPUT_RING_BYTES - g_inring.fill;
+            size_t space = g_inring.max_fill - g_inring.fill;
             size_t chunk_len = (size_t)n - off;
             if (chunk_len > space) chunk_len = space;
             size_t to_end = INPUT_RING_BYTES - g_inring.wr;
@@ -270,10 +271,17 @@ static void *input_ring_thread(void *arg)
     return NULL;
 }
 
-static void input_ring_start(int fd)
+static void input_ring_start(int fd, unsigned byte_rate, int cap_ms)
 {
     g_inring.data = malloc(INPUT_RING_BYTES);
     g_inring.fd = fd;
+    /* Cap admission by buffered PLAYTIME, not allocation size: an over-deep
+     * ring lets the feeder run tens of seconds ahead of the audible position,
+     * which breaks anything mapping feed position to wall clock (sync-group
+     * late joiners join silent until the clock catches up). The cap covers
+     * the pre-start prefill (latency) plus margin. */
+    uint64_t cap = (uint64_t)byte_rate * (uint64_t)cap_ms / 1000;
+    g_inring.max_fill = (cap && cap < INPUT_RING_BYTES) ? (size_t)cap : INPUT_RING_BYTES;
     g_inring.started = true;
     pthread_create(&g_inring.thread, NULL, input_ring_thread, NULL);
 }
@@ -1225,8 +1233,11 @@ int main(int argc, char *argv[])
         pthread_create(&g_cmdpipe_thread, NULL, cmdpipe_reader_thread, &cfg);
     }
 
-    /* Drain the audio source eagerly from here on (see the input ring note) */
-    input_ring_start(infile);
+    /* Drain the audio source eagerly from here on (see the input ring note),
+     * keeping at most the pre-start prefill plus margin buffered. */
+    unsigned in_byte_rate =
+        (unsigned)((cfg.bit_depth <= 16 ? 2 : 4) * cfg.channels * cfg.sample_rate);
+    input_ring_start(infile, in_byte_rate, cfg.latency_ms + 2000);
 
     /* Run the selected protocol */
     int result;
