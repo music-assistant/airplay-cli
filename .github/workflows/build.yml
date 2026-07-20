@@ -100,10 +100,18 @@ jobs:
           path: artifacts
       - name: Collect binaries and checksums
         run: |
+          binaries=(
+            cliairplay-linux-aarch64
+            cliairplay-linux-x86_64
+            cliairplay-macos-arm64
+            cliairplay-macos-x86_64
+          )
           mkdir release
-          find artifacts -type f -name 'cliairplay-*' -exec cp {} release/ \;
+          for binary in "${binaries[@]}"; do
+            cp "artifacts/$binary/$binary" "release/$binary"
+          done
           chmod +x release/cliairplay-*
-          (cd release && sha256sum cliairplay-* > SHA256SUMS)
+          (cd release && sha256sum "${binaries[@]}" > SHA256SUMS)
           ls -la release
       - name: Create release
         env:
@@ -113,3 +121,66 @@ jobs:
           --repo "${{ github.repository }}"
           --title "${{ github.ref_name }}"
           --generate-notes
+
+  verify-release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: release
+    runs-on: ubuntu-22.04
+    steps:
+      - name: Download published assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          mkdir release
+          gh release download "${{ github.ref_name }}" \
+            --repo "${{ github.repository }}" \
+            --dir release
+      - name: Verify asset contract and checksums
+        run: |
+          assets=(
+            SHA256SUMS
+            cliairplay-linux-aarch64
+            cliairplay-linux-x86_64
+            cliairplay-macos-arm64
+            cliairplay-macos-x86_64
+          )
+          test "$(find release -maxdepth 1 -type f | wc -l)" -eq "${#assets[@]}"
+          for asset in "${assets[@]}"; do
+            test -f "release/$asset"
+          done
+          cat release/SHA256SUMS
+          (cd release && sha256sum --check SHA256SUMS)
+          chmod +x release/cliairplay-linux-x86_64
+          release/cliairplay-linux-x86_64 --check
+      - name: Verify privileged PTP binding
+        run: |
+          image=ubuntu:22.04
+          docker pull "$image"
+
+          set +e
+          output=$(docker run --rm \
+            --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
+            --cap-drop ALL \
+            --user 65534:65534 \
+            --volume "$PWD/release:/assets:ro" \
+            "$image" \
+            sh -c 'printf "SYSCTL="; cat /proc/sys/net/ipv4/ip_unprivileged_port_start; exec /assets/cliairplay-linux-x86_64 --ptp-daemon' 2>&1)
+          rc=$?
+          set -e
+          printf '%s\nNON_ROOT_EXIT_CODE=%s\n' "$output" "$rc"
+          test "$rc" -eq 2
+          grep -F "cannot bind UDP 319/320" <<<"$output"
+
+          set +e
+          output=$(docker run --rm \
+            --sysctl net.ipv4.ip_unprivileged_port_start=1024 \
+            --cap-drop ALL \
+            --cap-add NET_BIND_SERVICE \
+            --volume "$PWD/release:/assets:ro" \
+            "$image" \
+            sh -c 'printf "SYSCTL="; cat /proc/sys/net/ipv4/ip_unprivileged_port_start; exec timeout --signal=TERM --kill-after=1 2 /assets/cliairplay-linux-x86_64 --ptp-daemon' 2>&1)
+          rc=$?
+          set -e
+          printf '%s\nCAPABILITY_TIMEOUT_EXIT_CODE=%s\n' "$output" "$rc"
+          test "$rc" -eq 124
+          grep -F "daemon up: engine on 319/320" <<<"$output"
