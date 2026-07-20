@@ -495,7 +495,7 @@ static int run_raop(cli_config_t *cfg, int infile)
     char *iface = NULL;
     raop_crypto_t crypto = RAOP_CLEAR;
     int latency;
-    uint64_t start = 0, last = 0, frames = 0;
+    uint64_t last = 0, frames = 0;
     uint8_t *buf;
     bool got_eof = false;
 
@@ -586,7 +586,6 @@ static int run_raop(cli_config_t *cfg, int infile)
     }
 
     g_status = STATUS_PLAYING;
-    start = raopcl_get_ntp(NULL);
     /* Stdin audio format:
      * For 16-bit: s16le (2 bytes per sample, 4 bytes per frame stereo)
      * For 24-bit: s32le (4 bytes per sample, 8 bytes per frame stereo)

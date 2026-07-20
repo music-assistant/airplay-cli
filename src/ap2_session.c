@@ -247,41 +247,6 @@ static int send_rtsp_encrypted(struct ap2_session *s, const char *method, const 
     return 0;
 }
 
-/* ---- Binary plist construction helpers ---- */
-
-/*
- * Construct a binary plist for stream SETUP manually.
- * The libraop bplist class can't handle nested arrays, so we build
- * the specific format needed for AP2 stream SETUP by hand.
- *
- * We use Python's plistlib as the reference for the binary format.
- * For simplicity, this constructs a minimal but correct bplist00.
- */
-
-/* Minimal manual bplist builder for the specific SETUP payloads */
-
-static int build_session_setup_plist(const char *session_uuid, int timing_port,
-                                      const char *timing_protocol,
-                                      uint8_t **out)
-{
-    /* Use the libraop bplist for flat session SETUP (which works) */
-    /* This is a simple dict with 3 keys - bplist handles it fine */
-    /* For now, use a pre-serialized approach via the bplist wrapper */
-
-    /* Actually, let's just construct it manually using the known-good format.
-     * We know plistlib.dumps({'timingProtocol':'NTP','timingPort':N,'sessionUUID':'...'})
-     * works. Let's replicate that exact format. */
-
-    /* For simplicity and correctness, shell out to Python for plist generation.
-     * This is a temporary approach - proper C plist builder would be better. */
-
-    /* TODO: Implement proper binary plist builder in C that supports
-     * nested arrays and dicts (needed for streams SETUP). */
-
-    /* For now, use the ap2_bplist wrapper which works for flat dicts */
-    return 0;  /* Caller should use ap2_bplist for session setup */
-}
-
 /* ---- Public API ---- */
 
 struct ap2_session *ap2_session_create(const char *host, int port,

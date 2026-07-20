@@ -34,7 +34,6 @@ typedef struct {
 } buf_t;
 
 static void buf_init(buf_t *b) { b->cap = 512; b->data = malloc(b->cap); b->len = 0; }
-static void buf_free(buf_t *b) { free(b->data); }
 static void buf_grow(buf_t *b, int need) {
     while (b->len + need > b->cap) { b->cap *= 2; b->data = realloc(b->data, b->cap); }
 }

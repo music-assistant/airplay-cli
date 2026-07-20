@@ -558,11 +558,12 @@ static void ptp_handle_signaling(struct ap2_ptp_ctx *ctx, const uint8_t *buf, in
     ctx->unicast_granted = true;
     ctx->unicast_mirror = true;                    /* serve the peer unicast from now on */
     pthread_mutex_unlock(&ctx->lock);
-    if (first)
+    if (first) {
         LOG_INFO("[PTP] Granted unicast transmission to %s (msgTypes %s) — serving "
                  "Announce/Sync unicast", srcip, kinds);
-    else
+    } else {
         LOG_DEBUG("[PTP] Renewed unicast grant for %s (msgTypes %s)", srcip, kinds);
+    }
 }
 
 static int ptp_open_socket(struct ap2_ptp_ctx *ctx, uint16_t port)
