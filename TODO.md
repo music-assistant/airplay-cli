@@ -27,8 +27,3 @@ Genuinely open work only. Completed work lives in git history.
       advertised table understates on Apple TV, and a SETUP 200 can lie — Sonos
       silently renders nothing on 48/24). A try-then-fall-back negotiation
       would let opt-in hi-res degrade gracefully.
-- [ ] **First release tag + MA container fetch.** The `v*` release job
-      (binaries + `SHA256SUMS`) exists but has never run. Cut a first versioned
-      release, then make the MA container build fetch the pinned release
-      binaries instead of committing prebuilt binaries into the provider `bin/`
-      dir (the committed binaries are for local testing only).

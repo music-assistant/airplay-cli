@@ -46,6 +46,16 @@ jobs:
             # Cross-built: can't execute here, just confirm the architecture.
             file "$bin" | grep -qi "aarch64"
           fi
+          glibc_ceiling=GLIBC_2.36
+          max_glibc=$(readelf --version-info "$bin" |
+            grep -o 'GLIBC_[0-9.]*' | sort -V | tail -1)
+          echo "Maximum glibc requirement: ${max_glibc:-none}"
+          if [ -n "$max_glibc" ] &&
+             [ "$(printf '%s\n' "$glibc_ceiling" "$max_glibc" |
+               sort -V | tail -1)" != "$glibc_ceiling" ]; then
+            echo "::error::$bin requires $max_glibc; server ceiling is $glibc_ceiling"
+            exit 1
+          fi
       - uses: actions/upload-artifact@v4
         with:
           name: cliairplay-linux-${{ matrix.platform }}

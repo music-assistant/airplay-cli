@@ -210,7 +210,7 @@ CI (`.github/workflows/build.yml`) cross-builds four targets on every push —
 `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64` — validates
 `--check` on the natively runnable ones, and uploads the binaries as
 artifacts. Pushing a `v*` tag additionally runs a release job (GitHub Release
-with the four binaries + `SHA256SUMS`); no versioned release has been cut yet.
+with the four binaries + `SHA256SUMS`).
 
 ## Architecture
 
