@@ -231,6 +231,12 @@ libraop/              Upstream philippe44/libraop (RAOP protocol + crypto)
 
 ## Credits and references
 
+This binary follows the trail blazed by **Brad Keifer**
+([@bradkeifer](https://github.com/bradkeifer)), whose earlier `cliap2` — the
+standalone AirPlay 2 streaming client for Music Assistant (adapting OwnTone
+into a dedicated client) — proved a CLI streamer was viable and directly
+inspired this unified RAOP + AirPlay 2 binary.
+
 **Built on**
 
 - **[philippe44/libraop](https://github.com/philippe44/libraop)** — bundled as a
