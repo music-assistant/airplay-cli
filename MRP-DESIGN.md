@@ -9,18 +9,20 @@ Apple TV holds off standby mid-stream, and (c) an Apple TV can later act as a
 sender lives in `src/ap2_mrp.{h,c}`, is in the build, and is now wired into the
 native audio flow via `ap2_native_setup_mrp()` in `ap2_client.c` (§8, §11).
 
-Status: path A (`POST /command`) was wired and tested against a real Apple TV
-4K — HTTP 400 on every push (§4, §10.2) — and is disabled by default. Path B
-(the type-130 data channel) is wired end to end and **live-verified against
-the Apple TV 4K (tvOS 26.x): the SETUP is accepted alongside the audio stream,
-the channel and handshake come up and SET_STATE pushes flow (`[STATUS] mrp
-path=channel status=1` on consecutive streams)** — but tvOS renders **no
-now-playing UI** from these bare sender pushes (§10.1). Leading hypothesis: the
-origin must advertise which transport commands it accepts — so SET_STATE now
-also carries `supportedCommands` (§10.1a, source-backed from pyatv protos), as
-yet unverified on screen. The decider is a capture of a real iPhone sender's
-MRP traffic against a fake receiver: the rig is built and ready in
-`../airplay2-receiver` (§10.2b). §10 ranks the remaining unknowns.
+Status: **a ground-truth capture of a real iPhone sender (2026-07-20, §10.2c)
+settled the mechanism: now-playing is pushed as `POST /command` with type
+`"updateMRNowPlayingInfo"`** (NOT the type-130 data channel, and NOT our
+fabricated `"updateNowPlayingInfo"`, which is why path A 400'd). The type-130
+channel the iPhone opens carries the remote-control **relay** (MediaRemote
+DEVICE_INFO of now-playing origins), not the sender's own now-playing state.
+Implemented this pass: `ap2_mrp_build_nowplaying_command` rewritten to the
+captured `updateMRNowPlayingInfo` envelope (npi-text / mergePolicy / nested
+`params`, CFDate `Timestamp`, full key set), a `date` type added to the plist
+writer, and path A re-enabled as the primary now-playing push. Emitter verified
+against the capture (plistlib + the rig's biplist decode our body to the iPhone
+shape). Path B (type-130 SET_STATE) stays wired best-effort but is NOT the
+display path (it came up `status=1` on the ATV yet never rendered). Awaiting the
+developer's on-TV test that the corrected path A renders now-playing.
 
 ---
 
@@ -458,21 +460,80 @@ covers both observations in one test).
    wire (the developer's live run predates the body-logging patch); enabling
    the env var on the next session will record it, though the diagnosis does
    not depend on it.
-2b. **Capture rig for the decider — BUILT AND READY.** A patched clone of
-   `openairplay/airplay2-receiver` lives at `../airplay2-receiver` (own
-   `.venv`, Python 3.12). It runs NTP-only style with `-npm` and was verified
-   NOT to bind PTP 319/320 (lsof-checked; those stay owned by the live MA
-   daemon) and to advertise `_airplay._tcp` as "MRP Capture" on
-   192.168.1.47. Patches (all local to that scratch clone): `av`/`pyaudio`
-   made optional + audio drain-only (no decode/playback); `handle_command`
-   dumps the full `/command` envelope (the real sender's `type` + now-playing
-   keys); a new `ap2/connections/mrp_capture.py` implements the **type-130
-   receiver side** (DataStream HKDF keys, ChaCha20 frame decrypt, 32-byte data
-   headers, bplist `params.data`, protobuf decode, `sync`→`rply`) and dumps
-   every message; a configurable `MRP_PORT` lets it coexist with another
-   receiver on 7000. The decrypt/parse pipeline was self-tested offline against
-   a synthetic frame. Run `../airplay2-receiver/capture.sh`, AirPlay from an
-   iPhone, diff the log against our sender.
+2b. **Capture rig for the decider — BUILT, FIXED, SELF-TESTED READY.** A
+   patched clone of `openairplay/airplay2-receiver` at `../airplay2-receiver`
+   (own `.venv`, Python 3.12, `-npm`, verified NOT to bind PTP 319/320,
+   advertises "MRP Capture"). Patches (scratch clone only): `av`/`pyaudio`
+   optional + audio drain-only; `handle_command` dumps the full `/command`
+   envelope; a new `ap2/connections/mrp_capture.py` implements the **type-130
+   receiver side** (DataStream HKDF keys, ChaCha20 frame decrypt, 32-byte
+   headers, bplist `params.data`, protobuf decode, `sync`→`rply`); `MRP_PORT`
+   coexistence; `do_SETUP` returns only the current request's streams.
+   Run `../airplay2-receiver/capture.sh`.
+   - **First iPhone capture (2026-07-20) came back thin — diagnosed + fixed.**
+     The iPhone streamed realtime audio (pt=96) and POSTed `/command`
+     `type:"updateMRSupportedCommands"` (the attested envelope, with a full
+     `mrSupportedCommandsFromSender` list — `kCommandInfoCommandKey`/
+     `EnabledKey`/`OptionsKey`) but **pushed no now-playing and never opened a
+     type-130 channel** — plain-speaker behavior. Root cause: the rig did not
+     advertise `Ft50NowPlayingInfo` (bit 50) nor `StatusFlags.RemoteControlRelay`
+     (bit 11, upstream-disabled with the note "must handle stream type 130 for
+     RCR"). A real Apple TV sets both. Fix: enabled both in the clone's
+     `bitflags.py` (now that the clone handles type 130). This confirms tvOS/iOS
+     gate the MRP now-playing push + type-130 channel on the receiver
+     advertising now-playing/remote-control capability.
+   - **Type-130 capture self-tested end to end** by driving the real
+     `Stream(type=130)`→`MRPCapture` path (SETUP-accept → dataPort → TCP accept
+     → channel decrypt → data-header → bplist → protobuf dump): DEVICE_INFO and
+     SET_STATE (incl. nested `supportedCommands`) decode correctly, clean
+     disconnect. `/command` dump proven with the real iPhone data above.
+
+2c. **GROUND-TRUTH capture (Ft50+RCR rig, real iPhone, 2026-07-20) — the
+   decider.** With now-playing capability advertised, the iPhone streamed audio
+   (pt=96) AND pushed metadata. What it actually sent:
+
+   | Channel | What the iPhone sent | Carries now-playing? |
+   |---|---|---|
+   | `POST /command` `type=updateMRNowPlayingInfo` | full track metadata + inline artwork (below) | **YES — this is the display push** |
+   | `POST /command` `type=updateMRSupportedCommands` | `mrSupportedCommandsFromSender` = MRMediaRemoteCommand list (0,1,2,3,4,5,8,9,10,11,17,18,24,25,26 + Shuffle/Repeat/scrub options) | no (capability advert) |
+   | `POST /command` `type=None` | `{params:{data:<protobuf>}}` = MRP DEVICE_INFO of now-playing origins (relay) | no (remote-control relay) |
+   | type-130 stream SETUP ×14 (`seed=0`) | **never completed a TCP data connection** (0 frames) | no |
+
+   So the display mechanism is `POST /command` `updateMRNowPlayingInfo`, shape:
+   ```
+   { type: "updateMRNowPlayingInfo",
+     params: { type: "npi-text", mergePolicy: "replace",
+               params: { kMRMediaRemoteNowPlayingInfo* } } }
+   ```
+   Inner keys observed: Title, Artist, Album, Duration(real s), ElapsedTime(real),
+   PlaybackRate(real), DefaultPlaybackRate(real), Timestamp(**CFDate**),
+   MediaType("MRMediaRemoteMediaTypeMusic"), UniqueIdentifier(uint64),
+   ArtworkData(JPEG, 600×600, ~43 KB, `ffd8ffe0…`), ArtworkMIMEType, plus
+   optional TrackNumber/DiscNumber/Total*/ContentItemIdentifier/etc.
+
+   **Diff vs our sender (before this pass):** our path A used
+   `type:"updateNowPlayingInfo"` with a single `params.params` nest and no
+   `npi-text`/`mergePolicy` — a fabricated type string → **HTTP 400**. We also
+   lacked Timestamp (no plist date type), DefaultPlaybackRate, MediaType, and a
+   UniqueIdentifier. Our path B pushed now-playing over type-130 SET_STATE — a
+   channel the real sender does **not** use for now-playing at all.
+
+   **Implemented (`src/ap2_mrp.c`, `src/ap2_plist.{c,h}`, `src/ap2_client.c`):**
+   rewrote `ap2_mrp_build_nowplaying_command` to the captured envelope; added
+   `ap2_pl_date()` (bplist marker `0x33`) for the CFDate Timestamp; a per-track
+   `np_uid` (random 63-bit, stable across a track's progress pushes); re-enabled
+   `ap2cl_mrp_push` (was env-gated) as the primary now-playing push on every
+   metadata/progress/artwork change. Artwork follows the iPhone's send-once
+   model: the bytes ride only the first push for a given image (plus a fresh
+   `ArtworkIdentifier`); later pushes reference that identifier without the
+   bytes, so a ~40 KB image is not re-sent on every progress tick over the
+   shared RTSP channel. Path B left as-is (best-effort; not the display path).
+   Verified: plistlib AND the rig's biplist decode our emitted body to the
+   identical iPhone shape (Timestamp → datetime, artwork → JPEG), and the
+   send-once/reference artwork behavior confirmed across two pushes.
+   Open: whether inbound handling is needed (the iPhone answered nothing inbound
+   in this trace; the relay `type=None` posts and type-130 are receiver→sender
+   control, not required for our sender→receiver display push).
 3. **Type-130 SETUP alongside an audio stream in one session — CONFIRMED OK
    (tvOS 26.x).** The Apple TV accepts the extra type-130 stream SETUP issued
    after SETPEERS on a live audio session (200 + `dataPort`), the channel

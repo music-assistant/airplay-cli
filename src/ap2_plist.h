@@ -74,6 +74,8 @@ ap2_pl_node *ap2_pl_array(void);
 ap2_pl_node *ap2_pl_string(const char *s);
 ap2_pl_node *ap2_pl_int(int64_t v);
 ap2_pl_node *ap2_pl_real(double v);
+/* CFDate value: v is CFAbsoluteTime (seconds since 2001-01-01 UTC). */
+ap2_pl_node *ap2_pl_date(double v);
 ap2_pl_node *ap2_pl_bool(bool b);
 ap2_pl_node *ap2_pl_data(const uint8_t *d, size_t len);
 

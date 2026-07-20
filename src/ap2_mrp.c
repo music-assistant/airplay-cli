@@ -184,6 +184,9 @@ struct ap2_mrp_ctx {
     char *artwork_mime;
     uint8_t *artwork;
     int artwork_len;
+    char artwork_id[17];      /* 16-hex ArtworkIdentifier for the current art */
+    bool artwork_sent;        /* bytes already pushed once (then ref by id) */
+    uint64_t np_uid;          /* per-track now-playing UniqueIdentifier */
 
     time_t last_state_push;
 };
@@ -975,6 +978,12 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
     mrp_replace_str(&m->artist, artist);
     mrp_replace_str(&m->album, album);
     m->duration_ms = duration_ms > 0 ? duration_ms : 0;
+    /* New track: fresh UniqueIdentifier (stable across this track's progress
+     * pushes; changing it per push would reset the receiver's now-playing UI).
+     * Random 63-bit, matching the large uint64 a real sender emits. */
+    uint64_t uid = 0;
+    RAND_bytes((uint8_t *)&uid, sizeof(uid));
+    m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
     if (!m->connected) return true;
     return mrp_push_state(m, false);
 }
@@ -990,6 +999,15 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     m->artwork = copy;
     m->artwork_len = len;
     mrp_replace_str(&m->artwork_mime, mime ? mime : "image/jpeg");
+    /* Fresh artwork: new ArtworkIdentifier and re-arm the one-shot byte send.
+     * Like a real sender, the /command push carries the bytes once and then
+     * references them by identifier (ap2_mrp_build_nowplaying_command). */
+    uint8_t idb[8];
+    RAND_bytes(idb, sizeof(idb));
+    snprintf(m->artwork_id, sizeof(m->artwork_id),
+             "%02x%02x%02x%02x%02x%02x%02x%02x",
+             idb[0], idb[1], idb[2], idb[3], idb[4], idb[5], idb[6], idb[7]);
+    m->artwork_sent = false;
     if (!m->connected) return true;
     return mrp_push_state(m, true);
 }
@@ -1064,13 +1082,16 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
 {
     if (!m || !out || !out_len) return false;
 
-    /* Push path A (MRP-DESIGN.md §4): a bplist body for POST /command on the
-     * main encrypted RTSP channel, carrying MediaRemote now-playing keys.
-     * Real iOS senders push this shape (openairplay/airplay2-receiver
-     * handle_command observes params.params.kMRMediaRemoteNowPlayingInfo*
-     * under a top-level "params" dict); the outer "type" string is our best
-     * guess — the reference receiver ignores it. Durations/elapsed/rate are
-     * plist reals (MediaRemote uses doubles). */
+    /* Push path A: POST /command carrying MediaRemote now-playing info. Shape
+     * captured VERBATIM from a real iPhone -> AirPlay 2 receiver session
+     * (2026-07-20, MRP-DESIGN.md §10): a triple-nested bplist
+     *   { "type": "updateMRNowPlayingInfo",
+     *     "params": { "type": "npi-text", "mergePolicy": "replace",
+     *                 "params": { kMRMediaRemoteNowPlayingInfo* ... } } }
+     * Our earlier "updateNowPlayingInfo" (missing the "npi-text"/"mergePolicy"
+     * wrapper and using a fabricated type string) was HTTP-400'd by the Apple
+     * TV; this is the attested envelope. Durations/elapsed/rate are plist
+     * reals; Timestamp is a CFDate (the reference time for ElapsedTime). */
     ap2_pl_node *info = ap2_pl_dict();
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoTitle",
                     ap2_pl_string(m->title ? m->title : ""));
@@ -1085,18 +1106,38 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                     ap2_pl_real((double)m->elapsed_ms / 1000.0));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoPlaybackRate",
                     ap2_pl_real(m->playing ? 1.0 : 0.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoDefaultPlaybackRate",
+                    ap2_pl_real(1.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoTimestamp",
+                    ap2_pl_date(m->elapsed_set_at > 0.0 ? m->elapsed_set_at
+                                                        : mrp_cf_now()));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoMediaType",
+                    ap2_pl_string("MRMediaRemoteMediaTypeMusic"));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoUniqueIdentifier",
+                    ap2_pl_int((int64_t)m->np_uid));
     if (m->artwork && m->artwork_len > 0) {
-        ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkData",
-                        ap2_pl_data(m->artwork, (size_t)m->artwork_len));
+        ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkIdentifier",
+                        ap2_pl_string(m->artwork_id));
         ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkMIMEType",
                         ap2_pl_string(m->artwork_mime ? m->artwork_mime
                                                       : "image/jpeg"));
+        /* Carry the bytes only on the first push for this artwork; later pushes
+         * reference it by identifier (the receiver caches by id), exactly as a
+         * real sender does — avoids re-sending ~tens of KB on every progress
+         * tick over the shared RTSP channel. */
+        if (!m->artwork_sent) {
+            ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkData",
+                            ap2_pl_data(m->artwork, (size_t)m->artwork_len));
+            m->artwork_sent = true;
+        }
     }
 
     ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "type", ap2_pl_string("npi-text"));
+    ap2_pl_dict_set(params, "mergePolicy", ap2_pl_string("replace"));
     ap2_pl_dict_set(params, "params", info);
     ap2_pl_node *root = ap2_pl_dict();
-    ap2_pl_dict_set(root, "type", ap2_pl_string("updateNowPlayingInfo"));
+    ap2_pl_dict_set(root, "type", ap2_pl_string("updateMRNowPlayingInfo"));
     ap2_pl_dict_set(root, "params", params);
 
     int len = ap2_pl_serialize(root, out);

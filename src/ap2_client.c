@@ -1931,13 +1931,11 @@ static void ap2_log_response_body(const char *tag, const uint8_t *body, int len)
 int ap2cl_mrp_push(struct ap2cl_s *p)
 {
     if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
-    /* Path A (POST /command) is OFF by default: the real Apple TV 4K returns
-     * HTTP 400 on every push (MRP-DESIGN.md §10.2) and now-playing rides the
-     * type-130 data channel (path B) instead. Firing dead requests on every
-     * metadata change is only log noise. Set CLIAIRPLAY_MRP_COMMAND=1 to re-run
-     * it for a one-off capture of the rejection body (logged below). */
-    if (!getenv("CLIAIRPLAY_MRP_COMMAND")) return 0;
-
+    /* Path A (POST /command, type "updateMRNowPlayingInfo") is the now-playing
+     * push a real iPhone sender uses (captured 2026-07-20, MRP-DESIGN.md §10);
+     * the earlier 400 was our fabricated "updateNowPlayingInfo" envelope, since
+     * corrected in ap2_mrp_build_nowplaying_command. Sent on every metadata/
+     * progress/artwork change; the response body is logged on any non-2xx. */
     uint8_t *body = NULL;
     int body_len = 0;
     if (!ap2_mrp_build_nowplaying_command(p->mrp, &body, &body_len)) return -1;

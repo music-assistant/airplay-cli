@@ -403,14 +403,14 @@ int ap2_plist_serialize(struct ap2_plist *p, uint8_t **out)
 
 /* ---- General nested plist node API ---- */
 
-enum { PLN_DICT, PLN_ARRAY, PLN_STRING, PLN_INT, PLN_REAL, PLN_BOOL, PLN_DATA };
+enum { PLN_DICT, PLN_ARRAY, PLN_STRING, PLN_INT, PLN_REAL, PLN_BOOL, PLN_DATA, PLN_DATE };
 
 struct ap2_pl_node {
     int type;
     int index;            /* assigned during serialization */
     char *str;            /* PLN_STRING */
     int64_t ival;         /* PLN_INT */
-    double rval;          /* PLN_REAL */
+    double rval;          /* PLN_REAL, PLN_DATE (CFAbsoluteTime seconds) */
     bool bval;            /* PLN_BOOL */
     uint8_t *data;        /* PLN_DATA */
     size_t dlen;
@@ -450,6 +450,13 @@ ap2_pl_node *ap2_pl_real(double v)
 {
     struct ap2_pl_node *n = pl_new(PLN_REAL);
     if (n) n->rval = v;
+    return n;
+}
+
+ap2_pl_node *ap2_pl_date(double cfabs_seconds)
+{
+    struct ap2_pl_node *n = pl_new(PLN_DATE);
+    if (n) n->rval = cfabs_seconds;
     return n;
 }
 
@@ -578,6 +585,16 @@ int ap2_pl_serialize(const ap2_pl_node *root, uint8_t **out)
             uint64_t bits;
             memcpy(&bits, &n->rval, sizeof(bits));
             buf_append_byte(&objs, 0x23);
+            for (int b = 7; b >= 0; b--)
+                buf_append_byte(&objs, (uint8_t)(bits >> (b * 8)));
+            break;
+        }
+        case PLN_DATE: {
+            /* date: marker 0x33, big-endian IEEE754 double CFAbsoluteTime
+             * (seconds since 2001-01-01 UTC) — matches Apple's CFDate. */
+            uint64_t bits;
+            memcpy(&bits, &n->rval, sizeof(bits));
+            buf_append_byte(&objs, 0x33);
             for (int b = 7; b >= 0; b--)
                 buf_append_byte(&objs, (uint8_t)(bits >> (b * 8)));
             break;
