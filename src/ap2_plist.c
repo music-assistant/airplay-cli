@@ -403,13 +403,14 @@ int ap2_plist_serialize(struct ap2_plist *p, uint8_t **out)
 
 /* ---- General nested plist node API ---- */
 
-enum { PLN_DICT, PLN_ARRAY, PLN_STRING, PLN_INT, PLN_BOOL, PLN_DATA };
+enum { PLN_DICT, PLN_ARRAY, PLN_STRING, PLN_INT, PLN_REAL, PLN_BOOL, PLN_DATA };
 
 struct ap2_pl_node {
     int type;
     int index;            /* assigned during serialization */
     char *str;            /* PLN_STRING */
     int64_t ival;         /* PLN_INT */
+    double rval;          /* PLN_REAL */
     bool bval;            /* PLN_BOOL */
     uint8_t *data;        /* PLN_DATA */
     size_t dlen;
@@ -442,6 +443,13 @@ ap2_pl_node *ap2_pl_int(int64_t v)
 {
     struct ap2_pl_node *n = pl_new(PLN_INT);
     if (n) n->ival = v;
+    return n;
+}
+
+ap2_pl_node *ap2_pl_real(double v)
+{
+    struct ap2_pl_node *n = pl_new(PLN_REAL);
+    if (n) n->rval = v;
     return n;
 }
 
@@ -565,6 +573,15 @@ int ap2_pl_serialize(const ap2_pl_node *root, uint8_t **out)
         case PLN_INT:
             write_int_value(&objs, n->ival);
             break;
+        case PLN_REAL: {
+            /* real: marker 0x23 (2^3 = 8 bytes), big-endian IEEE754 double */
+            uint64_t bits;
+            memcpy(&bits, &n->rval, sizeof(bits));
+            buf_append_byte(&objs, 0x23);
+            for (int b = 7; b >= 0; b--)
+                buf_append_byte(&objs, (uint8_t)(bits >> (b * 8)));
+            break;
+        }
         case PLN_BOOL:
             buf_append_byte(&objs, n->bval ? 0x09 : 0x08);
             break;

@@ -73,6 +73,7 @@ ap2_pl_node *ap2_pl_array(void);
 /* Scalar constructors. Strings/data are copied. */
 ap2_pl_node *ap2_pl_string(const char *s);
 ap2_pl_node *ap2_pl_int(int64_t v);
+ap2_pl_node *ap2_pl_real(double v);
 ap2_pl_node *ap2_pl_bool(bool b);
 ap2_pl_node *ap2_pl_data(const uint8_t *d, size_t len);
 

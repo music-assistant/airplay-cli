@@ -1016,11 +1016,10 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     /* Push path A (MRP-DESIGN.md §4): a bplist body for POST /command on the
      * main encrypted RTSP channel, carrying MediaRemote now-playing keys.
      * Real iOS senders push this shape (openairplay/airplay2-receiver
-     * handle_command observes params.params.kMRMediaRemoteNowPlayingInfo*);
-     * the exact envelope ("type" string, nesting) must be confirmed from a
-     * capture before the wiring pass. Durations/elapsed are emitted as
-     * integers for now: the plist writer lacks a real (double) type — adding
-     * ap2_pl_real to ap2_plist.c is a wiring-pass item. */
+     * handle_command observes params.params.kMRMediaRemoteNowPlayingInfo*
+     * under a top-level "params" dict); the outer "type" string is our best
+     * guess — the reference receiver ignores it. Durations/elapsed/rate are
+     * plist reals (MediaRemote uses doubles). */
     ap2_pl_node *info = ap2_pl_dict();
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoTitle",
                     ap2_pl_string(m->title ? m->title : ""));
@@ -1030,11 +1029,11 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                     ap2_pl_string(m->album ? m->album : ""));
     if (m->duration_ms > 0)
         ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoDuration",
-                        ap2_pl_int(m->duration_ms / 1000));
+                        ap2_pl_real((double)m->duration_ms / 1000.0));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoElapsedTime",
-                    ap2_pl_int(m->elapsed_ms / 1000));
+                    ap2_pl_real((double)m->elapsed_ms / 1000.0));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoPlaybackRate",
-                    ap2_pl_int(m->playing ? 1 : 0));
+                    ap2_pl_real(m->playing ? 1.0 : 0.0));
     if (m->artwork && m->artwork_len > 0) {
         ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkData",
                         ap2_pl_data(m->artwork, (size_t)m->artwork_len));

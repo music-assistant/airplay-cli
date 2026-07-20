@@ -177,6 +177,17 @@ static void status_error(const char *msg)
     status_print("[ERROR] %s", msg);
 }
 
+/* Path-A MRP experiment: surface the POST /command response on stdout when it
+ * changes, so the caller can log whether the device accepts the push. */
+static void mrp_status_report(int status)
+{
+    static int last;
+    if (status <= 0 || status == last) return;
+    last = status;
+    printf("[STATUS] mrp path=command status=%d\n", status);
+    fflush(stdout);
+}
+
 /* Also emit legacy format for backward compatibility during transition */
 static void status_connected_legacy(const char *host, int port, int latency_ms)
 {
@@ -334,6 +345,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             raopcl_set_progress_ms(g_raopcl, g_metadata.progress * 1000, g_metadata.duration * 1000);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_set_progress(g_ap2cl, g_metadata.progress, g_metadata.duration);
+            mrp_status_report(ap2cl_mrp_push(g_ap2cl));
         }
     } else if (strcmp(key, "ARTWORK") == 0) {
         if (access(value, F_OK) == 0) {
@@ -350,6 +362,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                     raopcl_set_artwork(g_raopcl, "image/jpg", numbytes, buffer);
                 } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
                     ap2cl_set_artwork(g_ap2cl, "image/jpeg", numbytes, buffer);
+                    mrp_status_report(ap2cl_mrp_push(g_ap2cl));
                 }
                 free(buffer);
             }
@@ -405,6 +418,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_set_metadata(g_ap2cl, g_metadata.title, g_metadata.artist,
                                g_metadata.album, g_metadata.duration);
+            mrp_status_report(ap2cl_mrp_push(g_ap2cl));
         }
     }
 }
@@ -424,6 +438,7 @@ static void send_initial_metadata(const cli_config_t *cfg)
     } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
         ap2cl_set_metadata(g_ap2cl, title, g_metadata.artist,
                            g_metadata.album, g_metadata.duration);
+        mrp_status_report(ap2cl_mrp_push(g_ap2cl));
     }
 }
 

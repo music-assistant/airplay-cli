@@ -38,6 +38,7 @@
 #include "alac_wrapper.h"
 #include "cross_util.h"
 #include "cross_log.h"
+#include "ap2_mrp.h"
 #include "ap2_client.h"
 #include "ap2_hap.h"
 #include "ap2_plist.h"
@@ -92,6 +93,9 @@ struct ap2cl_s {
     pthread_mutex_t rtsp_lock;
     struct ap2_hap_ctx *hap;      /* HAP encryption context */
     struct ap2_ptp_ctx *ptp;      /* Timing */
+    /* MRP now-playing over POST /command (path A, see MRP-DESIGN.md §4):
+     * state carrier + body builder; only on pair-verified native sessions. */
+    struct ap2_mrp_ctx *mrp;
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
     int events_sock;              /* reverse TCP events connection (kept open) */
@@ -1443,6 +1447,7 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->raopcl) { raopcl_disconnect(p->raopcl); raopcl_destroy(p->raopcl); }
     if (p->hap) ap2_hap_destroy(p->hap);
     if (p->ptp) ap2_ptp_destroy(p->ptp);
+    if (p->mrp) ap2_mrp_destroy(p->mrp);
     if (p->alac) alac_delete_encoder(p->alac);
     /* Close the RTSP socket under the lock so an in-flight request/response
      * cycle on another thread finishes first and a later cycle sees -1
@@ -1789,11 +1794,39 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
     return status >= 200 && status < 300;
 }
 
+/* Lazily create the MRP state carrier for pair-verified native sessions
+ * (Apple devices). Non-verified receivers (transient pairing, e.g. Sonos)
+ * never get MediaRemote pushes. */
+static void ap2_mrp_ready(struct ap2cl_s *p)
+{
+    if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return;
+    p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
+                            p->dacp_id, p->device.name, NULL);
+}
+
+int ap2cl_mrp_push(struct ap2cl_s *p)
+{
+    if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
+    uint8_t *body = NULL;
+    int body_len = 0;
+    if (!ap2_mrp_build_nowplaying_command(p->mrp, &body, &body_len)) return -1;
+    uint8_t *resp = NULL;
+    int resp_len = 0;
+    int status = ap2_rtsp_send(p, "POST", "/command", body, body_len,
+                               "application/x-apple-binary-plist", &resp, &resp_len);
+    free(body);
+    free(resp);
+    LOG_INFO("[MRP] /command now-playing push -> %d", status);
+    return status;
+}
+
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
                         const char *album, int duration)
 {
-    (void)duration;
     if (!p) return false;
+    ap2_mrp_ready(p);
+    if (p->mrp)
+        ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
         return ap2_native_send_metadata(p, title, artist, album);
     if (p->raopcl)
@@ -1805,6 +1838,9 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
 bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, const char *data)
 {
     if (!p) return false;
+    ap2_mrp_ready(p);
+    if (p->mrp)
+        ap2_mrp_set_artwork(p->mrp, content_type, (const uint8_t *)data, size);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* Same shape as the RAOP path: the image bytes as the SET_PARAMETER
          * body with its image content type, anchored via RTP-Info (receivers
@@ -1827,6 +1863,9 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, co
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
 {
     if (!p) return false;
+    ap2_mrp_ready(p);
+    if (p->mrp)
+        ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000, true);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* progress: <start>/<current>/<end>, all in the STREAM's RTP timestamp
          * units (the per-process timeline offset included, so the values match
