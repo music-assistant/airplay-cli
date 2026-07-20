@@ -57,10 +57,8 @@ extern log_level *loglevel;
 #define MRP_EVENTS_WRITE_INFO       "Events-Write-Encryption-Key"
 #define MRP_EVENTS_READ_INFO        "Events-Read-Encryption-Key"
 
-/* Data channel SETUP constants (pyatv ap2_session.py _setup_data_channel). */
-#define MRP_STREAM_TYPE_REMOTE_CONTROL  130
-#define MRP_STREAM_CONTROL_TYPE         2
-#define MRP_CLIENT_TYPE_UUID  "1910A70F-DBC0-4242-AF95-115DB30604E1"
+/* Data channel SETUP constants (AP2_MRP_STREAM_TYPE_REMOTE_CONTROL etc.) live
+ * in ap2_mrp.h so the SETUP request in ap2_client.c shares one definition. */
 
 /* HAP channel framing (identical shape to ap2_hap.c: [2-byte LE length]
  * [ciphertext + 16-byte tag], AAD = the length field, nonce = 4 zero bytes +
@@ -971,6 +969,23 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
     if (!m->connected) return true;
     /* The receiver extrapolates position from elapsedTime + timestamp +
      * playbackRate, so a progress change is a state push, not a stream. */
+    return mrp_push_state(m, false);
+}
+
+bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
+{
+    if (!m) return false;
+    /* Advance the stored elapsed to now before flipping so the frozen (pause)
+     * or resumed (play) position matches what the receiver extrapolated up to
+     * this instant, then re-anchor the timestamp at now. */
+    double now = mrp_cf_now();
+    if (m->playing && m->elapsed_set_at > 0.0) {
+        double advanced_ms = (now - m->elapsed_set_at) * 1000.0;
+        if (advanced_ms > 0.0) m->elapsed_ms += (int)advanced_ms;
+    }
+    m->playing = playing;
+    m->elapsed_set_at = now;
+    if (!m->connected) return true;
     return mrp_push_state(m, false);
 }
 

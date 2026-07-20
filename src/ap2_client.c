@@ -481,6 +481,87 @@ static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, cons
     return d;
 }
 
+/* Issue the type-130 remote-control (MRP) data-channel stream SETUP on the
+ * already-verified RTSP session, then attach the MRP sender to the returned
+ * dataPort (MRP-DESIGN.md §2/§5, the "combined/piggyback" model). This is
+ * best-effort decoration: any failure (SETUP non-200, no dataPort, connect or
+ * handshake failure) logs and leaves p->mrp NULL / audio untouched. Reachable
+ * only on a pair-verified session (Apple devices) — the DataStream keys derive
+ * from this session's pair-verify shared secret. */
+static void ap2_native_setup_mrp(struct ap2cl_s *p)
+{
+    if (!p->hap || !p->auth_credentials) return;   /* pair-verified only */
+
+    /* Random seed < 2^63: our plist writer stores signed int64 and Apple's own
+     * plist ints are signed at that width. The DataStream HKDF salt is
+     * "DataStream-Salt" + this seed in decimal (ap2_mrp_attach). */
+    uint64_t seed = 0;
+    RAND_bytes((uint8_t *)&seed, sizeof(seed));
+    seed &= 0x7FFFFFFFFFFFFFFFULL;
+
+    char channel_uuid[37], client_uuid[37];
+    ap2_gen_uuid(channel_uuid);
+    ap2_gen_uuid(client_uuid);
+
+    struct ap2_plist *ssp = ap2_plist_create();
+    ap2_plist_stream_begin(ssp);
+    ap2_plist_stream_add_int(ssp, "type", AP2_MRP_STREAM_TYPE_REMOTE_CONTROL);
+    ap2_plist_stream_add_int(ssp, "controlType", AP2_MRP_STREAM_CONTROL_TYPE);
+    ap2_plist_stream_add_string(ssp, "channelID", channel_uuid);
+    ap2_plist_stream_add_int(ssp, "seed", (int64_t)seed);
+    ap2_plist_stream_add_string(ssp, "clientUUID", client_uuid);
+    ap2_plist_stream_add_string(ssp, "clientTypeUUID", AP2_MRP_CLIENT_TYPE_UUID);
+    ap2_plist_stream_add_bool(ssp, "wantsDedicatedSocket", true);
+    ap2_plist_stream_end(ssp);
+
+    uint8_t *plist_data = NULL;
+    int plist_len = ap2_plist_serialize(ssp, &plist_data);
+    ap2_plist_free(ssp);
+
+    uint8_t *resp = NULL; int resp_len = 0;
+    int status = ap2_rtsp_send(p, "SETUP", p->session_url, plist_data, plist_len,
+                               "application/x-apple-binary-plist", &resp, &resp_len);
+    free(plist_data);
+
+    if (status != 200) {
+        LOG_WARN("[MRP] type-130 data-channel SETUP -> %d (no now-playing channel)",
+                 status);
+        free(resp);
+        return;
+    }
+
+    int data_port = 0;
+    uint64_t v;
+    if (resp && resp_len > 0 &&
+        ap2_bplist_find_uint(resp, (size_t)resp_len, "dataPort", &v) &&
+        v >= 1024 && v <= 65535)
+        data_port = (int)v;
+    free(resp);
+
+    if (data_port <= 0) {
+        LOG_WARN("[MRP] type-130 SETUP returned no dataPort; no now-playing channel");
+        return;
+    }
+    LOG_INFO("[MRP] type-130 data-channel SETUP OK (dataPort=%d, seed=%llu)",
+             data_port, (unsigned long long)seed);
+
+    /* Bind the sender to THIS session's pair-verify shared secret and open the
+     * channel (TCP connect + DEVICE_INFO-first handshake). */
+    if (!p->mrp)
+        p->mrp = ap2_mrp_create(p->device.address, p->device.port,
+                                p->auth_credentials, p->dacp_id, p->device.name,
+                                ap2_hap_get_shared_secret(p->hap));
+    if (!p->mrp) return;
+
+    if (!ap2_mrp_attach(p->mrp, data_port, seed)) {
+        LOG_WARN("[MRP] data-channel attach failed; degrading to no-MRP");
+        ap2_mrp_destroy(p->mrp);
+        p->mrp = NULL;
+        return;
+    }
+    LOG_INFO("[MRP] remote-control data channel established (now-playing active)");
+}
+
 /* ---- Native AP2 connect sequence ---- */
 
 static bool ap2_native_connect(struct ap2cl_s *p)
@@ -972,6 +1053,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         LOG_INFO("[AP2] Buffered data TCP connected to %s:%d",
                  inet_ntoa(p->data_addr.sin_addr), ntohs(p->data_addr.sin_port));
     }
+
+    /* 6d. MRP now-playing: issue the type-130 remote-control data channel on
+     * this verified session so tvOS renders the on-screen now-playing UI and
+     * holds off standby (MRP-DESIGN.md §2/§5). Best-effort; audio is up
+     * regardless. Non-Apple/transient sessions skip it inside the helper. */
+    ap2_native_setup_mrp(p);
 
     /* Create ALAC encoder */
     p->alac = alac_create_encoder(AP2_FRAMES_PER_CHUNK,
@@ -1536,6 +1623,9 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
 {
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
+        /* Push SET_CONNECTION_STATE=Disconnected and close the MRP channel
+         * before TEARDOWN, while the session (and its keys) are still live. */
+        if (p->mrp) ap2_mrp_stop(p->mrp);
         if (p->events_sock >= 0) {
             close(p->events_sock);
             p->events_sock = -1;
@@ -1666,6 +1756,8 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
 void ap2cl_pause(struct ap2cl_s *p)
 {
     if (!p) return;
+    /* Mirror the pause onto the now-playing UI (MRP-DESIGN.md §8). */
+    if (p->mrp) ap2_mrp_set_playing(p->mrp, false);
     if (p->use_buffered && p->buffered_sock >= 0) {
         /* Freeze the buffered timeline in place with a rate-0 anchor. */
         ap2_send_setrateanchortime(p, p->rtp_timestamp, ap2_ptp_master_now_ns(p->ptp), 0);
@@ -1680,6 +1772,8 @@ void ap2cl_pause(struct ap2cl_s *p)
 void ap2cl_play(struct ap2cl_s *p)
 {
     if (!p) return;
+    /* Mirror the resume onto the now-playing UI (MRP-DESIGN.md §8). */
+    if (p->mrp) ap2_mrp_set_playing(p->mrp, true);
     if (p->use_buffered && p->buffered_sock >= 0) {
         /* Re-anchor at rate 1 a short lead ahead to resume the buffered stream. */
         uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + (uint64_t)p->latency_ms * 1000000ULL;
@@ -1711,6 +1805,11 @@ bool ap2cl_feedback(struct ap2cl_s *p)
      * is raopcl_keepalive(). The response body carries stream status we do
      * not need; the POST itself is what resets the receiver's idle timer. */
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return false;
+    /* Ride the same 2s cadence for the MRP data channel (MRP-DESIGN.md §5):
+     * drain inbound frames (answer sync keep-alives) and re-push SET_STATE
+     * periodically to hold the now-playing session open. Separate socket from
+     * the RTSP /feedback POST; best-effort, harmless when no channel is up. */
+    if (p->mrp) ap2_mrp_tick(p->mrp);
     uint8_t *resp = NULL; int resp_len = 0;
     int status = ap2_rtsp_send(p, "POST", "/feedback", NULL, 0, NULL, &resp, &resp_len);
     free(resp);
@@ -1794,9 +1893,12 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
     return status >= 200 && status < 300;
 }
 
-/* Lazily create the MRP state carrier for pair-verified native sessions
- * (Apple devices). Non-verified receivers (transient pairing, e.g. Sonos)
- * never get MediaRemote pushes. */
+/* Lazily create an MRP state carrier for pair-verified native sessions when
+ * the type-130 data channel (path B, ap2_native_setup_mrp) did not already
+ * create one. With no shared secret it cannot open the channel — it only holds
+ * now-playing state for the env-gated POST /command diagnostic (path A). Path B
+ * remains the real now-playing path; non-verified receivers (transient pairing,
+ * e.g. Sonos) never get MediaRemote pushes. */
 static void ap2_mrp_ready(struct ap2cl_s *p)
 {
     if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return;
@@ -1804,9 +1906,38 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
                             p->dacp_id, p->device.name, NULL);
 }
 
+/* Log an RTSP response body for diagnosis: a printable-text view (control bytes
+ * escaped) plus a short hex prefix, and whether it is a binary plist. */
+static void ap2_log_response_body(const char *tag, const uint8_t *body, int len)
+{
+    if (!body || len <= 0) { LOG_INFO("%s response body: <empty>", tag); return; }
+    int shown = len < 256 ? len : 256;
+    char text[300];
+    int t = 0;
+    for (int i = 0; i < shown && t < (int)sizeof(text) - 1; i++) {
+        uint8_t c = body[i];
+        text[t++] = (c >= 0x20 && c < 0x7F) ? (char)c : '.';
+    }
+    text[t] = '\0';
+    char hex[8 * 3 + 1];
+    int hn = len < 8 ? len : 8;
+    for (int i = 0; i < hn; i++) sprintf(hex + i * 3, "%02x ", body[i]);
+    hex[hn * 3 ? hn * 3 - 1 : 0] = '\0';
+    bool is_bplist = len >= 8 && memcmp(body, "bplist00", 8) == 0;
+    LOG_INFO("%s response body: %d bytes%s [%s] text=\"%s\"",
+             tag, len, is_bplist ? " (bplist00)" : "", hex, text);
+}
+
 int ap2cl_mrp_push(struct ap2cl_s *p)
 {
     if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
+    /* Path A (POST /command) is OFF by default: the real Apple TV 4K returns
+     * HTTP 400 on every push (MRP-DESIGN.md §10.2) and now-playing rides the
+     * type-130 data channel (path B) instead. Firing dead requests on every
+     * metadata change is only log noise. Set CLIAIRPLAY_MRP_COMMAND=1 to re-run
+     * it for a one-off capture of the rejection body (logged below). */
+    if (!getenv("CLIAIRPLAY_MRP_COMMAND")) return 0;
+
     uint8_t *body = NULL;
     int body_len = 0;
     if (!ap2_mrp_build_nowplaying_command(p->mrp, &body, &body_len)) return -1;
@@ -1815,9 +1946,22 @@ int ap2cl_mrp_push(struct ap2cl_s *p)
     int status = ap2_rtsp_send(p, "POST", "/command", body, body_len,
                                "application/x-apple-binary-plist", &resp, &resp_len);
     free(body);
-    free(resp);
     LOG_INFO("[MRP] /command now-playing push -> %d", status);
+    /* The receiver's body explains a rejection (plist or text); capture it. */
+    if (status < 200 || status >= 300)
+        ap2_log_response_body("[MRP] /command", resp, resp_len);
+    free(resp);
     return status;
+}
+
+/* MRP data-channel (path B) status for the [STATUS] mrp line:
+ *   -1 = not attempted (non-Apple / not pair-verified),
+ *    0 = attempted but the channel is not up,
+ *    1 = channel established (now-playing active). */
+int ap2cl_mrp_channel_status(struct ap2cl_s *p)
+{
+    if (!p || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return -1;
+    return (p->mrp && ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,

@@ -26,6 +26,15 @@
 
 struct ap2_mrp_ctx;
 
+/* Remote-control (MRP) data-channel stream SETUP constants (MRP-DESIGN.md §2,
+ * pyatv ap2_session.py _setup_data_channel). The audio session issues a SETUP
+ * carrying a stream of this type on its pair-verified RTSP channel; the
+ * receiver answers with a dataPort for ap2_mrp_attach(). Shared here so the
+ * SETUP request (ap2_client.c) and the channel code use one definition. */
+#define AP2_MRP_STREAM_TYPE_REMOTE_CONTROL  130
+#define AP2_MRP_STREAM_CONTROL_TYPE         2
+#define AP2_MRP_CLIENT_TYPE_UUID            "1910A70F-DBC0-4242-AF95-115DB30604E1"
+
 /*
  * Create an MRP sender context.
  *
@@ -114,6 +123,16 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
  */
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
                           int duration_ms, bool playing);
+
+/*
+ * Flip the play/pause state without a fresh elapsed position (pause/resume).
+ * Advances the stored elapsed to now so the receiver's extrapolated position
+ * (elapsedTime + timestamp + playbackRate) is accurate across the transition.
+ * Takes effect on the next state push (immediate when connected).
+ *
+ * :param playing: true = Playing, false = Paused.
+ */
+bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing);
 
 /*
  * Keep-alive tick: drain any incoming frames (answering sync/heartbeat
