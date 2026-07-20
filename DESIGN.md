@@ -378,15 +378,19 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 
 ## 10. Session robustness
 
-- **Keepalive** — native AP2 sessions POST `/feedback` every ~2 s (real
-  senders do; receivers idle-time-out long sessions without it). RAOP paths
-  use libraop's keepalive (~20 s).
+- **Keepalive** — native AP2 sessions have a dedicated worker that POSTs
+  `/feedback` every ~2 s (real senders do; receivers idle-time-out long
+  sessions without it), independent of command-pipe metadata, artwork loading,
+  and progress updates. The worker services encrypted reverse events after
+  each feedback POST. RAOP paths use libraop's keepalive (~20 s).
 - **RTSP serialization** — one mutex serializes the RTSP channel, so the
   keepalive thread and the streaming path can never interleave frames on the
   encrypted channel.
-- **Socket timeouts** — the RTSP socket, events socket, and the buffered TCP
-  socket are receive/send-timeout bounded; a receiver that stops draining
-  can never hang the process.
+- **Socket deadlines** — established RTSP request/response cycles have a
+  1.5-second absolute deadline, event/DataStream writes have a one-second
+  deadline, and realtime RTP/control UDP sends are nonblocking with a short
+  bounded retry. A dead RTSP channel is terminal and surfaced to the caller
+  instead of leaving a half-alive process.
 - **Reverse event channel** — pair-verified sessions derive independent
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
@@ -405,7 +409,8 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   commands, explicit playback state, and a serialized NowPlayingClient.
   Start/pause/resume/stop transitions stay synchronized with the audio state.
   This path is enabled by default (`CLIAIRPLAY_MRP=0` is the diagnostic opt-out);
-  best-effort, audio never gates on it (§8).
+  its state is mutex-protected from the feedback worker, and metadata remains
+  best-effort so audio never gates on it (§8).
 - **Metadata inputs** — UTF-8 strings become UTF-16BE binary-plist strings when
   needed. `ARTWORK` accepts local files and MA's local HTTP imageproxy URLs;
   imageproxy requests are normalized to supported `size=512&fmt=jpeg` values,

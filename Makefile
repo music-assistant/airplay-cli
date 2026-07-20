@@ -41,6 +41,7 @@ BINDIR      = bin
 
 # Output binary
 EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
+TEST_EXECUTABLE = build/tests/test_ap2_io
 
 # Compiler flags
 DEFINES  = -DNDEBUG -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED
@@ -91,7 +92,7 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_hap.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c
+AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
@@ -140,6 +141,13 @@ $(BUILDDIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 clean:
-	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED)
+	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) $(TEST_EXECUTABLE)
 
-.PHONY: all directory clean
+test: $(TEST_EXECUTABLE)
+	$(TEST_EXECUTABLE)
+
+$(TEST_EXECUTABLE): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Isrc tests/test_ap2_io.c src/ap2_io.c -o $@
+
+.PHONY: all directory clean test

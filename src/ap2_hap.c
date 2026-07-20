@@ -1388,7 +1388,7 @@ int ap2_hap_decrypt(struct ap2_hap_ctx *ctx, const uint8_t *in, int in_len,
     if (!ctx || !ctx->verified || !in || in_len <= 0) return -1;
 
     /* Worst case: output is slightly smaller than input */
-    *out = malloc(in_len);
+    *out = malloc((size_t)in_len + 1);
     if (!*out) return -1;
 
     int out_offset = 0, in_offset = 0;
@@ -1426,5 +1426,6 @@ int ap2_hap_decrypt(struct ap2_hap_ctx *ctx, const uint8_t *in, int in_len,
         in_offset += chunk + HAP_TAG_SIZE;
     }
 
+    (*out)[out_offset] = '\0';
     return out_offset;
 }

@@ -353,14 +353,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         size_t image_size = 0;
         char content_type[32];
         char error[160];
-        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
-            ap2cl_is_connected(g_ap2cl))
-            ap2cl_feedback(g_ap2cl);
         bool loaded = artwork_load(value, &image, &image_size, content_type,
                                    error, sizeof(error));
-        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
-            ap2cl_is_connected(g_ap2cl))
-            ap2cl_feedback(g_ap2cl);
         if (!loaded) {
             LOG_WARN("Cannot load artwork: %s", error);
         } else {
@@ -452,7 +446,6 @@ static void *cmdpipe_reader_thread(void *arg)
 {
     cli_config_t *cfg = (cli_config_t *)arg;
     uint64_t last_keepalive = raopcl_get_ntp(NULL);
-    uint64_t last_feedback = last_keepalive;
 
     g_cmdpipe_fd = open(cfg->cmdpipe, O_RDWR | O_NONBLOCK);
     if (g_cmdpipe_fd == -1) {
@@ -471,15 +464,6 @@ static void *cmdpipe_reader_thread(void *arg)
             raopcl_keepalive(g_raopcl);
             last_keepalive = now;
         }
-        /* Native AP2 keepalive: real senders POST /feedback about every 2 s
-         * and long sessions can hit receiver-side idle timeouts without it
-         * (no-op for the RAOP-compat flow, which libraop keeps alive). */
-        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl && ap2cl_is_connected(g_ap2cl) &&
-            now - last_feedback >= MS2NTP(2000)) {
-            ap2cl_feedback(g_ap2cl);
-            last_feedback = now;
-        }
-
         if (n <= 0 || !(pfds.revents & POLLIN)) continue;
 
         ssize_t bytes_read = read(g_cmdpipe_fd, g_cmdpipe_buf, sizeof(g_cmdpipe_buf) - 1);
@@ -775,6 +759,11 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     while (g_status != STATUS_STOPPED && (!got_eof || ap2cl_is_playing(g_ap2cl))) {
         uint64_t now = raopcl_get_ntp(NULL);
 
+        if (!ap2cl_is_connected(g_ap2cl)) {
+            status_error("AirPlay 2 control channel failed");
+            break;
+        }
+
         /* After EOF, drain for at most latency + 2 seconds then stop */
         if (got_eof && eof_time && now - eof_time > MS2NTP(cfg->latency_ms + 2000)) {
             LOG_INFO("Drain timeout reached, ending stream");
@@ -813,7 +802,10 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 truncate_32to24(buf, n, ap2_alac_buf);
                 send = ap2_alac_buf;
             }
-            ap2cl_send_chunk(g_ap2cl, send, af);
+            if (!ap2cl_send_chunk(g_ap2cl, send, af)) {
+                status_error("AirPlay 2 realtime send failed");
+                break;
+            }
             frames += af;
         } else {
             usleep(1000);

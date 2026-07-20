@@ -37,6 +37,7 @@
 #include <openssl/crypto.h>
 
 #include "cross_log.h"
+#include "ap2_io.h"
 #include "ap2_plist.h"
 #include "ap2_mrp.h"
 
@@ -137,6 +138,7 @@ enum mrp_ext_field {
 
 /* Cadence of the defensive state re-push from ap2_mrp_tick (seconds). */
 #define MRP_STATE_REPUSH_S 15
+#define MRP_WRITE_TIMEOUT_MS 1000
 
 struct ap2_mrp_ctx {
     /* Target + identity */
@@ -704,18 +706,8 @@ static int mrp_channel_encrypt(struct ap2_mrp_ctx *m, const uint8_t *in,
 
 static bool mrp_write_all(int fd, const uint8_t *data, int len)
 {
-    int off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, data + off, (size_t)(len - off));
-        if (n > 0) {
-            off += (int)n;
-        } else if (n < 0 && errno == EINTR) {
-            continue;
-        } else {
-            return false;
-        }
-    }
-    return true;
+    return ap2_io_write_all_deadline(
+        fd, data, len, ap2_io_monotonic_ms() + MRP_WRITE_TIMEOUT_MS);
 }
 
 /* Write the 32-byte big-endian data-frame header. */
@@ -747,6 +739,12 @@ static bool mrp_send_raw(struct ap2_mrp_ctx *m, const uint8_t *data, int len)
     if (enc_len > 0 && enc)
         ok = mrp_write_all(m->sock, enc, enc_len);
     free(enc);
+    if (!ok) {
+        LOG_ERROR("[MRP] data channel write failed: %s", strerror(errno));
+        m->connected = false;
+        close(m->sock);
+        m->sock = -1;
+    }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
 }
@@ -959,6 +957,11 @@ static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
     bool ok = enc_len > 0 && enc &&
               mrp_write_all(m->event_sock, enc, enc_len);
     free(enc);
+    if (!ok) {
+        LOG_ERROR("[MRP] event channel write failed: %s", strerror(errno));
+        m->event_connected = false;
+        shutdown(m->event_sock, SHUT_RDWR);
+    }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
 }
