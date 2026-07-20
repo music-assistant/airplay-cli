@@ -1990,7 +1990,7 @@ static int ap2_mrp_post_command(struct ap2cl_s *p,
     int status = ap2_rtsp_send(p, "POST", "/command", body, body_len,
                                "application/x-apple-binary-plist", &resp, &resp_len);
     free(body);
-    LOG_INFO("[MRP] /command %s -> %d", tag, status);
+    LOG_INFO("[MRP] /command %s -> %d (%d-byte body)", tag, status, body_len);
     if (status < 200 || status >= 300)
         ap2_log_response_body(tag, resp, resp_len);
     free(resp);
@@ -2122,16 +2122,22 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
     return false;
 }
 
-bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, const char *data)
+bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
+                       const char *data, ap2_mrp_artwork_info_t *mrp_info)
 {
+    if (mrp_info) {
+        memset(mrp_info, 0, sizeof(*mrp_info));
+        mrp_info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
+        mrp_info->bytes = size > 0 ? (size_t)size : 0;
+    }
     if (!p) return false;
     ap2_mrp_ready(p);
     if (p->mrp)
-        ap2_mrp_set_artwork(p->mrp, content_type, (const uint8_t *)data, size);
+        ap2_mrp_set_artwork(p->mrp, content_type, (const uint8_t *)data,
+                            size, mrp_info);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
-        /* Same shape as the RAOP path: the image bytes as the SET_PARAMETER
-         * body with its image content type, anchored via RTP-Info (receivers
-         * such as Apple TV render it on their now-playing display). */
+        /* Preserve the DMAP/SET_PARAMETER path for receivers such as Sonos;
+         * pair-verified Apple sessions mirror validated artwork over MRP. */
         char rtpinfo[48];
         snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
         uint8_t *resp = NULL; int resp_len = 0;
@@ -2145,6 +2151,15 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, co
     }
     if (!p->raopcl) return false;
     return raopcl_set_artwork(p->raopcl, (char *)content_type, size, (char *)data);
+}
+
+bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p)
+{
+    if (!p) return false;
+    ap2_mrp_ready(p);
+    if (!p->mrp) return false;
+    ap2_mrp_clear_artwork(p->mrp);
+    return true;
 }
 
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)

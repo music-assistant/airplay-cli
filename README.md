@@ -178,7 +178,7 @@ running stream:
 - `VOLUME=<0-100>`
 - `ACTION=PLAY|PAUSE|STOP`
 - Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
-  `ARTWORK=<local file path>` (URLs are ignored), followed by
+  `ARTWORK=<local file path>` (JPEG/PNG/GIF/WebP; URLs are ignored), followed by
   `ACTION=SENDMETA` to push the set.
 
 Some receivers (notably Sonos) do not emit audio until they have received
@@ -188,6 +188,12 @@ Pair-verified native Apple sessions additionally mirror these updates over
 MediaRemote `POST /command`, including explicit play/pause/stop state. Set
 `CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
 
+The DMAP path receives the detected image type and original bytes. MediaRemote
+artwork has a stricter Apple TV compatibility contract: an 8-bit,
+three-component baseline JPEG, no larger than 600x600 or 65,536 bytes. Invalid
+MRP artwork is omitted without withholding it from DMAP, and is reported as
+`[STATUS] mrp artwork=rejected reason=...`.
+
 ## Building
 
 ```bash
@@ -196,6 +202,9 @@ make STATIC=1
 
 # Linux cross-compile (example)
 make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
+
+# Focused native regression tests
+make test STATIC=1
 ```
 
 Requires the libraop submodule with pre-built static libraries (OpenSSL,

@@ -36,6 +36,7 @@
 #include "ap2_client.h"
 #include "ap2_ptp.h"
 #include "ap2_hap.h"
+#include "artwork.h"
 
 #define VERSION "0.1.0"
 #define AP2_FRAMES_PER_CHUNK 352
@@ -185,6 +186,28 @@ static void mrp_status_report(int status)
     last = status;
     printf("[STATUS] mrp path=command status=%d\n", status);
     fflush(stdout);
+}
+
+static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info)
+{
+    if (!info || info->result == AP2_MRP_ARTWORK_NOT_APPLICABLE) return;
+    if (info->result == AP2_MRP_ARTWORK_ACCEPTED) {
+        status_print("[STATUS] mrp artwork=accepted bytes=%zu width=%u height=%u",
+                     info->bytes, info->width, info->height);
+        return;
+    }
+    status_print("[STATUS] mrp artwork=rejected reason=%s bytes=%zu "
+                 "width=%u height=%u max_bytes=%d max_width=%d max_height=%d",
+                 ap2_mrp_artwork_result_name(info->result), info->bytes,
+                 info->width, info->height, AP2_MRP_ARTWORK_MAX_BYTES,
+                 AP2_MRP_ARTWORK_MAX_WIDTH, AP2_MRP_ARTWORK_MAX_HEIGHT);
+}
+
+static void mrp_artwork_reject_local(const char *reason)
+{
+    if (!g_ap2cl || !ap2cl_clear_mrp_artwork(g_ap2cl)) return;
+    status_print("[STATUS] mrp artwork=rejected reason=%s", reason);
+    mrp_status_report(ap2cl_mrp_push(g_ap2cl));
 }
 
 /* Also emit the older human-readable status line; the [STATUS] lines from
@@ -348,26 +371,40 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             mrp_status_report(ap2cl_mrp_push(g_ap2cl));
         }
     } else if (strcmp(key, "ARTWORK") == 0) {
-        if (access(value, F_OK) == 0) {
-            /* Local file artwork */
-            FILE *artfile = fopen(value, "r");
-            if (artfile) {
-                fseek(artfile, 0L, SEEK_END);
-                long numbytes = ftell(artfile);
-                fseek(artfile, 0L, SEEK_SET);
-                char *buffer = (char *)calloc(numbytes, sizeof(char));
-                fread(buffer, sizeof(char), numbytes, artfile);
-                fclose(artfile);
-                if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-                    raopcl_set_artwork(g_raopcl, "image/jpg", numbytes, buffer);
-                } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-                    ap2cl_set_artwork(g_ap2cl, "image/jpeg", numbytes, buffer);
-                    mrp_status_report(ap2cl_mrp_push(g_ap2cl));
-                }
-                free(buffer);
-            }
-        } else {
+        if (!value || !*value) {
+            LOG_WARN("Ignoring empty artwork path");
+            if (cfg->protocol == PROTO_AIRPLAY2)
+                mrp_artwork_reject_local("invalid_local_file");
+        } else if (strncmp(value, "http://", 7) == 0 ||
+                   strncmp(value, "https://", 8) == 0) {
             LOG_DEBUG("Artwork URL not supported in binary, skipping: %s", value);
+            if (cfg->protocol == PROTO_AIRPLAY2)
+                mrp_artwork_reject_local("non_local_source");
+        } else {
+            uint8_t *image = NULL;
+            size_t image_size = 0;
+            char content_type[ARTWORK_CONTENT_TYPE_SIZE];
+            char error[160];
+            if (!artwork_load_file(value, &image, &image_size, content_type,
+                                   error, sizeof(error))) {
+                LOG_WARN("Cannot load artwork: %s", error);
+                if (cfg->protocol == PROTO_AIRPLAY2)
+                    mrp_artwork_reject_local("invalid_local_file");
+            } else if (cfg->protocol == PROTO_RAOP && g_raopcl) {
+                raopcl_set_artwork(g_raopcl, content_type, (int)image_size,
+                                   (char *)image);
+            } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+                ap2_mrp_artwork_info_t mrp_info;
+                bool dmap_ok = ap2cl_set_artwork(
+                    g_ap2cl, content_type, (int)image_size,
+                    (const char *)image, &mrp_info);
+                if (!dmap_ok)
+                    LOG_WARN("Receiver rejected DMAP artwork (%zu bytes, %s)",
+                             image_size, content_type);
+                mrp_artwork_status_report(&mrp_info);
+                mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+            }
+            free(image);
         }
     } else if (strcmp(key, "VOLUME") == 0) {
         int vol = atoi(value);

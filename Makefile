@@ -95,7 +95,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
-	cliairplay.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	artwork.c cliairplay.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -119,7 +119,15 @@ OBJECTS_CLI += $(patsubst %.cpp,$(BUILDDIR)/%.o,$(filter %.cpp,$(CLI_SOURCES)))
 
 OBJECTS_ALL = $(OBJECTS_RAOP) $(OBJECTS_AP2) $(OBJECTS_CLI)
 
+TEST_EXECUTABLE = $(BUILDDIR)/test-mrp-artwork
+TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
+	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_plist.o \
+	$(BUILDDIR)/artwork.o $(BUILDDIR)/cross_log.o
+
 all: directory $(EXECUTABLE)
+
+test: directory $(TEST_EXECUTABLE)
+	$(TEST_EXECUTABLE)
 
 directory:
 	@mkdir -p $(BUILDDIR)
@@ -133,6 +141,12 @@ $(LIBCODECS_PATCHED): $(CODECS)/$(HOST)/$(PLATFORM)/libcodecs.a
 $(EXECUTABLE): $(OBJECTS_ALL) $(LIBCODECS_PATCHED)
 	$(CXX) $(OBJECTS_ALL) $(LIBRARY) $(LDFLAGS) -o $@
 
+$(TEST_EXECUTABLE): $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a
+	$(CC) $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+$(BUILDDIR)/test_mrp_artwork.o: tests/test_mrp_artwork.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
 $(BUILDDIR)/%.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
@@ -142,4 +156,4 @@ $(BUILDDIR)/%.o: %.cpp
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED)
 
-.PHONY: all directory clean
+.PHONY: all test directory clean
