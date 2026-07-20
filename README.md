@@ -218,8 +218,6 @@ src/ap2_client.c      AP2 orchestrator: route resolution, RAOP-compat + native
                       flows, realtime/buffered senders, anchor & pacing
 src/ap2_hap.c         HAP pair-verify, transient and PIN pair-setup, encrypted
                       RTSP framing (ChaCha20-Poly1305)
-src/ap2_rtsp.c        RTSP request/response over the (optionally encrypted) channel
-src/ap2_session.c     Native AP2 RTSP session helpers (encrypted channel)
 src/ap2_mrp.c         MediaRemote now-playing sender: /command builders,
                       proto2 + bplist emitters, type-130 DataStream channel
 src/ap2_plist.c       Binary plist writer (nested streams array)
