@@ -741,7 +741,6 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     if (cfg->volume > 0) {
         ap2cl_set_volume(g_ap2cl, cfg->volume);
     }
-    send_initial_metadata(cfg);
 
     /* Schedule start time */
     if (cfg->ntp_start) {
@@ -751,6 +750,12 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         uint64_t start_at = now + MS2NTP(cfg->latency_ms);
         ap2cl_start_at(g_ap2cl, start_at);
     }
+
+    /* Placeholder metadata must follow ap2cl_start_at: that call sets the RTP
+     * timeline the metadata's RTP-Info anchors to. Sent earlier it anchors to
+     * rtptime=0 — metadata-gated receivers (Sonos) then show the title but do
+     * not treat it as the audio timeline's metadata and keep audio muted. */
+    send_initial_metadata(cfg);
 
     g_status = STATUS_PLAYING;
     uint64_t last = 0, frames = 0;
