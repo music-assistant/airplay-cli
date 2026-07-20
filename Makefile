@@ -128,6 +128,7 @@ all: directory $(EXECUTABLE)
 
 test: directory $(TEST_EXECUTABLE)
 	$(TEST_EXECUTABLE)
+	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 
 directory:
 	@mkdir -p $(BUILDDIR)

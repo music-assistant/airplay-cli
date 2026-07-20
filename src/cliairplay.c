@@ -188,26 +188,37 @@ static void mrp_status_report(int status)
     fflush(stdout);
 }
 
-static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info)
+static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info,
+                                      int command_status)
 {
     if (!info || info->result == AP2_MRP_ARTWORK_NOT_APPLICABLE) return;
     if (info->result == AP2_MRP_ARTWORK_ACCEPTED) {
-        status_print("[STATUS] mrp artwork=accepted bytes=%zu width=%u height=%u",
-                     info->bytes, info->width, info->height);
+        status_print("[STATUS] mrp artwork=posted status=%d bytes=%zu "
+                     "width=%u height=%u precision=%u sof=0x%02x "
+                     "components=%u progressive=%d safety_max_bytes=%d",
+                     command_status, info->bytes, info->width, info->height,
+                     info->precision, info->sof_marker, info->components,
+                     info->progressive,
+                     AP2_MRP_ARTWORK_SAFETY_MAX_BYTES);
         return;
     }
     status_print("[STATUS] mrp artwork=rejected reason=%s bytes=%zu "
-                 "width=%u height=%u max_bytes=%d max_width=%d max_height=%d",
+                 "width=%u height=%u precision=%u sof=0x%02x components=%u "
+                 "progressive=%d clear_status=%d safety_max_bytes=%d",
                  ap2_mrp_artwork_result_name(info->result), info->bytes,
-                 info->width, info->height, AP2_MRP_ARTWORK_MAX_BYTES,
-                 AP2_MRP_ARTWORK_MAX_WIDTH, AP2_MRP_ARTWORK_MAX_HEIGHT);
+                 info->width, info->height, info->precision, info->sof_marker,
+                 info->components, info->progressive, command_status,
+                 AP2_MRP_ARTWORK_SAFETY_MAX_BYTES);
 }
 
 static void mrp_artwork_reject_local(const char *reason)
 {
     if (!g_ap2cl || !ap2cl_clear_mrp_artwork(g_ap2cl)) return;
-    status_print("[STATUS] mrp artwork=rejected reason=%s", reason);
-    mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+    int overall_status = ap2cl_mrp_push(g_ap2cl);
+    int status = ap2cl_mrp_last_nowplaying_status(g_ap2cl);
+    status_print("[STATUS] mrp artwork=rejected reason=%s clear_status=%d",
+                 reason, status);
+    mrp_status_report(overall_status);
 }
 
 /* Also emit the older human-readable status line; the [STATUS] lines from
@@ -401,8 +412,11 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                 if (!dmap_ok)
                     LOG_WARN("Receiver rejected DMAP artwork (%zu bytes, %s)",
                              image_size, content_type);
-                mrp_artwork_status_report(&mrp_info);
-                mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+                int overall_status = ap2cl_mrp_push(g_ap2cl);
+                int artwork_status =
+                    ap2cl_mrp_last_nowplaying_status(g_ap2cl);
+                mrp_artwork_status_report(&mrp_info, artwork_status);
+                mrp_status_report(overall_status);
             }
             free(image);
         }

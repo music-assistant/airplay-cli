@@ -48,6 +48,44 @@ static size_t jpeg_marker_offset(const uint8_t *data, size_t len,
     return len;
 }
 
+static uint8_t *make_padded_jpeg(size_t target_size)
+{
+    if (target_size < sizeof(k_baseline_jpeg) + 4) return NULL;
+    uint8_t *out = malloc(target_size);
+    if (!out) return NULL;
+
+    memcpy(out, k_baseline_jpeg, 2);
+    size_t off = 2;
+    size_t remaining = target_size - sizeof(k_baseline_jpeg);
+    while (remaining > 0) {
+        if (remaining < 4) {
+            free(out);
+            return NULL;
+        }
+        size_t total = remaining > 65537 ? 65537 : remaining;
+        size_t tail = remaining - total;
+        if (tail > 0 && tail < 4) {
+            size_t shift = 4 - tail;
+            total -= shift;
+        }
+        uint16_t segment_len = (uint16_t)(total - 2);
+        out[off++] = 0xFF;
+        out[off++] = 0xFE; /* legal JPEG comment segment */
+        out[off++] = (uint8_t)(segment_len >> 8);
+        out[off++] = (uint8_t)segment_len;
+        memset(out + off, 'M', total - 4);
+        off += total - 4;
+        remaining -= total;
+    }
+    memcpy(out + off, k_baseline_jpeg + 2, sizeof(k_baseline_jpeg) - 2);
+    off += sizeof(k_baseline_jpeg) - 2;
+    if (off != target_size) {
+        free(out);
+        return NULL;
+    }
+    return out;
+}
+
 static bool write_all(int fd, const uint8_t *data, size_t len)
 {
     size_t off = 0;
@@ -115,22 +153,38 @@ static bool test_mrp_validation_boundary(void)
     changed[sof + 1] = 0xC2;
     CHECK(ap2_mrp_validate_artwork(
               "image/jpeg", changed, sizeof(changed), &info) ==
-          AP2_MRP_ARTWORK_NOT_BASELINE);
+          AP2_MRP_ARTWORK_ACCEPTED);
+    CHECK(info.progressive && info.sof_marker == 0xC2);
 
     memcpy(changed, k_baseline_jpeg, sizeof(changed));
     changed[sof + 7] = 0x02;
     changed[sof + 8] = 0x59; /* 601 pixels */
     CHECK(ap2_mrp_validate_artwork(
               "image/jpeg", changed, sizeof(changed), &info) ==
-          AP2_MRP_ARTWORK_INVALID_DIMENSIONS);
+          AP2_MRP_ARTWORK_ACCEPTED);
     CHECK(info.width == 601 && info.height == 1);
 
-    uint8_t *oversize = calloc(AP2_MRP_ARTWORK_MAX_BYTES + 1, 1);
+    static const size_t matrix_sizes[] = {
+        44032, 61440, 65535, 65536, 66560, 102400, 153600,
+    };
+    for (size_t i = 0; i < sizeof(matrix_sizes) / sizeof(matrix_sizes[0]); i++) {
+        uint8_t *matrix_jpeg = make_padded_jpeg(matrix_sizes[i]);
+        CHECK(matrix_jpeg != NULL);
+        CHECK(ap2_mrp_validate_artwork(
+                  "image/jpeg", matrix_jpeg, matrix_sizes[i], &info) ==
+              AP2_MRP_ARTWORK_ACCEPTED);
+        CHECK(info.bytes == matrix_sizes[i]);
+        free(matrix_jpeg);
+    }
+
+    uint8_t *oversize =
+        calloc(AP2_MRP_ARTWORK_SAFETY_MAX_BYTES + 1, 1);
     CHECK(oversize != NULL);
     memcpy(oversize, k_baseline_jpeg, sizeof(k_baseline_jpeg));
     CHECK(ap2_mrp_validate_artwork(
-              "image/jpeg", oversize, AP2_MRP_ARTWORK_MAX_BYTES + 1, &info) ==
-          AP2_MRP_ARTWORK_TOO_LARGE);
+              "image/jpeg", oversize,
+              AP2_MRP_ARTWORK_SAFETY_MAX_BYTES + 1, &info) ==
+          AP2_MRP_ARTWORK_SAFETY_LIMIT);
     free(oversize);
     return true;
 }
@@ -205,14 +259,24 @@ static bool test_nowplaying_command_payload(void)
 
     CHECK(ap2_mrp_set_artwork(mrp, "image/jpeg", k_baseline_jpeg,
                               (int)sizeof(k_baseline_jpeg), &info));
-    uint8_t progressive[sizeof(k_baseline_jpeg)];
-    memcpy(progressive, k_baseline_jpeg, sizeof(progressive));
-    size_t sof = jpeg_marker_offset(progressive, sizeof(progressive), 0xC0);
-    CHECK(sof + 1 < sizeof(progressive));
-    progressive[sof + 1] = 0xC2;
-    CHECK(!ap2_mrp_set_artwork(mrp, "image/jpeg", progressive,
-                               (int)sizeof(progressive), &info));
-    CHECK(info.result == AP2_MRP_ARTWORK_NOT_BASELINE);
+
+    uint8_t *large = make_padded_jpeg(153600);
+    CHECK(large != NULL);
+    CHECK(ap2_mrp_set_artwork(mrp, "image/jpeg", large, 153600, &info));
+    CHECK(info.bytes == 153600);
+    uint8_t *large_payload = NULL;
+    int large_payload_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(
+        mrp, &large_payload, &large_payload_len));
+    CHECK(large_payload_len > 153600);
+    CHECK(bytes_contain(large_payload, (size_t)large_payload_len,
+                        large, 153600));
+    free(large_payload);
+    free(large);
+
+    CHECK(!ap2_mrp_set_artwork(mrp, "image/jpeg", k_baseline_jpeg,
+                               (int)sizeof(k_baseline_jpeg) - 1, &info));
+    CHECK(info.result == AP2_MRP_ARTWORK_INVALID_JPEG);
 
     uint8_t *cleared = NULL;
     int cleared_len = 0;
@@ -231,12 +295,34 @@ static bool test_nowplaying_command_payload(void)
     return true;
 }
 
-int main(void)
+static bool validate_generated_case(const char *path)
+{
+    uint8_t *data = NULL;
+    size_t size = 0;
+    char content_type[ARTWORK_CONTENT_TYPE_SIZE];
+    char error[160];
+    CHECK(artwork_load_file(path, &data, &size, content_type,
+                            error, sizeof(error)));
+    ap2_mrp_artwork_info_t info;
+    ap2_mrp_artwork_result_t result =
+        ap2_mrp_validate_artwork(content_type, data, size, &info);
+    free(data);
+    CHECK(result == AP2_MRP_ARTWORK_ACCEPTED);
+    printf("%s: %zu bytes %ux%u SOF=0x%02x components=%u progressive=%d\n",
+           path, size, info.width, info.height, info.sof_marker,
+           info.components, info.progressive);
+    return true;
+}
+
+int main(int argc, char **argv)
 {
     if (!test_local_file_boundary() ||
         !test_mrp_validation_boundary() ||
         !test_nowplaying_command_payload())
         return 1;
+    for (int i = 1; i < argc; i++) {
+        if (!validate_generated_case(argv[i])) return 1;
+    }
     puts("MRP artwork tests passed");
     return 0;
 }

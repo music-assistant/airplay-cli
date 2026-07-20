@@ -99,6 +99,7 @@ struct ap2cl_s {
     bool mrp_device_registered;
     bool mrp_extended_registered;
     int mrp_last_playback_state;
+    int mrp_last_nowplaying_status;
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
     int events_sock;              /* reverse TCP events connection (kept open) */
@@ -2051,6 +2052,7 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
 int ap2cl_mrp_push(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
+    p->mrp_last_nowplaying_status = 0;
     ap2_mrp_ready(p);
     if (!p->mrp) return -1;
 
@@ -2060,6 +2062,7 @@ int ap2cl_mrp_push(struct ap2cl_s *p)
     int status = ap2_mrp_post_command(
         p, ap2_mrp_build_nowplaying_command,
         "[MRP] /command updateMRNowPlayingInfo");
+    p->mrp_last_nowplaying_status = status;
     if (!ap2_mrp_status_ok(status)) return status;
     ap2_mrp_mark_artwork_sent(p->mrp);
 
@@ -2074,6 +2077,11 @@ int ap2cl_mrp_push(struct ap2cl_s *p)
         ext_status = ap2_mrp_send_playback_state(p, state, false);
     }
     return ap2_mrp_status_ok(ext_status) ? status : ext_status;
+}
+
+int ap2cl_mrp_last_nowplaying_status(struct ap2cl_s *p)
+{
+    return p ? p->mrp_last_nowplaying_status : 0;
 }
 
 /* MRP data-channel (path B) status for the [STATUS] mrp line:

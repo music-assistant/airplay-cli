@@ -32,26 +32,22 @@ typedef enum {
 } ap2_mrp_playback_state_t;
 
 /*
- * Apple MediaRemote artwork compatibility contract.
+ * Local allocation safety boundary, not an Apple TV receiver limit.
  *
- * AirPlaySender requests 600x600 artwork from MediaRemote and captured iPhone
- * payloads are compact baseline JPEGs. Apple TV silently omits substantially
- * larger command artwork even when POST /command returns 2xx, so keep the
- * image itself within one 64 KiB compatibility envelope.
+ * The actual tvOS artwork-size cutoff is not yet measured. Keep enough room
+ * for the controlled 43-150 KiB hardware matrix while bounding retained local
+ * input and binary-plist construction.
  */
-#define AP2_MRP_ARTWORK_MAX_BYTES  (64 * 1024)
-#define AP2_MRP_ARTWORK_MAX_WIDTH  600
-#define AP2_MRP_ARTWORK_MAX_HEIGHT 600
+#define AP2_MRP_ARTWORK_SAFETY_MAX_BYTES (1024 * 1024)
 
 typedef enum {
     AP2_MRP_ARTWORK_NOT_APPLICABLE = 0,
     AP2_MRP_ARTWORK_ACCEPTED,
     AP2_MRP_ARTWORK_INVALID_ARGUMENT,
     AP2_MRP_ARTWORK_UNSUPPORTED_TYPE,
-    AP2_MRP_ARTWORK_TOO_LARGE,
+    AP2_MRP_ARTWORK_SAFETY_LIMIT,
     AP2_MRP_ARTWORK_INVALID_JPEG,
-    AP2_MRP_ARTWORK_NOT_BASELINE,
-    AP2_MRP_ARTWORK_INVALID_DIMENSIONS,
+    AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE,
     AP2_MRP_ARTWORK_NO_MEMORY,
 } ap2_mrp_artwork_result_t;
 
@@ -60,6 +56,10 @@ typedef struct {
     size_t bytes;
     uint16_t width;
     uint16_t height;
+    uint8_t precision;
+    uint8_t components;
+    uint8_t sof_marker;
+    bool progressive;
 } ap2_mrp_artwork_info_t;
 
 /* Remote-control (MRP) data-channel stream SETUP constants (DESIGN.md §8,
@@ -147,9 +147,11 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
 /*
  * Set the now-playing artwork.
  *
- * MediaRemote accepts only a structurally valid, 8-bit, three-component
- * baseline JPEG within AP2_MRP_ARTWORK_MAX_*; invalid input clears any prior
- * MRP artwork so a new track cannot retain stale cover art.
+ * Accepts structurally parsed 8-bit Huffman baseline (SOF0) and progressive
+ * (SOF2) JPEGs within AP2_MRP_ARTWORK_SAFETY_MAX_BYTES. This is parser and
+ * allocation policy only; it deliberately does not claim a receiver byte,
+ * dimension, color-component, or progressive-JPEG limit. Invalid input clears
+ * prior MRP artwork so a new track cannot retain stale cover art.
  *
  * :param mime: image MIME type; must be "image/jpeg".
  * :param data: image bytes (copied).
