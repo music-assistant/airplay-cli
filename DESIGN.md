@@ -2,8 +2,7 @@
 
 How the unified AirPlay binary works: route selection, the streaming flows,
 the PTP engine, the timing/anchor model, and the wire formats. The code is the
-source of truth; this document explains it. Device validation status lives in
-`TEST-PLAN.md`, open work in `TODO.md`.
+source of truth; this document explains it. Open work lives in `TODO.md`.
 
 ---
 

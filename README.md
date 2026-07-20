@@ -9,8 +9,7 @@ on stdin. For synchronized multi-room AirPlay 2 playback it additionally runs
 one `cliairplay --ptp-daemon` per host, which owns the PTP clock that every
 per-device stream on that host shares.
 
-Protocol and architecture detail lives in `DESIGN.md`; the device validation
-matrix in `TEST-PLAN.md`.
+Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
 
 ## Features
 
