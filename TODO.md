@@ -29,7 +29,7 @@ status per route lives in `TEST-PLAN.md`.
       release binaries instead of committing a prebuilt binary into the
       provider `bin/` dir (the committed `macos-arm64` binary is for local
       testing only).
-- [ ] **Remaining ear-tests.** JBL MA9100 and WiiM Pro are session-verified
+- [ ] **Remaining ear-tests.** The JBL and WiiM test units are session-verified
       (paired, /info read) but not ear-tested; RAOP/RAOP-compat want a
       regression pass by ear after the native-AP2 work; and a RAOP-only
       device inside a PTP-active group needs a regression check. See the

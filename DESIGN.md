@@ -193,10 +193,10 @@ chain; Sonos omits the key and self-compensates). Members reporting it are
 scheduled that much earlier — the anchor line shifts by the value — so their
 ACOUSTIC output lands on T with the rest of the group. This is the same
 mechanism Apple senders use, which is why an iPhone keeps an Apple TV and a
-Sonos in sync. Verified by ear: a three-way group (Era 100 pair AP2+PTP, Move
-RAOP, Apple TV AP2 pair-verify through a TV) plays in sync with the
-compensation and lags without it. Manual per-player offsets remain a
-caller-side override for gear that misreports.
+Sonos in sync. Verified by ear: a three-way group (a Sonos stereo pair
+AP2+PTP, a second Sonos RAOP, an Apple TV AP2 pair-verify through a TV) plays
+in sync with the compensation and lags without it. Manual per-player offsets
+remain a caller-side override for gear that misreports.
 
 Per path:
 

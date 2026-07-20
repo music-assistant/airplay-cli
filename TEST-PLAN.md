@@ -23,11 +23,11 @@ as devices are (re)tested.
 
 | Device | IP:port | Route in practice | Pairing | Status |
 |---|---|---|---|---|
-| Sonos Era 100 "Kantoor" (stereo pair) | 192.168.1.69:7000 | native AP2 realtime + PTP | transient | ear-verified 2026-07-19 |
-| Sonos Move 2 "Woonkamer" | 192.168.1.224:7000 | RAOP / RAOP-compat / native AP2 + PTP | transient | ear-verified 2026-07-19 |
-| Apple TV 4K | _capture_ (historically 192.168.1.17):7000 | native AP2 realtime + PTP | stored creds (`--pair-setup` PIN) | ear-verified 2026-07-19 (incl. 24-bit) |
-| JBL MA9100 | _capture_ | native AP2 (expected) | transient | session-verified (paired + /info); **not ear-tested** |
-| WiiM Pro | _capture_ | RAOP or native AP2 (NTP or PTP) | transient | session-verified; **not ear-tested** |
+| Sonos stereo pair (Device A) | _fill in_ | native AP2 realtime + PTP | transient | ear-verified 2026-07-19 |
+| Sonos portable speaker (Device B) | _fill in_ | RAOP / RAOP-compat / native AP2 + PTP | transient | ear-verified 2026-07-19 |
+| Apple TV 4K (Device C) | _fill in_ | native AP2 realtime + PTP | stored creds (`--pair-setup` PIN) | ear-verified 2026-07-19 (incl. 24-bit) |
+| JBL soundbar (Device D) | _fill in_ | native AP2 (expected) | transient | session-verified (paired + /info); **not ear-tested** |
+| WiiM streamer (Device E) | _fill in_ | RAOP or native AP2 (NTP or PTP) | transient | session-verified; **not ear-tested** |
 
 ## Route matrix
 
@@ -44,8 +44,8 @@ session healthy, no audio confirmation) · `?` untested · `n/a` not applicable.
 | R6 | `--protocol auto` resolves the expected route from TXT | EAR 2026-07-19 | SES | EAR 2026-07-19 | SES |
 | R7 | 24-bit ALAC over realtime (44.1/24 and 48/24) | n/a (no 24-bit; 48/24 silent-accepts) | ? | EAR 2026-07-19 (+ reference-receiver decode, 0 errors) | ? |
 | R8 | Buffered (type 103) + PTP | parked | parked | parked | parked |
-| R9 | Multi-room sync: 2+ devices, `--ptp-daemon` + `--ptp-shared`, one `--start-unix-ms` | EAR 2026-07-19 (Era 100 pair + Move, sample-aligned) | ? | ? | ? |
-| R10 | Mixed-protocol group: RAOP + native-AP2 members, one `--start-unix-ms` | EAR 2026-07-19 (Era 100 pair AP2+PTP + Move RAOP/NTP, in sync; 3-way incl. Apple TV pair-verify IN SYNC after automatic arrivalToRenderLatencyMs compensation (ATV reports ~107ms)) | ? | ? | ? |
+| R9 | Multi-room sync: 2+ devices, `--ptp-daemon` + `--ptp-shared`, one `--start-unix-ms` | EAR 2026-07-19 (Devices A+B, sample-aligned) | ? | ? | ? |
+| R10 | Mixed-protocol group: RAOP + native-AP2 members, one `--start-unix-ms` | EAR 2026-07-19 (Device A AP2+PTP + Device B RAOP/NTP, in sync; 3-way incl. Apple TV pair-verify IN SYNC after automatic arrivalToRenderLatencyMs compensation (Apple TV reports ~107ms)) | ? | ? | ? |
 | R11 | PTP regression: RAOP-only device plays while PTP is active for the group | ? | — | — | — |
 
 Notes:
