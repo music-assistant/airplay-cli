@@ -322,6 +322,12 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
   without it).
+- **Apple MediaRemote metadata** — pair-verified native sessions register a
+  DEVICE_INFO origin, then send `updateMRNowPlayingInfo` followed by supported
+  commands, explicit playback state, and a serialized NowPlayingClient.
+  Start/pause/resume/stop transitions stay synchronized with the audio state.
+  This path is enabled by default (`CLIAIRPLAY_MRP=0` is the diagnostic opt-out);
+  see `MRP-DESIGN.md` for the wire formats and hardware acceptance status.
 
 ## 10. Device-behavior findings
 

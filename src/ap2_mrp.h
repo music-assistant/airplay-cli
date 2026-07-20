@@ -10,9 +10,7 @@
  *   2. keep the system now-playing session alive so tvOS does not drop to
  *      standby mid-stream.
  *
- * Design and protocol notes live in MRP-DESIGN.md. This is a compiling
- * skeleton: the wire primitives (protobuf, framing, channel crypto) are real;
- * the socket/pair-verify/thread wiring is stubbed for a later pass.
+ * Design and protocol notes live in MRP-DESIGN.md.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * See LICENSE
@@ -25,6 +23,12 @@
 #include <stdint.h>
 
 struct ap2_mrp_ctx;
+
+typedef enum {
+    AP2_MRP_PLAYBACK_PLAYING = 1,
+    AP2_MRP_PLAYBACK_PAUSED = 2,
+    AP2_MRP_PLAYBACK_STOPPED = 3,
+} ap2_mrp_playback_state_t;
 
 /* Remote-control (MRP) data-channel stream SETUP constants (MRP-DESIGN.md §2,
  * pyatv ap2_session.py _setup_data_channel). The audio session issues a SETUP
@@ -45,7 +49,7 @@ struct ap2_mrp_ctx;
  *    pair-verify shared secret, passed here as reuse_shared_secret.
  *  - sidecar (metadata-only display mode): ap2_mrp_start() later drives its own
  *    connection + pair-verify + remote-control-only session; not implemented in
- *    the skeleton.
+ *    the current implementation.
  *
  * :param host: device IP address.
  * :param port: device AirPlay control port (typically 7000).
@@ -56,6 +60,8 @@ struct ap2_mrp_ctx;
  * :param dacp_id: DACP identifier; doubles as our stable MRP device identifier
  *                 and (sidecar model) the pair-verify client identity.
  * :param device_name: sender display name to advertise (DEVICE_INFO).
+ * :param session_uuid: UUID of the AirPlay audio session this state belongs to.
+ * :param group_uuid: AirPlay group UUID advertised in the session SETUP.
  * :param reuse_shared_secret: 32-byte pairing shared secret of the verified
  *                             session the type-130 stream was SETUP on
  *                             (piggyback model). NULL for the sidecar model.
@@ -64,6 +70,8 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *auth_credentials,
                                     const char *dacp_id,
                                     const char *device_name,
+                                    const char *session_uuid,
+                                    const char *group_uuid,
                                     const uint8_t *reuse_shared_secret);
 
 /* Destroy the context and release all resources. */
@@ -87,7 +95,7 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
  * Bootstrap a standalone remote-control-only session (sidecar model, for the
  * metadata-only display mode): own TCP connection, pair-verify, session SETUP
  * with isRemoteControlOnly=true, event channel, RECORD, type-130 data channel.
- * NOT implemented in the skeleton — returns false; see MRP-DESIGN.md §9.
+ * Not implemented yet — returns false; see MRP-DESIGN.md §9.
  */
 bool ap2_mrp_start(struct ap2_mrp_ctx *m);
 
@@ -134,6 +142,10 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
  */
 bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing);
 
+/* Mark playback stopped. The current metadata remains available for the final
+ * updateMRPlaybackState push before session teardown. */
+bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m);
+
 /*
  * Keep-alive tick: drain any incoming frames (answering sync/heartbeat
  * requests) and re-push the current now-playing state to hold the system
@@ -158,6 +170,9 @@ bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
+/* Mark the one-shot artwork bytes as accepted after a successful POST. */
+void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
+
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before
  * pushing now-playing (MRP-DESIGN.md §10), for the same encrypted RTSP channel:
@@ -171,5 +186,17 @@ bool ap2_mrp_build_deviceinfo_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
                                              uint8_t **out, int *out_len);
+
+/*
+ * Build the remaining MediaRemote extended-metadata commands sent by Apple's
+ * AirPlaySender after updateMRNowPlayingInfo:
+ *   - updateMRPlaybackState: {params:{mrPlaybackState:<enum>}}
+ *   - updateMRNowPlayingClient: a serialized NowPlayingClient protobuf in
+ *     {params:{mrNowPlayingClient:<data>}}
+ */
+bool ap2_mrp_build_playbackstate_command(struct ap2_mrp_ctx *m,
+                                         uint8_t **out, int *out_len);
+bool ap2_mrp_build_nowplayingclient_command(struct ap2_mrp_ctx *m,
+                                            uint8_t **out, int *out_len);
 
 #endif /* __AP2_MRP_H_ */

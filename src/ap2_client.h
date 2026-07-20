@@ -165,10 +165,10 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, co
 /* Set playback progress. */
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
 
-/* Push the current now-playing state as a MediaRemote POST /command (path A
- * diagnostic, OFF unless CLIAIRPLAY_MRP_COMMAND is set; pair-verified native
- * sessions only). Returns the HTTP status, 0 when disabled, or -1 when the push
- * does not apply to this session. */
+/* Push the current now-playing state and any pending MediaRemote extended
+ * metadata over POST /command. Enabled for pair-verified native sessions;
+ * CLIAIRPLAY_MRP=0 disables it. Returns the HTTP status, 0 on registration
+ * failure, or -1 when the push does not apply to this session. */
 int ap2cl_mrp_push(struct ap2cl_s *p);
 
 /* Status of the type-130 MRP data channel (path B) for the [STATUS] mrp line:
@@ -176,9 +176,9 @@ int ap2cl_mrp_push(struct ap2cl_s *p);
  * 1 = channel established. */
 int ap2cl_mrp_channel_status(struct ap2cl_s *p);
 
-/* Perform the /command origin registration (DEVICE_INFO + supportedCommands) a
- * real iPhone sends before now-playing. Call once after connect, before the
- * first now-playing push. Returns 1 (both 2xx), 0, or -1 (not applicable). */
+/* Perform the /command DEVICE_INFO origin registration before now-playing.
+ * Extended metadata is sent immediately after the first now-playing update.
+ * Returns 1 (2xx), 0, or -1 (not applicable). */
 int ap2cl_mrp_register(struct ap2cl_s *p);
 
 /* Set RAOP-compatible properties (mDNS fields, interface, credentials).

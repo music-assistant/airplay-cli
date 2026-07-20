@@ -8,10 +8,9 @@
  * DataStream keys. Protocol references and the wiring plan live in
  * MRP-DESIGN.md.
  *
- * Skeleton status: the wire primitives below are real and the piggyback
- * attach path is implemented end-to-end (key derivation, TCP connect,
- * handshake push); the sidecar bootstrap (ap2_mrp_start) and the incoming
- * protobuf dispatch are stubbed for the wiring pass. NOT yet in the Makefile.
+ * The `/command` path carries sender now-playing state. The optional type-130
+ * channel provides remote-control transport and is kept for future inbound
+ * command handling.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * See LICENSE
@@ -117,8 +116,6 @@ enum mrp_ext_field {
 /* Enum values used inside the payload messages (pyatv protobuf sources). */
 #define MRP_CONNECTION_STATE_CONNECTED     2   /* SetConnectionStateMessage */
 #define MRP_CONNECTION_STATE_DISCONNECTED  3
-#define MRP_PLAYBACK_STATE_PLAYING         1   /* Common.proto PlaybackState */
-#define MRP_PLAYBACK_STATE_PAUSED          2
 #define MRP_DEVICE_CLASS_IPHONE            1   /* Common.proto DeviceClass */
 #define MRP_MEDIA_TYPE_AUDIO               1   /* ContentItemMetadata */
 #define MRP_MEDIA_SUBTYPE_MUSIC            1
@@ -148,6 +145,9 @@ struct ap2_mrp_ctx {
     char *auth_credentials;   /* 192-hex HAP creds (sidecar pair-verify) */
     char *dacp_id;            /* stable sender identifier */
     char *name;               /* advertised display name */
+    char *session_uuid;       /* active AirPlay session */
+    char *group_uuid;         /* active AirPlay group */
+    char device_uuid[37];     /* stable UUID derived from dacp_id */
 
     /* Channel crypto. The DataStream keys derive from the pairing shared
      * secret of the RTSP session that performed the type-130 SETUP. */
@@ -179,7 +179,7 @@ struct ap2_mrp_ctx {
     char *album;
     int duration_ms;
     int elapsed_ms;
-    bool playing;
+    ap2_mrp_playback_state_t playback_state;
     double elapsed_set_at;    /* CFAbsoluteTime when elapsed_ms was captured */
     char *artwork_mime;
     uint8_t *artwork;
@@ -208,6 +208,26 @@ static void mrp_gen_uuid(char out[37])
              "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
              b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
              b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]);
+}
+
+static void mrp_identity_uuid(const char *identity, char out[37])
+{
+    uint8_t digest[EVP_MAX_MD_SIZE];
+    unsigned int digest_len = 0;
+    if (!identity ||
+        EVP_Digest(identity, strlen(identity), digest, &digest_len,
+                   EVP_sha256(), NULL) != 1 || digest_len < 16) {
+        mrp_gen_uuid(out);
+        return;
+    }
+    digest[6] = (digest[6] & 0x0F) | 0x50; /* deterministic UUID v5 shape */
+    digest[8] = (digest[8] & 0x3F) | 0x80;
+    snprintf(out, 37,
+             "%02X%02X%02X%02X-%02X%02X-%02X%02X-%02X%02X-%02X%02X%02X%02X%02X%02X",
+             digest[0], digest[1], digest[2], digest[3],
+             digest[4], digest[5], digest[6], digest[7],
+             digest[8], digest[9], digest[10], digest[11],
+             digest[12], digest[13], digest[14], digest[15]);
 }
 
 static char *mrp_strdup(const char *s)
@@ -353,7 +373,7 @@ static bool build_device_info(struct ap2_mrp_ctx *m, mbuf *out)
 {
     bool ok = true;
     mbuf inner = {0};
-    ok &= pb_put_string_field(&inner, 1, m->dacp_id);           /* uniqueIdentifier */
+    ok &= pb_put_string_field(&inner, 1, m->device_uuid);       /* uniqueIdentifier */
     ok &= pb_put_string_field(&inner, 2, m->name);              /* name (required) */
     ok &= pb_put_string_field(&inner, 3, "iPhone");             /* localizedModelName */
     ok &= pb_put_string_field(&inner, 4, "21F90");              /* systemBuildVersion */
@@ -362,12 +382,21 @@ static bool build_device_info(struct ap2_mrp_ctx *m, mbuf *out)
     ok &= pb_put_varint_field(&inner, 8, 139);                  /* lastSupportedMessageType (captured from a real iPhone) */
     ok &= pb_put_bool_field(&inner, 9, true);                   /* supportsSystemPairing */
     ok &= pb_put_bool_field(&inner, 10, true);                  /* allowsPairing */
+    ok &= pb_put_string_field(&inner, 12, "com.apple.Music");   /* systemMediaApplication */
     ok &= pb_put_bool_field(&inner, 13, true);                  /* supportsACL */
     ok &= pb_put_bool_field(&inner, 14, true);                  /* supportsSharedQueue */
     ok &= pb_put_bool_field(&inner, 15, true);                  /* supportsExtendedMotion */
     ok &= pb_put_varint_field(&inner, 17, 2);                   /* sharedQueueVersion */
+    ok &= pb_put_string_field(&inner, 19, m->dacp_id);          /* deviceUID */
     ok &= pb_put_varint_field(&inner, 21, MRP_DEVICE_CLASS_IPHONE); /* deviceClass */
     ok &= pb_put_varint_field(&inner, 22, 1);                   /* logicalDeviceCount */
+    ok &= pb_put_string_field(&inner, 31, "com.apple.podcasts"); /* systemPodcastApplication */
+    ok &= pb_put_string_field(&inner, 39, "iPhone17,1");        /* modelID */
+    if (m->session_uuid && *m->session_uuid)
+        ok &= pb_put_string_field(&inner, 41, m->session_uuid); /* routingContextID */
+    if (m->group_uuid && *m->group_uuid)
+        ok &= pb_put_string_field(&inner, 42, m->group_uuid);   /* airPlayGroupID */
+    ok &= pb_put_string_field(&inner, 43, "com.apple.iBooks");  /* systemBooksApplication */
     ok = ok && mrp_envelope(out, MRP_MSG_DEVICE_INFO, MRP_EXT_DEVICE_INFO, &inner);
     mbuf_free(&inner);
     return ok;
@@ -403,16 +432,24 @@ static bool build_client_updates_config(mbuf *out)
     return ok;
 }
 
-/* SET_NOW_PLAYING_CLIENT_MESSAGE (ext 50): client = field 1 ->
- * NowPlayingClient { processIdentifier=1, bundleIdentifier=2, displayName=7 }.
- * Registers us as a now-playing origin on the receiver. */
+/* MRNowPlayingClientCreateExternalRepresentation serializes this protobuf
+ * directly. The same submessage is nested in SET_NOW_PLAYING_CLIENT on the
+ * optional type-130 channel. */
+static bool build_now_playing_client(struct ap2_mrp_ctx *m, mbuf *client)
+{
+    bool ok = true;
+    ok &= pb_put_varint_field(client, 1, (uint64_t)getpid());
+    ok &= pb_put_string_field(client, 2, "com.apple.Music");
+    ok &= pb_put_string_field(client, 7, m->name);
+    return ok;
+}
+
+/* SET_NOW_PLAYING_CLIENT_MESSAGE (ext 50): client = field 1. */
 static bool build_set_now_playing_client(struct ap2_mrp_ctx *m, mbuf *out)
 {
     bool ok = true;
     mbuf client = {0}, inner = {0};
-    ok &= pb_put_varint_field(&client, 1, (uint64_t)getpid());
-    ok &= pb_put_string_field(&client, 2, "com.apple.Music");
-    ok &= pb_put_string_field(&client, 7, m->name);
+    ok = build_now_playing_client(m, &client);
     ok = ok && pb_put_msg_field(&inner, 1, &client);
     ok = ok && mrp_envelope(out, MRP_MSG_SET_NOW_PLAYING_CLIENT,
                             MRP_EXT_SET_NOW_PLAYING_CLIENT, &inner);
@@ -434,11 +471,14 @@ static bool build_content_item_metadata(struct ap2_mrp_ctx *m, mbuf *meta)
     if (m->duration_ms > 0)
         ok &= pb_put_double_field(meta, 14, dur_s);                   /* duration */
     ok &= pb_put_bool_field(meta, 19, m->artwork_len > 0);            /* artworkAvailable */
-    ok &= pb_put_bool_field(meta, 27, true);                          /* isCurrentlyPlaying */
+    ok &= pb_put_bool_field(meta, 27,
+                            m->playback_state != AP2_MRP_PLAYBACK_STOPPED);
     if (m->artwork_mime && m->artwork_len > 0)
         ok &= pb_put_string_field(meta, 31, m->artwork_mime);         /* artworkMIMEType */
     ok &= pb_put_double_field(meta, 35, elapsed_s);                   /* elapsedTime */
-    ok &= pb_put_float_field(meta, 39, m->playing ? 1.0f : 0.0f);     /* playbackRate */
+    ok &= pb_put_float_field(meta, 39,
+                             m->playback_state == AP2_MRP_PLAYBACK_PLAYING
+                                 ? 1.0f : 0.0f);                      /* playbackRate */
     ok &= pb_put_varint_field(meta, 64, MRP_MEDIA_TYPE_AUDIO);        /* mediaType */
     ok &= pb_put_varint_field(meta, 65, MRP_MEDIA_SUBTYPE_MUSIC);     /* mediaSubType */
     ok &= pb_put_double_field(meta, 74, m->elapsed_set_at);           /* elapsedTimeTimestamp */
@@ -483,7 +523,9 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
     if (m->duration_ms > 0)
         ok &= pb_put_double_field(&npi, 3, m->duration_ms / 1000.0);  /* duration */
     ok &= pb_put_double_field(&npi, 4, m->elapsed_ms / 1000.0);       /* elapsedTime */
-    ok &= pb_put_float_field(&npi, 5, m->playing ? 1.0f : 0.0f);      /* playbackRate */
+    ok &= pb_put_float_field(&npi, 5,
+                             m->playback_state == AP2_MRP_PLAYBACK_PLAYING
+                                 ? 1.0f : 0.0f);                       /* playbackRate */
     ok &= pb_put_double_field(&npi, 8, now_cf);                       /* timestamp */
     ok &= pb_put_string_field(&npi, 9, m->title ? m->title : "");     /* title */
     ok &= pb_put_bool_field(&npi, 12, true);                          /* isMusicApp */
@@ -505,8 +547,7 @@ static bool build_set_state(struct ap2_mrp_ctx *m, bool include_artwork,
     ok = ok && pb_put_msg_field(&inner, 2, &sc);                      /* supportedCommands */
     ok = ok && pb_put_msg_field(&inner, 3, &queue);
     ok &= pb_put_string_field(&inner, 5, m->name);                    /* displayName */
-    ok &= pb_put_varint_field(&inner, 6, m->playing ?                 /* playbackState */
-                              MRP_PLAYBACK_STATE_PLAYING : MRP_PLAYBACK_STATE_PAUSED);
+    ok &= pb_put_varint_field(&inner, 6, m->playback_state);          /* playbackState */
     ok &= pb_put_double_field(&inner, 11, now_cf);                    /* playbackStateTimestamp */
 
     ok = ok && mrp_envelope(out, MRP_MSG_SET_STATE, MRP_EXT_SET_STATE, &inner);
@@ -816,6 +857,8 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *auth_credentials,
                                     const char *dacp_id,
                                     const char *device_name,
+                                    const char *session_uuid,
+                                    const char *group_uuid,
                                     const uint8_t *reuse_shared_secret)
 {
     if (!host) return NULL;
@@ -827,6 +870,11 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     m->auth_credentials = auth_credentials ? mrp_strdup(auth_credentials) : NULL;
     m->dacp_id = mrp_strdup(dacp_id && *dacp_id ? dacp_id : "cliairplay");
     m->name = mrp_strdup(device_name && *device_name ? device_name : "Music Assistant");
+    m->session_uuid = mrp_strdup(session_uuid);
+    m->group_uuid = mrp_strdup(group_uuid);
+    mrp_identity_uuid(m->dacp_id, m->device_uuid);
+    m->playback_state = AP2_MRP_PLAYBACK_PAUSED;
+    m->elapsed_set_at = mrp_cf_now();
     m->sock = -1;
     pthread_mutex_init(&m->send_lock, NULL);
 
@@ -856,6 +904,8 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     free(m->auth_credentials);
     free(m->dacp_id);
     free(m->name);
+    free(m->session_uuid);
+    free(m->group_uuid);
     free(m->title);
     free(m->artist);
     free(m->album);
@@ -1018,7 +1068,8 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
     if (!m) return false;
     m->elapsed_ms = elapsed_ms > 0 ? elapsed_ms : 0;
     if (duration_ms > 0) m->duration_ms = duration_ms;
-    m->playing = playing;
+    m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
+                                : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
     if (!m->connected) return true;
     /* The receiver extrapolates position from elapsedTime + timestamp +
@@ -1033,12 +1084,23 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
      * or resumed (play) position matches what the receiver extrapolated up to
      * this instant, then re-anchor the timestamp at now. */
     double now = mrp_cf_now();
-    if (m->playing && m->elapsed_set_at > 0.0) {
+    if (m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
+        m->elapsed_set_at > 0.0) {
         double advanced_ms = (now - m->elapsed_set_at) * 1000.0;
         if (advanced_ms > 0.0) m->elapsed_ms += (int)advanced_ms;
     }
-    m->playing = playing;
+    m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
+                                : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = now;
+    if (!m->connected) return true;
+    return mrp_push_state(m, false);
+}
+
+bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
+{
+    if (!m) return false;
+    m->playback_state = AP2_MRP_PLAYBACK_STOPPED;
+    m->elapsed_set_at = mrp_cf_now();
     if (!m->connected) return true;
     return mrp_push_state(m, false);
 }
@@ -1068,7 +1130,8 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
 
     /* Defensive periodic re-push: keeps the system now-playing session warm
      * (standby prevention hinges on it, MRP-DESIGN.md §6). */
-    if (m->playing && time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S)
+    if (m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
+        time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S)
         mrp_push_state(m, false);
 }
 
@@ -1105,7 +1168,8 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoElapsedTime",
                     ap2_pl_real((double)m->elapsed_ms / 1000.0));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoPlaybackRate",
-                    ap2_pl_real(m->playing ? 1.0 : 0.0));
+                    ap2_pl_real(m->playback_state == AP2_MRP_PLAYBACK_PLAYING
+                                    ? 1.0 : 0.0));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoDefaultPlaybackRate",
                     ap2_pl_real(1.0));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoTimestamp",
@@ -1128,7 +1192,6 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
         if (!m->artwork_sent) {
             ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkData",
                             ap2_pl_data(m->artwork, (size_t)m->artwork_len));
-            m->artwork_sent = true;
         }
     }
 
@@ -1145,6 +1208,12 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     if (len <= 0) return false;
     *out_len = len;
     return true;
+}
+
+void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m)
+{
+    if (m && m->artwork && m->artwork_len > 0)
+        m->artwork_sent = true;
 }
 
 /* Wrap a serialized protobuf as the bplist {"params": {"data": <varint length +
@@ -1248,6 +1317,56 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
     ap2_pl_dict_set(root, "params", params);
     int len = ap2_pl_serialize(root, out);
     ap2_pl_free(root);
+    if (len <= 0) return false;
+    *out_len = len;
+    return true;
+}
+
+bool ap2_mrp_build_playbackstate_command(struct ap2_mrp_ctx *m,
+                                         uint8_t **out, int *out_len)
+{
+    if (!m || !out || !out_len) return false;
+
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "mrPlaybackState",
+                    ap2_pl_int(m->playback_state));
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type",
+                    ap2_pl_string("updateMRPlaybackState"));
+    ap2_pl_dict_set(root, "params", params);
+
+    int len = ap2_pl_serialize(root, out);
+    ap2_pl_free(root);
+    if (len <= 0) return false;
+    *out_len = len;
+    return true;
+}
+
+bool ap2_mrp_build_nowplayingclient_command(struct ap2_mrp_ctx *m,
+                                            uint8_t **out, int *out_len)
+{
+    if (!m || !out || !out_len) return false;
+
+    /* MRNowPlayingClientCreateExternalRepresentation returns the serialized
+     * NowPlayingClient protobuf itself — unlike params.data DEVICE_INFO, there
+     * is no ProtocolMessage envelope or varint length prefix. */
+    mbuf client = {0};
+    if (!build_now_playing_client(m, &client)) {
+        mbuf_free(&client);
+        return false;
+    }
+
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "mrNowPlayingClient",
+                    ap2_pl_data(client.p, client.len));
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type",
+                    ap2_pl_string("updateMRNowPlayingClient"));
+    ap2_pl_dict_set(root, "params", params);
+
+    int len = ap2_pl_serialize(root, out);
+    ap2_pl_free(root);
+    mbuf_free(&client);
     if (len <= 0) return false;
     *out_len = len;
     return true;

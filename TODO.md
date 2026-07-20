@@ -34,21 +34,12 @@ status per route lives in `TEST-PLAN.md`.
       regression pass by ear after the native-AP2 work; and a RAOP-only
       device inside a PTP-active group needs a regression check. See the
       matrix in `TEST-PLAN.md`.
-- [ ] **Apple TV on-screen now-playing (MediaRemote) — planned follow-up.**
-      The legacy metadata channel (DMAP text, artwork, progress via
-      SET_PARAMETER) is fully implemented on the native flow and the Apple TV
-      200-accepts all of it, but tvOS renders its now-playing screen only from
-      the MediaRemote (MRP) messages on the AirPlay 2 data channel (protobuf),
-      which is how iPhones drive it. Speakers are unaffected (Sonos requires
-      and consumes the DMAP metadata). Beyond fixing the display during audio
-      playback, MRP also unlocks a **metadata-only display mode**: expose an
-      Apple TV as a display target that shows the active playback session of
-      an MA queue without routing audio to it — the same product shape as the
-      cast-displays work in MA. Expected third benefit: **standby prevention** —
-      tvOS gates its "media playing, don't sleep" logic on the system
-      now-playing session that MRP establishes, which is why an Apple TV sleeps
-      mid-stream today despite receiving audio. Acceptance test for the MRP
-      work: stream past the tvOS sleep timeout and confirm it stays awake.
-      Bundle with the provider's Companion-protocol TODO (explicit wake on
-      playback start + power-state tracking, pyatv-style) for full Apple TV
-      power management.
+- [ ] **Apple TV MediaRemote hardware acceptance.** The native pair-verified
+      flow now sends the complete Apple sender sequence over `POST /command`:
+      DEVICE_INFO, now-playing info, supported commands, explicit playback
+      state, and the serialized NowPlayingClient. All plist/protobuf bodies are
+      independently decoded and the Apple TV previously 200-accepted the
+      capture-derived subset. On a real Apple TV: confirm title/artist/album/art
+      render, stream past the tvOS sleep timeout, then repeat with
+      `CLIAIRPLAY_MRP=0` as the control. The separate metadata-only display mode
+      and Companion-protocol wake/power tracking remain follow-ups.

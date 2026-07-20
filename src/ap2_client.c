@@ -96,6 +96,9 @@ struct ap2cl_s {
     /* MRP now-playing over POST /command (path A, see MRP-DESIGN.md §4):
      * state carrier + body builder; only on pair-verified native sessions. */
     struct ap2_mrp_ctx *mrp;
+    bool mrp_device_registered;
+    bool mrp_extended_registered;
+    int mrp_last_playback_state;
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
     int events_sock;              /* reverse TCP events connection (kept open) */
@@ -123,6 +126,7 @@ struct ap2cl_s {
     uint64_t audio_nonce_counter;
     char session_url[128];
     char session_uuid[40];
+    char group_uuid[40];
     uint32_t session_id;
     int cseq;
 
@@ -139,6 +143,10 @@ struct ap2cl_s {
     int buffered_sock;     /* TCP connection to the receiver's dataPort */
     bool anchored;         /* SETRATEANCHORTIME has been sent */
 };
+
+static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
+                                       ap2_mrp_playback_state_t state,
+                                       bool force);
 
 /* ---- Native AP2 RTSP I/O ---- */
 
@@ -550,6 +558,7 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
     if (!p->mrp)
         p->mrp = ap2_mrp_create(p->device.address, p->device.port,
                                 p->auth_credentials, p->dacp_id, p->device.name,
+                                p->session_uuid, p->group_uuid,
                                 ap2_hap_get_shared_secret(p->hap));
     if (!p->mrp) return;
 
@@ -625,6 +634,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
              uuid_bytes[4], uuid_bytes[5], uuid_bytes[6], uuid_bytes[7],
              uuid_bytes[8], uuid_bytes[9], uuid_bytes[10], uuid_bytes[11],
              uuid_bytes[12], uuid_bytes[13], uuid_bytes[14], uuid_bytes[15]);
+    ap2_gen_uuid(p->group_uuid);
 
     /* 1. GET /info */
     uint8_t *resp = NULL; int resp_len = 0;
@@ -744,9 +754,8 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     /* 4. Session SETUP (encrypted). PTP and NTP use different session dicts. */
     uint8_t *plist_data = NULL; int plist_len = 0;
     if (p->use_ptp) {
-        char peer_id[37], group_uuid[37];
+        char peer_id[37];
         ap2_gen_uuid(peer_id);
-        ap2_gen_uuid(group_uuid);
         const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
 
         /* Advertise OUR clock as the session timeline (the engine holds
@@ -761,7 +770,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_pl_dict_set(root, "sessionUUID", ap2_pl_string(p->session_uuid));
         ap2_pl_dict_set(root, "name", ap2_pl_string(name));
         ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
-        ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(group_uuid));
+        ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
         ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
         ap2_pl_dict_set(root, "timingPeerInfo",
                         ap2_make_timing_peer(peer_id, timeline_id, our_addr));
@@ -1537,7 +1546,11 @@ struct ap2cl_s *ap2cl_create(
 bool ap2cl_destroy(struct ap2cl_s *p)
 {
     if (!p) return false;
-    if (p->raopcl) { raopcl_disconnect(p->raopcl); raopcl_destroy(p->raopcl); }
+    /* Preserve the on-wire shutdown sequence (final MediaRemote stopped state,
+     * MRP disconnect, RTSP TEARDOWN) on the normal EOF path too. */
+    if (p->state != AP2_DOWN || p->sock_fd >= 0)
+        ap2cl_disconnect(p);
+    if (p->raopcl) raopcl_destroy(p->raopcl);
     if (p->hap) ap2_hap_destroy(p->hap);
     if (p->ptp) ap2_ptp_destroy(p->ptp);
     if (p->mrp) ap2_mrp_destroy(p->mrp);
@@ -1629,9 +1642,13 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
 {
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
-        /* Push SET_CONNECTION_STATE=Disconnected and close the MRP channel
-         * before TEARDOWN, while the session (and its keys) are still live. */
-        if (p->mrp) ap2_mrp_stop(p->mrp);
+        /* Publish the final stopped state before disconnecting MediaRemote,
+         * while the encrypted RTSP session is still live. */
+        if (p->mrp) {
+            ap2_mrp_set_stopped(p->mrp);
+            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_STOPPED, true);
+            ap2_mrp_stop(p->mrp);
+        }
         if (p->events_sock >= 0) {
             close(p->events_sock);
             p->events_sock = -1;
@@ -1675,6 +1692,7 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
         p->seq_number = (uint16_t)(getpid() * 40503u);
         p->start_ntp = ntp_start;
         p->state = AP2_STREAMING;
+        if (p->mrp) ap2_mrp_set_playing(p->mrp, true);
         /* Announce the timeline IMMEDIATELY: with a future ntpstart the first
          * audio chunk (and the anchor coupled to it) would otherwise only go
          * out once pacing releases it, and a receiver that sees no time
@@ -1762,29 +1780,37 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
 void ap2cl_pause(struct ap2cl_s *p)
 {
     if (!p) return;
-    /* Mirror the pause onto the now-playing UI (MRP-DESIGN.md §8). */
-    if (p->mrp) ap2_mrp_set_playing(p->mrp, false);
     if (p->use_buffered && p->buffered_sock >= 0) {
         /* Freeze the buffered timeline in place with a rate-0 anchor. */
         ap2_send_setrateanchortime(p, p->rtp_timestamp, ap2_ptp_master_now_ns(p->ptp), 0);
         p->state = AP2_PAUSED;
+        if (p->mrp) {
+            ap2_mrp_set_playing(p->mrp, false);
+            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PAUSED, true);
+        }
         return;
     }
     if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
     p->rt_anchor_valid = false;    /* resume re-anchors on a fresh line */
     p->state = AP2_PAUSED;
+    if (p->mrp) {
+        ap2_mrp_set_playing(p->mrp, false);
+        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PAUSED, true);
+    }
 }
 
 void ap2cl_play(struct ap2cl_s *p)
 {
     if (!p) return;
-    /* Mirror the resume onto the now-playing UI (MRP-DESIGN.md §8). */
-    if (p->mrp) ap2_mrp_set_playing(p->mrp, true);
     if (p->use_buffered && p->buffered_sock >= 0) {
         /* Re-anchor at rate 1 a short lead ahead to resume the buffered stream. */
         uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + (uint64_t)p->latency_ms * 1000000ULL;
         ap2_send_setrateanchortime(p, p->rtp_timestamp, anchor_ns, 1);
         p->state = AP2_STREAMING;
+        if (p->mrp) {
+            ap2_mrp_set_playing(p->mrp, true);
+            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PLAYING, true);
+        }
         return;
     }
     if (p->raopcl) {
@@ -1793,6 +1819,10 @@ void ap2cl_play(struct ap2cl_s *p)
         raopcl_start_at(p->raopcl, now + MS2NTP(200) - TS2NTP(lat, raopcl_sample_rate(p->raopcl)));
     }
     p->state = AP2_STREAMING;
+    if (p->mrp) {
+        ap2_mrp_set_playing(p->mrp, true);
+        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PLAYING, true);
+    }
 }
 
 void ap2cl_stop(struct ap2cl_s *p)
@@ -1801,6 +1831,10 @@ void ap2cl_stop(struct ap2cl_s *p)
     if (p->use_buffered && p->buffered_sock >= 0)
         ap2_send_flushbuffered(p);
     if (p->raopcl) raopcl_stop(p->raopcl);
+    if (p->mrp) {
+        ap2_mrp_set_stopped(p->mrp);
+        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_STOPPED, true);
+    }
     p->rt_anchor_valid = false;
     p->state = AP2_DOWN;
 }
@@ -1899,24 +1933,25 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
     return status >= 200 && status < 300;
 }
 
-/* Lazily create an MRP state carrier for pair-verified native sessions when
- * the type-130 data channel (path B, ap2_native_setup_mrp) did not already
- * create one. With no shared secret it cannot open the channel — it only holds
- * now-playing state for the env-gated POST /command diagnostic (path A). Path B
- * remains the real now-playing path; non-verified receivers (transient pairing,
- * e.g. Sonos) never get MediaRemote pushes. */
+/* Lazily create the MediaRemote state carrier for pair-verified native
+ * sessions. With no shared secret it only drives the source-side /command
+ * metadata path; the optional type-130 channel supplies the secret itself.
+ * Transient-paired third-party speakers never receive these Apple-specific
+ * messages. Set CLIAIRPLAY_MRP=0 to disable the path for diagnosis. */
 static void ap2_mrp_ready(struct ap2cl_s *p)
 {
-    if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return;
-    /* MRP now-playing is dormant by default: replicating a real iOS sender's
-     * full /command registration + now-playing sequence is accepted by the
-     * Apple TV (HTTP 200) but does not render on screen — driving a screened
-     * receiver's now-playing UI as a sender is unsolved (see MRP-DESIGN.md).
-     * The implementation is preserved; set CLIAIRPLAY_MRP=1 to enable it (also
-     * the way to test whether the session prevents Apple TV standby). */
-    if (!getenv("CLIAIRPLAY_MRP")) return;
+    if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
+        p->sock_fd < 0 || !p->session_uuid[0])
+        return;
+    const char *setting = getenv("CLIAIRPLAY_MRP");
+    if (setting && (!strcmp(setting, "0") || !strcmp(setting, "false") ||
+                    !strcmp(setting, "off")))
+        return;
     p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
-                            p->dacp_id, p->device.name, NULL);
+                            p->dacp_id, p->device.name,
+                            p->session_uuid, p->group_uuid, NULL);
+    if (p->mrp)
+        ap2_mrp_set_playing(p->mrp, p->state == AP2_STREAMING);
 }
 
 /* Log an RTSP response body for diagnosis: a printable-text view (control bytes
@@ -1941,28 +1976,104 @@ static void ap2_log_response_body(const char *tag, const uint8_t *body, int len)
              tag, len, is_bplist ? " (bplist00)" : "", hex, text);
 }
 
-int ap2cl_mrp_push(struct ap2cl_s *p)
+typedef bool (*ap2_mrp_command_builder_t)(struct ap2_mrp_ctx *,
+                                          uint8_t **, int *);
+
+static int ap2_mrp_post_command(struct ap2cl_s *p,
+                                ap2_mrp_command_builder_t builder,
+                                const char *tag)
 {
-    if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
-    /* Path A (POST /command, type "updateMRNowPlayingInfo") is the now-playing
-     * push a real iPhone sender uses (captured 2026-07-20, MRP-DESIGN.md §10);
-     * the earlier 400 was our fabricated "updateNowPlayingInfo" envelope, since
-     * corrected in ap2_mrp_build_nowplaying_command. Sent on every metadata/
-     * progress/artwork change; the response body is logged on any non-2xx. */
-    uint8_t *body = NULL;
-    int body_len = 0;
-    if (!ap2_mrp_build_nowplaying_command(p->mrp, &body, &body_len)) return -1;
+    uint8_t *body = NULL; int body_len = 0;
+    if (!builder(p->mrp, &body, &body_len)) return -1;
     uint8_t *resp = NULL;
     int resp_len = 0;
     int status = ap2_rtsp_send(p, "POST", "/command", body, body_len,
                                "application/x-apple-binary-plist", &resp, &resp_len);
     free(body);
-    LOG_INFO("[MRP] /command now-playing push -> %d", status);
-    /* The receiver's body explains a rejection (plist or text); capture it. */
+    LOG_INFO("[MRP] /command %s -> %d", tag, status);
     if (status < 200 || status >= 300)
-        ap2_log_response_body("[MRP] /command", resp, resp_len);
+        ap2_log_response_body(tag, resp, resp_len);
     free(resp);
     return status;
+}
+
+static bool ap2_mrp_status_ok(int status)
+{
+    return status >= 200 && status < 300;
+}
+
+static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
+                                       ap2_mrp_playback_state_t state,
+                                       bool force)
+{
+    if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
+        return -1;
+    if (!force && p->mrp_last_playback_state == state) return 200;
+
+    int status = ap2_mrp_post_command(
+        p, ap2_mrp_build_playbackstate_command,
+        "[MRP] /command updateMRPlaybackState");
+    if (ap2_mrp_status_ok(status))
+        p->mrp_last_playback_state = state;
+    return status;
+}
+
+/* Apple AirPlaySender sends the extended metadata immediately after the first
+ * updateMRNowPlayingInfo: supported commands, explicit playback state, then the
+ * serialized NowPlayingClient. A receiver can accept the info plist while
+ * keeping it detached from its system now-playing player when these are absent. */
+static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
+{
+    ap2_mrp_playback_state_t state =
+        p->state == AP2_STREAMING ? AP2_MRP_PLAYBACK_PLAYING :
+        p->state == AP2_PAUSED ? AP2_MRP_PLAYBACK_PAUSED :
+                                 AP2_MRP_PLAYBACK_STOPPED;
+
+    int st_cmd = ap2_mrp_post_command(
+        p, ap2_mrp_build_supportedcommands_command,
+        "[MRP] /command updateMRSupportedCommands");
+    int st_state = ap2_mrp_send_playback_state(p, state, true);
+    int st_client = ap2_mrp_post_command(
+        p, ap2_mrp_build_nowplayingclient_command,
+        "[MRP] /command updateMRNowPlayingClient");
+
+    p->mrp_extended_registered =
+        ap2_mrp_status_ok(st_cmd) && ap2_mrp_status_ok(st_state) &&
+        ap2_mrp_status_ok(st_client);
+    LOG_INFO("[MRP] extended metadata: commands=%d playback=%d client=%d",
+             st_cmd, st_state, st_client);
+
+    if (!ap2_mrp_status_ok(st_cmd)) return st_cmd;
+    if (!ap2_mrp_status_ok(st_state)) return st_state;
+    return st_client;
+}
+
+int ap2cl_mrp_push(struct ap2cl_s *p)
+{
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
+    ap2_mrp_ready(p);
+    if (!p->mrp) return -1;
+
+    if (!p->mrp_device_registered && ap2cl_mrp_register(p) != 1)
+        return 0;
+
+    int status = ap2_mrp_post_command(
+        p, ap2_mrp_build_nowplaying_command,
+        "[MRP] /command updateMRNowPlayingInfo");
+    if (!ap2_mrp_status_ok(status)) return status;
+    ap2_mrp_mark_artwork_sent(p->mrp);
+
+    int ext_status;
+    if (!p->mrp_extended_registered) {
+        ext_status = ap2_mrp_send_extended_registration(p);
+    } else {
+        ap2_mrp_playback_state_t state =
+            p->state == AP2_STREAMING ? AP2_MRP_PLAYBACK_PLAYING :
+            p->state == AP2_PAUSED ? AP2_MRP_PLAYBACK_PAUSED :
+                                     AP2_MRP_PLAYBACK_STOPPED;
+        ext_status = ap2_mrp_send_playback_state(p, state, false);
+    }
+    return ap2_mrp_status_ok(ext_status) ? status : ext_status;
 }
 
 /* MRP data-channel (path B) status for the [STATUS] mrp line:
@@ -1979,39 +2090,21 @@ int ap2cl_mrp_channel_status(struct ap2cl_s *p)
     return (p->mrp && ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
 }
 
-/* Registration a real iPhone performs over /command before now-playing
- * (MRP-DESIGN.md §10): DEVICE_INFO (origin) then updateMRSupportedCommands
- * (transport capabilities). Best-effort; response bodies logged on non-2xx.
- * Returns 1 if both 2xx, 0 otherwise, -1 when not applicable. */
+/* Register the sender identity before the first now-playing update. The
+ * remaining extended metadata follows updateMRNowPlayingInfo in
+ * ap2cl_mrp_push(), matching Apple's current AirPlaySender implementation. */
 int ap2cl_mrp_register(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
     ap2_mrp_ready(p);
     if (!p->mrp) return -1;
+    if (p->mrp_device_registered) return 1;
 
-    uint8_t *body = NULL; int body_len = 0;
-    uint8_t *resp = NULL; int resp_len = 0;
-    int st_dev = -1, st_cmd = -1;
-
-    if (ap2_mrp_build_deviceinfo_command(p->mrp, &body, &body_len)) {
-        st_dev = ap2_rtsp_send(p, "POST", "/command", body, body_len,
-                               "application/x-apple-binary-plist", &resp, &resp_len);
-        free(body); body = NULL;
-        if (st_dev < 200 || st_dev >= 300)
-            ap2_log_response_body("[MRP] /command DEVICE_INFO", resp, resp_len);
-        free(resp); resp = NULL;
-    }
-    if (ap2_mrp_build_supportedcommands_command(p->mrp, &body, &body_len)) {
-        st_cmd = ap2_rtsp_send(p, "POST", "/command", body, body_len,
-                               "application/x-apple-binary-plist", &resp, &resp_len);
-        free(body); body = NULL;
-        if (st_cmd < 200 || st_cmd >= 300)
-            ap2_log_response_body("[MRP] /command supportedCommands", resp, resp_len);
-        free(resp); resp = NULL;
-    }
-    LOG_INFO("[MRP] /command registration: DEVICE_INFO -> %d, supportedCommands -> %d",
-             st_dev, st_cmd);
-    return (st_dev >= 200 && st_dev < 300 && st_cmd >= 200 && st_cmd < 300) ? 1 : 0;
+    int status = ap2_mrp_post_command(
+        p, ap2_mrp_build_deviceinfo_command,
+        "[MRP] /command DEVICE_INFO");
+    p->mrp_device_registered = ap2_mrp_status_ok(status);
+    return p->mrp_device_registered ? 1 : 0;
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
@@ -2059,7 +2152,8 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
     if (!p) return false;
     ap2_mrp_ready(p);
     if (p->mrp)
-        ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000, true);
+        ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000,
+                             p->state == AP2_STREAMING);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* progress: <start>/<current>/<end>, all in the STREAM's RTP timestamp
          * units (the per-process timeline offset included, so the values match

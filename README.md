@@ -21,6 +21,9 @@ matrix in `TEST-PLAN.md`.
 - **AirPlay 2 native**: HAP pairing (transient, or pair-verify with stored
   credentials), encrypted RTSP, binary-plist SETUP, ChaCha20-Poly1305 audio,
   realtime (type 96) streaming with PTP or NTP timing.
+- **Apple MediaRemote metadata**: pair-verified Apple targets receive the full
+  now-playing client, playback-state, transport-command, text and artwork
+  sequence used by current Apple senders.
 - **PTP timing**: an in-process gPTP-dialect grandmaster engine, plus a
   shared-clock daemon mode (`--ptp-daemon`/`--ptp-shared`) for multi-room.
 - **Route auto-selection** (`--protocol auto`): the binary picks RAOP vs
@@ -182,6 +185,9 @@ running stream:
 Some receivers (notably Sonos) do not emit audio until they have received
 metadata; the binary pushes an initial metadata set at connect on its own, so
 audio starts regardless of whether the caller ever sends `SENDMETA`.
+Pair-verified native Apple sessions additionally mirror these updates over
+MediaRemote `POST /command`, including explicit play/pause/stop state. Set
+`CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
 
 ## Building
 

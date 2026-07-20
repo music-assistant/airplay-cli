@@ -47,6 +47,7 @@ session healthy, no audio confirmation) · `?` untested · `n/a` not applicable.
 | R9 | Multi-room sync: 2+ devices, `--ptp-daemon` + `--ptp-shared`, one `--start-unix-ms` | EAR 2026-07-19 (Devices A+B, sample-aligned) | ? | ? | ? |
 | R10 | Mixed-protocol group: RAOP + native-AP2 members, one `--start-unix-ms` | EAR 2026-07-19 (Device A AP2+PTP + Device B RAOP/NTP, in sync; 3-way incl. Apple TV pair-verify IN SYNC after automatic arrivalToRenderLatencyMs compensation (Apple TV reports ~107ms)) | ? | ? | ? |
 | R11 | PTP regression: RAOP-only device plays while PTP is active for the group | ? | — | — | — |
+| R12 | Apple MediaRemote now-playing + standby prevention | n/a | n/a | wire-verified; hardware pending | n/a |
 
 Notes:
 
@@ -94,6 +95,11 @@ at least one run per device.
   same audible alignment.
 - **R11 PTP regression:** with the daemon and a PTP stream active, confirm a
   RAOP-only (or forced-RAOP) device in the same group still plays.
+- **R12 Apple MediaRemote:** pair-verified native stream with title, artist,
+  album, progress and 600 px JPEG artwork. Pass: all metadata renders and the
+  Apple TV remains awake for at least twice its configured sleep timeout. Repeat
+  with `CLIAIRPLAY_MRP=0` to establish whether the display and standby behavior
+  are specifically caused by MediaRemote rather than the audio keepalive.
 
 ## mDNS capture (before testing each new device)
 

@@ -725,9 +725,9 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         }
     }
 
-    /* Register as a now-playing origin over /command (DEVICE_INFO +
-     * updateMRSupportedCommands) BEFORE the first now-playing push, matching the
-     * captured real-sender order (MRP-DESIGN.md §10). */
+    /* Register the sender identity before the first now-playing update. The
+     * supported commands, playback state and NowPlayingClient follow that first
+     * update inside ap2cl_mrp_push(), matching Apple's AirPlaySender ordering. */
     ap2cl_mrp_register(g_ap2cl);
 
     /* Surface the effective lead and the receiver-reported buffering window so
