@@ -210,7 +210,10 @@ CI (`.github/workflows/build.yml`) cross-builds four targets on every push —
 `linux-x86_64`, `linux-aarch64`, `macos-arm64`, `macos-x86_64` — validates
 `--check` on the natively runnable ones, and uploads the binaries as
 artifacts. Pushing a `v*` tag additionally runs a release job (GitHub Release
-with the four binaries + `SHA256SUMS`).
+with the four binaries + `SHA256SUMS`). After verifying the published assets,
+CI hashes `SHA256SUMS` and opens or updates a non-auto-merge PR against the
+server `dev` branch with both Dockerfile pins. That step requires the
+`PRIVILEGED_GITHUB_TOKEN` Actions secret to have server write access.
 
 ## Architecture
 
