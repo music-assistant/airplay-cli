@@ -1,8 +1,11 @@
+#include <errno.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "cross_log.h"
@@ -40,6 +43,22 @@ static bool bytes_contain_string(const uint8_t *data, size_t data_len,
     return bytes_contain(data, data_len, needle, strlen(needle));
 }
 
+typedef struct {
+    int status;
+    const uint8_t *expected;
+    size_t expected_len;
+    bool saw_expected;
+} capture_sender_t;
+
+static int capture_sender(void *opaque, const uint8_t *body, int body_len)
+{
+    capture_sender_t *sender = opaque;
+    sender->saw_expected =
+        bytes_contain(body, (size_t)body_len,
+                      sender->expected, sender->expected_len);
+    return sender->status;
+}
+
 static size_t jpeg_marker_offset(const uint8_t *data, size_t len,
                                  uint8_t marker)
 {
@@ -59,6 +78,22 @@ static size_t jpeg_ac_scan_offset(const uint8_t *data, size_t len)
         if (segment_len != 6 + 2 * (size_t)components) continue;
         size_t spectral_start = i + 5 + 2 * (size_t)components;
         if (data[spectral_start] > 0) return i;
+    }
+    return len;
+}
+
+static size_t jpeg_ac_refinement_scan_offset(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i + 9 < len; i++) {
+        if (data[i] != 0xFF || data[i + 1] != 0xDA) continue;
+        size_t segment_len = ((size_t)data[i + 2] << 8) | data[i + 3];
+        if (segment_len < 6 || i + 2 + segment_len > len) continue;
+        uint8_t components = data[i + 4];
+        if (segment_len != 6 + 2 * (size_t)components) continue;
+        size_t spectral_start = i + 5 + 2 * (size_t)components;
+        size_t approximation = spectral_start + 2;
+        if (data[spectral_start] > 0 && (data[approximation] >> 4) > 0)
+            return i;
     }
     return len;
 }
@@ -275,6 +310,7 @@ static bool test_mrp_validation_boundary(void)
     CHECK(info.result == AP2_MRP_ARTWORK_ACCEPTED);
     CHECK(info.bytes == sizeof(k_baseline_jpeg));
     CHECK(info.width == 1 && info.height == 1);
+    CHECK(info.parsed_strictly);
 
     CHECK(ap2_mrp_validate_artwork(
               "image/png", k_baseline_jpeg, sizeof(k_baseline_jpeg), &info) ==
@@ -287,12 +323,12 @@ static bool test_mrp_validation_boundary(void)
               "image/jpeg", k_progressive_jpeg, sizeof(k_progressive_jpeg),
               &info) == AP2_MRP_ARTWORK_ACCEPTED);
     CHECK(info.progressive && info.sof_marker == 0xC2 &&
-          info.components == 3);
+          info.components == 3 && info.parsed_strictly);
     CHECK(ap2_mrp_validate_artwork(
               "image/jpeg", k_grayscale_jpeg, sizeof(k_grayscale_jpeg),
               &info) == AP2_MRP_ARTWORK_ACCEPTED);
     CHECK(!info.progressive && info.sof_marker == 0xC0 &&
-          info.components == 1);
+          info.components == 1 && info.parsed_strictly);
     uint8_t changed[sizeof(k_baseline_jpeg)];
     memcpy(changed, k_baseline_jpeg, sizeof(changed));
     size_t sof = jpeg_marker_offset(changed, sizeof(changed), 0xC0);
@@ -341,6 +377,133 @@ static bool test_mrp_validation_boundary(void)
               AP2_MRP_ARTWORK_STAGING_MAX_BYTES + 1, &info) ==
           AP2_MRP_ARTWORK_STAGING_LIMIT);
     free(oversize);
+    return true;
+}
+
+static bool test_unsupported_jpeg_profiles(void)
+{
+    static const struct {
+        const char *name;
+        const uint8_t *data;
+        size_t len;
+        uint8_t precision;
+        uint8_t sof_marker;
+        bool progressive;
+    } cases[] = {
+        {
+            "8-bit SOF1 with 16-bit DQT",
+            k_sof1_8bit_16dqt_jpeg, sizeof(k_sof1_8bit_16dqt_jpeg),
+            8, 0xC1, false,
+        },
+        {
+            "12-bit SOF1",
+            k_sof1_12bit_jpeg, sizeof(k_sof1_12bit_jpeg),
+            12, 0xC1, false,
+        },
+        {
+            "12-bit SOF2",
+            k_sof2_12bit_jpeg, sizeof(k_sof2_12bit_jpeg),
+            12, 0xC2, true,
+        },
+    };
+
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "Test sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL);
+    CHECK(mrp != NULL);
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ap2_mrp_artwork_info_t info;
+        ap2_mrp_artwork_result_t result = ap2_mrp_validate_artwork(
+            "image/jpeg", cases[i].data, cases[i].len, &info);
+        if (result != AP2_MRP_ARTWORK_ACCEPTED)
+            fprintf(stderr, "%s rejected as %s\n", cases[i].name,
+                    ap2_mrp_artwork_result_name(result));
+        CHECK(result == AP2_MRP_ARTWORK_ACCEPTED);
+        CHECK(!info.parsed_strictly);
+        CHECK(info.precision == cases[i].precision);
+        CHECK(info.sof_marker == cases[i].sof_marker);
+        CHECK(info.progressive == cases[i].progressive);
+        CHECK(info.width == 1 && info.height == 1 && info.components == 1);
+        CHECK(ap2_mrp_set_artwork(
+            mrp, "image/jpeg", cases[i].data, (int)cases[i].len, &info));
+        uint8_t *payload = NULL;
+        int payload_len = 0;
+        CHECK(ap2_mrp_build_nowplaying_command(
+            mrp, &payload, &payload_len));
+        CHECK(bytes_contain(
+            payload, (size_t)payload_len, cases[i].data, cases[i].len));
+        free(payload);
+    }
+
+    ap2_mrp_artwork_info_t info;
+    uint8_t malformed_dqt[sizeof(k_sof1_8bit_16dqt_jpeg)];
+    memcpy(malformed_dqt, k_sof1_8bit_16dqt_jpeg, sizeof(malformed_dqt));
+    size_t dqt = jpeg_marker_offset(
+        malformed_dqt, sizeof(malformed_dqt), 0xDB);
+    CHECK(dqt + 6 < sizeof(malformed_dqt));
+    malformed_dqt[dqt + 5] = 0;
+    malformed_dqt[dqt + 6] = 0;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", malformed_dqt, sizeof(malformed_dqt), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    uint8_t malformed_scan[sizeof(k_sof1_12bit_jpeg)];
+    memcpy(malformed_scan, k_sof1_12bit_jpeg, sizeof(malformed_scan));
+    size_t sos = jpeg_marker_offset(
+        malformed_scan, sizeof(malformed_scan), 0xDA);
+    CHECK(sos + 5 < sizeof(malformed_scan));
+    malformed_scan[sos + 5] = 2;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", malformed_scan, sizeof(malformed_scan), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    uint8_t malformed_huffman[sizeof(k_sof1_12bit_jpeg)];
+    memcpy(malformed_huffman, k_sof1_12bit_jpeg,
+           sizeof(malformed_huffman));
+    size_t dht = jpeg_marker_offset(
+        malformed_huffman, sizeof(malformed_huffman), 0xC4);
+    CHECK(dht + 21 < sizeof(malformed_huffman));
+    malformed_huffman[dht + 21] = 0xFF;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", malformed_huffman,
+              sizeof(malformed_huffman), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    uint8_t malformed_progression[sizeof(k_sof2_12bit_jpeg)];
+    memcpy(malformed_progression, k_sof2_12bit_jpeg,
+           sizeof(malformed_progression));
+    size_t ac_scan = jpeg_ac_scan_offset(
+        malformed_progression, sizeof(malformed_progression));
+    CHECK(ac_scan < sizeof(malformed_progression));
+    uint8_t ac_components = malformed_progression[ac_scan + 4];
+    size_t approximation = ac_scan + 7 + 2 * (size_t)ac_components;
+    CHECK(approximation < sizeof(malformed_progression));
+    malformed_progression[approximation] = 0x21;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", malformed_progression,
+              sizeof(malformed_progression), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    memcpy(malformed_progression, k_sof2_12bit_jpeg,
+           sizeof(malformed_progression));
+    size_t refinement_scan = jpeg_ac_refinement_scan_offset(
+        malformed_progression, sizeof(malformed_progression));
+    CHECK(refinement_scan + 6 < sizeof(malformed_progression));
+    malformed_progression[refinement_scan + 6] =
+        (malformed_progression[refinement_scan + 6] & 0xF0) | 3;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", malformed_progression,
+              sizeof(malformed_progression), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", k_sof2_12bit_jpeg,
+              sizeof(k_sof2_12bit_jpeg) - 1, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    ap2_mrp_destroy(mrp);
+    puts("Unsupported decoder-valid JPEG profiles staged safely");
     return true;
 }
 
@@ -396,6 +559,64 @@ static bool test_malformed_jpeg_structures(void)
               "image/jpeg", inserted, inserted_size, &info) ==
           AP2_MRP_ARTWORK_INVALID_JPEG);
     free(inserted);
+
+    inserted = insert_empty_jpeg_segment(0x02, &inserted_size);
+    CHECK(inserted != NULL);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", inserted, inserted_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    free(inserted);
+
+    inserted = insert_empty_jpeg_segment(0xCC, &inserted_size);
+    CHECK(inserted != NULL);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", inserted, inserted_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    free(inserted);
+
+    inserted = insert_empty_jpeg_segment(0xDC, &inserted_size);
+    CHECK(inserted != NULL);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", inserted, inserted_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    free(inserted);
+
+    static const uint8_t dnl[] = {0xFF, 0xDC, 0x00, 0x04, 0x00, 0x01};
+    size_t dnl_size = sizeof(k_baseline_jpeg) + sizeof(dnl);
+    size_t baseline_sof = jpeg_marker_offset(
+        k_baseline_jpeg, sizeof(k_baseline_jpeg), 0xC0);
+    size_t baseline_sos = jpeg_marker_offset(
+        k_baseline_jpeg, sizeof(k_baseline_jpeg), 0xDA);
+    CHECK(baseline_sof + 6 < sizeof(k_baseline_jpeg));
+    CHECK(baseline_sos < sizeof(k_baseline_jpeg));
+
+    uint8_t *early_dnl = malloc(dnl_size);
+    CHECK(early_dnl != NULL);
+    memcpy(early_dnl, k_baseline_jpeg, baseline_sos);
+    memcpy(early_dnl + baseline_sos, dnl, sizeof(dnl));
+    memcpy(early_dnl + baseline_sos + sizeof(dnl),
+           k_baseline_jpeg + baseline_sos,
+           sizeof(k_baseline_jpeg) - baseline_sos);
+    early_dnl[baseline_sof + 5] = 0;
+    early_dnl[baseline_sof + 6] = 0;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", early_dnl, dnl_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    free(early_dnl);
+
+    uint8_t *valid_dnl = malloc(dnl_size);
+    CHECK(valid_dnl != NULL);
+    size_t eoi = sizeof(k_baseline_jpeg) - 2;
+    memcpy(valid_dnl, k_baseline_jpeg, eoi);
+    memcpy(valid_dnl + eoi, dnl, sizeof(dnl));
+    memcpy(valid_dnl + eoi + sizeof(dnl), k_baseline_jpeg + eoi, 2);
+    valid_dnl[baseline_sof + 5] = 0;
+    valid_dnl[baseline_sof + 6] = 0;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", valid_dnl, dnl_size, &info) ==
+          AP2_MRP_ARTWORK_ACCEPTED);
+    CHECK(info.height == 1 && !info.parsed_strictly);
+    free(valid_dnl);
 
     inserted = insert_16bit_dqt(&inserted_size);
     CHECK(inserted != NULL);
@@ -526,6 +747,214 @@ static bool test_malformed_jpeg_structures(void)
     return true;
 }
 
+typedef struct {
+    struct ap2_mrp_ctx *mrp;
+    pthread_mutex_t lock;
+    pthread_cond_t cond;
+    bool sender_entered;
+    bool release_sender;
+    bool replacement_started;
+    bool replacement_done;
+    bool sender_saw_artwork;
+    bool replacement_ok;
+    int response_status;
+    int request_status;
+} atomic_request_test_t;
+
+static int blocking_sender(void *opaque, const uint8_t *body, int body_len)
+{
+    atomic_request_test_t *test = opaque;
+    pthread_mutex_lock(&test->lock);
+    test->sender_saw_artwork = bytes_contain(
+        body, (size_t)body_len, k_baseline_jpeg, sizeof(k_baseline_jpeg));
+    test->sender_entered = true;
+    pthread_cond_broadcast(&test->cond);
+    while (!test->release_sender)
+        pthread_cond_wait(&test->cond, &test->lock);
+    pthread_mutex_unlock(&test->lock);
+    return test->response_status;
+}
+
+static void *send_request_thread(void *opaque)
+{
+    atomic_request_test_t *test = opaque;
+    test->request_status = ap2_mrp_send_nowplaying_command(
+        test->mrp, blocking_sender, test);
+    return NULL;
+}
+
+typedef struct {
+    struct ap2_mrp_ctx *mrp;
+    int response_status;
+    int request_status;
+} scoped_request_test_t;
+
+static int status_sender(void *opaque, const uint8_t *body, int body_len)
+{
+    scoped_request_test_t *test = opaque;
+    (void)body;
+    (void)body_len;
+    return test->response_status;
+}
+
+static void *send_scoped_request_thread(void *opaque)
+{
+    scoped_request_test_t *test = opaque;
+    test->request_status = ap2_mrp_send_nowplaying_command(
+        test->mrp, status_sender, test);
+    return NULL;
+}
+
+static void *replace_artwork_thread(void *opaque)
+{
+    atomic_request_test_t *test = opaque;
+    pthread_mutex_lock(&test->lock);
+    test->replacement_started = true;
+    pthread_cond_broadcast(&test->cond);
+    pthread_mutex_unlock(&test->lock);
+
+    bool ok = ap2_mrp_set_artwork(
+        test->mrp, "image/jpeg", k_sof1_12bit_jpeg,
+        (int)sizeof(k_sof1_12bit_jpeg), NULL);
+
+    pthread_mutex_lock(&test->lock);
+    test->replacement_ok = ok;
+    test->replacement_done = true;
+    pthread_cond_broadcast(&test->cond);
+    pthread_mutex_unlock(&test->lock);
+    return NULL;
+}
+
+typedef struct {
+    struct ap2_mrp_ctx *mrp;
+    bool saw_original;
+    bool replacement_ok;
+} generation_sender_t;
+
+static int replacing_sender(void *opaque, const uint8_t *body, int body_len)
+{
+    generation_sender_t *sender = opaque;
+    sender->saw_original = bytes_contain(
+        body, (size_t)body_len, k_baseline_jpeg, sizeof(k_baseline_jpeg));
+    sender->replacement_ok = ap2_mrp_set_artwork(
+        sender->mrp, "image/jpeg", k_sof2_12bit_jpeg,
+        (int)sizeof(k_sof2_12bit_jpeg), NULL);
+    return 204;
+}
+
+static bool test_nowplaying_request_atomicity(void)
+{
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "Test sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL);
+    CHECK(mrp != NULL);
+    CHECK(ap2_mrp_set_artwork(
+        mrp, "image/jpeg", k_baseline_jpeg,
+        (int)sizeof(k_baseline_jpeg), NULL));
+
+    atomic_request_test_t test = {
+        .mrp = mrp,
+        .response_status = 207,
+    };
+    CHECK(pthread_mutex_init(&test.lock, NULL) == 0);
+    CHECK(pthread_cond_init(&test.cond, NULL) == 0);
+    pthread_t request_thread;
+    pthread_t scoped_request_thread;
+    pthread_t replacement_thread;
+    CHECK(pthread_create(
+              &request_thread, NULL, send_request_thread, &test) == 0);
+
+    pthread_mutex_lock(&test.lock);
+    while (!test.sender_entered)
+        pthread_cond_wait(&test.cond, &test.lock);
+    pthread_mutex_unlock(&test.lock);
+
+    scoped_request_test_t scoped_request = {
+        .mrp = mrp,
+        .response_status = 418,
+    };
+    CHECK(pthread_create(
+              &scoped_request_thread, NULL,
+              send_scoped_request_thread, &scoped_request) == 0);
+    CHECK(pthread_create(
+              &replacement_thread, NULL, replace_artwork_thread, &test) == 0);
+    pthread_mutex_lock(&test.lock);
+    while (!test.replacement_started)
+        pthread_cond_wait(&test.cond, &test.lock);
+    struct timespec deadline;
+    CHECK(clock_gettime(CLOCK_REALTIME, &deadline) == 0);
+    deadline.tv_nsec += 100 * 1000 * 1000;
+    if (deadline.tv_nsec >= 1000 * 1000 * 1000) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000 * 1000 * 1000;
+    }
+    int wait_status = 0;
+    while (!test.replacement_done && wait_status == 0)
+        wait_status = pthread_cond_timedwait(
+            &test.cond, &test.lock, &deadline);
+    CHECK(wait_status == ETIMEDOUT);
+    CHECK(!test.replacement_done);
+    test.release_sender = true;
+    pthread_cond_broadcast(&test.cond);
+    pthread_mutex_unlock(&test.lock);
+
+    CHECK(pthread_join(request_thread, NULL) == 0);
+    CHECK(pthread_join(scoped_request_thread, NULL) == 0);
+    CHECK(pthread_join(replacement_thread, NULL) == 0);
+    CHECK(test.request_status == 207);
+    CHECK(scoped_request.request_status == 418);
+    CHECK(test.sender_saw_artwork);
+    CHECK(test.replacement_ok && test.replacement_done);
+
+    uint8_t *pending = NULL;
+    int pending_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &pending, &pending_len));
+    CHECK(bytes_contain(
+        pending, (size_t)pending_len,
+        k_sof1_12bit_jpeg, sizeof(k_sof1_12bit_jpeg)));
+    free(pending);
+
+    capture_sender_t failed = {
+        .status = 503,
+        .expected = k_sof1_12bit_jpeg,
+        .expected_len = sizeof(k_sof1_12bit_jpeg),
+    };
+    CHECK(ap2_mrp_send_nowplaying_command(
+              mrp, capture_sender, &failed) == 503);
+    CHECK(failed.saw_expected);
+    pending = NULL;
+    pending_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &pending, &pending_len));
+    CHECK(bytes_contain(
+        pending, (size_t)pending_len,
+        k_sof1_12bit_jpeg, sizeof(k_sof1_12bit_jpeg)));
+    free(pending);
+
+    CHECK(ap2_mrp_set_artwork(
+        mrp, "image/jpeg", k_baseline_jpeg,
+        (int)sizeof(k_baseline_jpeg), NULL));
+    generation_sender_t replacing = {.mrp = mrp};
+    CHECK(ap2_mrp_send_nowplaying_command(
+              mrp, replacing_sender, &replacing) == 204);
+    CHECK(replacing.saw_original && replacing.replacement_ok);
+    pending = NULL;
+    pending_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &pending, &pending_len));
+    CHECK(bytes_contain(
+        pending, (size_t)pending_len,
+        k_sof2_12bit_jpeg, sizeof(k_sof2_12bit_jpeg)));
+    free(pending);
+
+    CHECK(ap2_mrp_send_nowplaying_command(NULL, capture_sender, &failed) == -1);
+    CHECK(ap2_mrp_send_nowplaying_command(mrp, NULL, NULL) == -1);
+    CHECK(pthread_cond_destroy(&test.cond) == 0);
+    CHECK(pthread_mutex_destroy(&test.lock) == 0);
+    ap2_mrp_destroy(mrp);
+    puts("Concurrent MRP requests retain scoped status and artwork generation");
+    return true;
+}
+
 static bool test_nowplaying_command_payload(void)
 {
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
@@ -562,7 +991,14 @@ static bool test_nowplaying_command_payload(void)
     CHECK(bytes_contain(first, (size_t)first_len,
                         k_baseline_jpeg, sizeof(k_baseline_jpeg)));
 
-    ap2_mrp_mark_artwork_sent(mrp);
+    capture_sender_t sender = {
+        .status = 204,
+        .expected = k_baseline_jpeg,
+        .expected_len = sizeof(k_baseline_jpeg),
+    };
+    CHECK(ap2_mrp_send_nowplaying_command(
+              mrp, capture_sender, &sender) == 204);
+    CHECK(sender.saw_expected);
     uint8_t *cached = NULL;
     int cached_len = 0;
     CHECK(ap2_mrp_build_nowplaying_command(mrp, &cached, &cached_len));
@@ -655,8 +1091,10 @@ int main(int argc, char **argv)
 {
     if (!test_local_file_boundary() ||
         !test_mrp_validation_boundary() ||
+        !test_unsupported_jpeg_profiles() ||
         !test_empty_table_repro() ||
         !test_malformed_jpeg_structures() ||
+        !test_nowplaying_request_atomicity() ||
         !test_nowplaying_command_payload())
         return 1;
     for (int i = 1; i < argc; i++) {

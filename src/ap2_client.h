@@ -175,14 +175,17 @@ bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p);
 /* Set playback progress. */
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
 
+typedef struct {
+    int overall_status;
+    int nowplaying_status;
+} ap2_mrp_push_result_t;
+
 /* Push the current now-playing state and any pending MediaRemote extended
  * metadata over POST /command. Enabled for pair-verified native sessions;
- * CLIAIRPLAY_MRP=0 disables it. Returns the HTTP status, 0 on registration
- * failure, or -1 when the push does not apply to this session. */
-int ap2cl_mrp_push(struct ap2cl_s *p);
-
-/* Exact HTTP status from updateMRNowPlayingInfo in the most recent push. */
-int ap2cl_mrp_last_nowplaying_status(struct ap2cl_s *p);
+ * CLIAIRPLAY_MRP=0 disables it. overall_status preserves the prior return
+ * semantics; nowplaying_status is the exact updateMRNowPlayingInfo status for
+ * this request, or 0 when registration prevented that request. */
+ap2_mrp_push_result_t ap2cl_mrp_push(struct ap2cl_s *p);
 
 /* Status of the type-130 MRP data channel (path B) for the [STATUS] mrp line:
  * -1 = not attempted (non-Apple / not pair-verified), 0 = attempted but not up,

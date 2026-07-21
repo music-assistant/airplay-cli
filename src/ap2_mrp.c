@@ -173,6 +173,7 @@ struct ap2_mrp_ctx {
     int rx_msg_len;
 
     /* Now-playing state (owned copies) */
+    pthread_mutex_t operation_lock;
     char *title;
     char *artist;
     char *album;
@@ -185,6 +186,7 @@ struct ap2_mrp_ctx {
     int artwork_len;
     char artwork_id[17];      /* 16-hex ArtworkIdentifier for the current art */
     bool artwork_sent;        /* bytes already pushed once (then ref by id) */
+    uint64_t artwork_generation;
     uint64_t np_uid;          /* per-track now-playing UniqueIdentifier */
 
     time_t last_state_push;
@@ -233,6 +235,44 @@ static bool mrp_jpeg_is_sof(uint8_t marker)
     default:
         return false;
     }
+}
+
+static bool mrp_jpeg_sof_uses_quantization(uint8_t marker)
+{
+    return marker != 0xC3 && marker != 0xC7 &&
+           marker != 0xCB && marker != 0xCF;
+}
+
+static bool mrp_jpeg_sof_is_lossless(uint8_t marker)
+{
+    return marker == 0xC3 || marker == 0xC7 ||
+           marker == 0xCB || marker == 0xCF;
+}
+
+static bool mrp_jpeg_is_arithmetic_sof(uint8_t marker)
+{
+    return marker == 0xC9 || marker == 0xCA || marker == 0xCB ||
+           marker == 0xCD || marker == 0xCE || marker == 0xCF;
+}
+
+static bool mrp_jpeg_parse_dac(const uint8_t *data, size_t len)
+{
+    if (len == 0 || (len & 1) != 0) return false;
+    for (size_t pos = 0; pos < len; pos += 2) {
+        uint8_t spec = data[pos];
+        uint8_t table_class = spec >> 4;
+        uint8_t table = spec & 0x0F;
+        uint8_t conditioning = data[pos + 1];
+        if (table_class > 1 || table > 3) return false;
+        if (table_class == 0) {
+            uint8_t lower = conditioning & 0x0F;
+            uint8_t upper = conditioning >> 4;
+            if (lower > upper) return false;
+        } else if (conditioning > 63) {
+            return false;
+        }
+    }
+    return true;
 }
 
 typedef struct {
@@ -355,24 +395,319 @@ static bool mrp_jpeg_scan_entropy(const uint8_t *data, size_t len,
     return false;
 }
 
-ap2_mrp_artwork_result_t
-ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
+static bool mrp_jpeg_parse_generic_dqt(const uint8_t *data, size_t len,
+                                       uint8_t *defined_tables,
+                                       bool *has_16_bit_table)
+{
+    size_t pos = 0;
+    bool found = false;
+    while (pos < len) {
+        uint8_t spec = data[pos++];
+        uint8_t precision = spec >> 4;
+        uint8_t table = spec & 0x0F;
+        if (precision > 1 || table > 3) return false;
+        size_t values = precision ? 128 : 64;
+        if (values > len - pos) return false;
+        for (size_t i = 0; i < 64; i++) {
+            size_t value_pos = pos + i * (precision ? 2 : 1);
+            uint16_t value = precision
+                                 ? ((uint16_t)data[value_pos] << 8) |
+                                       data[value_pos + 1]
+                                 : data[value_pos];
+            if (value == 0) return false;
+        }
+        pos += values;
+        *defined_tables |= (uint8_t)(1u << table);
+        *has_16_bit_table |= precision == 1;
+        found = true;
+    }
+    return found;
+}
+
+static bool mrp_jpeg_parse_generic_dht(const uint8_t *data, size_t len,
+                                       uint8_t *dc_tables, uint8_t *ac_tables,
+                                       uint8_t *max_dc_category,
+                                       uint8_t *max_ac_size)
+{
+    size_t pos = 0;
+    bool found = false;
+    while (pos < len) {
+        if (len - pos < 17) return false;
+        uint8_t spec = data[pos++];
+        uint8_t table_class = spec >> 4;
+        uint8_t table = spec & 0x0F;
+        if (table_class > 1 || table > 3) return false;
+
+        int code_space = 1;
+        size_t symbols = 0;
+        for (int i = 0; i < 16; i++) {
+            uint8_t count = data[pos++];
+            code_space = code_space * 2 - count;
+            if (code_space < 0) return false;
+            symbols += count;
+        }
+        if (code_space == 0 || symbols == 0 ||
+            symbols > 256 || symbols > len - pos)
+            return false;
+        for (size_t i = 0; i < symbols; i++) {
+            uint8_t symbol = data[pos + i];
+            if (table_class == 0) {
+                if (symbol > *max_dc_category)
+                    *max_dc_category = symbol;
+            } else {
+                uint8_t size = symbol & 0x0F;
+                if (size > *max_ac_size) *max_ac_size = size;
+            }
+        }
+        pos += symbols;
+        if (table_class == 0)
+            *dc_tables |= (uint8_t)(1u << table);
+        else
+            *ac_tables |= (uint8_t)(1u << table);
+        found = true;
+    }
+    return found;
+}
+
+/*
+ * Validate marker framing and scan boundaries for profiles the strict parser
+ * does not understand. This deliberately stops short of coefficient decoding,
+ * but still rejects malformed lengths, tables, component references and scans.
+ */
+static bool mrp_jpeg_validate_container(const uint8_t *data, size_t len,
+                                        ap2_mrp_artwork_info_t *info,
+                                        bool *strict_profile)
+{
+    bool frame_ids[256] = {0};
+    bool component_scanned[256] = {0};
+    uint8_t frame_qtable[256] = {0};
+    int8_t progressive_bits[256][64];
+    memset(progressive_bits, -1, sizeof(progressive_bits));
+    unsigned frame_component_count = 0;
+    uint8_t quant_tables = 0;
+    uint8_t dc_tables = 0;
+    uint8_t ac_tables = 0;
+    uint8_t max_dc_category = 0;
+    uint8_t max_ac_size = 0;
+    uint16_t restart_interval = 0;
+    bool saw_sof = false;
+    bool saw_16_bit_dqt = false;
+    bool saw_dac = false;
+    bool needs_dnl = false;
+    bool just_finished_first_scan = false;
+    unsigned scan_count = 0;
+    bool can_use_strict_parser = true;
+    size_t pos = 2;
+
+    while (pos + 1 < len) {
+        if (data[pos++] != 0xFF) return false;
+        while (pos < len && data[pos] == 0xFF) pos++;
+        if (pos >= len) return false;
+        uint8_t marker = data[pos++];
+        bool dnl_allowed = just_finished_first_scan;
+        just_finished_first_scan = false;
+
+        if (marker == 0xD9) {
+            if (!saw_sof || needs_dnl || scan_count == 0 || pos != len)
+                return false;
+            if (info->sof_marker == 0xC0 && saw_16_bit_dqt) return false;
+            if (saw_dac && !mrp_jpeg_is_arithmetic_sof(info->sof_marker))
+                return false;
+            uint8_t max_allowed_dc = mrp_jpeg_sof_is_lossless(info->sof_marker)
+                                         ? info->precision
+                                         : (uint8_t)(info->precision + 3);
+            uint8_t max_allowed_ac = (uint8_t)(info->precision + 2);
+            if (max_allowed_dc > 16) max_allowed_dc = 16;
+            if (max_allowed_ac > 14) max_allowed_ac = 14;
+            if (max_dc_category > max_allowed_dc ||
+                max_ac_size > max_allowed_ac)
+                return false;
+            if (info->sof_marker == 0xC0 || info->sof_marker == 0xC1 ||
+                info->sof_marker == 0xC2) {
+                for (unsigned id = 0; id < 256; id++) {
+                    if (frame_ids[id] && !component_scanned[id]) return false;
+                }
+            }
+            *strict_profile = can_use_strict_parser && !saw_16_bit_dqt;
+            return true;
+        }
+        if (marker == 0x00 || marker == 0x01 || marker == 0xD8 ||
+            (marker >= 0xD0 && marker <= 0xD7) || pos + 2 > len)
+            return false;
+
+        size_t segment_len = ((size_t)data[pos] << 8) | data[pos + 1];
+        if (segment_len < 2 || segment_len > len - pos) return false;
+
+        if (mrp_jpeg_is_sof(marker)) {
+            if (saw_sof || segment_len < 8) return false;
+            const uint8_t *sof = data + pos + 2;
+            unsigned components = sof[5];
+            if (components == 0 ||
+                segment_len != 8 + 3 * (size_t)components)
+                return false;
+
+            info->precision = sof[0];
+            info->height = ((uint16_t)sof[1] << 8) | sof[2];
+            info->width = ((uint16_t)sof[3] << 8) | sof[4];
+            info->components = (uint8_t)components;
+            info->sof_marker = marker;
+            info->progressive = marker == 0xC2;
+            if (info->precision == 0 || info->precision > 16 ||
+                info->width == 0)
+                return false;
+            needs_dnl = info->height == 0;
+
+            can_use_strict_parser = can_use_strict_parser &&
+                (marker == 0xC0 || marker == 0xC2) &&
+                info->precision == 8 && components <= 4 && !needs_dnl;
+            for (unsigned i = 0; i < components; i++) {
+                const uint8_t *component = sof + 6 + i * 3;
+                uint8_t id = component[0];
+                uint8_t horizontal = component[1] >> 4;
+                uint8_t vertical = component[1] & 0x0F;
+                uint8_t quant_table = component[2];
+                if (frame_ids[id] || horizontal == 0 || horizontal > 4 ||
+                    vertical == 0 || vertical > 4 || quant_table > 3)
+                    return false;
+                frame_ids[id] = true;
+                frame_qtable[id] = quant_table;
+            }
+            frame_component_count = components;
+            saw_sof = true;
+        } else if (marker == 0xDB) {
+            if (!mrp_jpeg_parse_generic_dqt(
+                    data + pos + 2, segment_len - 2, &quant_tables,
+                    &saw_16_bit_dqt))
+                return false;
+            if (saw_16_bit_dqt) can_use_strict_parser = false;
+        } else if (marker == 0xC4) {
+            if (!mrp_jpeg_parse_generic_dht(
+                    data + pos + 2, segment_len - 2, &dc_tables, &ac_tables,
+                    &max_dc_category, &max_ac_size))
+                return false;
+        } else if (marker == 0xDD) {
+            if (segment_len != 4) return false;
+            restart_interval =
+                ((uint16_t)data[pos + 2] << 8) | data[pos + 3];
+        } else if (marker == 0xDA) {
+            if (!saw_sof || segment_len < 6) return false;
+            const uint8_t *sos = data + pos + 2;
+            unsigned scan_components = sos[0];
+            if (scan_components == 0 ||
+                scan_components > frame_component_count ||
+                segment_len != 6 + 2 * (size_t)scan_components)
+                return false;
+
+            bool scan_ids[256] = {0};
+            uint8_t selectors_by_id[256] = {0};
+            for (unsigned i = 0; i < scan_components; i++) {
+                uint8_t id = sos[1 + i * 2];
+                uint8_t selectors = sos[2 + i * 2];
+                if (!frame_ids[id] || scan_ids[id] ||
+                    (selectors >> 4) > 3 || (selectors & 0x0F) > 3 ||
+                    (mrp_jpeg_sof_uses_quantization(info->sof_marker) &&
+                     !(quant_tables & (1u << frame_qtable[id]))))
+                    return false;
+                scan_ids[id] = true;
+                selectors_by_id[id] = selectors;
+            }
+
+            size_t scan_fields = 1 + 2 * (size_t)scan_components;
+            uint8_t spectral_start = sos[scan_fields];
+            uint8_t spectral_end = sos[scan_fields + 1];
+            uint8_t approximation = sos[scan_fields + 2];
+            uint8_t approx_high = approximation >> 4;
+            uint8_t approx_low = approximation & 0x0F;
+            if (info->sof_marker == 0xC0 || info->sof_marker == 0xC1) {
+                if (spectral_start != 0 || spectral_end != 63 ||
+                    approximation != 0)
+                    return false;
+                for (unsigned id = 0; id < 256; id++) {
+                    if (!scan_ids[id]) continue;
+                    uint8_t selectors = selectors_by_id[id];
+                    if (!(dc_tables & (1u << (selectors >> 4))) ||
+                        !(ac_tables & (1u << (selectors & 0x0F))))
+                        return false;
+                    if (component_scanned[id]) return false;
+                    component_scanned[id] = true;
+                }
+            } else if (info->sof_marker == 0xC2) {
+                if (spectral_start > spectral_end || spectral_end > 63 ||
+                    (spectral_start == 0 && spectral_end != 0) ||
+                    (spectral_start > 0 && scan_components != 1) ||
+                    approx_high > 13 || approx_low > 13 ||
+                    (approx_high > 0 && approx_high != approx_low + 1))
+                    return false;
+                for (unsigned id = 0; id < 256; id++) {
+                    if (!scan_ids[id]) continue;
+                    uint8_t selectors = selectors_by_id[id];
+                    if (spectral_start > 0 &&
+                        progressive_bits[id][0] < 0)
+                        return false;
+                    for (uint8_t coefficient = spectral_start;
+                         coefficient <= spectral_end; coefficient++) {
+                        int8_t current = progressive_bits[id][coefficient];
+                        if ((approx_high == 0 && current >= 0) ||
+                            (approx_high > 0 && current != approx_high))
+                            return false;
+                    }
+                    if (spectral_start == 0 && approx_high == 0) {
+                        if (!(dc_tables & (1u << (selectors >> 4))))
+                            return false;
+                        component_scanned[id] = true;
+                    } else if (spectral_start > 0 &&
+                               !(ac_tables & (1u << (selectors & 0x0F)))) {
+                        return false;
+                    }
+                }
+                for (unsigned id = 0; id < 256; id++) {
+                    if (!scan_ids[id]) continue;
+                    for (uint8_t coefficient = spectral_start;
+                         coefficient <= spectral_end; coefficient++)
+                        progressive_bits[id][coefficient] = approx_low;
+                }
+            } else {
+                can_use_strict_parser = false;
+                for (unsigned id = 0; id < 256; id++) {
+                    if (scan_ids[id]) component_scanned[id] = true;
+                }
+            }
+
+            scan_count++;
+            pos += segment_len;
+            if (!mrp_jpeg_scan_entropy(data, len, &pos, restart_interval))
+                return false;
+            just_finished_first_scan = scan_count == 1;
+            continue;
+        } else if (marker == 0xCC) {
+            if (!mrp_jpeg_parse_dac(data + pos + 2, segment_len - 2))
+                return false;
+            saw_dac = true;
+            can_use_strict_parser = false;
+        } else if (marker == 0xDC) {
+            if (!saw_sof || !needs_dnl || !dnl_allowed || segment_len != 4)
+                return false;
+            uint16_t lines =
+                ((uint16_t)data[pos + 2] << 8) | data[pos + 3];
+            if (lines == 0) return false;
+            info->height = lines;
+            needs_dnl = false;
+            can_use_strict_parser = false;
+        } else if (marker == 0xDE || marker == 0xDF) {
+            return false;
+        } else if (!((marker >= 0xE0 && marker <= 0xEF) ||
+                     marker == 0xFE)) {
+            return false;
+        }
+        pos += segment_len;
+    }
+    return false;
+}
+
+static ap2_mrp_artwork_result_t
+mrp_jpeg_validate_strict(const uint8_t *data, size_t len,
                          ap2_mrp_artwork_info_t *info)
 {
-    ap2_mrp_artwork_info_t local_info;
-    if (!info) info = &local_info;
-    mrp_artwork_info_init(info, len);
-    if (!mime || !data || len == 0)
-        return AP2_MRP_ARTWORK_INVALID_ARGUMENT;
-    if (strcmp(mime, "image/jpeg") != 0)
-        return mrp_artwork_result(info, AP2_MRP_ARTWORK_UNSUPPORTED_TYPE);
-    if (len > AP2_MRP_ARTWORK_STAGING_MAX_BYTES)
-        return mrp_artwork_result(info, AP2_MRP_ARTWORK_STAGING_LIMIT);
-    if (len < 6 || data[0] != 0xFF || data[1] != 0xD8 ||
-        data[len - 2] != 0xFF || data[len - 1] != 0xD9) {
-        return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
-    }
-
     bool saw_sof = false;
     mrp_jpeg_component_t frame_components[4] = {0};
     uint8_t frame_component_count = 0;
@@ -407,6 +742,7 @@ ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
             }
             if (!saw_sof || scan_count == 0 || !all_scanned || pos != len)
                 return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+            info->parsed_strictly = true;
             return mrp_artwork_result(info, AP2_MRP_ARTWORK_ACCEPTED);
         }
         if (marker == 0x00 || marker == 0x01 || marker == 0xD8 ||
@@ -597,6 +933,31 @@ ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
     return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
 }
 
+ap2_mrp_artwork_result_t
+ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
+                         ap2_mrp_artwork_info_t *info)
+{
+    ap2_mrp_artwork_info_t local_info;
+    if (!info) info = &local_info;
+    mrp_artwork_info_init(info, len);
+    if (!mime || !data || len == 0)
+        return AP2_MRP_ARTWORK_INVALID_ARGUMENT;
+    if (strcmp(mime, "image/jpeg") != 0)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_UNSUPPORTED_TYPE);
+    if (len > AP2_MRP_ARTWORK_STAGING_MAX_BYTES)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_STAGING_LIMIT);
+    if (len < 6 || data[0] != 0xFF || data[1] != 0xD8 ||
+        data[len - 2] != 0xFF || data[len - 1] != 0xD9)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    bool strict_profile = false;
+    if (!mrp_jpeg_validate_container(data, len, info, &strict_profile))
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+    if (!strict_profile)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_ACCEPTED);
+    return mrp_jpeg_validate_strict(data, len, info);
+}
+
 static void mrp_reset_artwork(struct ap2_mrp_ctx *m)
 {
     if (!m) return;
@@ -607,6 +968,8 @@ static void mrp_reset_artwork(struct ap2_mrp_ctx *m)
     m->artwork_mime = NULL;
     m->artwork_id[0] = '\0';
     m->artwork_sent = false;
+    m->artwork_generation++;
+    if (m->artwork_generation == 0) m->artwork_generation++;
 }
 
 /* ---- Small helpers ---- */
@@ -1271,6 +1634,16 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
 
 /* ---- Public API ---- */
 
+void ap2_mrp_operation_lock(struct ap2_mrp_ctx *m)
+{
+    if (m) pthread_mutex_lock(&m->operation_lock);
+}
+
+void ap2_mrp_operation_unlock(struct ap2_mrp_ctx *m)
+{
+    if (m) pthread_mutex_unlock(&m->operation_lock);
+}
+
 struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *auth_credentials,
                                     const char *dacp_id,
@@ -1282,6 +1655,22 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     if (!host) return NULL;
     struct ap2_mrp_ctx *m = calloc(1, sizeof(*m));
     if (!m) return NULL;
+
+    pthread_mutexattr_t operation_attr;
+    if (pthread_mutexattr_init(&operation_attr) != 0) {
+        free(m);
+        return NULL;
+    }
+    int operation_lock_status =
+        pthread_mutexattr_settype(&operation_attr, PTHREAD_MUTEX_RECURSIVE);
+    if (operation_lock_status == 0)
+        operation_lock_status =
+            pthread_mutex_init(&m->operation_lock, &operation_attr);
+    pthread_mutexattr_destroy(&operation_attr);
+    if (operation_lock_status != 0) {
+        free(m);
+        return NULL;
+    }
 
     m->host = mrp_strdup(host);
     m->port = port;
@@ -1329,14 +1718,17 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     free(m->album);
     free(m->artwork_mime);
     free(m->artwork);
+    pthread_mutex_destroy(&m->operation_lock);
     free(m);
 }
 
 bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
 {
     if (!m || data_port <= 0) return false;
+    ap2_mrp_operation_lock(m);
     if (!m->have_secret) {
         LOG_ERROR("[MRP] attach requires the session's pairing shared secret");
+        ap2_mrp_operation_unlock(m);
         return false;
     }
 
@@ -1350,6 +1742,7 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
         !mrp_hkdf_sha512(m->shared_secret, MRP_KEY_SIZE, salt,
                          MRP_DATASTREAM_INPUT_INFO, m->in_key, MRP_KEY_SIZE)) {
         LOG_ERROR("[MRP] DataStream key derivation failed");
+        ap2_mrp_operation_unlock(m);
         return false;
     }
     m->out_counter = 0;
@@ -1357,7 +1750,10 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
 
     /* TCP connect to the receiver's dataPort */
     m->sock = socket(AF_INET, SOCK_STREAM, 0);
-    if (m->sock < 0) return false;
+    if (m->sock < 0) {
+        ap2_mrp_operation_unlock(m);
+        return false;
+    }
     struct timeval tv = { .tv_sec = 5 };
     setsockopt(m->sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
     setsockopt(m->sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
@@ -1371,6 +1767,7 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
                   m->host, data_port, strerror(errno));
         close(m->sock);
         m->sock = -1;
+        ap2_mrp_operation_unlock(m);
         return false;
     }
     int one = 1;
@@ -1397,10 +1794,12 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     if (!ok) {
         LOG_ERROR("[MRP] handshake push failed");
         ap2_mrp_stop(m);
+        ap2_mrp_operation_unlock(m);
         return false;
     }
     LOG_INFO("[MRP] handshake pushed (device info, connection state, "
              "now-playing client, initial state)");
+    ap2_mrp_operation_unlock(m);
     return true;
 }
 
@@ -1421,6 +1820,7 @@ bool ap2_mrp_start(struct ap2_mrp_ctx *m)
 void ap2_mrp_stop(struct ap2_mrp_ctx *m)
 {
     if (!m) return;
+    ap2_mrp_operation_lock(m);
     if (m->connected) {
         mbuf msg = {0};
         if (build_set_connection_state(&msg, MRP_CONNECTION_STATE_DISCONNECTED))
@@ -1434,6 +1834,7 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
     }
     m->rx_enc_len = 0;
     m->rx_msg_len = 0;
+    ap2_mrp_operation_unlock(m);
 }
 
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
@@ -1441,6 +1842,7 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
                           int duration_ms)
 {
     if (!m) return false;
+    ap2_mrp_operation_lock(m);
     mrp_replace_str(&m->title, title);
     mrp_replace_str(&m->artist, artist);
     mrp_replace_str(&m->album, album);
@@ -1451,8 +1853,9 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
     uint64_t uid = 0;
     RAND_bytes((uint8_t *)&uid, sizeof(uid));
     m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    bool ok = !m->connected || mrp_push_state(m, false);
+    ap2_mrp_operation_unlock(m);
+    return ok;
 }
 
 bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
@@ -1468,12 +1871,17 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     ap2_mrp_artwork_result_t result =
         ap2_mrp_validate_artwork(mime, data, len > 0 ? (size_t)len : 0, info);
     if (result != AP2_MRP_ARTWORK_ACCEPTED) {
+        ap2_mrp_operation_lock(m);
         mrp_reset_artwork(m);
+        ap2_mrp_operation_unlock(m);
         LOG_WARN("[MRP] artwork rejected: reason=%s bytes=%d width=%u height=%u "
-                 "sof=0x%02x components=%u progressive=%d staging_max_bytes=%d",
+                 "sof=0x%02x components=%u progressive=%d local_parser=%s "
+                 "staging_max_bytes=%d",
                  ap2_mrp_artwork_result_name(result), len,
                  info->width, info->height, info->sof_marker, info->components,
-                 info->progressive, AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
+                 info->progressive,
+                 info->parsed_strictly ? "strict" : "generic_container",
+                 AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
         return false;
     }
 
@@ -1482,12 +1890,15 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     if (!copy || !mime_copy) {
         free(copy);
         free(mime_copy);
+        ap2_mrp_operation_lock(m);
         mrp_reset_artwork(m);
+        ap2_mrp_operation_unlock(m);
         info->result = AP2_MRP_ARTWORK_NO_MEMORY;
         LOG_ERROR("[MRP] cannot retain artwork: out of memory");
         return false;
     }
     memcpy(copy, data, (size_t)len);
+    ap2_mrp_operation_lock(m);
     free(m->artwork);
     m->artwork = copy;
     m->artwork_len = len;
@@ -1502,39 +1913,48 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
              "%02x%02x%02x%02x%02x%02x%02x%02x",
              idb[0], idb[1], idb[2], idb[3], idb[4], idb[5], idb[6], idb[7]);
     m->artwork_sent = false;
+    m->artwork_generation++;
+    if (m->artwork_generation == 0) m->artwork_generation++;
     LOG_INFO("[MRP] artwork staged: bytes=%d width=%u height=%u sof=0x%02x "
-             "components=%u progressive=%d",
+             "components=%u progressive=%d local_parser=%s",
              len, info->width, info->height, info->sof_marker,
-             info->components, info->progressive);
-    if (!m->connected) return true;
-    return mrp_push_state(m, true);
+             info->components, info->progressive,
+             info->parsed_strictly ? "strict" : "generic_container");
+    bool ok = !m->connected || mrp_push_state(m, true);
+    ap2_mrp_operation_unlock(m);
+    return ok;
 }
 
 void ap2_mrp_clear_artwork(struct ap2_mrp_ctx *m)
 {
     if (!m) return;
+    ap2_mrp_operation_lock(m);
     mrp_reset_artwork(m);
     if (m->connected) mrp_push_state(m, false);
+    ap2_mrp_operation_unlock(m);
 }
 
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
                           int duration_ms, bool playing)
 {
     if (!m) return false;
+    ap2_mrp_operation_lock(m);
     m->elapsed_ms = elapsed_ms > 0 ? elapsed_ms : 0;
     if (duration_ms > 0) m->duration_ms = duration_ms;
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
-    if (!m->connected) return true;
     /* The receiver extrapolates position from elapsedTime + timestamp +
      * playbackRate, so a progress change is a state push, not a stream. */
-    return mrp_push_state(m, false);
+    bool ok = !m->connected || mrp_push_state(m, false);
+    ap2_mrp_operation_unlock(m);
+    return ok;
 }
 
 bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
 {
     if (!m) return false;
+    ap2_mrp_operation_lock(m);
     /* Advance the stored elapsed to now before flipping so the frozen (pause)
      * or resumed (play) position matches what the receiver extrapolated up to
      * this instant, then re-anchor the timestamp at now. */
@@ -1547,22 +1967,40 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = now;
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    bool ok = !m->connected || mrp_push_state(m, false);
+    ap2_mrp_operation_unlock(m);
+    return ok;
 }
 
 bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
 {
     if (!m) return false;
+    ap2_mrp_operation_lock(m);
     m->playback_state = AP2_MRP_PLAYBACK_STOPPED;
     m->elapsed_set_at = mrp_cf_now();
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    bool ok = !m->connected || mrp_push_state(m, false);
+    ap2_mrp_operation_unlock(m);
+    return ok;
+}
+
+ap2_mrp_playback_state_t
+ap2_mrp_get_playback_state(struct ap2_mrp_ctx *m)
+{
+    if (!m) return AP2_MRP_PLAYBACK_STOPPED;
+    ap2_mrp_operation_lock(m);
+    ap2_mrp_playback_state_t state = m->playback_state;
+    ap2_mrp_operation_unlock(m);
+    return state;
 }
 
 void ap2_mrp_tick(struct ap2_mrp_ctx *m)
 {
-    if (!m || !m->connected || m->sock < 0) return;
+    if (!m) return;
+    ap2_mrp_operation_lock(m);
+    if (!m->connected || m->sock < 0) {
+        ap2_mrp_operation_unlock(m);
+        return;
+    }
 
     /* Drain inbound bytes without blocking */
     struct pollfd pfd = { .fd = m->sock, .events = POLLIN };
@@ -1575,12 +2013,16 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
             m->connected = false;
             close(m->sock);
             m->sock = -1;
+            ap2_mrp_operation_unlock(m);
             return;
         }
         m->rx_enc_len += (int)n;
         mrp_drain_encrypted(m);
         mrp_process_frames(m);
-        if (!m->connected) return;
+        if (!m->connected) {
+            ap2_mrp_operation_unlock(m);
+            return;
+        }
     }
 
     /* Defensive periodic re-push: keeps the system now-playing session warm
@@ -1588,15 +2030,20 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
     if (m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
         time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S)
         mrp_push_state(m, false);
+    ap2_mrp_operation_unlock(m);
 }
 
 bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m)
 {
-    return m && m->connected;
+    if (!m) return false;
+    ap2_mrp_operation_lock(m);
+    bool connected = m->connected;
+    ap2_mrp_operation_unlock(m);
+    return connected;
 }
 
-bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
-                                      uint8_t **out, int *out_len)
+static bool mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
+                                         uint8_t **out, int *out_len)
 {
     if (!m || !out || !out_len) return false;
 
@@ -1665,10 +2112,43 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     return true;
 }
 
-void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m)
+bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
+                                      uint8_t **out, int *out_len)
 {
-    if (m && m->artwork && m->artwork_len > 0)
+    if (!m) return false;
+    ap2_mrp_operation_lock(m);
+    bool ok = mrp_build_nowplaying_command(m, out, out_len);
+    ap2_mrp_operation_unlock(m);
+    return ok;
+}
+
+int ap2_mrp_send_nowplaying_command(struct ap2_mrp_ctx *m,
+                                    ap2_mrp_command_sender_t sender,
+                                    void *opaque)
+{
+    if (!m || !sender) return -1;
+    ap2_mrp_operation_lock(m);
+
+    uint64_t artwork_generation =
+        m->artwork && m->artwork_len > 0 && !m->artwork_sent
+            ? m->artwork_generation
+            : 0;
+    uint8_t *body = NULL;
+    int body_len = 0;
+    if (!mrp_build_nowplaying_command(m, &body, &body_len)) {
+        ap2_mrp_operation_unlock(m);
+        return -1;
+    }
+
+    int status = sender(opaque, body, body_len);
+    free(body);
+    if (status >= 200 && status < 300 && artwork_generation != 0 &&
+        m->artwork_generation == artwork_generation &&
+        m->artwork && m->artwork_len > 0)
         m->artwork_sent = true;
+
+    ap2_mrp_operation_unlock(m);
+    return status;
 }
 
 /* Wrap a serialized protobuf as the bplist {"params": {"data": <varint length +
@@ -1781,6 +2261,7 @@ bool ap2_mrp_build_playbackstate_command(struct ap2_mrp_ctx *m,
                                          uint8_t **out, int *out_len)
 {
     if (!m || !out || !out_len) return false;
+    ap2_mrp_operation_lock(m);
 
     ap2_pl_node *params = ap2_pl_dict();
     ap2_pl_dict_set(params, "mrPlaybackState",
@@ -1792,9 +2273,10 @@ bool ap2_mrp_build_playbackstate_command(struct ap2_mrp_ctx *m,
 
     int len = ap2_pl_serialize(root, out);
     ap2_pl_free(root);
-    if (len <= 0) return false;
-    *out_len = len;
-    return true;
+    bool ok = len > 0;
+    if (ok) *out_len = len;
+    ap2_mrp_operation_unlock(m);
+    return ok;
 }
 
 bool ap2_mrp_build_nowplayingclient_command(struct ap2_mrp_ctx *m,

@@ -60,7 +60,11 @@ typedef struct {
     uint8_t components;
     uint8_t sof_marker;
     bool progressive;
+    bool parsed_strictly;
 } ap2_mrp_artwork_info_t;
+
+typedef int (*ap2_mrp_command_sender_t)(void *opaque,
+                                         const uint8_t *body, int body_len);
 
 /* Remote-control (MRP) data-channel stream SETUP constants (DESIGN.md §8,
  * pyatv ap2_session.py _setup_data_channel). The audio session issues a SETUP
@@ -147,11 +151,11 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
 /*
  * Set the now-playing artwork.
  *
- * Runs a bounded JPEG-container preflight for 8-bit Huffman baseline (SOF0)
- * and progressive (SOF2) input within AP2_MRP_ARTWORK_STAGING_MAX_BYTES.
- * This preflight does not entropy-decode image coefficients or pixels. The
- * bound is internal staging/allocation policy only; it deliberately does not
- * claim a receiver byte, dimension, component, or progressive-JPEG limit.
+ * Runs a bounded strict JPEG preflight for the 8-bit Huffman SOF0/SOF2
+ * profiles understood locally. Other profiles use a bounded generic marker
+ * and scan-container preflight and are staged when structurally valid; this
+ * does not claim receiver support. Neither path entropy-decodes coefficients
+ * or pixels. The byte bound is internal staging/allocation policy only.
  * Invalid input clears prior MRP artwork so a new track cannot retain stale
  * cover art.
  *
@@ -199,6 +203,10 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing);
  * updateMRPlaybackState push before session teardown. */
 bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m);
 
+/* Return the playback state protected by the MRP operation mutex. */
+ap2_mrp_playback_state_t
+ap2_mrp_get_playback_state(struct ap2_mrp_ctx *m);
+
 /*
  * Keep-alive tick: drain any incoming frames (answering sync/heartbeat
  * requests) and re-push the current now-playing state to hold the system
@@ -222,8 +230,22 @@ bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
-/* Mark the one-shot artwork bytes as accepted after a successful POST. */
-void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
+/*
+ * Serialize an entire MRP operation against state mutation and other command
+ * sends. The mutex is recursive so builders and setters remain safe while a
+ * client-level multi-command push owns the operation.
+ */
+void ap2_mrp_operation_lock(struct ap2_mrp_ctx *m);
+void ap2_mrp_operation_unlock(struct ap2_mrp_ctx *m);
+
+/*
+ * Build and send updateMRNowPlayingInfo while holding the operation mutex.
+ * The exact sender status is returned. Artwork is marked sent only when its
+ * generation was included in this request and the sender returns 2xx.
+ */
+int ap2_mrp_send_nowplaying_command(struct ap2_mrp_ctx *m,
+                                    ap2_mrp_command_sender_t sender,
+                                    void *opaque);
 
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before
