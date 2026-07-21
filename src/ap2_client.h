@@ -19,6 +19,8 @@
 #include <stdint.h>
 #include <netinet/in.h>
 
+#include "ap2_io.h"
+
 struct ap2cl_s;
 
 /* AP2 session states */
@@ -128,14 +130,25 @@ bool ap2cl_disconnect(struct ap2cl_s *p);
 bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start);
 
 /* Send a chunk of PCM audio data.
- * Returns true on success.
+ * A transient realtime UDP drop advances the media timeline and returns
+ * AP2_SEND_DROPPED; hard encode/control/session failures return AP2_SEND_FATAL.
  * :param sample: Raw PCM audio bytes (interleaved, little-endian).
  * :param frames: Number of audio frames in the sample buffer.
  */
-bool ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames);
+ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
+                                   int frames);
 
 /* Check if the client is ready to accept more audio frames. */
 bool ap2cl_accept_frames(struct ap2cl_s *p);
+
+/* Re-anchor a realtime stream after PCM starvation exhausts its pacing lead. */
+bool ap2cl_recover_input_gap(struct ap2cl_s *p);
+
+/* Emit native pacing, packet-drop, and anchor diagnostics at debug level 10. */
+void ap2cl_log_diagnostics(struct ap2cl_s *p);
+
+/* False after terminal RTSP/media/event failures. */
+bool ap2cl_control_healthy(struct ap2cl_s *p);
 
 /* Pause playback. */
 void ap2cl_pause(struct ap2cl_s *p);

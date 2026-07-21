@@ -181,7 +181,7 @@ running stream:
 - `VOLUME=<0-100>`
 - `ACTION=PLAY|PAUSE|STOP`
 - Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
-  `ARTWORK=<local file path>` (URLs are ignored), followed by
+  `ARTWORK=<local file path or http:// imageproxy URL>`, followed by
   `ACTION=SENDMETA` to push the set.
 
 Some receivers (notably Sonos) do not emit audio until they have received
@@ -190,6 +190,9 @@ audio starts regardless of whether the caller ever sends `SENDMETA`.
 Pair-verified native Apple sessions additionally mirror these updates over
 MediaRemote `POST /command`, including explicit play/pause/stop state. Set
 `CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
+Metadata strings are encoded as Unicode binary-plist strings; artwork is
+signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
+supported `size=512&fmt=jpeg` request.
 
 ## Building
 
@@ -224,6 +227,7 @@ src/ap2_client.c      AP2 orchestrator: route resolution, RAOP-compat + native
                       flows, realtime/buffered senders, anchor & pacing
 src/ap2_hap.c         HAP pair-verify, transient and PIN pair-setup, encrypted
                       RTSP framing (ChaCha20-Poly1305)
+src/ap2_io.c          Absolute-deadline socket I/O shared by RTSP and MRP
 src/ap2_mrp.c         MediaRemote now-playing sender: /command builders,
                       proto2 + bplist emitters, type-130 DataStream channel
 src/ap2_plist.c       Binary plist writer (nested streams array)

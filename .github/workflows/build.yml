@@ -52,6 +52,7 @@ jobs:
           if [ "${{ matrix.platform }}" = "x86_64" ]; then
             # Native: run the self-check (should print "cliairplay check").
             "./$bin" --check | grep -qE "cliairplay.*check"
+            make test CC=${{ matrix.cc }}
           else
             # Cross-built: can't execute here, just confirm the architecture.
             file "$bin" | grep -qi "aarch64"
@@ -98,6 +99,7 @@ jobs:
           test -f "$bin"
           if [ "${{ matrix.platform }}" = "arm64" ]; then
             "./$bin" --check | grep -qE "cliairplay.*check"
+            make test CC=clang
           else
             file "$bin" | grep -qi "x86_64"
           fi

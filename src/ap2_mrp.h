@@ -92,6 +92,13 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
 bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
 
 /*
+ * Attach the session event socket. Ownership transfers to the MRP context on
+ * success. This derives the independent Events-Salt keys and services encrypted
+ * reverse HTTP requests with 200 responses from ap2_mrp_tick().
+ */
+bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
+
+/*
  * Bootstrap a standalone remote-control-only session (sidecar model, for the
  * metadata-only display mode): own TCP connection, pair-verify, session SETUP
  * with isRemoteControlOnly=true, event channel, RECORD, type-130 data channel.
@@ -104,7 +111,7 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m);
 
 /*
  * Set the now-playing track metadata. Values are copied; NULL is treated as
- * empty. Takes effect on the next state push (immediate when connected).
+ * empty. Takes effect on the next feedback-worker state push.
  *
  * :param duration_ms: track duration in milliseconds (0 = unknown/live).
  */
@@ -136,7 +143,7 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
  * Flip the play/pause state without a fresh elapsed position (pause/resume).
  * Advances the stored elapsed to now so the receiver's extrapolated position
  * (elapsedTime + timestamp + playbackRate) is accurate across the transition.
- * Takes effect on the next state push (immediate when connected).
+ * Takes effect on the next feedback-worker state push.
  *
  * :param playing: true = Playing, false = Paused.
  */
@@ -147,15 +154,29 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing);
 bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m);
 
 /*
- * Keep-alive tick: drain any incoming frames (answering sync/heartbeat
- * requests) and re-push the current now-playing state to hold the system
- * now-playing session open (standby prevention). Call about every 2 s from the
- * caller's existing loop; harmless when not connected.
+ * Keep-alive tick: answer encrypted event-channel HTTP requests and drain any
+ * type-130 frames (answering sync/heartbeat requests). Call only from the
+ * feedback worker.
  */
 void ap2_mrp_tick(struct ap2_mrp_ctx *m);
 
+/*
+ * Snapshot a pending/periodic type-130 state push while the caller protects
+ * mutable MRP state, then send the owned payload without that state lock.
+ * The feedback worker is the sole sender for these snapshots.
+ */
+bool ap2_mrp_prepare_state_push(struct ap2_mrp_ctx *m, uint8_t **out,
+                                int *out_len, uint64_t *generation);
+bool ap2_mrp_send_state_push(struct ap2_mrp_ctx *m,
+                             const uint8_t *data, int len);
+void ap2_mrp_complete_state_push(struct ap2_mrp_ctx *m,
+                                 uint64_t generation, bool success);
+
 /* True once the data channel is established. */
 bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
+
+/* Reverse event-channel status: -1 unattached, 0 closed/failed, 1 active. */
+int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
 
 /*
  * Build a binary-plist body for POST /command on the MAIN encrypted RTSP
@@ -171,6 +192,9 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
 
 /* Mark the one-shot artwork bytes as accepted after a successful POST. */
 void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
+uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m);
+void ap2_mrp_mark_artwork_sent_if_generation(
+    struct ap2_mrp_ctx *m, uint64_t generation);
 
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before

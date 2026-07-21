@@ -41,6 +41,11 @@ BINDIR      = bin
 
 # Output binary
 EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
+IO_TEST       = build/tests/test_ap2_io
+TIMELINE_TEST = build/tests/test_ap2_timeline
+EVENT_TEST    = build/tests/test_ap2_event
+CLIENT_TEST   = build/tests/test_ap2_client
+TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
 DEFINES  = -DNDEBUG -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED
@@ -91,11 +96,11 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_hap.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c
+AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
-	cliairplay.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c artwork.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -118,6 +123,8 @@ OBJECTS_CLI  = $(patsubst %.c,$(BUILDDIR)/%.o,$(filter %.c,$(CLI_SOURCES)))
 OBJECTS_CLI += $(patsubst %.cpp,$(BUILDDIR)/%.o,$(filter %.cpp,$(CLI_SOURCES)))
 
 OBJECTS_ALL = $(OBJECTS_RAOP) $(OBJECTS_AP2) $(OBJECTS_CLI)
+CLIENT_TEST_OBJECTS = $(filter-out $(BUILDDIR)/ap2_client.o \
+	$(BUILDDIR)/cliairplay.o $(BUILDDIR)/cross_ssl.o,$(OBJECTS_ALL))
 
 all: directory $(EXECUTABLE)
 
@@ -140,6 +147,52 @@ $(BUILDDIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 clean:
-	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED)
+	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
-.PHONY: all directory clean
+test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST)
+	$(TIMELINE_TEST)
+	$(EVENT_TEST)
+	$(IO_TEST)
+	$(CLIENT_TEST)
+
+$(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) -Isrc $< $(EXTRA_LDFLAGS) -o $@
+
+$(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
+		$(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
+		$(BUILDDIR)/cross_log.o Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) \
+		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
+		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/cross_log.o \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+$(IO_TEST): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_ap2_io.c src/ap2_io.c \
+		$(EXTRA_LDFLAGS) -lpthread -o $@
+
+build/tests/ap2_client.o: src/ap2_client.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DAP2_TESTING $< -c -o $@
+
+build/tests/cross_ssl.o: $(TOOLS)/cross_ssl.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DSSL_STATIC_LIB $< -c -o $@
+
+build/tests/test_ap2_client_main.o: tests/test_ap2_client.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) $< -c -o $@
+
+$(CLIENT_TEST): build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
+		build/tests/cross_ssl.o \
+		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	@mkdir -p $(dir $@)
+	$(CXX) build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
+		build/tests/cross_ssl.o \
+		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) \
+		$(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+.PHONY: all directory clean test

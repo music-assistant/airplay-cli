@@ -18,7 +18,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
 #include <stdbool.h>
+#include <stdatomic.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -36,6 +38,7 @@
 #include <openssl/crypto.h>
 
 #include "cross_log.h"
+#include "ap2_io.h"
 #include "ap2_plist.h"
 #include "ap2_mrp.h"
 
@@ -136,6 +139,7 @@ enum mrp_ext_field {
 
 /* Cadence of the defensive state re-push from ap2_mrp_tick (seconds). */
 #define MRP_STATE_REPUSH_S 15
+#define MRP_WRITE_TIMEOUT_MS 1000
 
 struct ap2_mrp_ctx {
     /* Target + identity */
@@ -172,6 +176,20 @@ struct ap2_mrp_ctx {
     uint8_t rx_msg[16384];    /* decrypted data-frame bytes */
     int rx_msg_len;
 
+    /* Encrypted reverse event channel. It has independent HKDF keys/counters
+     * from both RTSP control and the optional type-130 data channel. */
+    int event_sock;
+    _Atomic bool event_connected;
+    bool event_attached;
+    uint8_t event_out_key[MRP_KEY_SIZE]; /* Events-Read-Encryption-Key */
+    uint8_t event_in_key[MRP_KEY_SIZE];  /* Events-Write-Encryption-Key */
+    uint64_t event_out_counter;
+    uint64_t event_in_counter;
+    uint8_t event_rx_enc[8192];
+    int event_rx_enc_len;
+    uint8_t event_plain[16384];
+    int event_plain_len;
+
     /* Now-playing state (owned copies) */
     char *title;
     char *artist;
@@ -185,9 +203,13 @@ struct ap2_mrp_ctx {
     int artwork_len;
     char artwork_id[17];      /* 16-hex ArtworkIdentifier for the current art */
     bool artwork_sent;        /* bytes already pushed once (then ref by id) */
+    uint64_t artwork_generation;
     uint64_t np_uid;          /* per-track now-playing UniqueIdentifier */
 
     time_t last_state_push;
+    uint64_t state_generation;
+    bool state_dirty;
+    bool state_include_artwork;
 };
 
 /* ---- Small helpers ---- */
@@ -639,10 +661,11 @@ static int mrp_chacha_decrypt(const uint8_t *key, const uint8_t *nonce,
     return ok == 1 ? pt_len : -1;
 }
 
-/* Encrypt a plaintext blob into HAP channel frames with our out_key/counter.
- * Caller frees *out. Returns total byte count or -1. */
-static int mrp_channel_encrypt(struct ap2_mrp_ctx *m, const uint8_t *in,
-                               int in_len, uint8_t **out)
+/* Encrypt a plaintext blob into HAP channel frames. Caller frees *out. */
+static int mrp_channel_encrypt_with(const uint8_t key[MRP_KEY_SIZE],
+                                    uint64_t *counter,
+                                    const uint8_t *in, int in_len,
+                                    uint8_t **out)
 {
     int num_frames = (in_len + MRP_FRAME_MAX - 1) / MRP_FRAME_MAX;
     int total = num_frames * (2 + MRP_TAG_SIZE) + in_len;
@@ -658,11 +681,13 @@ static int mrp_channel_encrypt(struct ap2_mrp_ctx *m, const uint8_t *in,
         memcpy(*out + out_off, len_bytes, 2);
         out_off += 2;
 
+        /* Encryption consumes the nonce even if the eventual write fails.
+         * Callers close the channel on failure rather than retrying ciphertext. */
         uint8_t nonce[MRP_NONCE_SIZE];
-        mrp_make_nonce(m->out_counter++, nonce);
+        mrp_make_nonce((*counter)++, nonce);
 
         uint8_t tag[MRP_TAG_SIZE];
-        if (mrp_chacha_encrypt(m->out_key, nonce, len_bytes, 2,
+        if (mrp_chacha_encrypt(key, nonce, len_bytes, 2,
                                in + in_off, chunk,
                                *out + out_off, tag) < 0) {
             free(*out);
@@ -677,7 +702,41 @@ static int mrp_channel_encrypt(struct ap2_mrp_ctx *m, const uint8_t *in,
     return out_off;
 }
 
+static int mrp_channel_encrypt(struct ap2_mrp_ctx *m, const uint8_t *in,
+                               int in_len, uint8_t **out)
+{
+    return mrp_channel_encrypt_with(m->out_key, &m->out_counter,
+                                    in, in_len, out);
+}
+
 /* ---- Data-frame construction and send ---- */
+
+static bool mrp_write_all(int fd, const uint8_t *data, int len)
+{
+    return ap2_io_write_all_deadline(
+        fd, data, (size_t)len,
+        ap2_io_monotonic_ms() + MRP_WRITE_TIMEOUT_MS);
+}
+
+static void mrp_close_data_channel(struct ap2_mrp_ctx *m)
+{
+    m->connected = false;
+    if (m->sock >= 0) {
+        shutdown(m->sock, SHUT_RDWR);
+        close(m->sock);
+        m->sock = -1;
+    }
+}
+
+static void mrp_close_event_channel(struct ap2_mrp_ctx *m)
+{
+    atomic_store(&m->event_connected, false);
+    if (m->event_sock >= 0) {
+        shutdown(m->event_sock, SHUT_RDWR);
+        close(m->event_sock);
+        m->event_sock = -1;
+    }
+}
 
 /* Write the 32-byte big-endian data-frame header. */
 static void mrp_write_data_header(uint8_t hdr[MRP_DATA_HDR_LEN],
@@ -700,14 +759,21 @@ static void mrp_write_data_header(uint8_t hdr[MRP_DATA_HDR_LEN],
 /* Send raw bytes through the encrypted channel (holds send_lock). */
 static bool mrp_send_raw(struct ap2_mrp_ctx *m, const uint8_t *data, int len)
 {
-    if (m->sock < 0) return false;
     pthread_mutex_lock(&m->send_lock);
+    if (m->sock < 0) {
+        pthread_mutex_unlock(&m->send_lock);
+        return false;
+    }
     uint8_t *enc = NULL;
     int enc_len = mrp_channel_encrypt(m, data, len, &enc);
     bool ok = false;
     if (enc_len > 0 && enc)
-        ok = write(m->sock, enc, enc_len) == enc_len;
+        ok = mrp_write_all(m->sock, enc, enc_len);
     free(enc);
+    if (!ok) {
+        LOG_ERROR("[MRP] data channel write failed: %s", strerror(errno));
+        mrp_close_data_channel(m);
+    }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
 }
@@ -780,38 +846,57 @@ static bool mrp_push_state(struct ap2_mrp_ctx *m, bool include_artwork)
 
 /* ---- Inbound handling ---- */
 
-/* Decrypt whatever channel frames are complete in rx_enc into rx_msg. */
-static void mrp_drain_encrypted(struct ap2_mrp_ctx *m)
+static bool mrp_drain_channel_frames(uint8_t *enc, int *enc_len,
+                                     uint8_t *plain, int *plain_len,
+                                     int plain_cap,
+                                     const uint8_t key[MRP_KEY_SIZE],
+                                     uint64_t *counter,
+                                     const char *label)
 {
     int off = 0;
-    while (off + 2 <= m->rx_enc_len) {
-        int chunk = m->rx_enc[off] | (m->rx_enc[off + 1] << 8);
-        if (off + 2 + chunk + MRP_TAG_SIZE > m->rx_enc_len) break;
-
-        uint8_t len_bytes[2] = { m->rx_enc[off], m->rx_enc[off + 1] };
-        uint8_t nonce[MRP_NONCE_SIZE];
-        mrp_make_nonce(m->in_counter++, nonce);
-
-        if (m->rx_msg_len + chunk <= (int)sizeof(m->rx_msg)) {
-            int n = mrp_chacha_decrypt(m->in_key, nonce, len_bytes, 2,
-                                       m->rx_enc + off + 2, chunk,
-                                       m->rx_enc + off + 2 + chunk,
-                                       m->rx_msg + m->rx_msg_len);
-            if (n < 0) {
-                LOG_ERROR("[MRP] channel frame decryption failed");
-                m->connected = false;
-                return;
-            }
-            m->rx_msg_len += n;
-        } else {
-            LOG_WARN("[MRP] inbound message buffer full, dropping frame");
+    while (off + 2 <= *enc_len) {
+        int chunk = enc[off] | (enc[off + 1] << 8);
+        if (chunk <= 0 || chunk > MRP_FRAME_MAX) {
+            LOG_ERROR("[MRP] invalid %s frame size %d", label, chunk);
+            return false;
         }
+        if (off + 2 + chunk + MRP_TAG_SIZE > *enc_len) break;
+
+        if (*plain_len + chunk > plain_cap) {
+            LOG_ERROR("[MRP] %s plaintext buffer full", label);
+            return false;
+        }
+
+        uint8_t len_bytes[2] = { enc[off], enc[off + 1] };
+        uint8_t nonce[MRP_NONCE_SIZE];
+        mrp_make_nonce((*counter)++, nonce);
+
+        int n = mrp_chacha_decrypt(key, nonce, len_bytes, 2,
+                                   enc + off + 2, chunk,
+                                   enc + off + 2 + chunk,
+                                   plain + *plain_len);
+        if (n < 0) {
+            LOG_ERROR("[MRP] %s frame decryption failed", label);
+            return false;
+        }
+        *plain_len += n;
         off += 2 + chunk + MRP_TAG_SIZE;
     }
     if (off > 0) {
-        memmove(m->rx_enc, m->rx_enc + off, m->rx_enc_len - off);
-        m->rx_enc_len -= off;
+        memmove(enc, enc + off, *enc_len - off);
+        *enc_len -= off;
     }
+    return true;
+}
+
+/* Decrypt whatever data-channel frames are complete into rx_msg. */
+static void mrp_drain_encrypted(struct ap2_mrp_ctx *m)
+{
+    if (!mrp_drain_channel_frames(m->rx_enc, &m->rx_enc_len,
+                                  m->rx_msg, &m->rx_msg_len,
+                                  (int)sizeof(m->rx_msg),
+                                  m->in_key, &m->in_counter, "data channel"))
+        mrp_close_data_channel(m);
 }
 
 /* Consume complete 32-byte-header data frames from rx_msg. Incoming protobufs
@@ -850,6 +935,199 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
     }
 }
 
+/* ---- Reverse event-channel handling ---- */
+
+static int mrp_http_header_end(const uint8_t *data, int len)
+{
+    for (int i = 0; i + 3 < len; i++) {
+        if (data[i] == '\r' && data[i + 1] == '\n' &&
+            data[i + 2] == '\r' && data[i + 3] == '\n')
+            return i + 4;
+    }
+    return 0;
+}
+
+static bool mrp_http_header_value(const char *header, const char *name,
+                                  char *out, size_t out_size)
+{
+    size_t name_len = strlen(name);
+    const char *line = strstr(header, "\r\n");
+    if (!line) return false;
+    line += 2;
+
+    while (*line) {
+        const char *end = strstr(line, "\r\n");
+        if (!end || end == line) break;
+        size_t line_len = (size_t)(end - line);
+        if (line_len > name_len && line[name_len] == ':' &&
+            strncasecmp(line, name, name_len) == 0) {
+            const char *value = line + name_len + 1;
+            while (value < end && (*value == ' ' || *value == '\t')) value++;
+            while (end > value && (end[-1] == ' ' || end[-1] == '\t')) end--;
+            size_t value_len = (size_t)(end - value);
+            if (value_len >= out_size) value_len = out_size - 1;
+            memcpy(out, value, value_len);
+            out[value_len] = '\0';
+            return true;
+        }
+        line = end + 2;
+    }
+    return false;
+}
+
+static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
+                                    const uint8_t *response, int response_len)
+{
+    pthread_mutex_lock(&m->send_lock);
+    if (!atomic_load(&m->event_connected) || m->event_sock < 0) {
+        pthread_mutex_unlock(&m->send_lock);
+        return false;
+    }
+    uint8_t *enc = NULL;
+    int enc_len = mrp_channel_encrypt_with(
+        m->event_out_key, &m->event_out_counter,
+        response, response_len, &enc);
+    bool ok = enc_len > 0 && enc &&
+              mrp_write_all(m->event_sock, enc, enc_len);
+    free(enc);
+    if (!ok) {
+        LOG_ERROR("[MRP] event channel write failed: %s", strerror(errno));
+        mrp_close_event_channel(m);
+    }
+    pthread_mutex_unlock(&m->send_lock);
+    return ok;
+}
+
+static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
+{
+    int off = 0;
+    while (off < m->event_plain_len) {
+        int available = m->event_plain_len - off;
+        int header_len = mrp_http_header_end(m->event_plain + off, available);
+        if (!header_len) break;
+        if (header_len >= 8192) {
+            LOG_ERROR("[MRP] event HTTP header too large");
+            return false;
+        }
+
+        char header[8192];
+        memcpy(header, m->event_plain + off, (size_t)header_len);
+        header[header_len] = '\0';
+
+        int content_len = 0;
+        char value[256];
+        if (mrp_http_header_value(header, "Content-Length",
+                                  value, sizeof(value))) {
+            char *end = NULL;
+            long parsed = strtol(value, &end, 10);
+            if (!end || end == value || *end != '\0' || parsed < 0 ||
+                parsed > (long)sizeof(m->event_plain)) {
+                LOG_ERROR("[MRP] invalid event Content-Length: %s", value);
+                return false;
+            }
+            content_len = (int)parsed;
+        }
+        if (header_len + content_len > available) break;
+
+        char method[16] = "";
+        char path[256] = "";
+        char version[16] = "RTSP/1.0";
+        if (sscanf(header, "%15s %255s %15s", method, path, version) < 3) {
+            LOG_ERROR("[MRP] malformed event request line");
+            return false;
+        }
+
+        char cseq[64] = "";
+        char server[256] = "";
+        bool have_cseq = mrp_http_header_value(header, "CSeq",
+                                               cseq, sizeof(cseq));
+        bool have_server = mrp_http_header_value(header, "Server",
+                                                 server, sizeof(server));
+        char response[768];
+        int response_len = snprintf(
+            response, sizeof(response),
+            "%s 200 OK\r\n"
+            "Content-Length: 0\r\n"
+            "Audio-Latency: 0\r\n"
+            "%s%s%s"
+            "%s%s%s"
+            "\r\n",
+            version,
+            have_server ? "Server: " : "", have_server ? server : "",
+            have_server ? "\r\n" : "",
+            have_cseq ? "CSeq: " : "", have_cseq ? cseq : "",
+            have_cseq ? "\r\n" : "");
+        if (response_len <= 0 || response_len >= (int)sizeof(response) ||
+            !mrp_event_send_response(m, (const uint8_t *)response,
+                                     response_len)) {
+            LOG_ERROR("[MRP] event response send failed");
+            return false;
+        }
+        LOG_DEBUG("[MRP] event %s %s -> 200%s%s",
+                  method, path, have_cseq ? " cseq=" : "",
+                  have_cseq ? cseq : "");
+        off += header_len + content_len;
+    }
+
+    if (off > 0) {
+        memmove(m->event_plain, m->event_plain + off,
+                (size_t)(m->event_plain_len - off));
+        m->event_plain_len -= off;
+    }
+    return true;
+}
+
+static void mrp_tick_events(struct ap2_mrp_ctx *m)
+{
+    if (!atomic_load(&m->event_connected) || m->event_sock < 0) return;
+
+    struct pollfd pfd = {
+        .fd = m->event_sock,
+        .events = POLLIN,
+    };
+    while (poll(&pfd, 1, 0) > 0) {
+        if (pfd.revents & (POLLERR | POLLNVAL)) {
+            LOG_WARN("[MRP] event channel socket error");
+            mrp_close_event_channel(m);
+            return;
+        }
+        if (!(pfd.revents & POLLIN)) {
+            if (pfd.revents & POLLHUP) {
+                LOG_WARN("[MRP] event channel closed by receiver");
+                mrp_close_event_channel(m);
+            }
+            return;
+        }
+
+        int space = (int)sizeof(m->event_rx_enc) - m->event_rx_enc_len;
+        if (space <= 0) {
+            LOG_ERROR("[MRP] event encrypted buffer full");
+            mrp_close_event_channel(m);
+            return;
+        }
+        ssize_t n = read(m->event_sock,
+                         m->event_rx_enc + m->event_rx_enc_len,
+                         (size_t)space);
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
+        if (n <= 0) {
+            LOG_WARN("[MRP] event channel closed by receiver");
+            mrp_close_event_channel(m);
+            return;
+        }
+        m->event_rx_enc_len += (int)n;
+        if (!mrp_drain_channel_frames(
+                m->event_rx_enc, &m->event_rx_enc_len,
+                m->event_plain, &m->event_plain_len,
+                (int)sizeof(m->event_plain),
+                m->event_in_key, &m->event_in_counter, "event channel") ||
+            !mrp_process_event_requests(m)) {
+            mrp_close_event_channel(m);
+            return;
+        }
+        pfd.revents = 0;
+    }
+}
+
 /* ---- Public API ---- */
 
 struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
@@ -874,8 +1152,12 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     mrp_identity_uuid(m->dacp_id, m->device_uuid);
     m->playback_state = AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
+    m->state_generation = 1;
+    m->state_dirty = true;
     m->sock = -1;
+    m->event_sock = -1;
     pthread_mutex_init(&m->send_lock, NULL);
+    atomic_init(&m->event_connected, false);
 
     if (reuse_shared_secret) {
         memcpy(m->shared_secret, reuse_shared_secret, MRP_KEY_SIZE);
@@ -899,6 +1181,8 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     OPENSSL_cleanse(m->shared_secret, sizeof(m->shared_secret));
     OPENSSL_cleanse(m->out_key, sizeof(m->out_key));
     OPENSSL_cleanse(m->in_key, sizeof(m->in_key));
+    OPENSSL_cleanse(m->event_out_key, sizeof(m->event_out_key));
+    OPENSSL_cleanse(m->event_in_key, sizeof(m->event_in_key));
     free(m->host);
     free(m->auth_credentials);
     free(m->dacp_id);
@@ -911,6 +1195,35 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     free(m->artwork_mime);
     free(m->artwork);
     free(m);
+}
+
+bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
+{
+    if (!m || event_sock < 0) return false;
+    if (!m->have_secret) {
+        LOG_ERROR("[MRP] event channel requires the pairing shared secret");
+        return false;
+    }
+    /* The receiver is the logical writer on this reverse channel, so the key
+     * labels are swapped from our perspective (pyatv EventChannel). */
+    if (!mrp_hkdf_sha512(m->shared_secret, MRP_KEY_SIZE, MRP_EVENTS_SALT,
+                         MRP_EVENTS_READ_INFO,
+                         m->event_out_key, MRP_KEY_SIZE) ||
+        !mrp_hkdf_sha512(m->shared_secret, MRP_KEY_SIZE, MRP_EVENTS_SALT,
+                         MRP_EVENTS_WRITE_INFO,
+                         m->event_in_key, MRP_KEY_SIZE)) {
+        LOG_ERROR("[MRP] event channel key derivation failed");
+        return false;
+    }
+    m->event_sock = event_sock;
+    atomic_store(&m->event_connected, true);
+    m->event_attached = true;
+    m->event_out_counter = 0;
+    m->event_in_counter = 0;
+    m->event_rx_enc_len = 0;
+    m->event_plain_len = 0;
+    LOG_INFO("[MRP] encrypted event channel attached");
+    return true;
 }
 
 bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
@@ -974,6 +1287,10 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     ok = ok && build_set_now_playing_client(m, &msg) && mrp_send_protobuf(m, &msg);
     mbuf_free(&msg);
     ok = ok && mrp_push_state(m, m->artwork_len > 0);
+    if (ok) {
+        m->state_dirty = false;
+        m->state_include_artwork = false;
+    }
 
     if (!ok) {
         LOG_ERROR("[MRP] handshake push failed");
@@ -1009,12 +1326,12 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
         mbuf_free(&msg);
         m->connected = false;
     }
-    if (m->sock >= 0) {
-        close(m->sock);
-        m->sock = -1;
-    }
+    mrp_close_data_channel(m);
+    mrp_close_event_channel(m);
     m->rx_enc_len = 0;
     m->rx_msg_len = 0;
+    m->event_rx_enc_len = 0;
+    m->event_plain_len = 0;
 }
 
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
@@ -1032,8 +1349,9 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
     uint64_t uid = 0;
     RAND_bytes((uint8_t *)&uid, sizeof(uid));
     m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_generation++;
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
@@ -1056,8 +1374,11 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
              "%02x%02x%02x%02x%02x%02x%02x%02x",
              idb[0], idb[1], idb[2], idb[3], idb[4], idb[5], idb[6], idb[7]);
     m->artwork_sent = false;
-    if (!m->connected) return true;
-    return mrp_push_state(m, true);
+    m->artwork_generation++;
+    m->state_generation++;
+    m->state_dirty = true;
+    m->state_include_artwork = true;
+    return true;
 }
 
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
@@ -1069,10 +1390,9 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
-    if (!m->connected) return true;
-    /* The receiver extrapolates position from elapsedTime + timestamp +
-     * playbackRate, so a progress change is a state push, not a stream. */
-    return mrp_push_state(m, false);
+    m->state_generation++;
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
@@ -1090,8 +1410,9 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = now;
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_generation++;
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
@@ -1099,13 +1420,16 @@ bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
     if (!m) return false;
     m->playback_state = AP2_MRP_PLAYBACK_STOPPED;
     m->elapsed_set_at = mrp_cf_now();
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_generation++;
+    m->state_dirty = true;
+    return true;
 }
 
 void ap2_mrp_tick(struct ap2_mrp_ctx *m)
 {
-    if (!m || !m->connected || m->sock < 0) return;
+    if (!m) return;
+    mrp_tick_events(m);
+    if (!m->connected || m->sock < 0) return;
 
     /* Drain inbound bytes without blocking */
     struct pollfd pfd = { .fd = m->sock, .events = POLLIN };
@@ -1115,9 +1439,7 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         ssize_t n = read(m->sock, m->rx_enc + m->rx_enc_len, (size_t)space);
         if (n <= 0) {
             LOG_WARN("[MRP] data channel closed by receiver");
-            m->connected = false;
-            close(m->sock);
-            m->sock = -1;
+            mrp_close_data_channel(m);
             return;
         }
         m->rx_enc_len += (int)n;
@@ -1126,16 +1448,58 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         if (!m->connected) return;
     }
 
-    /* Defensive periodic re-push: keeps the system now-playing session warm
-     * (standby prevention hinges on it, DESIGN.md §8). */
-    if (m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
-        time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S)
-        mrp_push_state(m, false);
+}
+
+bool ap2_mrp_prepare_state_push(struct ap2_mrp_ctx *m, uint8_t **out,
+                                int *out_len, uint64_t *generation)
+{
+    if (!m || !out || !out_len || !generation || !m->connected) return false;
+    bool periodic =
+        m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
+        time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S;
+    if (!m->state_dirty && !periodic) return false;
+
+    mbuf msg = {0};
+    if (!build_set_state(m, m->state_include_artwork, &msg)) {
+        mbuf_free(&msg);
+        return false;
+    }
+    *out = msg.p;
+    *out_len = (int)msg.len;
+    *generation = m->state_generation;
+    return true;
+}
+
+bool ap2_mrp_send_state_push(struct ap2_mrp_ctx *m,
+                             const uint8_t *data, int len)
+{
+    if (!m || !data || len <= 0 || !m->connected) return false;
+    mbuf msg = { .p = (uint8_t *)data, .len = (size_t)len, .cap = (size_t)len };
+    bool ok = mrp_send_protobuf(m, &msg);
+    LOG_DEBUG("[MRP] queued SET_STATE push -> %s", ok ? "sent" : "failed");
+    return ok;
+}
+
+void ap2_mrp_complete_state_push(struct ap2_mrp_ctx *m,
+                                 uint64_t generation, bool success)
+{
+    if (!m || !success) return;
+    m->last_state_push = time(NULL);
+    if (m->state_generation == generation) {
+        m->state_dirty = false;
+        m->state_include_artwork = false;
+    }
 }
 
 bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m)
 {
     return m && m->connected;
+}
+
+int ap2_mrp_event_status(struct ap2_mrp_ctx *m)
+{
+    if (!m || !m->event_attached) return -1;
+    return atomic_load(&m->event_connected) ? 1 : 0;
 }
 
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
@@ -1212,6 +1576,18 @@ void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m)
 {
     if (m && m->artwork && m->artwork_len > 0)
         m->artwork_sent = true;
+}
+
+uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m)
+{
+    return m ? m->artwork_generation : 0;
+}
+
+void ap2_mrp_mark_artwork_sent_if_generation(
+    struct ap2_mrp_ctx *m, uint64_t generation)
+{
+    if (m && m->artwork_generation == generation)
+        ap2_mrp_mark_artwork_sent(m);
 }
 
 /* Wrap a serialized protobuf as the bplist {"params": {"data": <varint length +
