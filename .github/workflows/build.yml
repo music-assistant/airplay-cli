@@ -11,6 +11,14 @@ permissions:
   contents: read
 
 jobs:
+  test-release-automation:
+    name: Test release automation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Test server pin updater
+        run: python3 -m unittest discover -s .github/scripts -p "test_*.py"
+
   build-linux:
     # Keep release binaries on a stable libc baseline that runs on Debian 12+.
     runs-on: ubuntu-22.04
@@ -100,7 +108,7 @@ jobs:
   release:
     # Publish binaries as release assets when a version tag is pushed.
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: [build-linux, build-macos]
+    needs: [build-linux, build-macos, test-release-automation]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -136,6 +144,8 @@ jobs:
     if: startsWith(github.ref, 'refs/tags/v')
     needs: release
     runs-on: ubuntu-22.04
+    outputs:
+      checksums_sha256: ${{ steps.verify-assets.outputs.checksums_sha256 }}
     steps:
       - name: Download published assets
         env:
@@ -146,6 +156,7 @@ jobs:
             --repo "${{ github.repository }}" \
             --dir release
       - name: Verify asset contract and checksums
+        id: verify-assets
         run: |
           assets=(
             SHA256SUMS
@@ -160,6 +171,10 @@ jobs:
           done
           cat release/SHA256SUMS
           (cd release && sha256sum --check SHA256SUMS)
+          checksums_sha256=$(sha256sum release/SHA256SUMS | cut -d " " -f 1)
+          [[ "$checksums_sha256" =~ ^[0-9a-f]{64}$ ]]
+          echo "SHA256SUMS asset digest: sha256:$checksums_sha256"
+          echo "checksums_sha256=$checksums_sha256" >> "$GITHUB_OUTPUT"
           chmod +x release/cliairplay-linux-x86_64
           release/cliairplay-linux-x86_64 --check
       - name: Verify privileged PTP binding
@@ -194,3 +209,62 @@ jobs:
           printf '%s\nCAPABILITY_TIMEOUT_EXIT_CODE=%s\n' "$output" "$rc"
           test "$rc" -eq 124
           grep -F "daemon up: engine on 319/320" <<<"$output"
+
+  bump-server:
+    name: Create server bump PR
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: verify-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Validate server PR token
+        env:
+          SERVER_PR_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+        run: |
+          if [ -z "$SERVER_PR_TOKEN" ]; then
+            echo "::error::PRIVILEGED_GITHUB_TOKEN is required to update music-assistant/server"
+            exit 1
+          fi
+
+      - name: Checkout release automation
+        uses: actions/checkout@v7
+        with:
+          path: airplay-cli
+          persist-credentials: false
+
+      - name: Checkout server repository
+        uses: actions/checkout@v7
+        with:
+          repository: music-assistant/server
+          ref: dev
+          token: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+          path: server
+          persist-credentials: false
+
+      - name: Update server release pins
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          CHECKSUMS_SHA256: ${{ needs.verify-release.outputs.checksums_sha256 }}
+        run: |
+          python3 airplay-cli/.github/scripts/update_server_airplay_pins.py \
+            --dockerfile server/Dockerfile \
+            --version "$RELEASE_TAG" \
+            --checksums-sha256 "$CHECKSUMS_SHA256"
+
+      - name: Create or update server pull request
+        uses: peter-evans/create-pull-request@v8
+        with:
+          path: server
+          token: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+          add-paths: Dockerfile
+          commit-message: "Update AirPlay CLI to ${{ github.ref_name }}"
+          # Server auto-merges only its auto-update frontend/models branches.
+          branch: "bump-airplay-cli-${{ github.ref_name }}"
+          delete-branch: true
+          base: dev
+          title: "Update AirPlay CLI to ${{ github.ref_name }}"
+          body: |
+            Update the server's AirPlay CLI pin to [${{ github.ref_name }}](https://github.com/music-assistant/airplay-cli/releases/tag/${{ github.ref_name }}), including the verified `SHA256SUMS` digest.
+          labels: |
+            dependencies
