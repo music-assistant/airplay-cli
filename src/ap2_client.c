@@ -124,7 +124,6 @@ struct ap2cl_s {
     bool mrp_device_registered;
     bool mrp_extended_registered;
     int mrp_last_playback_state;
-    int mrp_last_nowplaying_status;
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
     int events_sock;              /* reverse TCP events connection (kept open) */
