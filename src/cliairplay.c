@@ -213,12 +213,11 @@ static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info,
 
 static void mrp_artwork_reject_local(const char *reason)
 {
-    if (!g_ap2cl || !ap2cl_clear_mrp_artwork(g_ap2cl)) return;
-    int overall_status = ap2cl_mrp_push(g_ap2cl);
-    int status = ap2cl_mrp_last_nowplaying_status(g_ap2cl);
+    ap2_mrp_push_result_t push;
+    if (!g_ap2cl || !ap2cl_clear_mrp_artwork(g_ap2cl, &push)) return;
     status_print("[STATUS] mrp artwork=rejected reason=%s clear_status=%d",
-                 reason, status);
-    mrp_status_report(overall_status);
+                 reason, push.nowplaying_status);
+    mrp_status_report(push.overall_status);
 }
 
 /* Also emit the older human-readable status line; the [STATUS] lines from
@@ -457,17 +456,16 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                                    (int)image_size, (char *)image);
             } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
                 ap2_mrp_artwork_info_t mrp_info;
+                ap2_mrp_push_result_t push;
                 bool dmap_ok = ap2cl_set_artwork(
                     g_ap2cl, content_type, (int)image_size,
-                    (const char *)image, &mrp_info);
+                    (const char *)image, &mrp_info, &push);
                 if (!dmap_ok)
                     LOG_WARN("Receiver rejected DMAP artwork (%zu bytes, %s)",
                              image_size, content_type);
-                int overall_status = ap2cl_mrp_push(g_ap2cl);
-                int artwork_status =
-                    ap2cl_mrp_last_nowplaying_status(g_ap2cl);
-                mrp_artwork_status_report(&mrp_info, artwork_status);
-                mrp_status_report(overall_status);
+                mrp_artwork_status_report(
+                    &mrp_info, push.nowplaying_status);
+                mrp_status_report(push.overall_status);
             }
             free(image);
         }

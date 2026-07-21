@@ -46,8 +46,7 @@ typedef enum {
     AP2_MRP_ARTWORK_INVALID_ARGUMENT,
     AP2_MRP_ARTWORK_UNSUPPORTED_TYPE,
     AP2_MRP_ARTWORK_STAGING_LIMIT,
-    AP2_MRP_ARTWORK_INVALID_JPEG,
-    AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE,
+    AP2_MRP_ARTWORK_INVALID_JPEG_ENVELOPE,
     AP2_MRP_ARTWORK_NO_MEMORY,
 } ap2_mrp_artwork_result_t;
 
@@ -154,18 +153,17 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
 /*
  * Set the now-playing artwork.
  *
- * Runs a bounded JPEG-container preflight for 8-bit Huffman baseline (SOF0)
- * and progressive (SOF2) input within AP2_MRP_ARTWORK_STAGING_MAX_BYTES.
- * This preflight does not entropy-decode image coefficients or pixels. The
- * bound is internal staging/allocation policy only; it deliberately does not
- * claim a receiver byte, dimension, component, or progressive-JPEG limit.
- * Invalid input clears prior MRP artwork so a new track cannot retain stale
- * cover art.
+ * Stages any bounded image/jpeg with a basic SOI/terminal-EOI envelope.
+ * Dimensions, precision, SOF marker, components, and progressive shape are
+ * best-effort telemetry only and never acceptance criteria. The bound is
+ * internal staging/allocation policy; it does not claim a receiver byte,
+ * dimension, component, or JPEG-profile limit. Rejected input clears prior
+ * MRP artwork so a new track cannot retain stale cover art.
  *
  * :param mime: image MIME type; must be "image/jpeg".
  * :param data: image bytes (copied).
  * :param len: image byte count.
- * :param info: optional validation details.
+ * :param info: optional probe result and best-effort telemetry.
  */
 bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
                          const uint8_t *data, int len,
@@ -174,10 +172,10 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
 /* Clear retained artwork (used when a replacement local file cannot load). */
 void ap2_mrp_clear_artwork(struct ap2_mrp_ctx *m);
 
-/* Validate artwork without mutating an MRP context. */
+/* Probe the staging envelope and best-effort metadata without mutating state. */
 ap2_mrp_artwork_result_t
-ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
-                         ap2_mrp_artwork_info_t *info);
+ap2_mrp_probe_artwork(const char *mime, const uint8_t *data, size_t len,
+                      ap2_mrp_artwork_info_t *info);
 
 /* Stable diagnostic token for an artwork result. */
 const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result);

@@ -195,15 +195,14 @@ signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
 
 The DMAP path receives the detected image type and original bytes. Before MRP
-staging, a bounded JPEG-container preflight checks quantization/Huffman
-definitions, frame/scan component references, entropy marker escaping, and one
-terminal EOI; it does not decode coefficients or pixels. No Apple TV byte or
-profile cutoff is assumed.
+staging, a bounded metadata probe requires `image/jpeg`, SOI, and a terminal
+EOI, then extracts dimensions/profile best-effort without decoding or rejecting
+JPEG internals. No Apple TV byte or profile cutoff is assumed.
 Baseline/progressive and grayscale/color cases are logged with exact bytes,
 dimensions, SOF marker, component count, and `/command` response. A
 1 MiB internal staging-allocation guard bounds the copied input and plist; it
-is not a receiver capability claim. Invalid MRP artwork is omitted without
-withholding it from DMAP and clears stale MRP state.
+is not a receiver capability claim. Non-JPEG, over-bound, or incomplete-envelope
+MRP artwork is omitted without withholding it from DMAP and clears stale state.
 
 `tests/mrp_artwork_matrix.py` generates the controlled Apple TV size/profile
 matrix or records/sends any existing JPEG cache path with its SHA-256, profile,
