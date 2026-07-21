@@ -10,6 +10,7 @@
 #include "ap2_mrp.h"
 
 #include "mrp_jpeg_fixture.h"
+#include "mrp_jpeg_profile_fixtures.h"
 
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
@@ -46,6 +47,142 @@ static size_t jpeg_marker_offset(const uint8_t *data, size_t len,
         if (data[i] == 0xFF && data[i + 1] == marker) return i;
     }
     return len;
+}
+
+static size_t jpeg_ac_scan_offset(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i + 9 < len; i++) {
+        if (data[i] != 0xFF || data[i + 1] != 0xDA) continue;
+        size_t segment_len = ((size_t)data[i + 2] << 8) | data[i + 3];
+        if (segment_len < 6 || i + 2 + segment_len > len) continue;
+        uint8_t components = data[i + 4];
+        if (segment_len != 6 + 2 * (size_t)components) continue;
+        size_t spectral_start = i + 5 + 2 * (size_t)components;
+        if (data[spectral_start] > 0) return i;
+    }
+    return len;
+}
+
+static uint8_t *make_noninterleaved_jpeg(size_t *out_size)
+{
+    size_t sof = jpeg_marker_offset(k_baseline_jpeg,
+                                    sizeof(k_baseline_jpeg), 0xC0);
+    size_t sos = jpeg_marker_offset(k_baseline_jpeg,
+                                    sizeof(k_baseline_jpeg), 0xDA);
+    if (sof + 18 >= sizeof(k_baseline_jpeg) ||
+        sos >= sizeof(k_baseline_jpeg))
+        return NULL;
+
+    size_t size = sos + 3 * 11 + 2;
+    uint8_t *out = malloc(size);
+    if (!out) return NULL;
+    memcpy(out, k_baseline_jpeg, sos);
+    out[sof + 11] = 0x44; /* valid for separate scans; 16 blocks if interleaved */
+
+    size_t pos = sos;
+    for (uint8_t i = 0; i < 3; i++) {
+        uint8_t component_id = out[sof + 10 + i * 3];
+        uint8_t selectors = i == 0 ? 0x00 : 0x11;
+        static const uint8_t scan_prefix[] = {
+            0xFF, 0xDA, 0x00, 0x08, 0x01,
+        };
+        memcpy(out + pos, scan_prefix, sizeof(scan_prefix));
+        pos += sizeof(scan_prefix);
+        out[pos++] = component_id;
+        out[pos++] = selectors;
+        out[pos++] = 0;
+        out[pos++] = 63;
+        out[pos++] = 0;
+        out[pos++] = 1; /* one structural entropy byte */
+    }
+    out[pos++] = 0xFF;
+    out[pos++] = 0xD9;
+    if (pos != size) {
+        free(out);
+        return NULL;
+    }
+    *out_size = size;
+    return out;
+}
+
+static uint8_t *insert_empty_jpeg_segment(uint8_t marker, size_t *out_size)
+{
+    size_t size = sizeof(k_baseline_jpeg) + 4;
+    uint8_t *out = malloc(size);
+    if (!out) return NULL;
+    memcpy(out, k_baseline_jpeg, 2);
+    out[2] = 0xFF;
+    out[3] = marker;
+    out[4] = 0;
+    out[5] = 2;
+    memcpy(out + 6, k_baseline_jpeg + 2, sizeof(k_baseline_jpeg) - 2);
+    *out_size = size;
+    return out;
+}
+
+static uint8_t *insert_16bit_dqt(size_t *out_size)
+{
+    size_t size = sizeof(k_baseline_jpeg) + 133;
+    uint8_t *out = malloc(size);
+    if (!out) return NULL;
+    memcpy(out, k_baseline_jpeg, 2);
+    size_t pos = 2;
+    out[pos++] = 0xFF;
+    out[pos++] = 0xDB;
+    out[pos++] = 0x00;
+    out[pos++] = 0x83; /* 2-byte length + spec + 64 16-bit values */
+    out[pos++] = 0x10; /* Pq=1, Tq=0 */
+    for (size_t i = 0; i < 64; i++) {
+        out[pos++] = 0;
+        out[pos++] = 1;
+    }
+    memcpy(out + pos, k_baseline_jpeg + 2, sizeof(k_baseline_jpeg) - 2);
+    pos += sizeof(k_baseline_jpeg) - 2;
+    if (pos != size) {
+        free(out);
+        return NULL;
+    }
+    *out_size = size;
+    return out;
+}
+
+static uint8_t *make_restart_jpeg(size_t *out_size,
+                                  size_t *dri_offset,
+                                  size_t *restart_offset)
+{
+    size_t sos = jpeg_marker_offset(k_baseline_jpeg,
+                                    sizeof(k_baseline_jpeg), 0xDA);
+    if (sos + 4 >= sizeof(k_baseline_jpeg)) return NULL;
+    size_t sos_len =
+        ((size_t)k_baseline_jpeg[sos + 2] << 8) |
+        k_baseline_jpeg[sos + 3];
+    size_t entropy = sos + 2 + sos_len;
+    if (entropy >= sizeof(k_baseline_jpeg) - 2) return NULL;
+
+    size_t size = sizeof(k_baseline_jpeg) + 8;
+    uint8_t *out = malloc(size);
+    if (!out) return NULL;
+    size_t pos = 0;
+    memcpy(out, k_baseline_jpeg, sos);
+    pos += sos;
+    *dri_offset = pos;
+    static const uint8_t dri[] = {0xFF, 0xDD, 0x00, 0x04, 0x00, 0x01};
+    memcpy(out + pos, dri, sizeof(dri));
+    pos += sizeof(dri);
+    memcpy(out + pos, k_baseline_jpeg + sos, entropy - sos + 1);
+    pos += entropy - sos + 1;
+    *restart_offset = pos;
+    out[pos++] = 0xFF;
+    out[pos++] = 0xD0;
+    memcpy(out + pos, k_baseline_jpeg + entropy + 1,
+           sizeof(k_baseline_jpeg) - entropy - 1);
+    pos += sizeof(k_baseline_jpeg) - entropy - 1;
+    if (pos != size) {
+        free(out);
+        return NULL;
+    }
+    *out_size = size;
+    return out;
 }
 
 static uint8_t *make_padded_jpeg(size_t target_size)
@@ -146,23 +283,41 @@ static bool test_mrp_validation_boundary(void)
               "image/jpeg", k_baseline_jpeg, sizeof(k_baseline_jpeg) - 1,
               &info) == AP2_MRP_ARTWORK_INVALID_JPEG);
 
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", k_progressive_jpeg, sizeof(k_progressive_jpeg),
+              &info) == AP2_MRP_ARTWORK_ACCEPTED);
+    CHECK(info.progressive && info.sof_marker == 0xC2 &&
+          info.components == 3);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", k_grayscale_jpeg, sizeof(k_grayscale_jpeg),
+              &info) == AP2_MRP_ARTWORK_ACCEPTED);
+    CHECK(!info.progressive && info.sof_marker == 0xC0 &&
+          info.components == 1);
     uint8_t changed[sizeof(k_baseline_jpeg)];
     memcpy(changed, k_baseline_jpeg, sizeof(changed));
     size_t sof = jpeg_marker_offset(changed, sizeof(changed), 0xC0);
     CHECK(sof + 9 < sizeof(changed));
-    changed[sof + 1] = 0xC2;
-    CHECK(ap2_mrp_validate_artwork(
-              "image/jpeg", changed, sizeof(changed), &info) ==
-          AP2_MRP_ARTWORK_ACCEPTED);
-    CHECK(info.progressive && info.sof_marker == 0xC2);
-
-    memcpy(changed, k_baseline_jpeg, sizeof(changed));
     changed[sof + 7] = 0x02;
     changed[sof + 8] = 0x59; /* 601 pixels */
     CHECK(ap2_mrp_validate_artwork(
               "image/jpeg", changed, sizeof(changed), &info) ==
           AP2_MRP_ARTWORK_ACCEPTED);
     CHECK(info.width == 601 && info.height == 1);
+
+    size_t noninterleaved_size = 0;
+    uint8_t *noninterleaved =
+        make_noninterleaved_jpeg(&noninterleaved_size);
+    CHECK(noninterleaved != NULL);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", noninterleaved, noninterleaved_size, &info) ==
+          AP2_MRP_ARTWORK_ACCEPTED);
+    free(noninterleaved);
+
+    memcpy(changed, k_baseline_jpeg, sizeof(changed));
+    changed[sof + 11] = 0x44;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", changed, sizeof(changed), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
 
     static const size_t matrix_sizes[] = {
         44032, 61440, 65535, 65536, 66560, 102400, 153600,
@@ -186,6 +341,181 @@ static bool test_mrp_validation_boundary(void)
               AP2_MRP_ARTWORK_SAFETY_MAX_BYTES + 1, &info) ==
           AP2_MRP_ARTWORK_SAFETY_LIMIT);
     free(oversize);
+    return true;
+}
+
+static bool test_malformed_jpeg_structures(void)
+{
+    ap2_mrp_artwork_info_t info;
+    static const uint8_t empty_tables[] = {
+        0xFF, 0xD8,
+        0xFF, 0xFE, 0x00, 0x07, 'f', 'a', 'k', 'e', '!',
+        0xFF, 0xDB, 0x00, 0x02,
+        0xFF, 0xC4, 0x00, 0x02,
+        0xFF, 0xC0, 0x00, 0x0B, 0x08, 0x00, 0x01, 0x00, 0x01,
+        0x01, 0x01, 0x11, 0x00,
+        0xFF, 0xDA, 0x00, 0x08, 0x01, 0x01, 0x00, 0x00, 0x3F, 0x00,
+        0x01, 0xFF, 0xD9,
+    };
+    CHECK(sizeof(empty_tables) == 45);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", empty_tables, sizeof(empty_tables), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    uint8_t changed[sizeof(k_baseline_jpeg)];
+    size_t dqt = jpeg_marker_offset(k_baseline_jpeg,
+                                    sizeof(k_baseline_jpeg), 0xDB);
+    size_t dht = jpeg_marker_offset(k_baseline_jpeg,
+                                    sizeof(k_baseline_jpeg), 0xC4);
+    size_t sof = jpeg_marker_offset(k_baseline_jpeg,
+                                    sizeof(k_baseline_jpeg), 0xC0);
+    size_t sos = jpeg_marker_offset(k_baseline_jpeg,
+                                    sizeof(k_baseline_jpeg), 0xDA);
+    CHECK(dqt + 5 < sizeof(changed));
+    CHECK(dht + 5 < sizeof(changed));
+    CHECK(sof + 12 < sizeof(changed));
+    CHECK(sos + 6 < sizeof(changed));
+
+    size_t inserted_size = 0;
+    uint8_t *inserted = insert_empty_jpeg_segment(0xDB, &inserted_size);
+    CHECK(inserted != NULL);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", inserted, inserted_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    free(inserted);
+
+    inserted = insert_empty_jpeg_segment(0xC4, &inserted_size);
+    CHECK(inserted != NULL);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", inserted, inserted_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    free(inserted);
+
+    inserted = insert_16bit_dqt(&inserted_size);
+    CHECK(inserted != NULL);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", inserted, inserted_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    free(inserted);
+
+    memcpy(changed, k_baseline_jpeg, sizeof(changed));
+    changed[dqt + 5] = 0; /* zero quantizer */
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", changed, sizeof(changed), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    memcpy(changed, k_baseline_jpeg, sizeof(changed));
+    size_t huffman_symbols = 0;
+    for (size_t i = 0; i < 16; i++)
+        huffman_symbols += changed[dht + 5 + i];
+    CHECK(huffman_symbols >= 3 && huffman_symbols <= 258);
+    memset(changed + dht + 5, 0, 16);
+    changed[dht + 5] = 3;
+    changed[dht + 20] = (uint8_t)(huffman_symbols - 3);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", changed, sizeof(changed), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    uint8_t progressive[sizeof(k_progressive_jpeg)];
+    size_t progressive_dht = jpeg_marker_offset(
+        k_progressive_jpeg, sizeof(k_progressive_jpeg), 0xC4);
+    CHECK(progressive_dht + 6 < sizeof(progressive));
+    CHECK(k_progressive_jpeg[progressive_dht + 5] == 1);
+    CHECK(k_progressive_jpeg[progressive_dht + 6] == 1);
+    memcpy(progressive, k_progressive_jpeg, sizeof(progressive));
+    progressive[progressive_dht + 5] = 2;
+    progressive[progressive_dht + 6] = 0; /* complete tree: all-ones code */
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", progressive, sizeof(progressive), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    size_t ac_scan = jpeg_ac_scan_offset(
+        k_progressive_jpeg, sizeof(k_progressive_jpeg));
+    CHECK(ac_scan < sizeof(progressive));
+    uint8_t ac_components = k_progressive_jpeg[ac_scan + 4];
+    size_t approximation = ac_scan + 7 + 2 * (size_t)ac_components;
+    CHECK(approximation < sizeof(progressive));
+    memcpy(progressive, k_progressive_jpeg, sizeof(progressive));
+    progressive[approximation] = 0x21; /* refinement before an AC first scan */
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", progressive, sizeof(progressive), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    memcpy(changed, k_baseline_jpeg, sizeof(changed));
+    changed[sof + 12] = 3; /* undefined quantization table */
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", changed, sizeof(changed), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    memcpy(changed, k_baseline_jpeg, sizeof(changed));
+    changed[sos + 5] = 0x7F; /* scan component absent from SOF */
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", changed, sizeof(changed), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    memcpy(changed, k_baseline_jpeg, sizeof(changed));
+    changed[sos + 6] = 0x22; /* undefined DC/AC Huffman tables */
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", changed, sizeof(changed), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    size_t sos_len =
+        ((size_t)k_baseline_jpeg[sos + 2] << 8) |
+        k_baseline_jpeg[sos + 3];
+    size_t entropy = sos + 2 + sos_len;
+    CHECK(entropy + 3 < sizeof(changed));
+
+    uint8_t empty_scan[sizeof(k_baseline_jpeg)];
+    memcpy(empty_scan, k_baseline_jpeg, entropy);
+    empty_scan[entropy] = 0xFF;
+    empty_scan[entropy + 1] = 0xD9;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", empty_scan, entropy + 2, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    memcpy(changed, k_baseline_jpeg, sizeof(changed));
+    changed[entropy] = 0xFF;
+    changed[entropy + 1] = 0xFF;
+    changed[entropy + 2] = 0x00; /* invalid fill + stuffing */
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", changed, sizeof(changed), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    uint8_t trailing[sizeof(k_baseline_jpeg) + 1];
+    memcpy(trailing, k_baseline_jpeg, sizeof(k_baseline_jpeg));
+    trailing[sizeof(k_baseline_jpeg)] = 0;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", trailing, sizeof(trailing), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    uint8_t duplicate_eoi[sizeof(k_baseline_jpeg) + 2];
+    memcpy(duplicate_eoi, k_baseline_jpeg, sizeof(k_baseline_jpeg));
+    duplicate_eoi[sizeof(k_baseline_jpeg)] = 0xFF;
+    duplicate_eoi[sizeof(k_baseline_jpeg) + 1] = 0xD9;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", duplicate_eoi, sizeof(duplicate_eoi), &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+
+    size_t restart_size = 0;
+    size_t dri_offset = 0;
+    size_t restart_offset = 0;
+    uint8_t *restart = make_restart_jpeg(
+        &restart_size, &dri_offset, &restart_offset);
+    CHECK(restart != NULL);
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", restart, restart_size, &info) ==
+          AP2_MRP_ARTWORK_ACCEPTED);
+    restart[dri_offset + 4] = 0;
+    restart[dri_offset + 5] = 0;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", restart, restart_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    restart[dri_offset + 5] = 1;
+    restart[restart_offset + 1] = 0xD1;
+    CHECK(ap2_mrp_validate_artwork(
+              "image/jpeg", restart, restart_size, &info) ==
+          AP2_MRP_ARTWORK_INVALID_JPEG);
+    free(restart);
     return true;
 }
 
@@ -318,6 +648,7 @@ int main(int argc, char **argv)
 {
     if (!test_local_file_boundary() ||
         !test_mrp_validation_boundary() ||
+        !test_malformed_jpeg_structures() ||
         !test_nowplaying_command_payload())
         return 1;
     for (int i = 1; i < argc; i++) {

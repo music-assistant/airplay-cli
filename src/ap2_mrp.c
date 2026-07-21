@@ -257,6 +257,126 @@ static bool mrp_jpeg_is_sof(uint8_t marker)
     }
 }
 
+typedef struct {
+    uint8_t id;
+    uint8_t quant_table;
+    uint8_t horizontal_sampling;
+    uint8_t vertical_sampling;
+} mrp_jpeg_component_t;
+
+static bool mrp_jpeg_parse_dqt(const uint8_t *data, size_t len,
+                               uint8_t *defined_tables)
+{
+    size_t pos = 0;
+    bool found = false;
+    while (pos < len) {
+        uint8_t spec = data[pos++];
+        uint8_t precision = spec >> 4;
+        uint8_t table = spec & 0x0F;
+        if (precision != 0 || table > 3) return false;
+        size_t table_size = 64;
+        if (table_size > len - pos) return false;
+        for (size_t i = 0; i < 64; i++) {
+            if (data[pos + i] == 0) return false;
+        }
+        pos += table_size;
+        *defined_tables |= (uint8_t)(1u << table);
+        found = true;
+    }
+    return found;
+}
+
+static bool mrp_jpeg_parse_dht(const uint8_t *data, size_t len,
+                               uint8_t *dc_tables, uint8_t *ac_tables)
+{
+    size_t pos = 0;
+    bool found = false;
+    while (pos < len) {
+        if (len - pos < 17) return false;
+        uint8_t spec = data[pos++];
+        uint8_t table_class = spec >> 4;
+        uint8_t table = spec & 0x0F;
+        if (table_class > 1 || table > 3) return false;
+
+        const uint8_t *counts = data + pos;
+        pos += 16;
+        int code_space = 1;
+        size_t symbols = 0;
+        for (int i = 0; i < 16; i++) {
+            code_space = code_space * 2 - counts[i];
+            if (code_space < 0) return false;
+            symbols += counts[i];
+        }
+        if (code_space == 0 || symbols == 0 ||
+            symbols > 256 || symbols > len - pos)
+            return false;
+
+        for (size_t i = 0; i < symbols; i++) {
+            uint8_t symbol = data[pos + i];
+            if (table_class == 0) {
+                if (symbol > 11) return false;
+            } else {
+                uint8_t size = symbol & 0x0F;
+                if (size > 10) return false;
+            }
+        }
+        pos += symbols;
+        if (table_class == 0)
+            *dc_tables |= (uint8_t)(1u << table);
+        else
+            *ac_tables |= (uint8_t)(1u << table);
+        found = true;
+    }
+    return found;
+}
+
+static int mrp_jpeg_find_component(const mrp_jpeg_component_t *components,
+                                   uint8_t count, uint8_t id)
+{
+    for (uint8_t i = 0; i < count; i++) {
+        if (components[i].id == id) return i;
+    }
+    return -1;
+}
+
+/* Advance from scan data to the next non-stuffed, non-restart marker. */
+static bool mrp_jpeg_scan_entropy(const uint8_t *data, size_t len,
+                                  size_t *position,
+                                  uint16_t restart_interval)
+{
+    size_t pos = *position;
+    size_t entropy_bytes = 0;
+    uint8_t expected_restart = 0;
+    while (pos < len) {
+        if (data[pos] != 0xFF) {
+            pos++;
+            entropy_bytes++;
+            continue;
+        }
+
+        size_t marker_start = pos++;
+        if (pos >= len) return false;
+        if (data[pos] == 0x00) {
+            pos++;
+            entropy_bytes++;
+            continue;
+        }
+        while (pos < len && data[pos] == 0xFF) pos++;
+        if (pos >= len || data[pos] == 0x00) return false;
+        if (data[pos] >= 0xD0 && data[pos] <= 0xD7) {
+            if (restart_interval == 0 ||
+                data[pos] != (uint8_t)(0xD0 + expected_restart))
+                return false;
+            expected_restart = (uint8_t)((expected_restart + 1) & 7);
+            pos++;
+            continue;
+        }
+        *position = marker_start;
+        return entropy_bytes > 0;
+    }
+    return false;
+}
+
 ap2_mrp_artwork_result_t
 ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
                          ap2_mrp_artwork_info_t *info)
@@ -276,8 +396,16 @@ ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
     }
 
     bool saw_sof = false;
-    bool saw_quantization_table = false;
-    bool saw_huffman_table = false;
+    mrp_jpeg_component_t frame_components[4] = {0};
+    uint8_t frame_component_count = 0;
+    uint8_t quant_tables = 0;
+    uint8_t dc_tables = 0;
+    uint8_t ac_tables = 0;
+    uint8_t baseline_scanned = 0;
+    uint16_t restart_interval = 0;
+    int8_t progressive_bits[4][64];
+    memset(progressive_bits, -1, sizeof(progressive_bits));
+    unsigned scan_count = 0;
     size_t pos = 2;
     while (pos + 1 < len) {
         if (data[pos++] != 0xFF)
@@ -286,11 +414,26 @@ ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
         if (pos >= len) break;
         uint8_t marker = data[pos++];
 
-        if (marker == 0xD9) break;
-        if (marker == 0x00 || marker == 0xD8)
+        if (marker == 0xD9) {
+            uint8_t all_components =
+                (uint8_t)((1u << frame_component_count) - 1u);
+            bool all_scanned = baseline_scanned == all_components;
+            if (info->progressive) {
+                all_scanned = true;
+                for (uint8_t i = 0; i < frame_component_count; i++) {
+                    if (progressive_bits[i][0] < 0) {
+                        all_scanned = false;
+                        break;
+                    }
+                }
+            }
+            if (!saw_sof || scan_count == 0 || !all_scanned || pos != len)
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+            return mrp_artwork_result(info, AP2_MRP_ARTWORK_ACCEPTED);
+        }
+        if (marker == 0x00 || marker == 0x01 || marker == 0xD8 ||
+            (marker >= 0xD0 && marker <= 0xD7))
             return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
-        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
-            continue;
         if (pos + 2 > len) break;
 
         size_t segment_len = ((size_t)data[pos] << 8) | data[pos + 1];
@@ -312,42 +455,163 @@ ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
             if (sof[0] != 8 || components < 1 || components > 4)
                 return mrp_artwork_result(
                     info, AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE);
-            if (info) {
-                info->precision = sof[0];
-                info->height = ((uint16_t)sof[1] << 8) | sof[2];
-                info->width = ((uint16_t)sof[3] << 8) | sof[4];
-                info->components = components;
-                info->sof_marker = marker;
-                info->progressive = marker == 0xC2;
-                if (info->width == 0 || info->height == 0)
+            info->precision = sof[0];
+            info->height = ((uint16_t)sof[1] << 8) | sof[2];
+            info->width = ((uint16_t)sof[3] << 8) | sof[4];
+            info->components = components;
+            info->sof_marker = marker;
+            info->progressive = marker == 0xC2;
+            if (info->width == 0 || info->height == 0)
+                return mrp_artwork_result(
+                    info, AP2_MRP_ARTWORK_INVALID_JPEG);
+
+            for (uint8_t i = 0; i < components; i++) {
+                const uint8_t *component = sof + 6 + i * 3;
+                uint8_t id = component[0];
+                uint8_t horizontal = component[1] >> 4;
+                uint8_t vertical = component[1] & 0x0F;
+                uint8_t quant_table = component[2];
+                if (mrp_jpeg_find_component(frame_components, i, id) >= 0 ||
+                    horizontal == 0 || horizontal > 4 ||
+                    vertical == 0 || vertical > 4 || quant_table > 3)
+                    return mrp_artwork_result(
+                        info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                frame_components[i].id = id;
+                frame_components[i].quant_table = quant_table;
+                frame_components[i].horizontal_sampling = horizontal;
+                frame_components[i].vertical_sampling = vertical;
+            }
+            frame_component_count = components;
+            saw_sof = true;
+        } else if (marker == 0xDB) {
+            if (!mrp_jpeg_parse_dqt(data + pos + 2, segment_len - 2,
+                                    &quant_tables))
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+        } else if (marker == 0xC4) {
+            if (!mrp_jpeg_parse_dht(data + pos + 2, segment_len - 2,
+                                    &dc_tables, &ac_tables))
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+        } else if (marker == 0xDD) {
+            if (segment_len != 4)
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+            restart_interval =
+                ((uint16_t)data[pos + 2] << 8) | data[pos + 3];
+        } else if (marker == 0xDA) {
+            if (!saw_sof)
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+            const uint8_t *sos = data + pos + 2;
+            uint8_t scan_components = segment_len >= 3 ? sos[0] : 0;
+            if (scan_components < 1 ||
+                scan_components > frame_component_count ||
+                segment_len != 6 + 2 * (size_t)scan_components)
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+
+            uint8_t scan_component_mask = 0;
+            uint8_t dc_selectors[4] = {0};
+            uint8_t ac_selectors[4] = {0};
+            int frame_indexes[4] = {0};
+            for (uint8_t i = 0; i < scan_components; i++) {
+                uint8_t id = sos[1 + i * 2];
+                uint8_t selectors = sos[2 + i * 2];
+                int frame_index = mrp_jpeg_find_component(
+                    frame_components, frame_component_count, id);
+                if (frame_index < 0 ||
+                    (scan_component_mask & (1u << frame_index)) ||
+                    (selectors >> 4) > 3 || (selectors & 0x0F) > 3)
+                    return mrp_artwork_result(
+                        info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                if (!(quant_tables &
+                      (1u << frame_components[frame_index].quant_table)))
+                    return mrp_artwork_result(
+                        info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                scan_component_mask |= (uint8_t)(1u << frame_index);
+                frame_indexes[i] = frame_index;
+                dc_selectors[i] = selectors >> 4;
+                ac_selectors[i] = selectors & 0x0F;
+            }
+            if (scan_components > 1) {
+                unsigned blocks_per_mcu = 0;
+                for (uint8_t i = 0; i < scan_components; i++) {
+                    int frame_index = frame_indexes[i];
+                    blocks_per_mcu +=
+                        frame_components[frame_index].horizontal_sampling *
+                        frame_components[frame_index].vertical_sampling;
+                }
+                if (blocks_per_mcu > 10)
                     return mrp_artwork_result(
                         info, AP2_MRP_ARTWORK_INVALID_JPEG);
             }
-            saw_sof = true;
-        }
 
-        if (marker == 0xDB) saw_quantization_table = true;
-        if (marker == 0xC4) saw_huffman_table = true;
-        if (marker == 0xDA) {
-            const uint8_t *sos = data + pos + 2;
-            uint8_t components = segment_len >= 3 ? sos[0] : 0;
-            size_t scan_fields = 1 + 2 * (size_t)components;
-            bool valid_scan =
-                segment_len == 6 + 2 * (size_t)components &&
-                components >= 1 &&
-                (!info || components <= info->components);
-            if (valid_scan && info && !info->progressive) {
-                valid_scan =
-                    sos[scan_fields] == 0 &&
-                    sos[scan_fields + 1] == 63 &&
-                    sos[scan_fields + 2] == 0;
+            size_t scan_fields = 1 + 2 * (size_t)scan_components;
+            uint8_t spectral_start = sos[scan_fields];
+            uint8_t spectral_end = sos[scan_fields + 1];
+            uint8_t approximation = sos[scan_fields + 2];
+            uint8_t approx_high = approximation >> 4;
+            uint8_t approx_low = approximation & 0x0F;
+            if (!info->progressive) {
+                if (spectral_start != 0 || spectral_end != 63 ||
+                    approximation != 0 ||
+                    (baseline_scanned & scan_component_mask))
+                    return mrp_artwork_result(
+                        info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                for (uint8_t i = 0; i < scan_components; i++) {
+                    if (!(dc_tables & (1u << dc_selectors[i])) ||
+                        !(ac_tables & (1u << ac_selectors[i])))
+                        return mrp_artwork_result(
+                            info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                }
+                baseline_scanned |= scan_component_mask;
+            } else {
+                if (spectral_start > spectral_end || spectral_end > 63 ||
+                    (spectral_start == 0 && spectral_end != 0) ||
+                    (spectral_start > 0 && scan_components != 1) ||
+                    approx_high > 13 || approx_low > 13 ||
+                    (approx_high > 0 && approx_high != approx_low + 1))
+                    return mrp_artwork_result(
+                        info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                for (uint8_t i = 0; i < scan_components; i++) {
+                    int frame_index = frame_indexes[i];
+                    if (spectral_start > 0 &&
+                        progressive_bits[frame_index][0] < 0)
+                        return mrp_artwork_result(
+                            info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                    for (uint8_t coefficient = spectral_start;
+                         coefficient <= spectral_end; coefficient++) {
+                        int8_t current =
+                            progressive_bits[frame_index][coefficient];
+                        if ((approx_high == 0 && current >= 0) ||
+                            (approx_high > 0 && current != approx_high))
+                            return mrp_artwork_result(
+                                info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                    }
+                    if (spectral_start == 0 && approx_high == 0) {
+                        if (!(dc_tables & (1u << dc_selectors[i])))
+                            return mrp_artwork_result(
+                                info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                    } else {
+                        if (spectral_start > 0 &&
+                            !(ac_tables & (1u << ac_selectors[i])))
+                            return mrp_artwork_result(
+                                info, AP2_MRP_ARTWORK_INVALID_JPEG);
+                    }
+                }
+                for (uint8_t i = 0; i < scan_components; i++) {
+                    int frame_index = frame_indexes[i];
+                    for (uint8_t coefficient = spectral_start;
+                         coefficient <= spectral_end; coefficient++)
+                        progressive_bits[frame_index][coefficient] = approx_low;
+                }
             }
-            ap2_mrp_artwork_result_t result =
-                saw_sof && saw_quantization_table &&
-                saw_huffman_table && valid_scan
-                    ? AP2_MRP_ARTWORK_ACCEPTED
-                    : AP2_MRP_ARTWORK_INVALID_JPEG;
-            return mrp_artwork_result(info, result);
+
+            scan_count++;
+            pos += segment_len;
+            if (!mrp_jpeg_scan_entropy(data, len, &pos, restart_interval))
+                return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
+            continue;
+        } else if (!((marker >= 0xE0 && marker <= 0xEF) ||
+                     marker == 0xFE)) {
+            return mrp_artwork_result(
+                info, AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE);
         }
         pos += segment_len;
     }
