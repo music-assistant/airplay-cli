@@ -108,10 +108,10 @@ static bool test_local_file_boundary(void)
 
     uint8_t *loaded = NULL;
     size_t loaded_len = 0;
-    char content_type[ARTWORK_CONTENT_TYPE_SIZE];
+    char content_type[32];
     char error[160];
-    CHECK(artwork_load_file(path, &loaded, &loaded_len, content_type,
-                            error, sizeof(error)));
+    CHECK(artwork_load(path, &loaded, &loaded_len, content_type,
+                       error, sizeof(error)));
     CHECK(unlink(path) == 0);
     CHECK(loaded_len == sizeof(k_baseline_jpeg));
     CHECK(memcmp(loaded, k_baseline_jpeg, loaded_len) == 0);
@@ -124,8 +124,8 @@ static bool test_local_file_boundary(void)
     static const uint8_t invalid[] = "not an image";
     CHECK(write_all(fd, invalid, sizeof(invalid) - 1));
     CHECK(close(fd) == 0);
-    CHECK(!artwork_load_file(invalid_path, &loaded, &loaded_len, content_type,
-                             error, sizeof(error)));
+    CHECK(!artwork_load(invalid_path, &loaded, &loaded_len, content_type,
+                        error, sizeof(error)));
     CHECK(unlink(invalid_path) == 0);
     return true;
 }
@@ -227,9 +227,9 @@ static bool test_decoder_valid_profile_fixtures(void)
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         uint8_t *data = NULL;
         size_t size = 0;
-        char content_type[ARTWORK_CONTENT_TYPE_SIZE];
+        char content_type[32];
         char error[160];
-        CHECK(artwork_load_file(
+        CHECK(artwork_load(
             cases[i].path, &data, &size, content_type, error, sizeof(error)));
         ap2_mrp_artwork_info_t info;
         CHECK(ap2_mrp_probe_artwork(
@@ -369,10 +369,10 @@ static bool probe_generated_case(const char *path)
 {
     uint8_t *data = NULL;
     size_t size = 0;
-    char content_type[ARTWORK_CONTENT_TYPE_SIZE];
+    char content_type[32];
     char error[160];
-    CHECK(artwork_load_file(path, &data, &size, content_type,
-                            error, sizeof(error)));
+    CHECK(artwork_load(path, &data, &size, content_type,
+                       error, sizeof(error)));
     ap2_mrp_artwork_info_t info;
     ap2_mrp_artwork_result_t result =
         ap2_mrp_probe_artwork(content_type, data, size, &info);

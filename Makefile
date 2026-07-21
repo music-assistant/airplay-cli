@@ -128,7 +128,7 @@ CLIENT_TEST_OBJECTS = $(filter-out $(BUILDDIR)/ap2_client.o \
 
 TEST_EXECUTABLE = $(BUILDDIR)/test-mrp-artwork
 TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
-	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_plist.o \
+	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
 	$(BUILDDIR)/artwork.o $(BUILDDIR)/cross_log.o
 RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-raop-lifecycle
 RAOP_LIFECYCLE_TEST_OBJECTS = $(BUILDDIR)/test_ap2_raop_lifecycle.o \

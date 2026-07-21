@@ -166,9 +166,9 @@ static bool contains_bytes(const uint8_t *haystack, int haystack_len,
 static void test_artwork_snapshot_generation(const uint8_t secret[KEY_SIZE])
 {
     static const uint8_t first_art[] =
-        {0xf1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x7f};
+        {0xff, 0xd8, 0xf1, 0x11, 0x22, 0x33, 0xff, 0xd9};
     static const uint8_t second_art[] =
-        {0xe2, 0x91, 0x82, 0x73, 0x64, 0x55, 0x46, 0x3e};
+        {0xff, 0xd8, 0xe2, 0x91, 0x82, 0x73, 0xff, 0xd9};
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
         "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
         "Music Assistant", "11111111-2222-4333-8444-555555555555",
@@ -176,7 +176,7 @@ static void test_artwork_snapshot_generation(const uint8_t secret[KEY_SIZE])
     assert(mrp);
 
     assert(ap2_mrp_set_artwork(
-        mrp, "image/test", first_art, (int)sizeof(first_art)));
+        mrp, "image/jpeg", first_art, (int)sizeof(first_art), NULL));
     uint64_t first_generation = ap2_mrp_artwork_generation(mrp);
     uint8_t *first_snapshot = NULL;
     int first_len = 0;
@@ -186,7 +186,7 @@ static void test_artwork_snapshot_generation(const uint8_t secret[KEY_SIZE])
         first_snapshot, first_len, first_art, (int)sizeof(first_art)));
 
     assert(ap2_mrp_set_artwork(
-        mrp, "image/test", second_art, (int)sizeof(second_art)));
+        mrp, "image/jpeg", second_art, (int)sizeof(second_art), NULL));
     ap2_mrp_mark_artwork_sent_if_generation(mrp, first_generation);
 
     uint8_t *second_snapshot = NULL;
