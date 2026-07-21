@@ -1506,11 +1506,26 @@ static bool ap2_native_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames
 
 /* ---- RAOP-compat connect ---- */
 
+/* lifecycle_lock is held by every caller. Disconnect the protocol session
+ * before releasing its client so reconnect can never overwrite the owner. */
+static void ap2_raop_compat_cleanup(struct ap2cl_s *p)
+{
+    if (p->raopcl) {
+        raopcl_disconnect(p->raopcl);
+        raopcl_destroy(p->raopcl);
+        p->raopcl = NULL;
+    }
+    p->state = AP2_DOWN;
+}
+
 static bool ap2_raop_compat_connect(struct ap2cl_s *p)
 {
     /* auth-setup (the MFi X25519 exchange some AP2 receivers require) is handled
      * inside libraop's raopcl_connect() via rtspcl_auth_setup() when the device's
      * et field advertises type 4 — on the real RTSP socket, not a throwaway one. */
+
+    /* A failed/partial prior session must not be replaced without release. */
+    ap2_raop_compat_cleanup(p);
 
     /* Use libraop RAOP client */
     struct in_addr host_addr, player_addr;
@@ -1739,8 +1754,7 @@ static bool ap2cl_disconnect_unlocked(struct ap2cl_s *p)
         }
         ap2_native_session_cleanup(p);
     } else if (p->raopcl) {
-        raopcl_disconnect(p->raopcl);
-        p->state = AP2_DOWN;
+        ap2_raop_compat_cleanup(p);
     }
     return true;
 }

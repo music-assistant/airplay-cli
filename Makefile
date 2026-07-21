@@ -123,11 +123,22 @@ TEST_EXECUTABLE = $(BUILDDIR)/test-mrp-artwork
 TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
 	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_plist.o \
 	$(BUILDDIR)/artwork.o $(BUILDDIR)/cross_log.o
+RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-raop-lifecycle
+RAOP_LIFECYCLE_TEST_DEFINES = \
+	-Draopcl_create=test_raopcl_create \
+	-Draopcl_connect=test_raopcl_connect \
+	-Draopcl_disconnect=test_raopcl_disconnect \
+	-Draopcl_destroy=test_raopcl_destroy
+RAOP_LIFECYCLE_TEST_OBJECTS = $(BUILDDIR)/test_raop_lifecycle.o \
+	$(BUILDDIR)/ap2_client_raop_lifecycle_test.o \
+	$(filter-out $(BUILDDIR)/ap2_client.o $(BUILDDIR)/cliairplay.o \
+		$(BUILDDIR)/cross_ssl.o,$(OBJECTS_ALL))
 
 all: directory $(EXECUTABLE)
 
-test: directory $(TEST_EXECUTABLE)
+test: directory $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(TEST_EXECUTABLE)
+	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 
 directory:
@@ -145,8 +156,19 @@ $(EXECUTABLE): $(OBJECTS_ALL) $(LIBCODECS_PATCHED)
 $(TEST_EXECUTABLE): $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a
 	$(CC) $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
+$(RAOP_LIFECYCLE_TEST_EXECUTABLE): $(RAOP_LIFECYCLE_TEST_OBJECTS) $(LIBCODECS_PATCHED) $(OPENSSL)/libopenssl.a
+	$(CXX) $(RAOP_LIFECYCLE_TEST_OBJECTS) \
+		$(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) $(OPENSSL)/libopenssl.a \
+		$(LDFLAGS) -o $@
+
 $(BUILDDIR)/test_mrp_artwork.o: tests/test_mrp_artwork.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
+$(BUILDDIR)/test_raop_lifecycle.o: tests/test_raop_lifecycle.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
+
+$(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
 
 $(BUILDDIR)/%.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
