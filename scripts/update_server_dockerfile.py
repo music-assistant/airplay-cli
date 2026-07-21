@@ -128,6 +128,12 @@ def update_dockerfile(
             os.fsync(temporary.fileno())
         os.replace(temporary_name, dockerfile)
         replaced = True
+        # Persist the renamed directory entry as well as the file contents.
+        directory_fd = os.open(dockerfile.parent, os.O_RDONLY)
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if not replaced:
             Path(temporary_name).unlink(missing_ok=True)
