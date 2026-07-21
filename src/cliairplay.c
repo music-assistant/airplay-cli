@@ -239,6 +239,7 @@ static struct {
     size_t rd, wr, fill;
     size_t max_fill;
     bool eof;
+    int error;
     bool started;
     int fd;
     pthread_t thread;
@@ -256,9 +257,13 @@ static void *input_ring_thread(void *arg)
     while (g_running) {
         ssize_t n = read(g_inring.fd, chunk, sizeof(chunk));
         if (n < 0 && errno == EINTR) continue;
+        int read_error = n < 0 ? errno : 0;
         pthread_mutex_lock(&g_inring.lock);
         if (n <= 0) {
-            g_inring.eof = true;
+            if (n == 0)
+                g_inring.eof = true;
+            else
+                g_inring.error = read_error;
             pthread_cond_broadcast(&g_inring.can_read);
             pthread_mutex_unlock(&g_inring.lock);
             break;
@@ -294,6 +299,9 @@ static void input_ring_start(int fd, unsigned byte_rate, int cap_ms)
      * the pre-start prefill (latency) plus margin. */
     uint64_t cap = (uint64_t)byte_rate * (uint64_t)cap_ms / 1000;
     g_inring.max_fill = (cap && cap < INPUT_RING_BYTES) ? (size_t)cap : INPUT_RING_BYTES;
+    g_inring.rd = g_inring.wr = g_inring.fill = 0;
+    g_inring.eof = false;
+    g_inring.error = 0;
     g_inring.started = true;
     pthread_create(&g_inring.thread, NULL, input_ring_thread, NULL);
 }
@@ -302,7 +310,7 @@ static void input_ring_start(int fd, unsigned byte_rate, int cap_ms)
 static int input_ring_read(uint8_t *buf, size_t want)
 {
     pthread_mutex_lock(&g_inring.lock);
-    while (g_inring.fill == 0 && !g_inring.eof && g_running)
+    while (g_inring.fill == 0 && !g_inring.eof && !g_inring.error && g_running)
         pthread_cond_wait(&g_inring.can_read, &g_inring.lock);
     size_t n = g_inring.fill < want ? g_inring.fill : want;
     size_t got = 0;
@@ -316,8 +324,50 @@ static int input_ring_read(uint8_t *buf, size_t want)
     }
     g_inring.fill -= n;
     if (n) pthread_cond_broadcast(&g_inring.can_write);
+    int error = g_inring.error;
     pthread_mutex_unlock(&g_inring.lock);
-    return (int)n;
+    return n ? (int)n : (error ? -1 : 0);
+}
+
+enum { INPUT_RING_TIMEOUT = -2 };
+
+/* Read with a bounded wait so native control failures remain observable while
+ * the PCM producer is stalled. */
+static int input_ring_read_timed(uint8_t *buf, size_t want, int timeout_ms)
+{
+    struct timespec deadline;
+    clock_gettime(CLOCK_REALTIME, &deadline);
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+
+    pthread_mutex_lock(&g_inring.lock);
+    while (g_inring.fill == 0 && !g_inring.eof && !g_inring.error && g_running) {
+        int rc = pthread_cond_timedwait(&g_inring.can_read, &g_inring.lock,
+                                        &deadline);
+        if (rc == ETIMEDOUT) {
+            pthread_mutex_unlock(&g_inring.lock);
+            return INPUT_RING_TIMEOUT;
+        }
+    }
+    size_t n = g_inring.fill < want ? g_inring.fill : want;
+    size_t got = 0;
+    while (got < n) {
+        size_t to_end = INPUT_RING_BYTES - g_inring.rd;
+        size_t chunk_len = n - got;
+        if (chunk_len > to_end) chunk_len = to_end;
+        memcpy(buf + got, g_inring.data + g_inring.rd, chunk_len);
+        g_inring.rd = (g_inring.rd + chunk_len) % INPUT_RING_BYTES;
+        got += chunk_len;
+    }
+    g_inring.fill -= n;
+    if (n) pthread_cond_broadcast(&g_inring.can_write);
+    int error = g_inring.error;
+    pthread_mutex_unlock(&g_inring.lock);
+    return n ? (int)n : (error ? -1 : 0);
 }
 
 /* ---- Command pipe handler ---- */
@@ -731,12 +781,17 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     }
 
     /* Schedule start time */
+    bool started;
     if (cfg->ntp_start) {
-        ap2cl_start_at(g_ap2cl, cfg->ntp_start);
+        started = ap2cl_start_at(g_ap2cl, cfg->ntp_start);
     } else {
         uint64_t now = raopcl_get_ntp(NULL);
         uint64_t start_at = now + MS2NTP(cfg->latency_ms);
-        ap2cl_start_at(g_ap2cl, start_at);
+        started = ap2cl_start_at(g_ap2cl, start_at);
+    }
+    if (!started) {
+        status_error("Cannot start AirPlay 2 stream");
+        return 1;
     }
 
     /* Placeholder metadata must follow ap2cl_start_at: that call sets the RTP
@@ -752,6 +807,9 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     uint8_t *buf = malloc(AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
     uint8_t *ap2_alac_buf = (cfg->bit_depth > 16) ? malloc(AP2_FRAMES_PER_CHUNK * ap2_alac_bpf) : NULL;
     bool got_eof = false;
+    bool playback_failed = false;
+    bool starving = false;
+    uint64_t starvation_started = 0;
 
     uint64_t eof_time = 0;
 
@@ -759,8 +817,10 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     while (g_status != STATUS_STOPPED && (!got_eof || ap2cl_is_playing(g_ap2cl))) {
         uint64_t now = raopcl_get_ntp(NULL);
 
-        if (!ap2cl_is_connected(g_ap2cl)) {
+        if (!ap2cl_is_connected(g_ap2cl) ||
+            !ap2cl_control_healthy(g_ap2cl)) {
             status_error("AirPlay 2 control channel failed");
+            playback_failed = true;
             break;
         }
 
@@ -783,9 +843,21 @@ static int run_airplay2(cli_config_t *cfg, int infile)
 
         /* Send audio chunk */
         if (g_status == STATUS_PLAYING && ap2cl_accept_frames(g_ap2cl)) {
-            int n = input_ring_read(buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
+            int n = input_ring_read_timed(
+                buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf, 250);
+            if (n == INPUT_RING_TIMEOUT) {
+                if (!starving) {
+                    starving = true;
+                    starvation_started = raopcl_get_ntp(NULL);
+                    LOG_WARN("[AP2] PCM input starved; waiting in 250 ms intervals");
+                    ap2cl_log_diagnostics(g_ap2cl);
+                }
+                ap2cl_recover_input_gap(g_ap2cl);
+                continue;
+            }
             if (n < 0) {
                 status_error("Error reading from audio source");
+                playback_failed = true;
                 break;
             } else if (n == 0) {
                 if (!got_eof) {
@@ -795,6 +867,14 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 }
                 continue;
             }
+            if (starving) {
+                uint32_t stalled_ms =
+                    (uint32_t)NTP2MS(raopcl_get_ntp(NULL) -
+                                     starvation_started);
+                LOG_INFO("[AP2] PCM input recovered after %u ms", stalled_ms);
+                ap2cl_log_diagnostics(g_ap2cl);
+                starving = false;
+            }
 
             int af = n / ap2_input_bpf;
             uint8_t *send = buf;
@@ -802,8 +882,11 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 truncate_32to24(buf, n, ap2_alac_buf);
                 send = ap2_alac_buf;
             }
-            if (!ap2cl_send_chunk(g_ap2cl, send, af)) {
+            ap2_send_result_t result =
+                ap2cl_send_chunk(g_ap2cl, send, af);
+            if (result == AP2_SEND_FATAL) {
                 status_error("AirPlay 2 realtime send failed");
+                playback_failed = true;
                 break;
             }
             frames += af;
@@ -812,11 +895,11 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         }
     }
 
-    status_eof();
+    if (got_eof && !playback_failed) status_eof();
     g_running = false;
     free(buf);
     free(ap2_alac_buf);
-    return 0;
+    return playback_failed ? 1 : 0;
 }
 
 

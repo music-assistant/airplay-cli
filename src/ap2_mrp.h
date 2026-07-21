@@ -92,9 +92,9 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
 bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
 
 /*
- * Attach the session event socket. The socket stays owned by ap2_client; this
- * derives the independent Events-Salt keys and services encrypted reverse HTTP
- * requests with 200 responses from ap2_mrp_tick().
+ * Attach the session event socket. Ownership transfers to the MRP context on
+ * success. This derives the independent Events-Salt keys and services encrypted
+ * reverse HTTP requests with 200 responses from ap2_mrp_tick().
  */
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 
@@ -163,6 +163,9 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m);
 
 /* True once the data channel is established. */
 bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
+
+/* Reverse event-channel status: -1 unattached, 0 closed/failed, 1 active. */
+int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
 
 /*
  * Build a binary-plist body for POST /command on the MAIN encrypted RTSP

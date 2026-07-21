@@ -41,7 +41,10 @@ BINDIR      = bin
 
 # Output binary
 EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
-TEST_EXECUTABLE = build/tests/test_ap2_io
+IO_TEST       = build/tests/test_ap2_io
+TIMELINE_TEST = build/tests/test_ap2_timeline
+EVENT_TEST    = build/tests/test_ap2_event
+TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
 DEFINES  = -DNDEBUG -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED
@@ -141,13 +144,27 @@ $(BUILDDIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 clean:
-	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) $(TEST_EXECUTABLE)
+	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
-test: $(TEST_EXECUTABLE)
-	$(TEST_EXECUTABLE)
+test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST)
+	$(TIMELINE_TEST)
+	$(EVENT_TEST)
+	$(IO_TEST)
 
-$(TEST_EXECUTABLE): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h
+$(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
+	$(CC) $(TEST_CFLAGS) -Isrc $< $(EXTRA_LDFLAGS) -o $@
+
+$(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
+		$(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
+		$(BUILDDIR)/cross_log.o Makefile
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) \
+		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
+		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/cross_log.o \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+$(IO_TEST): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h Makefile
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -Isrc tests/test_ap2_io.c src/ap2_io.c -o $@
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_ap2_io.c src/ap2_io.c \
+		$(EXTRA_LDFLAGS) -o $@
 
 .PHONY: all directory clean test

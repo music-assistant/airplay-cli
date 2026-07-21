@@ -386,11 +386,12 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 - **RTSP serialization** — one mutex serializes the RTSP channel, so the
   keepalive thread and the streaming path can never interleave frames on the
   encrypted channel.
-- **Socket deadlines** — established RTSP request/response cycles have a
-  1.5-second absolute deadline, event/DataStream writes have a one-second
-  deadline, and realtime RTP/control UDP sends are nonblocking with a short
-  bounded retry. A dead RTSP channel is terminal and surfaced to the caller
-  instead of leaving a half-alive process.
+- **Socket deadlines** — established RTSP request/response cycles use cumulative
+  absolute deadlines appropriate to the request: 1.5 seconds for feedback,
+  2 seconds for control, 5 seconds for metadata, and 15 seconds for artwork.
+  Event/DataStream writes have a one-second deadline, while realtime RTP/control
+  UDP sends are nonblocking with a short bounded retry. A dead encrypted channel
+  is fail-closed and terminal so an advanced nonce is never reused.
 - **Reverse event channel** — pair-verified sessions derive independent
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
@@ -398,6 +399,13 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 - **Eager input ring** — a dedicated reader drains stdin into a 4 MB ring as
   fast as the source delivers, decoupled from network pacing: the pipeline
   fills before a scheduled start, while a full ring backpressures the pipe.
+  Native playback waits in 250 ms intervals so control failures remain visible
+  during producer starvation. If realtime lead is exhausted, it advances the
+  scheduling/PTP anchor while preserving contiguous RTP content.
+- **Realtime send outcomes** — local UDP backpressure is a bounded transient
+  drop that advances sequence, RTP, and scheduling timestamps. Encode,
+  allocation, encryption, socket, and control failures are terminal and produce
+  a nonzero process exit rather than a false EOF.
 - **EOF drain** — after input EOF the session drains at most
   `latency + 2 s`, then tears down.
 - **Initial metadata** — pushed at connect with a placeholder title if the
