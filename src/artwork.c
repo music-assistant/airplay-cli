@@ -682,8 +682,7 @@ read_error:
 }
 
 bool artwork_load(const char *source, uint8_t **data, size_t *size,
-                  char content_type[32],
-                  char *error, size_t error_size)
+                  char content_type[32], char *error, size_t error_size)
 {
     if (!source || !*source || !data || !size || !content_type) {
         artwork_error(error, error_size, "invalid artwork source");

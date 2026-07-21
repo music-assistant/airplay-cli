@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
+#include <stdatomic.h>
 #include <assert.h>
 #include <getopt.h>
 #include <sys/stat.h>
@@ -105,8 +106,9 @@ typedef struct {
 } cli_config_t;
 
 /* Globals */
-static bool g_running = true;
-static playback_status_t g_status = STATUS_STOPPED;
+static atomic_bool g_running = true;
+static _Atomic playback_status_t g_status = STATUS_STOPPED;
+static pthread_mutex_t g_playback_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_t g_cmdpipe_thread;
 static int g_cmdpipe_fd = -1;
 static char g_cmdpipe_buf[512];
@@ -178,13 +180,12 @@ static void status_error(const char *msg)
     status_print("[ERROR] %s", msg);
 }
 
-/* Path-A MRP experiment: surface the POST /command response on stdout when it
- * changes, so the caller can log whether the device accepts the push. */
+/* Surface that a path-A MRP update was accepted for asynchronous delivery.
+ * The worker logs each receiver response without blocking audio startup. */
 static void mrp_status_report(int status)
 {
-    static int last;
-    if (status <= 0 || status == last) return;
-    last = status;
+    static atomic_int last;
+    if (status <= 0 || status == atomic_exchange(&last, status)) return;
     printf("[STATUS] mrp path=command status=%d\n", status);
     fflush(stdout);
 }
@@ -408,17 +409,22 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             ap2cl_set_volume(g_ap2cl, vol);
         }
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "PAUSE") == 0) {
-        if (g_status == STATUS_PLAYING) {
+        bool paused = false;
+        pthread_mutex_lock(&g_playback_lock);
+        if (atomic_load(&g_status) == STATUS_PLAYING) {
             if (cfg->protocol == PROTO_RAOP && g_raopcl) {
                 raopcl_pause(g_raopcl);
                 raopcl_flush(g_raopcl);
             } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
                 ap2cl_pause(g_ap2cl);
             }
-            g_status = STATUS_PAUSED;
-            status_paused(0);
+            atomic_store(&g_status, STATUS_PAUSED);
+            paused = true;
         }
+        pthread_mutex_unlock(&g_playback_lock);
+        if (paused) status_paused(0);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "PLAY") == 0) {
+        pthread_mutex_lock(&g_playback_lock);
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
             int latency = raopcl_latency(g_raopcl);
             uint64_t now = raopcl_get_ntp(NULL);
@@ -430,14 +436,17 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         /* No status emission here: reporting elapsed_ms=0 would snap the
          * sender's position display backwards. The periodic reporter (gated on
          * STATUS_PLAYING) re-reports the true elapsed within a second. */
-        g_status = STATUS_PLAYING;
+        atomic_store(&g_status, STATUS_PLAYING);
+        pthread_mutex_unlock(&g_playback_lock);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STOP") == 0) {
-        g_status = STATUS_STOPPED;
+        pthread_mutex_lock(&g_playback_lock);
+        atomic_store(&g_status, STATUS_STOPPED);
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
             raopcl_stop(g_raopcl);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_stop(g_ap2cl);
         }
+        pthread_mutex_unlock(&g_playback_lock);
         status_print("[STATUS] stopped");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "SENDMETA") == 0) {
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
@@ -644,11 +653,19 @@ static int run_raop(cli_config_t *cfg, int infile)
         }
 
         /* Send audio chunk */
-        if (g_status == STATUS_PLAYING && raopcl_accept_frames(g_raopcl)) {
+        if (atomic_load(&g_status) == STATUS_PLAYING &&
+            raopcl_accept_frames(g_raopcl)) {
+            pthread_mutex_lock(&g_playback_lock);
+            if (atomic_load(&g_status) != STATUS_PLAYING) {
+                pthread_mutex_unlock(&g_playback_lock);
+                continue;
+            }
             int n = input_ring_read(buf, DEFAULT_FRAMES_PER_CHUNK * input_bpf);
             if (n == INPUT_RING_WAIT) {
+                pthread_mutex_unlock(&g_playback_lock);
                 continue;
             } else if (n < 0) {
+                pthread_mutex_unlock(&g_playback_lock);
                 status_error("Error reading from audio source");
                 break;
             } else if (n == 0) {
@@ -656,6 +673,7 @@ static int run_raop(cli_config_t *cfg, int infile)
                     LOG_INFO("End of audio stream, draining buffer...");
                     got_eof = true;
                 }
+                pthread_mutex_unlock(&g_playback_lock);
                 continue;
             }
 
@@ -669,6 +687,7 @@ static int run_raop(cli_config_t *cfg, int infile)
             uint64_t playtime;
             raopcl_send_chunk(g_raopcl, send_buf, audio_frames, &playtime);
             frames += audio_frames;
+            pthread_mutex_unlock(&g_playback_lock);
         } else {
             usleep(1000);
         }
@@ -740,11 +759,6 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         }
     }
 
-    /* Register the sender identity before the first now-playing update. The
-     * supported commands, playback state and NowPlayingClient follow that first
-     * update inside ap2cl_mrp_push(), matching Apple's AirPlaySender ordering. */
-    ap2cl_mrp_register(g_ap2cl);
-
     /* Surface the effective lead and the receiver-reported buffering window so
      * the caller (MA) can plan group starts from real device capabilities. */
     {
@@ -780,7 +794,9 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     /* Placeholder metadata must follow ap2cl_start_at: that call sets the RTP
      * timeline the metadata's RTP-Info anchors to. Sent earlier it anchors to
      * rtptime=0 — metadata-gated receivers (Sonos) then show the title but do
-     * not treat it as the audio timeline's metadata and keep audio muted. */
+     * not treat it as the audio timeline's metadata and keep audio muted. The
+     * optional MRP mirror is queued to the maintenance worker, so it cannot
+     * delay entry into the audio loop. */
     send_initial_metadata(cfg);
 
     g_status = STATUS_PLAYING;
@@ -836,9 +852,16 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         }
 
         /* Send audio chunk */
-        if (g_status == STATUS_PLAYING && ap2cl_accept_frames(g_ap2cl)) {
+        if (atomic_load(&g_status) == STATUS_PLAYING &&
+            ap2cl_accept_frames(g_ap2cl)) {
+            pthread_mutex_lock(&g_playback_lock);
+            if (atomic_load(&g_status) != STATUS_PLAYING) {
+                pthread_mutex_unlock(&g_playback_lock);
+                continue;
+            }
             int n = input_ring_read(buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
             if (n == INPUT_RING_WAIT) {
+                pthread_mutex_unlock(&g_playback_lock);
                 uint64_t wait_now = raopcl_get_ntp(NULL);
                 if (!input_wait_since) input_wait_since = wait_now;
                 uint64_t wait_ms = NTP2MS(wait_now - input_wait_since);
@@ -854,6 +877,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 }
                 continue;
             } else if (n < 0) {
+                pthread_mutex_unlock(&g_playback_lock);
                 status_error("Error reading from audio source");
                 failed = true;
                 break;
@@ -863,6 +887,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                     got_eof = true;
                     eof_time = raopcl_get_ntp(NULL);
                 }
+                pthread_mutex_unlock(&g_playback_lock);
                 continue;
             }
             if (input_wait_since) {
@@ -884,11 +909,13 @@ static int run_airplay2(cli_config_t *cfg, int infile)
             ap2_send_result_t send_result =
                 ap2cl_send_chunk(g_ap2cl, send, af);
             if (send_result == AP2_SEND_FATAL) {
+                pthread_mutex_unlock(&g_playback_lock);
                 status_error("AirPlay audio send failed");
                 failed = true;
                 break;
             }
             frames += af;
+            pthread_mutex_unlock(&g_playback_lock);
         } else {
             usleep(1000);
         }
@@ -1360,8 +1387,8 @@ int main(int argc, char *argv[])
         if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
         unlink(cfg.cmdpipe);
     }
-    /* The command thread owns metadata/feedback/event-channel calls. Destroy
-     * protocol clients only after it is fully quiesced. */
+    /* The command thread owns metadata mutations. The protocol client's
+     * destroy path stops and joins its dedicated feedback/event worker. */
     if (g_ap2cl) {
         ap2cl_destroy(g_ap2cl);
         g_ap2cl = NULL;

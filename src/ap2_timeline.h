@@ -10,11 +10,35 @@ typedef struct {
     uint32_t offset;
 } ap2_timeline_recovery_t;
 
+typedef struct {
+    uint32_t frame_1;
+    uint32_t frame_2;
+} ap2_timeline_ptp_anchor_t;
+
 static inline uint64_t ap2_timeline_frames_to_ns(uint64_t frames,
                                                  uint32_t sample_rate)
 {
+    if (!sample_rate) return 0;
     return (frames / sample_rate) * 1000000000ULL +
            ((frames % sample_rate) * 1000000000ULL) / sample_rate;
+}
+
+static inline bool ap2_timeline_ptp_anchor(
+    uint64_t wall_ns, uint64_t anchor_wall_ns, uint32_t anchor_position,
+    uint32_t sample_rate, int latency_ms, ap2_timeline_ptp_anchor_t *anchor)
+{
+    if (!anchor || !sample_rate) return false;
+    int64_t elapsed_ns = (int64_t)wall_ns - (int64_t)anchor_wall_ns -
+                         (int64_t)latency_ms * 1000000LL;
+    int64_t elapsed_seconds = elapsed_ns / 1000000000LL;
+    int64_t remainder_ns = elapsed_ns % 1000000000LL;
+    int64_t elapsed_frames =
+        elapsed_seconds * sample_rate +
+        (remainder_ns * sample_rate) / 1000000000LL;
+    uint32_t play_position = anchor_position + (uint32_t)elapsed_frames;
+    anchor->frame_1 = play_position + 11035;
+    anchor->frame_2 = anchor->frame_1 + 77175;
+    return true;
 }
 
 /*

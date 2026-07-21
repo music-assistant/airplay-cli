@@ -205,8 +205,8 @@ make STATIC=1
 # Linux cross-compile (example)
 make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
 
-# Focused timeline, event-channel, deadline, and worker tests
-make test
+# Focused timeline, channel-I/O, and event-channel tests
+make test STATIC=1
 ```
 
 Requires the libraop submodule with pre-built static libraries (OpenSSL,

@@ -179,8 +179,9 @@ int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
-/* Mark the one-shot artwork bytes as accepted after a successful POST. */
-void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
+/* Mark one artwork generation as accepted after a successful POST. */
+uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m);
+void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m, uint64_t generation);
 
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before

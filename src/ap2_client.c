@@ -21,6 +21,7 @@
 #include <string.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <limits.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
@@ -44,6 +45,7 @@
 #include "ap2_mrp.h"
 #include "ap2_client.h"
 #include "ap2_hap.h"
+#include "ap2_io.h"
 #include "ap2_plist.h"
 #include "ap2_bplist.h"
 #include "ap2_ptp.h"
@@ -55,14 +57,16 @@ extern log_level *loglevel;
 
 #define AP2_FRAMES_PER_CHUNK 352
 #define AP2_CHACHA_TAG_SIZE  16
-#define AP2_RTSP_SETUP_TIMEOUT_MS   8000
-#define AP2_RTSP_CONTROL_TIMEOUT_MS 2000
-#define AP2_RTSP_FEEDBACK_TIMEOUT_MS 1500
-#define AP2_RTSP_METADATA_TIMEOUT_MS 5000
-#define AP2_RTSP_ARTWORK_TIMEOUT_MS 15000
-#define AP2_FEEDBACK_INTERVAL_MS    2000
-#define AP2_UDP_SEND_TIMEOUT_MS     20
-#define AP2_BUFFERED_WRITE_TIMEOUT_MS 8000
+#define AP2_RTSP_SETUP_TIMEOUT_MS     8000
+#define AP2_RTSP_FEEDBACK_TIMEOUT_MS  1500
+#define AP2_RTSP_CONTROL_TIMEOUT_MS   3000
+#define AP2_RTSP_METADATA_TIMEOUT_MS  5000
+#define AP2_FEEDBACK_INTERVAL_MS      2000
+#define AP2_UDP_SEND_TIMEOUT_MS       20
+#define AP2_HAP_FRAME_MAX             1024
+#define AP2_MRP_PENDING_REGISTER      (1u << 0)
+#define AP2_MRP_PENDING_PUSH          (1u << 1)
+#define AP2_MRP_PENDING_PLAYBACK      (1u << 2)
 
 typedef enum {
     FLOW_RAOP_COMPAT = 0,
@@ -73,7 +77,7 @@ struct ap2cl_s {
     /* Configuration */
     ap2_device_info_t device;
     ap2_audio_format_t format;
-    ap2_state_t state;
+    _Atomic ap2_state_t state;
     int latency_ms;
     uint32_t dev_latency_min;      /* receiver-reported buffering window (frames) */
     uint32_t dev_latency_max;
@@ -101,21 +105,28 @@ struct ap2cl_s {
     int sock_fd;                  /* TCP connection */
     /* The RTSP socket carries whole request/response cycles from multiple
      * threads (streaming thread: SETRATEANCHORTIME/FLUSHBUFFERED/TEARDOWN;
-     * cmdpipe thread: SET_PARAMETER volume/metadata, /feedback keepalive).
+     * command thread: SET_PARAMETER volume/metadata; maintenance worker:
+     * /feedback keepalive).
      * This lock serializes the cycles so a response cannot be attributed to
      * the wrong request and the HAP nonce sequence stays intact. */
     pthread_mutex_t rtsp_lock;
-    _Atomic bool rtsp_healthy;
-    _Atomic bool media_healthy;
-    bool rtsp_established;
-    ap2_periodic_worker_t feedback_worker;
-    uint64_t feedback_last_tick_ms;
+    atomic_bool rtsp_dead;
+    atomic_bool rtsp_established;
+    pthread_t feedback_thread;
+    atomic_bool feedback_stop;
+    atomic_bool feedback_waiting;
+    bool feedback_thread_started;
+    pthread_t mrp_thread;
+    bool mrp_thread_started;
+    int feedback_interval_ms;
     struct ap2_hap_ctx *hap;      /* HAP encryption context */
     struct ap2_ptp_ctx *ptp;      /* Timing */
     /* MRP now-playing over POST /command (path A, see DESIGN.md §8):
      * state carrier + body builder; only on pair-verified native sessions. */
     struct ap2_mrp_ctx *mrp;
     pthread_mutex_t mrp_lock;
+    atomic_int mrp_event_status;
+    atomic_uint mrp_pending;
     bool mrp_device_registered;
     bool mrp_extended_registered;
     int mrp_last_playback_state;
@@ -135,7 +146,6 @@ struct ap2cl_s {
     uint64_t audio_packets_dropped;
     uint64_t sync_packets_sent;
     uint64_t sync_packets_dropped;
-    _Atomic unsigned feedback_failures;
     uint64_t timeline_reanchors;
 
     /* Frozen realtime anchor line (PTP): the rtp<->wall mapping is fixed once
@@ -173,59 +183,123 @@ struct ap2cl_s {
 static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
                                        ap2_mrp_playback_state_t state,
                                        bool force);
+static int ap2cl_mrp_register_locked(struct ap2cl_s *p);
+static int ap2cl_mrp_push_locked(struct ap2cl_s *p);
+
+static void ap2_mrp_process_pending(struct ap2cl_s *p, unsigned int pending)
+{
+    if (!pending || atomic_load(&p->rtsp_dead)) return;
+    if (pending & AP2_MRP_PENDING_PUSH) {
+        ap2cl_mrp_push_locked(p);
+    } else {
+        if (pending & AP2_MRP_PENDING_REGISTER)
+            ap2cl_mrp_register_locked(p);
+        if (pending & AP2_MRP_PENDING_PLAYBACK) {
+            ap2_mrp_playback_state_t state =
+                p->state == AP2_STREAMING ? AP2_MRP_PLAYBACK_PLAYING :
+                p->state == AP2_PAUSED ? AP2_MRP_PLAYBACK_PAUSED :
+                                         AP2_MRP_PLAYBACK_STOPPED;
+            ap2_mrp_send_playback_state(p, state, true);
+        }
+    }
+}
 
 /* ---- Native AP2 RTSP I/O ---- */
+
+
+
+static int ap2_rtsp_timeout_ms(struct ap2cl_s *p, const char *method,
+                               const char *uri, const char *content_type,
+                               int body_len)
+{
+    if (!p->rtsp_established) return AP2_RTSP_SETUP_TIMEOUT_MS;
+    if (strcmp(method, "POST") == 0 && strcmp(uri, "/feedback") == 0)
+        return AP2_RTSP_FEEDBACK_TIMEOUT_MS;
+    if ((strcmp(method, "POST") == 0 && strcmp(uri, "/command") == 0) ||
+        (strcmp(method, "SET_PARAMETER") == 0 && content_type &&
+         (strstr(content_type, "image/") == content_type ||
+          strcmp(content_type, "application/x-dmap-tagged") == 0)) ||
+        body_len > 4096)
+        return AP2_RTSP_METADATA_TIMEOUT_MS;
+    return AP2_RTSP_CONTROL_TIMEOUT_MS;
+}
 
 static void ap2_mark_rtsp_dead(struct ap2cl_s *p, const char *method,
                                const char *uri, const char *phase,
                                uint64_t elapsed_ms)
 {
-    int saved_errno = errno ? errno : EIO;
-    if (atomic_exchange(&p->rtsp_healthy, false)) {
+    int saved_errno = errno;
+    if ((p->rtsp_established || p->hap) &&
+        !atomic_exchange(&p->rtsp_dead, true)) {
         LOG_ERROR("[AP2] RTSP channel failed during %s %s %s after %" PRIu64
                   "ms: %s; terminating native session",
                   method, uri, phase, elapsed_ms, strerror(saved_errno));
-        if (p->sock_fd >= 0) {
-            shutdown(p->sock_fd, SHUT_RDWR);
-            close(p->sock_fd);
-            p->sock_fd = -1;
-        }
+        shutdown(p->sock_fd, SHUT_RDWR);
     }
     errno = saved_errno;
 }
 
-static int ap2_rtsp_timeout_ms(struct ap2cl_s *p, const char *method,
-                               const char *uri, const char *content_type)
+static int ap2_parse_rtsp_response(uint8_t *data, int len, int expected_cseq,
+                                   int *status, int *header_len,
+                                   int *content_len)
 {
-    if (!p->rtsp_established) return AP2_RTSP_SETUP_TIMEOUT_MS;
-    if (!strcmp(uri, "/feedback")) return AP2_RTSP_FEEDBACK_TIMEOUT_MS;
-    if (content_type && !strncasecmp(content_type, "image/", 6))
-        return AP2_RTSP_ARTWORK_TIMEOUT_MS;
-    if (!strcmp(uri, "/command") || !strcmp(method, "SET_PARAMETER"))
-        return AP2_RTSP_METADATA_TIMEOUT_MS;
-    return AP2_RTSP_CONTROL_TIMEOUT_MS;
-}
+    if (!data || len <= 0) return 0;
+    data[len] = '\0';
+    char *end = strstr((char *)data, "\r\n\r\n");
+    if (!end) return 0;
+    int hlen = (int)(end - (char *)data) + 4;
+    if (hlen > len) return -1;
 
-static bool ap2_set_nonblocking(int fd)
-{
-    int flags = fcntl(fd, F_GETFL, 0);
-    return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
-}
+    int parsed_status = 0;
+    if (sscanf((char *)data, "%*s %d", &parsed_status) != 1) return -1;
+    char *cseq_header = strcasestr((char *)data, "CSeq:");
+    int response_cseq = -1;
+    if (!cseq_header || cseq_header >= end ||
+        sscanf(cseq_header + 5, "%d", &response_cseq) != 1 ||
+        response_cseq != expected_cseq)
+        return -1;
 
-static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, const char *uri,
-                          const uint8_t *body, int body_len, const char *ct,
-                          const char *extra_hdr,
-                          uint8_t **resp_body, int *resp_len)
-{
-    if (!atomic_load(&p->rtsp_healthy) || p->sock_fd < 0) {
-        *resp_body = NULL;
-        *resp_len = 0;
-        errno = ENOTCONN;
-        return 0;
+    int cl = 0;
+    char *length_header = strcasestr((char *)data, "Content-Length:");
+    if (length_header && length_header < end) {
+        char *number_end = NULL;
+        long parsed = strtol(length_header + 15, &number_end, 10);
+        if (!number_end || number_end == length_header + 15 ||
+            parsed < 0 || parsed > INT_MAX)
+            return -1;
+        cl = (int)parsed;
     }
+    if (cl > len - hlen) return 0;
+    *status = parsed_status;
+    *header_len = hlen;
+    *content_len = cl;
+    return 1;
+}
+
+static int ap2_hap_frames_complete(const uint8_t *data, int len)
+{
+    int offset = 0;
+    while (offset < len) {
+        if (len - offset < 2) return 0;
+        int frame_len = data[offset] | (data[offset + 1] << 8);
+        if (frame_len <= 0 || frame_len > AP2_HAP_FRAME_MAX) return -1;
+        int wire_len = 2 + frame_len + AP2_CHACHA_TAG_SIZE;
+        if (len - offset < wire_len) return 0;
+        offset += wire_len;
+    }
+    return 1;
+}
+
+static int ap2_rtsp_send_ex_unlocked(
+    struct ap2cl_s *p, const char *method, const char *uri,
+    const uint8_t *body, int body_len, const char *ct,
+    const char *extra_hdr, uint8_t **resp_body, int *resp_len)
+{
+    if (atomic_load(&p->rtsp_dead)) return 0;
     int cseq = p->cseq++;
     char hdr[1024];
-    int hdr_len = snprintf(hdr, sizeof(hdr),
+    int hdr_len = snprintf(
+        hdr, sizeof(hdr),
         "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: AirPlay/670.6.2\r\n"
         "DACP-ID: %s\r\nActive-Remote: %s\r\n%s%s%s%s"
         "Content-Length: %d\r\n\r\n",
@@ -233,56 +307,44 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
         p->dacp_id ? p->dacp_id : "0",
         p->active_remote ? p->active_remote : "0",
         ct ? "Content-Type: " : "", ct ? ct : "", ct ? "\r\n" : "",
-        extra_hdr ? extra_hdr : "",
-        body_len);
+        extra_hdr ? extra_hdr : "", body_len);
     if (hdr_len <= 0 || hdr_len >= (int)sizeof(hdr)) {
-        LOG_ERROR("[AP2] RTSP request headers too large for %s %s", method, uri);
         errno = EMSGSIZE;
-        ap2_mark_rtsp_dead(p, method, uri, "construct", 0);
         return 0;
     }
 
     uint8_t *msg = NULL;
-    int msg_len = 0;
-
+    int msg_len;
     if (p->hap) {
-        /* Encrypt RTSP via HAP framing */
         int raw_len = hdr_len + body_len;
-        uint8_t *raw = malloc(raw_len);
-        if (!raw) {
-            errno = ENOMEM;
-            ap2_mark_rtsp_dead(p, method, uri, "allocate", 0);
-            return 0;
-        }
-        memcpy(raw, hdr, hdr_len);
-        if (body && body_len > 0) memcpy(raw + hdr_len, body, body_len);
+        uint8_t *raw = malloc((size_t)raw_len);
+        if (!raw) return 0;
+        memcpy(raw, hdr, (size_t)hdr_len);
+        if (body && body_len > 0)
+            memcpy(raw + hdr_len, body, (size_t)body_len);
         msg_len = ap2_hap_encrypt(p->hap, raw, raw_len, &msg);
         free(raw);
-        if (msg_len <= 0) {
+        if (msg_len <= 0 || !msg) {
             free(msg);
-            errno = EPROTO;
-            ap2_mark_rtsp_dead(p, method, uri, "encrypt", 0);
+            errno = EIO;
+            ap2_mark_rtsp_dead(p, method, uri, "encryption", 0);
             return 0;
         }
     } else {
         msg_len = hdr_len + body_len;
-        msg = malloc(msg_len);
-        if (!msg) {
-            errno = ENOMEM;
-            ap2_mark_rtsp_dead(p, method, uri, "allocate", 0);
-            return 0;
-        }
-        memcpy(msg, hdr, hdr_len);
-        if (body && body_len > 0) memcpy(msg + hdr_len, body, body_len);
+        msg = malloc((size_t)msg_len);
+        if (!msg) return 0;
+        memcpy(msg, hdr, (size_t)hdr_len);
+        if (body && body_len > 0)
+            memcpy(msg + hdr_len, body, (size_t)body_len);
     }
 
-    int timeout_ms = ap2_rtsp_timeout_ms(p, method, uri, ct);
+    int timeout_ms = ap2_rtsp_timeout_ms(p, method, uri, ct, body_len);
     uint64_t started_ms = ap2_io_monotonic_ms();
     uint64_t deadline_ms = started_ms + (uint64_t)timeout_ms;
-    LOG_DEBUG("[AP2] RTSP TX cseq=%d %s %s body=%d wire=%d timeout=%dms",
-              cseq, method, uri, body_len, msg_len, timeout_ms);
-    if (!ap2_io_write_all_deadline(
-            p->sock_fd, msg, (size_t)msg_len, deadline_ms)) {
+    LOG_SDEBUG("[AP2DIAG] RTSP TX cseq=%d %s %s body=%d wire=%d "
+               "timeout=%dms", cseq, method, uri, body_len, msg_len, timeout_ms);
+    if (!ap2_io_write_all_deadline(p->sock_fd, msg, msg_len, deadline_ms)) {
         free(msg);
         ap2_mark_rtsp_dead(p, method, uri, "write",
                            ap2_io_monotonic_ms() - started_ms);
@@ -290,125 +352,86 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
     }
     free(msg);
 
-    /* Read encrypted response.
-     * HAP framing: [2-byte LE length][encrypted chunk + 16-byte tag]
-     * We accumulate raw bytes, then decrypt complete frames. */
     uint8_t buf[16384] = {0};
     int total = 0;
-
     if (!p->hap) {
-        while (total < (int)sizeof(buf)) {
+        while (total < (int)sizeof(buf) - 1) {
             int n = (int)ap2_io_read_deadline(
-                p->sock_fd, buf + total, sizeof(buf) - (size_t)total,
-                deadline_ms);
+                p->sock_fd, buf + total,
+                sizeof(buf) - 1 - (size_t)total, deadline_ms);
             if (n <= 0) break;
             total += n;
-            ap2_rtsp_response_t parsed;
-            int parse_status = ap2_io_parse_rtsp_response(
-                buf, (size_t)total, &parsed);
-            if (parse_status < 0) {
+            int status, hlen, cl;
+            int parsed = ap2_parse_rtsp_response(
+                buf, total, cseq, &status, &hlen, &cl);
+            if (parsed < 0) {
                 errno = EPROTO;
                 break;
             }
-            if (parse_status > 0) {
-                if (parsed.message_len != (size_t)total) {
-                    LOG_ERROR("[AP2] RTSP response for %s %s contained "
-                              "unexpected trailing data",
-                              method, uri);
-                    errno = EPROTO;
-                    break;
-                }
-                if (parsed.cseq != cseq) {
-                    LOG_ERROR("[AP2] RTSP CSeq mismatch for %s %s: sent=%d got=%d",
-                              method, uri, cseq, parsed.cseq);
-                    errno = EPROTO;
-                    break;
-                }
-                *resp_len = (int)parsed.body_len;
-                *resp_body = parsed.body_len ? malloc(parsed.body_len) : NULL;
-                if (parsed.body_len && !*resp_body) {
+            if (parsed > 0) {
+                *resp_len = cl;
+                *resp_body = cl > 0 ? malloc((size_t)cl) : NULL;
+                if (cl > 0 && !*resp_body) {
                     errno = ENOMEM;
                     break;
                 }
-                if (*resp_body)
-                    memcpy(*resp_body, buf + parsed.header_len, parsed.body_len);
-                LOG_DEBUG("[AP2] RTSP RX cseq=%d %s %s status=%d body=%d "
-                          "elapsed=%" PRIu64 "ms",
-                          cseq, method, uri, parsed.status, *resp_len,
-                          ap2_io_monotonic_ms() - started_ms);
-                return parsed.status;
+                if (*resp_body) memcpy(*resp_body, buf + hlen, (size_t)cl);
+                return status;
             }
         }
-        ap2_mark_rtsp_dead(p, method, uri, "read",
-                           ap2_io_monotonic_ms() - started_ms);
-        *resp_body = NULL;
-        *resp_len = 0;
-        return 0;
-    }
+    } else {
+        while (total < (int)sizeof(buf) - 1) {
+            int n = (int)ap2_io_read_deadline(
+                p->sock_fd, buf + total,
+                sizeof(buf) - 1 - (size_t)total, deadline_ms);
+            if (n <= 0) break;
+            total += n;
+            int frames_complete = ap2_hap_frames_complete(buf, total);
+            if (frames_complete == 0) continue;
+            if (frames_complete < 0) {
+                errno = EPROTO;
+                break;
+            }
 
-    while (total < (int)sizeof(buf)) {
-        int n = (int)ap2_io_read_deadline(
-            p->sock_fd, buf + total, sizeof(buf) - (size_t)total,
-            deadline_ms);
-        if (n <= 0) break;
-        total += n;
-
-        if (total >= 2) {
-            int frame_len = buf[0] | (buf[1] << 8);
-            if (total >= 2 + frame_len + 16) {
-                uint8_t *dec = NULL;
-                uint64_t saved_counter = ap2_hap_save_read_counter(p->hap);
-                int dec_len = ap2_hap_decrypt(p->hap, buf, total, &dec);
-                if (dec_len > 0 && dec) {
-                    ap2_rtsp_response_t parsed;
-                    int parse_status = ap2_io_parse_rtsp_response(
-                        dec, (size_t)dec_len, &parsed);
-                    if (parse_status < 0) {
+            uint64_t saved_counter = ap2_hap_save_read_counter(p->hap);
+            uint8_t *dec = NULL;
+            int dec_len = ap2_hap_decrypt(p->hap, buf, total, &dec);
+            if (dec_len > 0 && dec) {
+                uint8_t *terminated = realloc(dec, (size_t)dec_len + 1);
+                if (!terminated) {
+                    free(dec);
+                    ap2_hap_restore_read_counter(p->hap, saved_counter);
+                    errno = ENOMEM;
+                    break;
+                }
+                dec = terminated;
+                int status, hlen, cl;
+                int parsed = ap2_parse_rtsp_response(
+                    dec, dec_len, cseq, &status, &hlen, &cl);
+                if (parsed > 0) {
+                    *resp_len = cl;
+                    *resp_body = cl > 0 ? malloc((size_t)cl) : NULL;
+                    if (cl > 0 && !*resp_body) {
                         free(dec);
-                        errno = EPROTO;
+                        ap2_hap_restore_read_counter(p->hap, saved_counter);
+                        errno = ENOMEM;
                         break;
                     }
-                    if (parse_status > 0) {
-                        if (parsed.message_len != (size_t)dec_len) {
-                            LOG_ERROR("[AP2] RTSP response for %s %s contained "
-                                      "unexpected trailing data",
-                                      method, uri);
-                            free(dec);
-                            errno = EPROTO;
-                            break;
-                        }
-                        if (parsed.cseq != cseq) {
-                            LOG_ERROR("[AP2] RTSP CSeq mismatch for %s %s: "
-                                      "sent=%d got=%d",
-                                      method, uri, cseq, parsed.cseq);
-                            free(dec);
-                            errno = EPROTO;
-                            break;
-                        }
-                        *resp_len = (int)parsed.body_len;
-                        *resp_body = parsed.body_len ? malloc(parsed.body_len) : NULL;
-                        if (parsed.body_len && !*resp_body) {
-                            free(dec);
-                            errno = ENOMEM;
-                            break;
-                        }
-                        if (*resp_body)
-                            memcpy(*resp_body, dec + parsed.header_len,
-                                   parsed.body_len);
-                        int status = parsed.status;
-                        free(dec);
-                        LOG_DEBUG("[AP2] RTSP RX cseq=%d %s %s status=%d "
-                                  "body=%d elapsed=%" PRIu64 "ms",
-                                  cseq, method, uri, status, *resp_len,
-                                  ap2_io_monotonic_ms() - started_ms);
-                        return status;
-                    }
+                    if (*resp_body)
+                        memcpy(*resp_body, dec + hlen, (size_t)cl);
                     free(dec);
-                    ap2_hap_restore_read_counter(p->hap, saved_counter);
-                } else {
-                    free(dec);
-                    ap2_hap_restore_read_counter(p->hap, saved_counter);
+                    return status;
                 }
+                free(dec);
+                ap2_hap_restore_read_counter(p->hap, saved_counter);
+                if (parsed < 0) {
+                    errno = EPROTO;
+                    break;
+                }
+            } else {
+                free(dec);
+                errno = EPROTO;
+                break;
             }
         }
     }
@@ -420,27 +443,25 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
     return 0;
 }
 
-/* Serialize the full request/response cycle (see the rtsp_lock field note);
- * taking the lock here covers every RTSP caller, whichever thread it runs on. */
-static int ap2_rtsp_send_ex(struct ap2cl_s *p, const char *method, const char *uri,
-                          const uint8_t *body, int body_len, const char *ct,
-                          const char *extra_hdr,
-                          uint8_t **resp_body, int *resp_len)
+/* CSeq assignment, HAP nonce advancement, request write and response read are
+ * one serialized transaction. */
+static int ap2_rtsp_send_ex(
+    struct ap2cl_s *p, const char *method, const char *uri,
+    const uint8_t *body, int body_len, const char *ct,
+    const char *extra_hdr, uint8_t **resp_body, int *resp_len)
 {
-    uint64_t started_ms = ap2_io_monotonic_ms();
     if (resp_body) *resp_body = NULL;
     if (resp_len) *resp_len = 0;
-    if (!atomic_load(&p->rtsp_healthy)) return 0;
+    uint64_t wait_started = ap2_io_monotonic_ms();
     pthread_mutex_lock(&p->rtsp_lock);
-    int status = 0;
-    if (atomic_load(&p->rtsp_healthy)) {
-        status = ap2_rtsp_send_ex_unlocked(p, method, uri, body, body_len, ct,
-                                           extra_hdr, resp_body, resp_len);
-    }
+    uint64_t waited_ms = ap2_io_monotonic_ms() - wait_started;
+    if (waited_ms >= 250)
+        LOG_SDEBUG("[AP2DIAG] RTSP %s %s waited %" PRIu64
+                   "ms for control lock", method, uri, waited_ms);
+    int status = ap2_rtsp_send_ex_unlocked(
+        p, method, uri, body, body_len, ct, extra_hdr,
+        resp_body, resp_len);
     pthread_mutex_unlock(&p->rtsp_lock);
-    uint64_t duration_ms = ap2_io_monotonic_ms() - started_ms;
-    LOG_SDEBUG("[AP2DIAG] RTSP %s %s -> %d duration_ms=%" PRIu64,
-               method, uri, status, duration_ms);
     return status;
 }
 
@@ -453,23 +474,175 @@ static int ap2_rtsp_send(struct ap2cl_s *p, const char *method, const char *uri,
                             resp_body, resp_len);
 }
 
-static bool ap2_feedback_worker_tick(void *arg)
+static void *ap2_feedback_thread_main(void *arg)
 {
     struct ap2cl_s *p = arg;
-    uint64_t now = ap2_io_monotonic_ms();
-    uint64_t gap = p->feedback_last_tick_ms
-                       ? now - p->feedback_last_tick_ms
-                       : AP2_FEEDBACK_INTERVAL_MS;
-    p->feedback_last_tick_ms = now;
-    if (gap > AP2_FEEDBACK_INTERVAL_MS + 500)
-        LOG_WARN("[AP2] feedback cadence delayed: %" PRIu64 "ms", gap);
+    uint64_t last_feedback_ms = ap2_io_monotonic_ms();
+    uint64_t next_feedback_ms =
+        last_feedback_ms + (uint64_t)p->feedback_interval_ms;
+    unsigned int feedback_failures = 0;
+    LOG_DEBUG("[AP2] feedback worker started (interval=%dms)",
+              p->feedback_interval_ms);
 
-    ap2cl_feedback(p);
-    pthread_mutex_lock(&p->mrp_lock);
-    if (p->mrp) ap2_mrp_tick(p->mrp);
-    pthread_mutex_unlock(&p->mrp_lock);
-    return atomic_load(&p->rtsp_healthy);
+    while (!atomic_load(&p->feedback_stop) &&
+           !atomic_load(&p->rtsp_dead)) {
+        uint64_t now_ms = ap2_io_monotonic_ms();
+        if (now_ms >= next_feedback_ms) {
+            uint64_t gap_ms = now_ms - last_feedback_ms;
+            LOG_SDEBUG("[AP2DIAG] feedback tick gap=%" PRIu64 "ms", gap_ms);
+            if (gap_ms > (uint64_t)p->feedback_interval_ms + 500)
+                LOG_WARN("[AP2] feedback cadence delayed: %" PRIu64 "ms",
+                         gap_ms);
+            atomic_store(&p->feedback_waiting, true);
+            bool feedback_ok = ap2cl_feedback(p);
+            atomic_store(&p->feedback_waiting, false);
+            if (feedback_ok) {
+                feedback_failures = 0;
+            } else if (!atomic_load(&p->rtsp_dead) &&
+                       ++feedback_failures >= 3) {
+                errno = EPROTO;
+                ap2_mark_rtsp_dead(p, "POST", "/feedback",
+                                   "repeated non-200 response",
+                                   ap2_io_monotonic_ms() - last_feedback_ms);
+            }
+            last_feedback_ms = ap2_io_monotonic_ms();
+            next_feedback_ms += (uint64_t)p->feedback_interval_ms;
+            if (next_feedback_ms <= last_feedback_ms)
+                next_feedback_ms =
+                    last_feedback_ms + (uint64_t)p->feedback_interval_ms;
+        }
+
+        /* This worker is the sole owner of reverse-event/DataStream ticking.
+         * Run it after the keepalive so a busy event stream cannot delay the
+         * receiver's feedback deadline. */
+        pthread_mutex_lock(&p->mrp_lock);
+        int event_status = -1;
+        if (p->mrp) {
+            ap2_mrp_tick(p->mrp);
+            event_status = ap2_mrp_event_status(p->mrp);
+        }
+        atomic_store(&p->mrp_event_status, event_status);
+        pthread_mutex_unlock(&p->mrp_lock);
+        usleep(100000);
+    }
+    LOG_DEBUG("[AP2] feedback worker stopped (dead=%d)",
+              atomic_load(&p->rtsp_dead) ? 1 : 0);
+    return NULL;
 }
+
+static void *ap2_mrp_thread_main(void *arg)
+{
+    struct ap2cl_s *p = arg;
+    while (!atomic_load(&p->feedback_stop) &&
+           !atomic_load(&p->rtsp_dead)) {
+        unsigned int pending = atomic_exchange(&p->mrp_pending, 0);
+        if (pending)
+            ap2_mrp_process_pending(p, pending);
+        else
+            usleep(100000);
+    }
+    return NULL;
+}
+
+static bool ap2_feedback_start(struct ap2cl_s *p)
+{
+    atomic_store(&p->feedback_stop, false);
+    int err = pthread_create(
+        &p->feedback_thread, NULL, ap2_feedback_thread_main, p);
+    if (err != 0) {
+        LOG_ERROR("[AP2] Cannot start feedback worker: %s", strerror(err));
+        return false;
+    }
+    p->feedback_thread_started = true;
+    err = pthread_create(&p->mrp_thread, NULL, ap2_mrp_thread_main, p);
+    if (err != 0) {
+        LOG_ERROR("[AP2] Cannot start MRP publication worker: %s",
+                  strerror(err));
+        atomic_store(&p->feedback_stop, true);
+        pthread_join(p->feedback_thread, NULL);
+        p->feedback_thread_started = false;
+        return false;
+    }
+    p->mrp_thread_started = true;
+    return true;
+}
+
+static void ap2_feedback_stop(struct ap2cl_s *p)
+{
+    if (!p || (!p->feedback_thread_started && !p->mrp_thread_started)) return;
+    atomic_store(&p->feedback_stop, true);
+    if (p->mrp_thread_started) {
+        pthread_join(p->mrp_thread, NULL);
+        p->mrp_thread_started = false;
+    }
+    if (p->feedback_thread_started) {
+        pthread_join(p->feedback_thread, NULL);
+        p->feedback_thread_started = false;
+    }
+}
+
+#ifdef AP2_TESTING
+bool ap2cl_test_start_feedback_worker(struct ap2cl_s *p, int socket_fd,
+                                      int interval_ms)
+{
+    if (!p || socket_fd < 0 || interval_ms <= 0) return false;
+    p->flow = FLOW_NATIVE_AP2;
+    p->sock_fd = socket_fd;
+    p->rtsp_established = true;
+    p->state = AP2_CONNECTED;
+    p->feedback_interval_ms = interval_ms;
+    atomic_store(&p->rtsp_dead, false);
+    return ap2_feedback_start(p);
+}
+
+bool ap2cl_test_attach_mrp(struct ap2cl_s *p, int event_socket,
+                           const uint8_t shared_secret[32])
+{
+    if (!p || event_socket < 0 || !shared_secret) return false;
+    pthread_mutex_lock(&p->mrp_lock);
+    p->mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, p->auth_credentials, p->dacp_id,
+        "test sender", "11111111-2222-4333-8444-555555555555",
+        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", shared_secret);
+    bool attached = p->mrp && ap2_mrp_attach_events(p->mrp, event_socket);
+    if (!attached && p->mrp) {
+        ap2_mrp_destroy(p->mrp);
+        p->mrp = NULL;
+    }
+    atomic_store(&p->mrp_event_status, attached ? 1 : -1);
+    pthread_mutex_unlock(&p->mrp_lock);
+    return attached;
+}
+
+void ap2cl_test_stop_feedback_worker(struct ap2cl_s *p)
+{
+    if (!p) return;
+    ap2_feedback_stop(p);
+    p->sock_fd = -1;
+    p->rtsp_established = false;
+    atomic_init(&p->state, AP2_DOWN);
+}
+
+int ap2cl_test_post_command(struct ap2cl_s *p)
+{
+    if (!p) return 0;
+    uint8_t *response = NULL;
+    int response_len = 0;
+    int status = ap2_rtsp_send(
+        p, "POST", "/command", NULL, 0, NULL, &response, &response_len);
+    free(response);
+    return status;
+}
+
+int ap2cl_test_parse_response(uint8_t *data, int len, int expected_cseq)
+{
+    int status = 0;
+    int header_len = 0;
+    int content_len = 0;
+    return ap2_parse_rtsp_response(
+        data, len, expected_cseq, &status, &header_len, &content_len);
+}
+#endif
 
 /* ---- Native AP2 connect helpers ---- */
 
@@ -716,27 +889,31 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
 
     /* Bind the sender to THIS session's pair-verify shared secret and open the
      * channel (TCP connect + DEVICE_INFO-first handshake). */
+    pthread_mutex_lock(&p->mrp_lock);
     if (!p->mrp)
         p->mrp = ap2_mrp_create(p->device.address, p->device.port,
                                 p->auth_credentials, p->dacp_id, p->device.name,
                                 p->session_uuid, p->group_uuid,
                                 ap2_hap_get_shared_secret(p->hap));
-    if (!p->mrp) return;
+    if (!p->mrp) goto done;
     if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
         LOG_WARN("[MRP] event-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
-        return;
+        goto done;
     }
-    p->events_sock = -1; /* ownership transferred to the MRP context */
+    atomic_store(&p->mrp_event_status, 1);
 
     if (!ap2_mrp_attach(p->mrp, data_port, seed)) {
         LOG_WARN("[MRP] data-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
-        return;
+        atomic_store(&p->mrp_event_status, -1);
+        goto done;
     }
     LOG_INFO("[MRP] remote-control data channel established (now-playing active)");
+done:
+    pthread_mutex_unlock(&p->mrp_lock);
 }
 
 /* ---- Native AP2 connect sequence ---- */
@@ -772,7 +949,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         return false;
     }
     freeaddrinfo(res);
-    atomic_store(&p->rtsp_healthy, true);
+    atomic_store(&p->rtsp_dead, false);
 #ifdef SO_NOSIGPIPE
     int no_sigpipe = 1;
     setsockopt(p->sock_fd, SOL_SOCKET, SO_NOSIGPIPE,
@@ -1006,7 +1183,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                 int one = 1;
                 setsockopt(events_sock, IPPROTO_TCP, TCP_NODELAY,
                            &one, sizeof(one));
-                p->events_sock = events_sock;
+                if (ap2_io_set_nonblocking(events_sock)) {
+                    p->events_sock = events_sock;
+                } else {
+                    LOG_WARN("[AP2] Cannot make events socket nonblocking: %s",
+                             strerror(errno));
+                    close(events_sock);
+                }
             } else {
                 LOG_WARN("[AP2] Events connect failed");
                 close(events_sock);
@@ -1029,7 +1212,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     struct sockaddr_in bind_addr = {.sin_family = AF_INET, .sin_addr = p->bind_addr};
     if (p->data_sock < 0 ||
         bind(p->data_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0 ||
-        !ap2_set_nonblocking(p->data_sock)) {
+        !ap2_io_set_nonblocking(p->data_sock)) {
         LOG_ERROR("[AP2] Cannot create non-blocking RTP data socket: %s",
                   strerror(errno));
         if (p->data_sock >= 0) { close(p->data_sock); p->data_sock = -1; }
@@ -1043,7 +1226,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     p->ctrl_sock = socket(AF_INET, SOCK_DGRAM, 0);
     if (p->ctrl_sock < 0 ||
         bind(p->ctrl_sock, (struct sockaddr *)&bind_addr, sizeof(bind_addr)) != 0 ||
-        !ap2_set_nonblocking(p->ctrl_sock)) {
+        !ap2_io_set_nonblocking(p->ctrl_sock)) {
         LOG_ERROR("[AP2] Cannot create non-blocking RTP control socket: %s",
                   strerror(errno));
         if (p->ctrl_sock >= 0) { close(p->ctrl_sock); p->ctrl_sock = -1; }
@@ -1234,9 +1417,8 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                          inet_ntoa(p->bind_addr));
         }
         if (p->buffered_sock >= 0) {
-            /* Bound both directions so a receiver that stops draining the
-             * stream can never hang the process: the blocking send loop in
-             * ap2_buffered_send_chunk relies on SO_SNDTIMEO expiring. */
+            /* Keep kernel timeouts as a second line of defense; audio writes
+             * also use a cumulative userspace deadline. */
             struct timeval stv = {.tv_sec = 8};
             setsockopt(p->buffered_sock, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
             setsockopt(p->buffered_sock, SOL_SOCKET, SO_RCVTIMEO, &stv, sizeof(stv));
@@ -1277,13 +1459,11 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     }
 
     p->first_packet = true;
+    if (atomic_load(&p->rtsp_dead)) return false;
     p->rtsp_established = true;
     p->state = AP2_CONNECTED;
-    p->feedback_last_tick_ms = ap2_io_monotonic_ms();
-    if (!ap2_periodic_worker_start(&p->feedback_worker)) {
-        LOG_ERROR("[AP2] Cannot start feedback worker: %s", strerror(errno));
-        errno = EIO;
-        ap2_mark_rtsp_dead(p, "POST", "/feedback", "worker-start", 0);
+    if (!ap2_feedback_start(p)) {
+        atomic_store(&p->rtsp_dead, true);
         return false;
     }
     LOG_INFO("[AP2] Native AP2 session ready");
@@ -1403,14 +1583,13 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
         }
         p->rt_anchor_valid = true;
     }
-    int64_t elapsed_ns = (int64_t)wall - (int64_t)p->rt_anchor_wall0
-                       - (int64_t)p->latency_ms * 1000000LL;
-    uint32_t play_pos = p->rt_anchor_pos0
-                      + (uint32_t)((elapsed_ns * p->format.sample_rate) / 1000000000LL);
-    uint32_t frame_1 = play_pos + 11035;
-    uint32_t frame_2 = frame_1 + 77175;
+    ap2_timeline_ptp_anchor_t anchor;
+    if (!ap2_timeline_ptp_anchor(
+            wall, p->rt_anchor_wall0, p->rt_anchor_pos0,
+            p->format.sample_rate, p->latency_ms, &anchor))
+        return;
 
-    uint32_t be = htonl(frame_1);
+    uint32_t be = htonl(anchor.frame_1);
     memcpy(pkt + 4, &be, 4);
 
     uint32_t wall_hi = htonl((uint32_t)(wall >> 32));
@@ -1418,7 +1597,7 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     memcpy(pkt + 8, &wall_hi, 4);
     memcpy(pkt + 12, &wall_lo, 4);
 
-    be = htonl(frame_2);
+    be = htonl(anchor.frame_2);
     memcpy(pkt + 16, &be, 4);
 
     uint64_t cid = ap2_ptp_master_clock_id(p->ptp);
@@ -1444,38 +1623,38 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
         }
     }
     LOG_DEBUG("[AP2] TX PTP sync %s play_pos=%u wall=%" PRIu64 "ns",
-              first ? "(initial)" : "", play_pos, wall);
-    return result;
+              first ? "(initial)" : "", anchor.frame_1 - 11035, wall);
 }
 
 /* ---- Native AP2 buffered audio (type 103) ---- */
 
-static bool ap2_encrypt_audio(const uint8_t key[32], const uint8_t nonce[12],
-                              const uint8_t aad[8], const uint8_t *plain,
-                              int plain_len, uint8_t *cipher,
-                              int *cipher_len, uint8_t tag[AP2_CHACHA_TAG_SIZE])
+static int ap2_encrypt_audio_payload(
+    const uint8_t key[32], const uint8_t nonce[12],
+    const uint8_t *aad, int aad_len,
+    const uint8_t *plaintext, int plaintext_len,
+    uint8_t *ciphertext, uint8_t tag[AP2_CHACHA_TAG_SIZE])
 {
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) return false;
+    if (!ctx) return -1;
+
     int len = 0;
     int total = 0;
     bool ok =
-        EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) > 0 &&
-        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) > 0 &&
-        EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) > 0 &&
-        EVP_EncryptUpdate(ctx, NULL, &len, aad, 8) > 0 &&
-        EVP_EncryptUpdate(ctx, cipher, &len, plain, plain_len) > 0;
+        EVP_EncryptInit_ex(ctx, EVP_chacha20_poly1305(), NULL, NULL, NULL) == 1 &&
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) == 1 &&
+        EVP_EncryptInit_ex(ctx, NULL, NULL, key, nonce) == 1 &&
+        EVP_EncryptUpdate(ctx, NULL, &len, aad, aad_len) == 1 &&
+        EVP_EncryptUpdate(ctx, ciphertext, &len, plaintext, plaintext_len) == 1;
     if (ok) {
         total = len;
-        ok = EVP_EncryptFinal_ex(ctx, cipher + total, &len) > 0;
+        ok = EVP_EncryptFinal_ex(ctx, ciphertext + total, &len) == 1;
         total += len;
     }
     if (ok)
         ok = EVP_CIPHER_CTX_ctrl(
-                 ctx, EVP_CTRL_AEAD_GET_TAG, AP2_CHACHA_TAG_SIZE, tag) > 0;
+                 ctx, EVP_CTRL_AEAD_GET_TAG, AP2_CHACHA_TAG_SIZE, tag) == 1;
     EVP_CIPHER_CTX_free(ctx);
-    if (ok) *cipher_len = total;
-    return ok;
+    return ok ? total : -1;
 }
 
 /* Send the SETRATEANCHORTIME anchor. It pins an RTP sample number to a point on
@@ -1547,20 +1726,17 @@ static bool ap2_send_flushbuffered(struct ap2cl_s *p)
 /* Push one encoded chunk over the buffered TCP data connection. The wire frame
  * is a 2-byte big-endian length prefix followed by the encrypted RTP packet
  * [12B hdr][ciphertext][16B tag][8B nonce]. TCP provides reliability and, via
- * bounded backpressure, flow control (no resend logic). */
+ * backpressure on the blocking write, flow control (no resend logic). */
 static ap2_send_result_t ap2_buffered_send_chunk(
     struct ap2cl_s *p, uint8_t *sample, int frames)
 {
-    if (p->buffered_sock < 0 || !p->alac) {
-        LOG_ERROR("[AP2] Buffered audio channel is unavailable");
-        return AP2_SEND_FATAL;
-    }
+    if (p->buffered_sock < 0 || !p->alac) return AP2_SEND_FATAL;
 
     uint8_t *encoded = NULL;
     int enc_size = 0;
     pcm_to_alac(p->alac, sample, frames, &encoded, &enc_size);
     if (!encoded || enc_size <= 0) {
-        LOG_ERROR("[AP2] ALAC encoder failed for buffered audio");
+        LOG_ERROR("[AP2] ALAC encoder failed");
         free(encoded);
         return AP2_SEND_FATAL;
     }
@@ -1596,26 +1772,23 @@ static ap2_send_result_t ap2_buffered_send_chunk(
     int cap = 2 + 12 + enc_size + AP2_CHACHA_TAG_SIZE + 8;
     uint8_t *frame = malloc(cap);
     if (!frame) {
-        LOG_ERROR("[AP2] Cannot allocate buffered RTP packet");
+        LOG_ERROR("[AP2] Cannot allocate buffered audio frame");
         free(encoded);
         return AP2_SEND_FATAL;
     }
     uint8_t *pkt = frame + 2;   /* payload starts after the 2-byte length prefix */
     memcpy(pkt, rtp_hdr, 12);
 
-    int ct_len = 0;
     uint8_t tag[AP2_CHACHA_TAG_SIZE];
-    bool encrypted_ok = ap2_encrypt_audio(
-        audio_key, nonce, rtp_hdr + 4, encoded, enc_size,
-        pkt + 12, &ct_len, tag);
+    int ct_len = ap2_encrypt_audio_payload(
+        audio_key, nonce, rtp_hdr + 4, 8, encoded, enc_size, pkt + 12, tag);
     free(encoded);
-    if (!encrypted_ok) {
+    if (ct_len < 0) {
         LOG_ERROR("[AP2] Buffered audio encryption failed");
         free(frame);
         return AP2_SEND_FATAL;
     }
     memcpy(pkt + 12 + ct_len, tag, sizeof(tag));
-    p->audio_nonce_counter++;
 
     int payload_len = 12 + ct_len + AP2_CHACHA_TAG_SIZE;
     memcpy(pkt + payload_len, nonce + 4, 8);   /* trailing nonce (nonce[4..11]) */
@@ -1629,8 +1802,8 @@ static ap2_send_result_t ap2_buffered_send_chunk(
     frame[1] = (uint8_t)(total & 0xFF);
 
     bool ok = ap2_io_write_all_deadline(
-        p->buffered_sock, frame, (size_t)total,
-        ap2_io_monotonic_ms() + AP2_BUFFERED_WRITE_TIMEOUT_MS);
+        p->buffered_sock, frame, total,
+        ap2_io_monotonic_ms() + AP2_RTSP_CONTROL_TIMEOUT_MS);
     free(frame);
 
     if (ok) {
@@ -1643,19 +1816,15 @@ static ap2_send_result_t ap2_buffered_send_chunk(
         shutdown(p->buffered_sock, SHUT_RDWR);
         close(p->buffered_sock);
         p->buffered_sock = -1;
-        return AP2_SEND_FATAL;
     }
-    return AP2_SEND_SENT;
+    return ok ? AP2_SEND_SENT : AP2_SEND_FATAL;
 }
 
 static ap2_send_result_t ap2_native_send_chunk(
     struct ap2cl_s *p, uint8_t *sample, int frames)
 {
     if (p->use_buffered) return ap2_buffered_send_chunk(p, sample, frames);
-    if (p->data_sock < 0 || !p->alac || !p->hap) {
-        LOG_ERROR("[AP2] Realtime audio session is incomplete");
-        return AP2_SEND_FATAL;
-    }
+    if (p->data_sock < 0 || !p->alac) return AP2_SEND_FATAL;
 
     /* Send initial sync/anchor packet before the very first audio packet, then
      * periodically every ~100 chunks (~0.8s at 352fpp/44.1kHz). PTP sessions use
@@ -1675,7 +1844,7 @@ static ap2_send_result_t ap2_native_send_chunk(
     int enc_size = 0;
     pcm_to_alac(p->alac, sample, frames, &encoded, &enc_size);
     if (!encoded || enc_size <= 0) {
-        LOG_ERROR("[AP2] ALAC encoder failed for realtime audio");
+        LOG_ERROR("[AP2] ALAC encoder failed");
         free(encoded);
         return AP2_SEND_FATAL;
     }
@@ -1721,13 +1890,11 @@ static ap2_send_result_t ap2_native_send_chunk(
     }
     memcpy(pkt, rtp_hdr, 12);
 
-    int ct_len = 0;
     uint8_t tag[AP2_CHACHA_TAG_SIZE];
-    bool encrypted_ok = ap2_encrypt_audio(
-        audio_key, nonce, rtp_hdr + 4, encoded, enc_size,
-        pkt + 12, &ct_len, tag);
+    int ct_len = ap2_encrypt_audio_payload(
+        audio_key, nonce, rtp_hdr + 4, 8, encoded, enc_size, pkt + 12, tag);
     free(encoded);
-    if (!encrypted_ok) {
+    if (ct_len < 0) {
         LOG_ERROR("[AP2] Realtime audio encryption failed");
         free(pkt);
         return AP2_SEND_FATAL;
@@ -1740,23 +1907,22 @@ static ap2_send_result_t ap2_native_send_chunk(
      * packet fails its auth tag and is silently dropped. */
     memcpy(pkt + 12 + ct_len + AP2_CHACHA_TAG_SIZE, nonce + 4, 8);
     int actual_pkt_size = 12 + ct_len + AP2_CHACHA_TAG_SIZE + 8;
-    ap2_send_result_t result = ap2_io_send_datagram_deadline(
+    ap2_io_datagram_result_t send_result = ap2_io_send_datagram_deadline(
         p->data_sock, pkt, (size_t)actual_pkt_size,
-        (const struct sockaddr *)&p->data_addr, sizeof(p->data_addr),
+        (struct sockaddr *)&p->data_addr, sizeof(p->data_addr),
         ap2_io_monotonic_ms() + AP2_UDP_SEND_TIMEOUT_MS);
     free(pkt);
 
-    if (result == AP2_SEND_SENT) {
+    if (send_result == AP2_IO_DATAGRAM_SENT) {
         p->audio_packets_sent++;
-    } else if (result == AP2_SEND_DROPPED) {
+    } else if (send_result == AP2_IO_DATAGRAM_DROPPED) {
         p->audio_packets_dropped++;
         if (p->audio_packets_dropped <= 3 ||
             (p->audio_packets_dropped % 100) == 0)
-            LOG_WARN("[AP2] RTP send transiently dropped seq=%u rtptime=%u",
-                     p->seq_number, p->rtp_timestamp);
+            LOG_WARN("[AP2] RTP send transiently dropped seq=%u rtptime=%u: %s",
+                     p->seq_number, p->rtp_timestamp, strerror(errno));
     } else {
-        LOG_ERROR("[AP2] Realtime RTP send failed seq=%u rtptime=%u "
-                  "bytes=%d: %s",
+        LOG_ERROR("[AP2] RTP send failed seq=%u rtptime=%u bytes=%d: %s",
                   p->seq_number, p->rtp_timestamp, actual_pkt_size,
                   strerror(errno));
         return AP2_SEND_FATAL;
@@ -1769,7 +1935,8 @@ static ap2_send_result_t ap2_native_send_chunk(
     p->rtp_timestamp += frames;
     p->head_ts += frames;
 
-    return result;
+    return send_result == AP2_IO_DATAGRAM_SENT
+               ? AP2_SEND_SENT : AP2_SEND_DROPPED;
 }
 
 /* ---- RAOP-compat connect ---- */
@@ -1838,25 +2005,15 @@ struct ap2cl_s *ap2cl_create(
     p->ctrl_sock = -1;
     p->events_sock = -1;
     p->buffered_sock = -1;
-    if (pthread_mutex_init(&p->rtsp_lock, NULL) != 0) {
-        free(p);
-        return NULL;
-    }
-    if (pthread_mutex_init(&p->mrp_lock, NULL) != 0) {
-        pthread_mutex_destroy(&p->rtsp_lock);
-        free(p);
-        return NULL;
-    }
-    if (!ap2_periodic_worker_init(&p->feedback_worker,
-                                  AP2_FEEDBACK_INTERVAL_MS,
-                                  ap2_feedback_worker_tick, p)) {
-        pthread_mutex_destroy(&p->mrp_lock);
-        pthread_mutex_destroy(&p->rtsp_lock);
-        free(p);
-        return NULL;
-    }
-    atomic_init(&p->rtsp_healthy, false);
-    atomic_init(&p->media_healthy, true);
+    pthread_mutex_init(&p->rtsp_lock, NULL);
+    pthread_mutex_init(&p->mrp_lock, NULL);
+    atomic_init(&p->rtsp_dead, false);
+    atomic_init(&p->rtsp_established, false);
+    atomic_init(&p->feedback_stop, true);
+    atomic_init(&p->feedback_waiting, false);
+    atomic_init(&p->mrp_event_status, -1);
+    atomic_init(&p->mrp_pending, 0);
+    p->feedback_interval_ms = AP2_FEEDBACK_INTERVAL_MS;
     if (dacp_id) p->dacp_id = strdup(dacp_id);
     if (active_remote) p->active_remote = strdup(active_remote);
     if (password) p->password = strdup(password);
@@ -1877,7 +2034,7 @@ struct ap2cl_s *ap2cl_create(
 bool ap2cl_destroy(struct ap2cl_s *p)
 {
     if (!p) return false;
-    ap2_periodic_worker_stop(&p->feedback_worker);
+    ap2_feedback_stop(p);
     /* Preserve the on-wire shutdown sequence (final MediaRemote stopped state,
      * MRP disconnect, RTSP TEARDOWN) on the normal EOF path too. */
     if (p->state != AP2_DOWN || p->sock_fd >= 0)
@@ -1886,8 +2043,11 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->hap) ap2_hap_destroy(p->hap);
     if (p->ptp) ap2_ptp_destroy(p->ptp);
     pthread_mutex_lock(&p->mrp_lock);
-    if (p->mrp) ap2_mrp_destroy(p->mrp);
-    p->mrp = NULL;
+    if (p->mrp) {
+        ap2_mrp_destroy(p->mrp);
+        p->mrp = NULL;
+        atomic_store(&p->mrp_event_status, -1);
+    }
     pthread_mutex_unlock(&p->mrp_lock);
     if (p->alac) alac_delete_encoder(p->alac);
     /* Close the RTSP socket under the lock so an in-flight request/response
@@ -1897,7 +2057,6 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->sock_fd >= 0) { close(p->sock_fd); p->sock_fd = -1; }
     pthread_mutex_unlock(&p->rtsp_lock);
     pthread_mutex_destroy(&p->rtsp_lock);
-    ap2_periodic_worker_destroy(&p->feedback_worker);
     pthread_mutex_destroy(&p->mrp_lock);
     if (p->data_sock >= 0) close(p->data_sock);
     if (p->ctrl_sock >= 0) close(p->ctrl_sock);
@@ -1979,17 +2138,20 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
 {
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
-        /* Stop and join the sole feedback/event owner before touching either
-         * encrypted channel. */
-        ap2_periodic_worker_stop(&p->feedback_worker);
+        ap2_feedback_stop(p);
+        atomic_store(&p->mrp_pending, 0);
         /* Publish the final stopped state before disconnecting MediaRemote,
          * while the encrypted RTSP session is still live. */
         pthread_mutex_lock(&p->mrp_lock);
-        if (p->mrp) {
-            ap2_mrp_set_stopped(p->mrp);
-            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_STOPPED, true);
-            ap2_mrp_stop(p->mrp);
-        }
+        bool mrp_ready = p->mrp != NULL;
+        if (mrp_ready) ap2_mrp_set_stopped(p->mrp);
+        pthread_mutex_unlock(&p->mrp_lock);
+        if (mrp_ready)
+            ap2_mrp_send_playback_state(
+                p, AP2_MRP_PLAYBACK_STOPPED, true);
+        pthread_mutex_lock(&p->mrp_lock);
+        if (p->mrp) ap2_mrp_stop(p->mrp);
+        atomic_store(&p->mrp_event_status, -1);
         pthread_mutex_unlock(&p->mrp_lock);
         if (p->events_sock >= 0) {
             close(p->events_sock);
@@ -2037,7 +2199,6 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
         p->seq_number = (uint16_t)(getpid() * 40503u);
         p->start_ntp = ntp_start;
         p->state = AP2_STREAMING;
-        atomic_store(&p->media_healthy, true);
         pthread_mutex_lock(&p->mrp_lock);
         if (p->mrp) ap2_mrp_set_playing(p->mrp, true);
         pthread_mutex_unlock(&p->mrp_lock);
@@ -2086,27 +2247,18 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
     return true;
 }
 
-ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
-                                   int frames)
+ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p,
+                                   uint8_t *sample, int frames)
 {
-    if (!p || p->state != AP2_STREAMING) {
-        LOG_ERROR("[AP2] Audio send attempted outside a streaming session");
-        return AP2_SEND_FATAL;
-    }
+    if (!p || p->state != AP2_STREAMING) return AP2_SEND_FATAL;
     if (p->flow == FLOW_NATIVE_AP2) {
-        ap2_send_result_t result = ap2_native_send_chunk(p, sample, frames);
-        if (result == AP2_SEND_FATAL)
-            atomic_store(&p->media_healthy, false);
-        return result;
+        if (atomic_load(&p->rtsp_dead)) return AP2_SEND_FATAL;
+        return ap2_native_send_chunk(p, sample, frames);
     }
-    if (!p->raopcl) {
-        LOG_ERROR("[AP2] RAOP-compatible audio session is unavailable");
-        return AP2_SEND_FATAL;
-    }
+    if (!p->raopcl) return AP2_SEND_FATAL;
     uint64_t playtime;
     return raopcl_send_chunk(p->raopcl, sample, frames, &playtime)
-               ? AP2_SEND_SENT
-               : AP2_SEND_FATAL;
+               ? AP2_SEND_SENT : AP2_SEND_FATAL;
 }
 
 static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
@@ -2172,7 +2324,7 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
     atomic_store(&p->rtp_offset, recovery.offset);
     if (p->use_ptp && p->rt_anchor_valid) {
         uint64_t shift_ns = ap2_timeline_frames_to_ns(
-            shifted_frames, (uint32_t)p->format.sample_rate);
+            shifted_frames, p->format.sample_rate);
         p->rt_anchor_wall0 += shift_ns;
     }
     p->timeline_reanchors++;
@@ -2211,30 +2363,39 @@ void ap2cl_log_diagnostics(struct ap2cl_s *p)
                ptp_now, clock_id, p->timeline_reanchors);
 }
 
+static void ap2_mrp_publish_playback_state(
+    struct ap2cl_s *p, ap2_state_t client_state,
+    ap2_mrp_playback_state_t state)
+{
+    p->state = client_state;
+    pthread_mutex_lock(&p->mrp_lock);
+    bool ready = p->mrp != NULL;
+    if (ready) {
+        if (state == AP2_MRP_PLAYBACK_STOPPED)
+            ap2_mrp_set_stopped(p->mrp);
+        else
+            ap2_mrp_set_playing(
+                 p->mrp, state == AP2_MRP_PLAYBACK_PLAYING);
+    }
+    pthread_mutex_unlock(&p->mrp_lock);
+    if (ready)
+        atomic_fetch_or(&p->mrp_pending, AP2_MRP_PENDING_PLAYBACK);
+}
+
 void ap2cl_pause(struct ap2cl_s *p)
 {
     if (!p) return;
     if (p->use_buffered && p->buffered_sock >= 0) {
         /* Freeze the buffered timeline in place with a rate-0 anchor. */
         ap2_send_setrateanchortime(p, p->rtp_timestamp, ap2_ptp_master_now_ns(p->ptp), 0);
-        p->state = AP2_PAUSED;
-        pthread_mutex_lock(&p->mrp_lock);
-        if (p->mrp) {
-            ap2_mrp_set_playing(p->mrp, false);
-            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PAUSED, true);
-        }
-        pthread_mutex_unlock(&p->mrp_lock);
+        ap2_mrp_publish_playback_state(
+            p, AP2_PAUSED, AP2_MRP_PLAYBACK_PAUSED);
         return;
     }
     if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
     p->rt_anchor_valid = false;    /* resume re-anchors on a fresh line */
-    p->state = AP2_PAUSED;
-    pthread_mutex_lock(&p->mrp_lock);
-    if (p->mrp) {
-        ap2_mrp_set_playing(p->mrp, false);
-        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PAUSED, true);
-    }
-    pthread_mutex_unlock(&p->mrp_lock);
+    ap2_mrp_publish_playback_state(
+        p, AP2_PAUSED, AP2_MRP_PLAYBACK_PAUSED);
 }
 
 void ap2cl_play(struct ap2cl_s *p)
@@ -2244,13 +2405,8 @@ void ap2cl_play(struct ap2cl_s *p)
         /* Re-anchor at rate 1 a short lead ahead to resume the buffered stream. */
         uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + (uint64_t)p->latency_ms * 1000000ULL;
         ap2_send_setrateanchortime(p, p->rtp_timestamp, anchor_ns, 1);
-        p->state = AP2_STREAMING;
-        pthread_mutex_lock(&p->mrp_lock);
-        if (p->mrp) {
-            ap2_mrp_set_playing(p->mrp, true);
-            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PLAYING, true);
-        }
-        pthread_mutex_unlock(&p->mrp_lock);
+        ap2_mrp_publish_playback_state(
+            p, AP2_STREAMING, AP2_MRP_PLAYBACK_PLAYING);
         return;
     }
     if (p->raopcl) {
@@ -2258,13 +2414,8 @@ void ap2cl_play(struct ap2cl_s *p)
         uint64_t now = raopcl_get_ntp(NULL);
         raopcl_start_at(p->raopcl, now + MS2NTP(200) - TS2NTP(lat, raopcl_sample_rate(p->raopcl)));
     }
-    p->state = AP2_STREAMING;
-    pthread_mutex_lock(&p->mrp_lock);
-    if (p->mrp) {
-        ap2_mrp_set_playing(p->mrp, true);
-        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PLAYING, true);
-    }
-    pthread_mutex_unlock(&p->mrp_lock);
+    ap2_mrp_publish_playback_state(
+        p, AP2_STREAMING, AP2_MRP_PLAYBACK_PLAYING);
 }
 
 void ap2cl_stop(struct ap2cl_s *p)
@@ -2273,14 +2424,9 @@ void ap2cl_stop(struct ap2cl_s *p)
     if (p->use_buffered && p->buffered_sock >= 0)
         ap2_send_flushbuffered(p);
     if (p->raopcl) raopcl_stop(p->raopcl);
-    pthread_mutex_lock(&p->mrp_lock);
-    if (p->mrp) {
-        ap2_mrp_set_stopped(p->mrp);
-        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_STOPPED, true);
-    }
-    pthread_mutex_unlock(&p->mrp_lock);
+    ap2_mrp_publish_playback_state(
+        p, AP2_DOWN, AP2_MRP_PLAYBACK_STOPPED);
     p->rt_anchor_valid = false;
-    p->state = AP2_DOWN;
 }
 
 bool ap2cl_feedback(struct ap2cl_s *p)
@@ -2293,31 +2439,14 @@ bool ap2cl_feedback(struct ap2cl_s *p)
     int status = ap2_rtsp_send(p, "POST", "/feedback", NULL, 0, NULL, &resp, &resp_len);
     free(resp);
     LOG_DEBUG("[AP2] /feedback keepalive -> %d", status);
-    if (status == 200) {
-        unsigned failures = atomic_exchange(&p->feedback_failures, 0);
-        if (failures)
-            LOG_INFO("[AP2] /feedback recovered after %u failure(s)",
-                     failures);
-    } else {
-        unsigned failures = atomic_fetch_add(&p->feedback_failures, 1) + 1;
-        if (failures <= 3 || (failures % 10) == 0)
-            LOG_WARN("[AP2] /feedback failed: status=%d consecutive=%u",
-                     status, failures);
-    }
     return status == 200;
 }
 
 bool ap2cl_control_healthy(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2) return true;
-    if (!atomic_load(&p->rtsp_healthy) ||
-        !atomic_load(&p->media_healthy) ||
-        atomic_load(&p->feedback_failures) >= 3)
-        return false;
-    pthread_mutex_lock(&p->mrp_lock);
-    bool healthy = !p->mrp || ap2_mrp_event_status(p->mrp) != 0;
-    pthread_mutex_unlock(&p->mrp_lock);
-    return healthy;
+    if (atomic_load(&p->rtsp_dead)) return false;
+    return atomic_load(&p->mrp_event_status) != 0;
 }
 
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
@@ -2402,7 +2531,8 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
  * messages. Set CLIAIRPLAY_MRP=0 to disable the path for diagnosis. */
 static void ap2_mrp_ready_locked(struct ap2cl_s *p)
 {
-    if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
+    if (p->mrp || !p->rtsp_established ||
+        p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
         p->sock_fd < 0 || p->events_sock < 0 || !p->session_uuid[0])
         return;
     const char *setting = getenv("CLIAIRPLAY_MRP");
@@ -2418,10 +2548,20 @@ static void ap2_mrp_ready_locked(struct ap2cl_s *p)
         LOG_WARN("[MRP] event-channel attach failed; MediaRemote disabled");
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
+        atomic_store(&p->mrp_event_status, -1);
         return;
     }
-    p->events_sock = -1; /* ownership transferred to the MRP context */
+    atomic_store(&p->mrp_event_status, 1);
     ap2_mrp_set_playing(p->mrp, p->state == AP2_STREAMING);
+}
+
+static bool ap2_mrp_ensure_ready(struct ap2cl_s *p)
+{
+    pthread_mutex_lock(&p->mrp_lock);
+    ap2_mrp_ready_locked(p);
+    bool ready = p->mrp != NULL;
+    pthread_mutex_unlock(&p->mrp_lock);
+    return ready;
 }
 
 /* Log an RTSP response body for diagnosis: a printable-text view (control bytes
@@ -2451,10 +2591,20 @@ typedef bool (*ap2_mrp_command_builder_t)(struct ap2_mrp_ctx *,
 
 static int ap2_mrp_post_command(struct ap2cl_s *p,
                                 ap2_mrp_command_builder_t builder,
-                                const char *tag)
+                                const char *tag,
+                                uint64_t *artwork_generation)
 {
     uint8_t *body = NULL; int body_len = 0;
-    if (!builder(p->mrp, &body, &body_len)) return -1;
+    pthread_mutex_lock(&p->mrp_lock);
+    bool built = p->mrp && builder(p->mrp, &body, &body_len);
+    if (built && artwork_generation)
+        *artwork_generation = ap2_mrp_artwork_generation(p->mrp);
+    pthread_mutex_unlock(&p->mrp_lock);
+    if (!built) return -1;
+    while (atomic_load(&p->feedback_waiting) &&
+           !atomic_load(&p->rtsp_dead) &&
+           !atomic_load(&p->feedback_stop))
+        usleep(1000);
     uint8_t *resp = NULL;
     int resp_len = 0;
     int status = ap2_rtsp_send(p, "POST", "/command", body, body_len,
@@ -2476,13 +2626,13 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
                                        ap2_mrp_playback_state_t state,
                                        bool force)
 {
-    if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
         return -1;
     if (!force && p->mrp_last_playback_state == state) return 200;
 
     int status = ap2_mrp_post_command(
         p, ap2_mrp_build_playbackstate_command,
-        "[MRP] /command updateMRPlaybackState");
+        "[MRP] /command updateMRPlaybackState", NULL);
     if (ap2_mrp_status_ok(status))
         p->mrp_last_playback_state = state;
     return status;
@@ -2501,11 +2651,11 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
 
     int st_cmd = ap2_mrp_post_command(
         p, ap2_mrp_build_supportedcommands_command,
-        "[MRP] /command updateMRSupportedCommands");
+        "[MRP] /command updateMRSupportedCommands", NULL);
     int st_state = ap2_mrp_send_playback_state(p, state, true);
     int st_client = ap2_mrp_post_command(
         p, ap2_mrp_build_nowplayingclient_command,
-        "[MRP] /command updateMRNowPlayingClient");
+        "[MRP] /command updateMRNowPlayingClient", NULL);
 
     p->mrp_extended_registered =
         ap2_mrp_status_ok(st_cmd) && ap2_mrp_status_ok(st_state) &&
@@ -2518,22 +2668,23 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
     return st_client;
 }
 
-static int ap2cl_mrp_register_locked(struct ap2cl_s *p);
-
 static int ap2cl_mrp_push_locked(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
-    ap2_mrp_ready_locked(p);
-    if (!p->mrp) return -1;
+    if (!ap2_mrp_ensure_ready(p)) return -1;
 
     if (!p->mrp_device_registered && ap2cl_mrp_register_locked(p) != 1)
         return 0;
 
+    uint64_t artwork_generation = 0;
     int status = ap2_mrp_post_command(
         p, ap2_mrp_build_nowplaying_command,
-        "[MRP] /command updateMRNowPlayingInfo");
+        "[MRP] /command updateMRNowPlayingInfo", &artwork_generation);
     if (!ap2_mrp_status_ok(status)) return status;
-    ap2_mrp_mark_artwork_sent(p->mrp);
+    pthread_mutex_lock(&p->mrp_lock);
+    if (p->mrp)
+        ap2_mrp_mark_artwork_sent(p->mrp, artwork_generation);
+    pthread_mutex_unlock(&p->mrp_lock);
 
     int ext_status;
     if (!p->mrp_extended_registered) {
@@ -2550,11 +2701,9 @@ static int ap2cl_mrp_push_locked(struct ap2cl_s *p)
 
 int ap2cl_mrp_push(struct ap2cl_s *p)
 {
-    if (!p) return -1;
-    pthread_mutex_lock(&p->mrp_lock);
-    int status = ap2cl_mrp_push_locked(p);
-    pthread_mutex_unlock(&p->mrp_lock);
-    return status;
+    if (!p || !ap2_mrp_ensure_ready(p)) return -1;
+    atomic_fetch_or(&p->mrp_pending, AP2_MRP_PENDING_PUSH);
+    return 202;
 }
 
 /* MRP data-channel (path B) status for the [STATUS] mrp line:
@@ -2580,24 +2729,21 @@ int ap2cl_mrp_channel_status(struct ap2cl_s *p)
 static int ap2cl_mrp_register_locked(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
-    ap2_mrp_ready_locked(p);
-    if (!p->mrp) return -1;
+    if (!ap2_mrp_ensure_ready(p)) return -1;
     if (p->mrp_device_registered) return 1;
 
     int status = ap2_mrp_post_command(
         p, ap2_mrp_build_deviceinfo_command,
-        "[MRP] /command DEVICE_INFO");
+        "[MRP] /command DEVICE_INFO", NULL);
     p->mrp_device_registered = ap2_mrp_status_ok(status);
     return p->mrp_device_registered ? 1 : 0;
 }
 
 int ap2cl_mrp_register(struct ap2cl_s *p)
 {
-    if (!p) return -1;
-    pthread_mutex_lock(&p->mrp_lock);
-    int status = ap2cl_mrp_register_locked(p);
-    pthread_mutex_unlock(&p->mrp_lock);
-    return status;
+    if (!p || !ap2_mrp_ensure_ready(p)) return -1;
+    atomic_fetch_or(&p->mrp_pending, AP2_MRP_PENDING_REGISTER);
+    return 202;
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,

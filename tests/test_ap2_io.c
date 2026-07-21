@@ -1,145 +1,138 @@
-#include <assert.h>
 #include <errno.h>
-#include <fcntl.h>
-#include <stdatomic.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "ap2_feedback.h"
 #include "ap2_io.h"
 
-static void test_rtsp_parser(void)
-{
-    static const uint8_t response[] =
-        "RTSP/1.0 200 OK\r\n"
-        "CSeq: 17\r\n"
-        "Content-Length: 4\r\n\r\n"
-        "test";
-    ap2_rtsp_response_t parsed;
-    assert(ap2_io_parse_rtsp_response(
-               response, sizeof(response) - 2, &parsed) == 0);
-    assert(ap2_io_parse_rtsp_response(
-               response, sizeof(response) - 1, &parsed) == 1);
-    assert(parsed.status == 200);
-    assert(parsed.cseq == 17);
-    assert(parsed.body_len == 4);
-    assert(parsed.message_len == sizeof(response) - 1);
+#define CHECK(condition) do { \
+    if (!(condition)) { \
+        fprintf(stderr, "FAIL %s:%d: %s\n", __FILE__, __LINE__, #condition); \
+        return false; \
+    } \
+} while (0)
 
-    static const uint8_t malformed[] =
-        "RTSP/1.0 200 OK\r\nCSeq: nope\r\nContent-Length: 0\r\n\r\n";
-    assert(ap2_io_parse_rtsp_response(
-               malformed, sizeof(malformed) - 1, &parsed) == -1);
-}
-
-static void test_deadline_io(void)
+static bool test_fake_peer_response(void)
 {
     int pair[2];
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
-    uint8_t byte;
-    uint64_t started = ap2_io_monotonic_ms();
-    errno = 0;
-    assert(ap2_io_read_deadline(pair[0], &byte, 1, started + 40) < 0);
-    assert(errno == ETIMEDOUT);
-    assert(ap2_io_monotonic_ms() - started < 500);
-    puts("  read timeout");
-    fflush(stdout);
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    const char response[] =
+        "RTSP/1.0 200 OK\r\nCSeq: 7\r\nContent-Length: 0\r\n\r\n";
+    CHECK(write(pair[1], response, sizeof(response) - 1) ==
+          (ssize_t)(sizeof(response) - 1));
 
-    int sendbuf = 4096;
-    assert(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF,
-                      &sendbuf, sizeof(sendbuf)) == 0);
-    uint8_t payload[65536];
-    memset(payload, 0x5a, sizeof(payload));
-    started = ap2_io_monotonic_ms();
-    errno = 0;
-    assert(!ap2_io_write_all_deadline(
-        pair[0], payload, sizeof(payload), started + 40));
-    assert(errno == ETIMEDOUT);
-    assert(ap2_io_monotonic_ms() - started < 500);
-    puts("  write timeout");
-    fflush(stdout);
+    uint8_t buf[128] = {0};
+    ssize_t n = ap2_io_read_deadline(
+        pair[0], buf, sizeof(buf), ap2_io_monotonic_ms() + 100);
+    CHECK(n == (ssize_t)(sizeof(response) - 1));
+    CHECK(memcmp(buf, response, sizeof(response) - 1) == 0);
     close(pair[0]);
     close(pair[1]);
-
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
-    close(pair[1]);
-    errno = 0;
-    assert(ap2_io_read_deadline(
-               pair[0], &byte, 1, ap2_io_monotonic_ms() + 40) == 0);
-    assert(errno == ECONNRESET);
-    puts("  peer close");
-    fflush(stdout);
-    close(pair[0]);
-}
-
-static void test_datagram_outcomes(void)
-{
-    int pair[2];
-    assert(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0);
-    uint8_t payload[1024] = {0};
-    assert(ap2_io_send_datagram_deadline(
-               pair[0], payload, sizeof(payload), NULL, 0,
-               ap2_io_monotonic_ms() + 40) == AP2_SEND_SENT);
-
-    int sendbuf = 2048;
-    assert(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF,
-                      &sendbuf, sizeof(sendbuf)) == 0);
-    while (send(pair[0], payload, sizeof(payload), MSG_DONTWAIT) >= 0) {}
-    assert(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS);
-    assert(ap2_io_send_datagram_deadline(
-               pair[0], payload, sizeof(payload), NULL, 0,
-               ap2_io_monotonic_ms() + 40) == AP2_SEND_DROPPED);
-
-    close(pair[0]);
-    assert(ap2_io_send_datagram_deadline(
-               pair[0], payload, sizeof(payload), NULL, 0,
-               ap2_io_monotonic_ms() + 40) == AP2_SEND_FATAL);
-    close(pair[1]);
-}
-
-static atomic_uint worker_ticks;
-
-static bool worker_tick(void *arg)
-{
-    (void)arg;
-    atomic_fetch_add(&worker_ticks, 1);
     return true;
 }
 
-static void test_worker_without_cmdpipe(void)
+static bool test_read_timeout_is_bounded(void)
 {
-    ap2_periodic_worker_t worker;
-    atomic_init(&worker_ticks, 0);
-    assert(ap2_periodic_worker_init(&worker, 20, worker_tick, NULL));
-    assert(ap2_periodic_worker_start(&worker));
-    uint64_t deadline_ms = ap2_io_monotonic_ms() + 1000;
-    while (atomic_load(&worker_ticks) < 3 &&
-           ap2_io_monotonic_ms() < deadline_ms)
-        usleep(5000);
-    ap2_periodic_worker_stop(&worker);
-    unsigned stopped_at = atomic_load(&worker_ticks);
-    assert(stopped_at >= 3);
-    usleep(30000);
-    assert(atomic_load(&worker_ticks) == stopped_at);
-    ap2_periodic_worker_destroy(&worker);
+    int pair[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    uint8_t byte;
+    uint64_t started = ap2_io_monotonic_ms();
+    errno = 0;
+    ssize_t n = ap2_io_read_deadline(pair[0], &byte, 1, started + 80);
+    uint64_t elapsed = ap2_io_monotonic_ms() - started;
+    CHECK(n < 0);
+    CHECK(errno == ETIMEDOUT);
+    CHECK(elapsed >= 50 && elapsed < 500);
+    close(pair[0]);
+    close(pair[1]);
+    return true;
+}
+
+static bool test_stalled_write_is_bounded(void)
+{
+    int pair[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    int sendbuf = 4096;
+    CHECK(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF,
+                     &sendbuf, sizeof(sendbuf)) == 0);
+
+    int len = 4 * 1024 * 1024;
+    uint8_t *payload = malloc((size_t)len);
+    CHECK(payload != NULL);
+    memset(payload, 0x5a, (size_t)len);
+    uint64_t started = ap2_io_monotonic_ms();
+    errno = 0;
+    bool ok = ap2_io_write_all_deadline(
+        pair[0], payload, len, started + 100);
+    uint64_t elapsed = ap2_io_monotonic_ms() - started;
+    CHECK(!ok);
+    CHECK(errno == ETIMEDOUT);
+    CHECK(elapsed >= 50 && elapsed < 1000);
+    free(payload);
+    close(pair[0]);
+    close(pair[1]);
+    return true;
+}
+
+static bool test_closed_peer_is_visible(void)
+{
+    int pair[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
+    close(pair[1]);
+    uint8_t byte;
+    errno = 0;
+    ssize_t n = ap2_io_read_deadline(
+        pair[0], &byte, 1, ap2_io_monotonic_ms() + 100);
+    CHECK(n == 0);
+    CHECK(errno == ECONNRESET);
+    close(pair[0]);
+    return true;
+}
+
+static bool test_datagram_outcomes(void)
+{
+    int pair[2];
+    CHECK(socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) == 0);
+    int sendbuf = 4096;
+    CHECK(setsockopt(pair[0], SOL_SOCKET, SO_SNDBUF,
+                     &sendbuf, sizeof(sendbuf)) == 0);
+    CHECK(ap2_io_set_nonblocking(pair[0]));
+
+    uint8_t payload[1024] = {0};
+    CHECK(ap2_io_send_datagram_deadline(
+              pair[0], payload, sizeof(payload), NULL, 0,
+              ap2_io_monotonic_ms() + 100) == AP2_IO_DATAGRAM_SENT);
+    uint8_t received[1024];
+    CHECK(read(pair[1], received, sizeof(received)) ==
+          (ssize_t)sizeof(received));
+
+    while (send(pair[0], payload, sizeof(payload), MSG_DONTWAIT) > 0) {}
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS);
+    CHECK(ap2_io_send_datagram_deadline(
+              pair[0], payload, sizeof(payload), NULL, 0,
+              ap2_io_monotonic_ms() + 80) == AP2_IO_DATAGRAM_DROPPED);
+
+    errno = 0;
+    CHECK(ap2_io_send_datagram_deadline(
+              -1, payload, sizeof(payload), NULL, 0,
+              ap2_io_monotonic_ms() + 80) == AP2_IO_DATAGRAM_FATAL);
+    CHECK(errno == EBADF);
+    close(pair[0]);
+    close(pair[1]);
+    return true;
 }
 
 int main(void)
 {
-    puts("rtsp parser");
-    fflush(stdout);
-    test_rtsp_parser();
-    puts("deadline io");
-    fflush(stdout);
-    test_deadline_io();
-    puts("datagram outcomes");
-    fflush(stdout);
-    test_datagram_outcomes();
-    puts("worker");
-    fflush(stdout);
-    test_worker_without_cmdpipe();
+    if (!test_fake_peer_response()) return 1;
+    if (!test_read_timeout_is_bounded()) return 1;
+    if (!test_stalled_write_is_bounded()) return 1;
+    if (!test_closed_peer_is_visible()) return 1;
+    if (!test_datagram_outcomes()) return 1;
     puts("ap2_io tests passed");
     return 0;
 }

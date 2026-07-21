@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 #include <openssl/kdf.h>
 
 #include "ap2_mrp.h"
+#include "ap2_io.h"
 #include "cross_log.h"
 
 #define KEY_SIZE 32
@@ -216,5 +218,47 @@ int main(void)
     assert(ap2_mrp_event_status(mrp) == 0);
     ap2_mrp_destroy(mrp);
     close(sockets[1]);
+
+    /* A receiver that stops reading responses must fail within the event
+     * channel's deadline and become visible to the session health check. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    int sendbuf = 4096;
+    assert(setsockopt(sockets[0], SOL_SOCKET, SO_SNDBUF,
+                      &sendbuf, sizeof(sendbuf)) == 0);
+    assert(ap2_io_set_nonblocking(sockets[0]));
+    mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
+        "Music Assistant", "11111111-2222-4333-8444-555555555555",
+        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret);
+    assert(mrp);
+    assert(ap2_mrp_attach_events(mrp, sockets[0]));
+
+    uint8_t filler[4096] = {0};
+    while (send(sockets[0], filler, sizeof(filler), MSG_DONTWAIT) > 0) {}
+    assert(errno == EAGAIN || errno == EWOULDBLOCK || errno == ENOBUFS);
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    uint64_t started = ap2_io_monotonic_ms();
+    ap2_mrp_tick(mrp);
+    uint64_t elapsed = ap2_io_monotonic_ms() - started;
+    assert(elapsed < 2000);
+    assert(ap2_mrp_event_status(mrp) == 0);
+    ap2_mrp_destroy(mrp);
+    close(sockets[0]);
+    close(sockets[1]);
+
+    /* Peer closure is terminal too; the failed channel must never be reused
+     * with already-advanced encryption counters. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
+        "Music Assistant", "11111111-2222-4333-8444-555555555555",
+        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret);
+    assert(mrp);
+    assert(ap2_mrp_attach_events(mrp, sockets[0]));
+    close(sockets[1]);
+    ap2_mrp_tick(mrp);
+    assert(ap2_mrp_event_status(mrp) == 0);
+    ap2_mrp_destroy(mrp);
+    close(sockets[0]);
     return 0;
 }

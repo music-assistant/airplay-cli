@@ -378,21 +378,28 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 
 ## 10. Session robustness
 
-- **Keepalive** — native AP2 sessions POST `/feedback` every ~2 s (real
-  senders do; receivers idle-time-out long sessions without it). RAOP paths
+- **Keepalive** — every native AP2 session starts a dedicated worker that POSTs
+  `/feedback` every ~2 s, including sessions without `--cmdpipe`. The same
+  worker is the sole owner of reverse-event and type-130 servicing. RAOP paths
   use libraop's keepalive (~20 s).
+- **MediaRemote publication** — a separate worker coalesces pending
+  registration, metadata, and playback-state updates. Callers only mutate a
+  locked state snapshot and queue work, so optional `/command` I/O never delays
+  audio startup, RTP transmission, pause, or resume. Feedback waiting on the
+  RTSP channel takes priority between metadata requests.
 - **RTSP serialization** — one mutex serializes the RTSP channel, so the
-  keepalive thread and the streaming path can never interleave frames on the
-  encrypted channel.
-- **RTSP fail-closed liveness** — absolute monotonic deadlines bound every
-  request/response cycle: feedback/control requests are short, metadata is
-  longer, and artwork gets the largest window. Incomplete writes/responses or a
-  mismatched `CSeq` close the TCP/HAP stream because advanced encryption nonces
-  cannot be reused; the process exits with an error so its supervisor can
-  reconnect instead of leaving a zombie UDP sender.
-- **Socket timeouts** — the RTSP socket, events socket, and the buffered TCP
-  socket are receive/send-timeout bounded; a receiver that stops draining
-  can never hang the process.
+  keepalive and metadata paths can never interleave frames on the encrypted
+  channel. CSeq assignment, HAP nonce advancement, I/O, response decryption,
+  and response-CSeq validation form one transaction.
+- **RTSP fail-closed liveness** — cumulative request deadlines are 8 s during
+  setup, 1.5 s for feedback, 3 s for ordinary control, and 5 s for
+  metadata/artwork. A partial encrypted write or incomplete response shuts
+  down the TCP/HAP stream because the advanced nonce and CSeq can never be
+  reused safely. The process exits with an error so its supervisor reconnects
+  instead of leaving a zombie UDP sender.
+- **Bounded channel I/O** — reverse-event, type-130 DataStream, and buffered
+  audio writes have absolute deadlines. A failed encrypted channel is closed
+  rather than reused with an already-advanced nonce.
 - **Reverse event channel** — pair-verified sessions derive independent
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
@@ -402,10 +409,12 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   sole reverse-event/DataStream tick owner, serializes MediaRemote state, and is
   stopped and joined before encrypted channels are torn down.
 - **Realtime send loop** — RTP data/control UDP sockets are non-blocking and
-  account for dropped datagrams, so local network backpressure cannot freeze
-  elapsed-status output. A PCM starvation gap that exhausts the receiver lead
-  shifts the pacing deadline and PTP anchor forward while keeping audio RTP
-  timestamps contiguous, allowing resumed content to render instead of staying
+  distinguish a transient queue drop from a fatal encoder/key/socket failure.
+  A dropped datagram advances sequence and RTP time, so local network
+  backpressure cannot freeze elapsed-status output or replay a stale packet.
+  A PCM starvation gap that exhausts the receiver lead shifts the pacing
+  deadline and PTP anchor forward while keeping audio RTP timestamps
+  contiguous, allowing resumed content to render instead of staying
   permanently late.
 - **Eager input ring** — a dedicated reader drains stdin into a 4 MB ring as
   fast as the source delivers, decoupled from network pacing: the pipeline
@@ -421,12 +430,14 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   commands, explicit playback state, and a serialized NowPlayingClient.
   Start/pause/resume/stop transitions stay synchronized with the audio state.
   This path is enabled by default (`CLIAIRPLAY_MRP=0` is the diagnostic opt-out);
-  best-effort, audio never gates on it (§8).
+  best-effort, audio never gates on it (§8). Rapid updates are coalesced and
+  artwork completion is generation-checked so an in-flight old cover cannot
+  mark a newer cover as already delivered.
 - **Metadata inputs** — UTF-8 strings become UTF-16BE binary-plist strings when
   needed. `ARTWORK` accepts local files and MA's local HTTP imageproxy URLs;
   imageproxy requests are normalized to supported `size=512&fmt=jpeg` values,
-  and fetches have a 5-second overall deadline. The independent maintenance
-  worker keeps feedback and reverse-event replies live during metadata I/O.
+  and fetches have a 5-second overall deadline. The dedicated keepalive worker
+  services reverse events independently of artwork loading.
 - **Diagnostics** — `--debug 10` emits `[CLIDIAG]` ring-buffer snapshots,
   `[AP2DIAG]` RTP/PTP pacing and packet counters, RTSP request durations,
   feedback failures, event-channel requests, and starvation/re-anchor events.

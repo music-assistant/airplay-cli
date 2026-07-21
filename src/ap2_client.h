@@ -129,14 +129,20 @@ bool ap2cl_disconnect(struct ap2cl_s *p);
 /* Start playback at the given NTP timestamp. */
 bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start);
 
+typedef enum {
+    AP2_SEND_FATAL = -1,
+    AP2_SEND_DROPPED = 0,
+    AP2_SEND_SENT = 1,
+} ap2_send_result_t;
+
 /* Send a chunk of PCM audio data.
- * Returns AP2_SEND_SENT, AP2_SEND_DROPPED for transient realtime UDP
- * backpressure (the timeline still advances), or AP2_SEND_FATAL.
+ * A transient realtime UDP drop still consumes the chunk and advances the RTP
+ * timeline; callers must only terminate playback for AP2_SEND_FATAL.
  * :param sample: Raw PCM audio bytes (interleaved, little-endian).
  * :param frames: Number of audio frames in the sample buffer.
  */
-ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
-                                   int frames);
+ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p,
+                                   uint8_t *sample, int frames);
 
 /* Check if the client is ready to accept more audio frames. */
 bool ap2cl_accept_frames(struct ap2cl_s *p);
@@ -162,6 +168,16 @@ bool ap2cl_feedback(struct ap2cl_s *p);
  * fails. The caller should terminate so its supervisor can reconnect. */
 bool ap2cl_control_healthy(struct ap2cl_s *p);
 
+#ifdef AP2_TESTING
+bool ap2cl_test_start_feedback_worker(struct ap2cl_s *p, int socket_fd,
+                                      int interval_ms);
+bool ap2cl_test_attach_mrp(struct ap2cl_s *p, int event_socket,
+                           const uint8_t shared_secret[32]);
+void ap2cl_test_stop_feedback_worker(struct ap2cl_s *p);
+int ap2cl_test_post_command(struct ap2cl_s *p);
+int ap2cl_test_parse_response(uint8_t *data, int len, int expected_cseq);
+#endif
+
 /* Emit a debug-level snapshot of RTP pacing/timeline/send health. */
 void ap2cl_log_diagnostics(struct ap2cl_s *p);
 
@@ -178,10 +194,10 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, co
 /* Set playback progress. */
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
 
-/* Push the current now-playing state and any pending MediaRemote extended
- * metadata over POST /command. Enabled for pair-verified native sessions;
- * CLIAIRPLAY_MRP=0 disables it. Returns the HTTP status, 0 on registration
- * failure, or -1 when the push does not apply to this session. */
+/* Queue the current now-playing state and any pending MediaRemote extended
+ * metadata for POST /command. Enabled for pair-verified native sessions;
+ * CLIAIRPLAY_MRP=0 disables it. Returns 202 when queued or -1 when the push
+ * does not apply to this session; receiver responses are logged by the worker. */
 int ap2cl_mrp_push(struct ap2cl_s *p);
 
 /* Status of the type-130 MRP data channel (path B) for the [STATUS] mrp line:
@@ -189,9 +205,9 @@ int ap2cl_mrp_push(struct ap2cl_s *p);
  * 1 = channel established. */
 int ap2cl_mrp_channel_status(struct ap2cl_s *p);
 
-/* Perform the /command DEVICE_INFO origin registration before now-playing.
- * Extended metadata is sent immediately after the first now-playing update.
- * Returns 1 (2xx), 0, or -1 (not applicable). */
+/* Queue /command DEVICE_INFO origin registration before now-playing.
+ * Extended metadata is sent after the first queued now-playing update.
+ * Returns 202 when queued or -1 when not applicable. */
 int ap2cl_mrp_register(struct ap2cl_s *p);
 
 /* Set RAOP-compatible properties (mDNS fields, interface, credentials).

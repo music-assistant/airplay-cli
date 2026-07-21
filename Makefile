@@ -44,6 +44,7 @@ EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
 TIMELINE_TEST = $(BUILDDIR)/test-ap2-timeline
 EVENT_TEST = $(BUILDDIR)/test-ap2-event
 IO_TEST = $(BUILDDIR)/test-ap2-io
+FEEDBACK_TEST = $(BUILDDIR)/test-ap2-feedback
 
 # Compiler flags
 DEFINES  = -DNDEBUG -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED
@@ -94,8 +95,8 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_feedback.c ap2_hap.c ap2_io.c ap2_ptp.c \
-	ap2_ptp_shm.c ap2_plist.c ap2_mrp.c
+AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c \
+	ap2_plist.c ap2_mrp.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
@@ -122,13 +123,20 @@ OBJECTS_CLI  = $(patsubst %.c,$(BUILDDIR)/%.o,$(filter %.c,$(CLI_SOURCES)))
 OBJECTS_CLI += $(patsubst %.cpp,$(BUILDDIR)/%.o,$(filter %.cpp,$(CLI_SOURCES)))
 
 OBJECTS_ALL = $(OBJECTS_RAOP) $(OBJECTS_AP2) $(OBJECTS_CLI)
+FEEDBACK_CLIENT_OBJECT = $(BUILDDIR)/ap2_client_test.o
+FEEDBACK_TEST_MAIN = $(BUILDDIR)/test_ap2_feedback.o
+FEEDBACK_TEST_OBJECTS = $(OBJECTS_RAOP) \
+	$(filter-out $(BUILDDIR)/ap2_client.o,$(OBJECTS_AP2)) \
+	$(filter-out $(BUILDDIR)/cliairplay.o $(BUILDDIR)/artwork.o,$(OBJECTS_CLI)) \
+	$(FEEDBACK_CLIENT_OBJECT) $(FEEDBACK_TEST_MAIN)
 
 all: directory $(EXECUTABLE)
 
-test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST)
+test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(FEEDBACK_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
+	$(FEEDBACK_TEST)
 
 directory:
 	@mkdir -p $(BUILDDIR)
@@ -149,21 +157,29 @@ $(BUILDDIR)/%.o: %.cpp
 	$(CXX) $(CXXFLAGS) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
-	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) -Isrc $< -o $@
+	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS) -Isrc \
+		$< $(EXTRA_LDFLAGS) -o $@
 
 $(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
-		$(BUILDDIR)/ap2_io.o \
-		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/cross_log.o Makefile
-	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(INCLUDE) \
+		$(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
+		$(BUILDDIR)/cross_log.o Makefile
+	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS) $(INCLUDE) \
 		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
 		$(BUILDDIR)/ap2_plist.o \
 		$(BUILDDIR)/cross_log.o $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
-$(IO_TEST): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h \
-		src/ap2_feedback.c src/ap2_feedback.h Makefile
-	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) -Isrc \
-		tests/test_ap2_io.c src/ap2_io.c src/ap2_feedback.c \
-		-lpthread -o $@
+$(IO_TEST): tests/test_ap2_io.c $(BUILDDIR)/ap2_io.o Makefile
+	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS) -Isrc \
+		$< $(BUILDDIR)/ap2_io.o $(EXTRA_LDFLAGS) -o $@
+
+$(FEEDBACK_CLIENT_OBJECT): src/ap2_client.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DAP2_TESTING $< -c -o $@
+
+$(FEEDBACK_TEST_MAIN): tests/test_ap2_feedback.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DAP2_TESTING $< -c -o $@
+
+$(FEEDBACK_TEST): $(FEEDBACK_TEST_OBJECTS) $(LIBCODECS_PATCHED)
+	$(CXX) $(FEEDBACK_TEST_OBJECTS) $(LIBRARY) $(LDFLAGS) -o $@
 
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED)

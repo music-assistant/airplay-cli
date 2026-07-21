@@ -68,6 +68,7 @@ extern log_level *loglevel;
 #define MRP_TAG_SIZE     16
 #define MRP_NONCE_SIZE   12
 #define MRP_KEY_SIZE     32
+#define MRP_WRITE_TIMEOUT_MS 1000
 
 /* Data-frame header: 32 bytes big-endian — size:u32 (includes the header),
  * message_type:12 raw bytes ("sync"+NULs from us, "rply"+NULs in replies),
@@ -204,7 +205,10 @@ struct ap2_mrp_ctx {
     int artwork_len;
     char artwork_id[17];      /* 16-hex ArtworkIdentifier for the current art */
     bool artwork_sent;        /* bytes already pushed once (then ref by id) */
+    uint64_t artwork_generation;
     uint64_t np_uid;          /* per-track now-playing UniqueIdentifier */
+    bool state_dirty;         /* type-130 state queued for the tick worker */
+    bool artwork_dirty;
 
     time_t last_state_push;
 };
@@ -711,28 +715,8 @@ static int mrp_channel_encrypt(struct ap2_mrp_ctx *m, const uint8_t *in,
 static bool mrp_write_all(int fd, const uint8_t *data, int len)
 {
     return ap2_io_write_all_deadline(
-        fd, data, (size_t)len,
+        fd, data, len,
         ap2_io_monotonic_ms() + MRP_WRITE_TIMEOUT_MS);
-}
-
-static void mrp_close_data_channel(struct ap2_mrp_ctx *m)
-{
-    m->connected = false;
-    if (m->sock >= 0) {
-        shutdown(m->sock, SHUT_RDWR);
-        close(m->sock);
-        m->sock = -1;
-    }
-}
-
-static void mrp_close_event_channel(struct ap2_mrp_ctx *m)
-{
-    atomic_store(&m->event_connected, false);
-    if (m->event_sock >= 0) {
-        shutdown(m->event_sock, SHUT_RDWR);
-        close(m->event_sock);
-        m->event_sock = -1;
-    }
 }
 
 /* Write the 32-byte big-endian data-frame header. */
@@ -769,7 +753,9 @@ static bool mrp_send_raw(struct ap2_mrp_ctx *m, const uint8_t *data, int len)
     free(enc);
     if (!ok) {
         LOG_ERROR("[MRP] data channel write failed: %s", strerror(errno));
-        mrp_close_data_channel(m);
+        m->connected = false;
+        close(m->sock);
+        m->sock = -1;
     }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
@@ -835,7 +821,11 @@ static bool mrp_push_state(struct ap2_mrp_ctx *m, bool include_artwork)
     bool ok = build_set_state(m, include_artwork, &msg);
     ok = ok && mrp_send_protobuf(m, &msg);
     mbuf_free(&msg);
-    if (ok) m->last_state_push = time(NULL);
+    if (ok) {
+        m->last_state_push = time(NULL);
+        m->state_dirty = false;
+        if (include_artwork) m->artwork_dirty = false;
+    }
     LOG_DEBUG("[MRP] SET_STATE push (%s artwork) -> %s",
               include_artwork ? "with" : "without", ok ? "sent" : "failed");
     return ok;
@@ -989,7 +979,8 @@ static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
     free(enc);
     if (!ok) {
         LOG_ERROR("[MRP] event channel write failed: %s", strerror(errno));
-        mrp_close_event_channel(m);
+        atomic_store(&m->event_connected, false);
+        shutdown(m->event_sock, SHUT_RDWR);
     }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
@@ -1105,6 +1096,7 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
         ssize_t n = read(m->event_sock,
                          m->event_rx_enc + m->event_rx_enc_len,
                          (size_t)space);
+        if (n < 0 && errno == EINTR) continue;
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (n <= 0) {
             LOG_WARN("[MRP] event channel closed by receiver");
@@ -1261,6 +1253,13 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
         m->sock = -1;
         return false;
     }
+    if (!ap2_io_set_nonblocking(m->sock)) {
+        LOG_ERROR("[MRP] failed to make data channel nonblocking: %s",
+                  strerror(errno));
+        close(m->sock);
+        m->sock = -1;
+        return false;
+    }
     int one = 1;
     setsockopt(m->sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     m->connected = true;
@@ -1339,8 +1338,8 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
     uint64_t uid = 0;
     RAND_bytes((uint8_t *)&uid, sizeof(uid));
     m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
@@ -1363,8 +1362,10 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
              "%02x%02x%02x%02x%02x%02x%02x%02x",
              idb[0], idb[1], idb[2], idb[3], idb[4], idb[5], idb[6], idb[7]);
     m->artwork_sent = false;
-    if (!m->connected) return true;
-    return mrp_push_state(m, true);
+    m->artwork_generation++;
+    m->state_dirty = true;
+    m->artwork_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
@@ -1376,10 +1377,8 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
-    if (!m->connected) return true;
-    /* The receiver extrapolates position from elapsedTime + timestamp +
-     * playbackRate, so a progress change is a state push, not a stream. */
-    return mrp_push_state(m, false);
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
@@ -1397,8 +1396,8 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = now;
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
@@ -1406,8 +1405,8 @@ bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
     if (!m) return false;
     m->playback_state = AP2_MRP_PLAYBACK_STOPPED;
     m->elapsed_set_at = mrp_cf_now();
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_dirty = true;
+    return true;
 }
 
 void ap2_mrp_tick(struct ap2_mrp_ctx *m)
@@ -1422,6 +1421,11 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         int space = (int)sizeof(m->rx_enc) - m->rx_enc_len;
         if (space <= 0) break;
         ssize_t n = read(m->sock, m->rx_enc + m->rx_enc_len, (size_t)space);
+        if (n < 0 && errno == EINTR) {
+            pfd.revents = 0;
+            continue;
+        }
+        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (n <= 0) {
             LOG_WARN("[MRP] data channel closed by receiver");
             mrp_close_data_channel(m);
@@ -1431,6 +1435,11 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         mrp_drain_encrypted(m);
         mrp_process_frames(m);
         if (!m->connected) return;
+    }
+
+    if (m->state_dirty || m->artwork_dirty) {
+        mrp_push_state(m, m->artwork_dirty);
+        return;
     }
 
     /* Defensive periodic re-push: keeps the system now-playing session warm
@@ -1521,9 +1530,15 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     return true;
 }
 
-void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m)
+uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m)
 {
-    if (m && m->artwork && m->artwork_len > 0)
+    return m ? m->artwork_generation : 0;
+}
+
+void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m, uint64_t generation)
+{
+    if (m && m->artwork_generation == generation &&
+        m->artwork && m->artwork_len > 0)
         m->artwork_sent = true;
 }
 
