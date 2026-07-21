@@ -160,6 +160,7 @@ static void ap2_mrp_update_playback(
 static int ap2_mrp_register_unlocked(struct ap2cl_s *p);
 static ap2_mrp_push_result_t ap2_mrp_push_unlocked(struct ap2cl_s *p);
 static bool ap2cl_disconnect_unlocked(struct ap2cl_s *p);
+static void ap2_raop_session_cleanup(struct ap2cl_s *p);
 
 /* ---- Native AP2 RTSP I/O ---- */
 
@@ -1540,8 +1541,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
     if (!p->raopcl) return false;
 
     if (!raopcl_connect(p->raopcl, player_addr, p->device.port, p->volume > 0)) {
-        raopcl_destroy(p->raopcl);
-        p->raopcl = NULL;
+        ap2_raop_session_cleanup(p);
         return false;
     }
 
@@ -1590,6 +1590,15 @@ struct ap2cl_s *ap2cl_create(
     return p;
 }
 
+/* Caller holds lifecycle_lock. */
+static void ap2_raop_session_cleanup(struct ap2cl_s *p)
+{
+    if (p->raopcl) {
+        raopcl_destroy(p->raopcl);
+        p->raopcl = NULL;
+    }
+}
+
 static void ap2_native_session_cleanup(struct ap2cl_s *p)
 {
     ap2_mrp_serial_lock(&p->mrp_serial);
@@ -1629,8 +1638,7 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     pthread_mutex_lock(&p->lifecycle_lock);
     p->destroying = true;
     ap2cl_disconnect_unlocked(p);
-    if (p->raopcl) raopcl_destroy(p->raopcl);
-    p->raopcl = NULL;
+    ap2_raop_session_cleanup(p);
     ap2_mrp_serial_destroy(&p->mrp_serial);
     pthread_mutex_destroy(&p->rtsp_lock);
     free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
@@ -1705,8 +1713,10 @@ bool ap2cl_connect(struct ap2cl_s *p)
             ap2cl_disconnect_unlocked(p);
         else
             ap2_native_session_cleanup(p);
-    } else if (p->state != AP2_DOWN) {
-        ap2cl_disconnect_unlocked(p);
+    } else {
+        if (p->state != AP2_DOWN)
+            ap2cl_disconnect_unlocked(p);
+        ap2_raop_session_cleanup(p);
     }
     bool result;
     if (p->flow == FLOW_NATIVE_AP2) {
