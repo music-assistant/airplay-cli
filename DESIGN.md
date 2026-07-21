@@ -339,7 +339,7 @@ Inner keys: `Title`, `Artist`, `Album`, `Duration`, `ElapsedTime`,
 track's progress pushes), `ArtworkData` (JPEG bytes), `ArtworkMIMEType`,
 `ArtworkIdentifier`.
 
-**Artwork evidence, validation, and send-once behavior.** AirPlaySender requests
+**Artwork evidence, probing, and send-once behavior.** AirPlaySender requests
 600x600 artwork from MediaRemote, and the captured iPhone command used a
 600x600, three-component baseline JPEG of about 43 KB. These establish a known
 sender shape, not a receiver maximum. No Apple source or hardware measurement
@@ -347,23 +347,23 @@ currently establishes a 64 KiB byte cutoff, a 600px rejection threshold, or a
 baseline/color-only rule.
 
 The local-file handler signature-detects JPEG/PNG/GIF/WebP and preserves the
-original bytes and correct MIME type for DMAP/Sonos. MRP performs a bounded
-JPEG-container preflight before retaining data: complete SOI/EOI, valid segment
-lengths, nonzero quantization tables, nonempty/non-oversubscribed Huffman
-tables, unique SOF component definitions, valid SOS table/component references,
-entropy stuffing/restart markers, and exactly one terminal EOI with no trailing
-structure. SOF0 baseline and SOF2 progressive, nonzero dimensions, 8-bit
-precision, and 1-4 components are supported. This preflight safely walks entropy
-markers but does not Huffman-decode coefficients or pixels; generated cases are
-separately decoded with Pillow. Reported profiles are not claims about what
-tvOS will render. A 1 MiB internal staging-allocation guard leaves room for the
-hardware matrix below and is explicitly not a receiver limit. Rejection clears
-previous MRP artwork, preventing stale cover art. No image codec is embedded in
-production code.
+original bytes and correct MIME type for DMAP/Sonos. MRP applies only a bounded
+metadata probe before retaining data: canonical `image/jpeg`, SOI, and terminal
+EOI. It walks length-delimited headers memory-safely to extract SOF dimensions,
+precision, component count, and profile when available, but those fields and
+all JPEG internals are telemetry rather than acceptance criteria. The receiver
+remains the decoder. Generated and arbitrary-cache test cases are separately
+decoded with Pillow before the harness sends them. A 1 MiB internal
+staging-allocation guard leaves room for the hardware matrix below and is
+explicitly not a receiver limit. Rejection clears previous MRP artwork,
+preventing stale cover art. No image codec is embedded in production code.
 
 Staged JPEG bytes ride only the *first* push for a given image, tagged with a
 fresh `ArtworkIdentifier`; later pushes carry the identifier without the bytes,
 so artwork is not re-sent on every progress tick over the shared RTSP channel.
+The complete registration/now-playing/extended-state sequence is serialized;
+its return value carries request-scoped overall and `updateMRNowPlayingInfo`
+statuses, so concurrent pushes cannot overwrite the artwork response.
 Every artwork attempt emits a non-deduplicated result with the exact source
 properties and command response:
 

@@ -39,6 +39,7 @@
 #include "cross_util.h"
 #include "cross_log.h"
 #include "ap2_mrp.h"
+#include "ap2_mrp_sync.h"
 #include "ap2_client.h"
 #include "ap2_hap.h"
 #include "ap2_plist.h"
@@ -96,10 +97,10 @@ struct ap2cl_s {
     /* MRP now-playing over POST /command (path A, see DESIGN.md §8):
      * state carrier + body builder; only on pair-verified native sessions. */
     struct ap2_mrp_ctx *mrp;
+    ap2_mrp_serial_t mrp_serial;    /* whole registration/state push sequence */
     bool mrp_device_registered;
     bool mrp_extended_registered;
     int mrp_last_playback_state;
-    int mrp_last_nowplaying_status;
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
     int events_sock;              /* reverse TCP events connection (kept open) */
@@ -145,9 +146,14 @@ struct ap2cl_s {
     bool anchored;         /* SETRATEANCHORTIME has been sent */
 };
 
-static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
-                                       ap2_mrp_playback_state_t state,
-                                       bool force);
+static int ap2_mrp_send_playback_state_unlocked(
+    struct ap2cl_s *p, ap2_mrp_playback_state_t state, bool force);
+static void ap2_mrp_update_playback(
+    struct ap2cl_s *p, ap2_state_t client_state,
+    ap2_mrp_playback_state_t mrp_state,
+    bool send_command, bool disconnect);
+static int ap2_mrp_register_unlocked(struct ap2cl_s *p);
+static ap2_mrp_push_result_t ap2_mrp_push_unlocked(struct ap2cl_s *p);
 
 /* ---- Native AP2 RTSP I/O ---- */
 
@@ -1527,6 +1533,7 @@ struct ap2cl_s *ap2cl_create(
     p->events_sock = -1;
     p->buffered_sock = -1;
     pthread_mutex_init(&p->rtsp_lock, NULL);
+    ap2_mrp_serial_init(&p->mrp_serial);
     if (dacp_id) p->dacp_id = strdup(dacp_id);
     if (active_remote) p->active_remote = strdup(active_remote);
     if (password) p->password = strdup(password);
@@ -1554,7 +1561,13 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->raopcl) raopcl_destroy(p->raopcl);
     if (p->hap) ap2_hap_destroy(p->hap);
     if (p->ptp) ap2_ptp_destroy(p->ptp);
-    if (p->mrp) ap2_mrp_destroy(p->mrp);
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    if (p->mrp) {
+        ap2_mrp_destroy(p->mrp);
+        p->mrp = NULL;
+    }
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+    ap2_mrp_serial_destroy(&p->mrp_serial);
     if (p->alac) alac_delete_encoder(p->alac);
     /* Close the RTSP socket under the lock so an in-flight request/response
      * cycle on another thread finishes first and a later cycle sees -1
@@ -1645,11 +1658,8 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     if (p->flow == FLOW_NATIVE_AP2) {
         /* Publish the final stopped state before disconnecting MediaRemote,
          * while the encrypted RTSP session is still live. */
-        if (p->mrp) {
-            ap2_mrp_set_stopped(p->mrp);
-            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_STOPPED, true);
-            ap2_mrp_stop(p->mrp);
-        }
+        ap2_mrp_update_playback(
+            p, AP2_DOWN, AP2_MRP_PLAYBACK_STOPPED, true, true);
         if (p->events_sock >= 0) {
             close(p->events_sock);
             p->events_sock = -1;
@@ -1670,7 +1680,7 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     } else if (p->raopcl) {
         raopcl_disconnect(p->raopcl);
     }
-    p->state = AP2_DOWN;
+    if (p->flow != FLOW_NATIVE_AP2) p->state = AP2_DOWN;
     return true;
 }
 
@@ -1692,8 +1702,8 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
         p->rtp_timestamp = (uint32_t)p->head_ts + p->rtp_offset;
         p->seq_number = (uint16_t)(getpid() * 40503u);
         p->start_ntp = ntp_start;
-        p->state = AP2_STREAMING;
-        if (p->mrp) ap2_mrp_set_playing(p->mrp, true);
+        ap2_mrp_update_playback(
+            p, AP2_STREAMING, AP2_MRP_PLAYBACK_PLAYING, false, false);
         /* Announce the timeline IMMEDIATELY: with a future ntpstart the first
          * audio chunk (and the anchor coupled to it) would otherwise only go
          * out once pacing releases it, and a receiver that sees no time
@@ -1784,20 +1794,14 @@ void ap2cl_pause(struct ap2cl_s *p)
     if (p->use_buffered && p->buffered_sock >= 0) {
         /* Freeze the buffered timeline in place with a rate-0 anchor. */
         ap2_send_setrateanchortime(p, p->rtp_timestamp, ap2_ptp_master_now_ns(p->ptp), 0);
-        p->state = AP2_PAUSED;
-        if (p->mrp) {
-            ap2_mrp_set_playing(p->mrp, false);
-            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PAUSED, true);
-        }
+        ap2_mrp_update_playback(
+            p, AP2_PAUSED, AP2_MRP_PLAYBACK_PAUSED, true, false);
         return;
     }
     if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
     p->rt_anchor_valid = false;    /* resume re-anchors on a fresh line */
-    p->state = AP2_PAUSED;
-    if (p->mrp) {
-        ap2_mrp_set_playing(p->mrp, false);
-        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PAUSED, true);
-    }
+    ap2_mrp_update_playback(
+        p, AP2_PAUSED, AP2_MRP_PLAYBACK_PAUSED, true, false);
 }
 
 void ap2cl_play(struct ap2cl_s *p)
@@ -1807,11 +1811,8 @@ void ap2cl_play(struct ap2cl_s *p)
         /* Re-anchor at rate 1 a short lead ahead to resume the buffered stream. */
         uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + (uint64_t)p->latency_ms * 1000000ULL;
         ap2_send_setrateanchortime(p, p->rtp_timestamp, anchor_ns, 1);
-        p->state = AP2_STREAMING;
-        if (p->mrp) {
-            ap2_mrp_set_playing(p->mrp, true);
-            ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PLAYING, true);
-        }
+        ap2_mrp_update_playback(
+            p, AP2_STREAMING, AP2_MRP_PLAYBACK_PLAYING, true, false);
         return;
     }
     if (p->raopcl) {
@@ -1819,11 +1820,8 @@ void ap2cl_play(struct ap2cl_s *p)
         uint64_t now = raopcl_get_ntp(NULL);
         raopcl_start_at(p->raopcl, now + MS2NTP(200) - TS2NTP(lat, raopcl_sample_rate(p->raopcl)));
     }
-    p->state = AP2_STREAMING;
-    if (p->mrp) {
-        ap2_mrp_set_playing(p->mrp, true);
-        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_PLAYING, true);
-    }
+    ap2_mrp_update_playback(
+        p, AP2_STREAMING, AP2_MRP_PLAYBACK_PLAYING, true, false);
 }
 
 void ap2cl_stop(struct ap2cl_s *p)
@@ -1832,12 +1830,9 @@ void ap2cl_stop(struct ap2cl_s *p)
     if (p->use_buffered && p->buffered_sock >= 0)
         ap2_send_flushbuffered(p);
     if (p->raopcl) raopcl_stop(p->raopcl);
-    if (p->mrp) {
-        ap2_mrp_set_stopped(p->mrp);
-        ap2_mrp_send_playback_state(p, AP2_MRP_PLAYBACK_STOPPED, true);
-    }
+    ap2_mrp_update_playback(
+        p, AP2_DOWN, AP2_MRP_PLAYBACK_STOPPED, true, false);
     p->rt_anchor_valid = false;
-    p->state = AP2_DOWN;
 }
 
 bool ap2cl_feedback(struct ap2cl_s *p)
@@ -1850,7 +1845,9 @@ bool ap2cl_feedback(struct ap2cl_s *p)
      * drain inbound frames (answer sync keep-alives) and re-push SET_STATE
      * periodically to hold the now-playing session open. Separate socket from
      * the RTSP /feedback POST; best-effort, harmless when no channel is up. */
+    ap2_mrp_serial_lock(&p->mrp_serial);
     if (p->mrp) ap2_mrp_tick(p->mrp);
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     uint8_t *resp = NULL; int resp_len = 0;
     int status = ap2_rtsp_send(p, "POST", "/feedback", NULL, 0, NULL, &resp, &resp_len);
     free(resp);
@@ -2003,9 +2000,8 @@ static bool ap2_mrp_status_ok(int status)
     return status >= 200 && status < 300;
 }
 
-static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
-                                       ap2_mrp_playback_state_t state,
-                                       bool force)
+static int ap2_mrp_send_playback_state_unlocked(
+    struct ap2cl_s *p, ap2_mrp_playback_state_t state, bool force)
 {
     if (!p || !p->mrp || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
         return -1;
@@ -2019,11 +2015,32 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
     return status;
 }
 
+static void ap2_mrp_update_playback(
+    struct ap2cl_s *p, ap2_state_t client_state,
+    ap2_mrp_playback_state_t mrp_state,
+    bool send_command, bool disconnect)
+{
+    if (!p) return;
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    p->state = client_state;
+    if (p->mrp) {
+        if (mrp_state == AP2_MRP_PLAYBACK_STOPPED)
+            ap2_mrp_set_stopped(p->mrp);
+        else
+            ap2_mrp_set_playing(
+                p->mrp, mrp_state == AP2_MRP_PLAYBACK_PLAYING);
+        if (send_command)
+            ap2_mrp_send_playback_state_unlocked(p, mrp_state, true);
+        if (disconnect) ap2_mrp_stop(p->mrp);
+    }
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+}
+
 /* Apple AirPlaySender sends the extended metadata immediately after the first
  * updateMRNowPlayingInfo: supported commands, explicit playback state, then the
  * serialized NowPlayingClient. A receiver can accept the info plist while
  * keeping it detached from its system now-playing player when these are absent. */
-static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
+static int ap2_mrp_send_extended_registration_unlocked(struct ap2cl_s *p)
 {
     ap2_mrp_playback_state_t state =
         p->state == AP2_STREAMING ? AP2_MRP_PLAYBACK_PLAYING :
@@ -2033,7 +2050,7 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
     int st_cmd = ap2_mrp_post_command(
         p, ap2_mrp_build_supportedcommands_command,
         "[MRP] /command updateMRSupportedCommands");
-    int st_state = ap2_mrp_send_playback_state(p, state, true);
+    int st_state = ap2_mrp_send_playback_state_unlocked(p, state, true);
     int st_client = ap2_mrp_post_command(
         p, ap2_mrp_build_nowplayingclient_command,
         "[MRP] /command updateMRNowPlayingClient");
@@ -2049,39 +2066,53 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
     return st_client;
 }
 
-int ap2cl_mrp_push(struct ap2cl_s *p)
+static ap2_mrp_push_result_t ap2_mrp_push_unlocked(struct ap2cl_s *p)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
-    p->mrp_last_nowplaying_status = 0;
+    ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return result;
     ap2_mrp_ready(p);
-    if (!p->mrp) return -1;
+    if (!p->mrp) return result;
 
-    if (!p->mrp_device_registered && ap2cl_mrp_register(p) != 1)
-        return 0;
+    if (!p->mrp_device_registered && ap2_mrp_register_unlocked(p) != 1) {
+        result.overall_status = 0;
+        return result;
+    }
 
     int status = ap2_mrp_post_command(
         p, ap2_mrp_build_nowplaying_command,
         "[MRP] /command updateMRNowPlayingInfo");
-    p->mrp_last_nowplaying_status = status;
-    if (!ap2_mrp_status_ok(status)) return status;
+    result.nowplaying_status = status;
+    result.overall_status = status;
+    if (!ap2_mrp_status_ok(status)) return result;
     ap2_mrp_mark_artwork_sent(p->mrp);
 
     int ext_status;
     if (!p->mrp_extended_registered) {
-        ext_status = ap2_mrp_send_extended_registration(p);
+        ext_status = ap2_mrp_send_extended_registration_unlocked(p);
     } else {
         ap2_mrp_playback_state_t state =
             p->state == AP2_STREAMING ? AP2_MRP_PLAYBACK_PLAYING :
             p->state == AP2_PAUSED ? AP2_MRP_PLAYBACK_PAUSED :
                                      AP2_MRP_PLAYBACK_STOPPED;
-        ext_status = ap2_mrp_send_playback_state(p, state, false);
+        ext_status = ap2_mrp_send_playback_state_unlocked(p, state, false);
     }
-    return ap2_mrp_status_ok(ext_status) ? status : ext_status;
+    if (!ap2_mrp_status_ok(ext_status)) result.overall_status = ext_status;
+    return result;
 }
 
-int ap2cl_mrp_last_nowplaying_status(struct ap2cl_s *p)
+ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p)
 {
-    return p ? p->mrp_last_nowplaying_status : 0;
+    ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
+    if (!p) return result;
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    result = ap2_mrp_push_unlocked(p);
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+    return result;
+}
+
+int ap2cl_mrp_push(struct ap2cl_s *p)
+{
+    return ap2cl_mrp_push_ex(p).overall_status;
 }
 
 /* MRP data-channel (path B) status for the [STATUS] mrp line:
@@ -2101,7 +2132,7 @@ int ap2cl_mrp_channel_status(struct ap2cl_s *p)
 /* Register the sender identity before the first now-playing update. The
  * remaining extended metadata follows updateMRNowPlayingInfo in
  * ap2cl_mrp_push(), matching Apple's current AirPlaySender implementation. */
-int ap2cl_mrp_register(struct ap2cl_s *p)
+static int ap2_mrp_register_unlocked(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
     ap2_mrp_ready(p);
@@ -2115,13 +2146,24 @@ int ap2cl_mrp_register(struct ap2cl_s *p)
     return p->mrp_device_registered ? 1 : 0;
 }
 
+int ap2cl_mrp_register(struct ap2cl_s *p)
+{
+    if (!p) return -1;
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    int result = ap2_mrp_register_unlocked(p);
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+    return result;
+}
+
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
                         const char *album, int duration)
 {
     if (!p) return false;
+    ap2_mrp_serial_lock(&p->mrp_serial);
     ap2_mrp_ready(p);
     if (p->mrp)
         ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000);
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
         return ap2_native_send_metadata(p, title, artist, album);
     if (p->raopcl)
@@ -2131,21 +2173,28 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
 }
 
 bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
-                       const char *data, ap2_mrp_artwork_info_t *mrp_info)
+                       const char *data, ap2_mrp_artwork_info_t *mrp_info,
+                       ap2_mrp_push_result_t *mrp_push)
 {
+    if (mrp_push) {
+        *mrp_push = ap2_mrp_push_result_empty();
+    }
     if (mrp_info) {
         memset(mrp_info, 0, sizeof(*mrp_info));
         mrp_info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
         mrp_info->bytes = size > 0 ? (size_t)size : 0;
     }
     if (!p) return false;
+    ap2_mrp_serial_lock(&p->mrp_serial);
     ap2_mrp_ready(p);
-    if (p->mrp)
+    bool have_mrp = p->mrp != NULL;
+    if (have_mrp)
         ap2_mrp_set_artwork(p->mrp, content_type, (const uint8_t *)data,
                             size, mrp_info);
+    bool dmap_ok = false;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* Preserve the DMAP/SET_PARAMETER path for receivers such as Sonos;
-         * pair-verified Apple sessions mirror validated artwork over MRP. */
+         * pair-verified Apple sessions mirror staged artwork over MRP. */
         char rtpinfo[48];
         snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
         uint8_t *resp = NULL; int resp_len = 0;
@@ -2155,28 +2204,48 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
         free(resp);
         LOG_INFO("[AP2] native artwork SET_PARAMETER -> status %d (%d bytes, %s)",
                  status, size, content_type);
-        return status >= 200 && status < 300;
+        dmap_ok = status >= 200 && status < 300;
+    } else if (p->raopcl) {
+        dmap_ok = raopcl_set_artwork(
+            p->raopcl, (char *)content_type, size, (char *)data);
     }
-    if (!p->raopcl) return false;
-    return raopcl_set_artwork(p->raopcl, (char *)content_type, size, (char *)data);
+    if (have_mrp) {
+        ap2_mrp_push_result_t result = ap2_mrp_push_unlocked(p);
+        if (mrp_push) *mrp_push = result;
+    }
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+    return dmap_ok;
 }
 
-bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p)
+bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p,
+                             ap2_mrp_push_result_t *mrp_push)
 {
+    if (mrp_push) {
+        *mrp_push = ap2_mrp_push_result_empty();
+    }
     if (!p) return false;
+    ap2_mrp_serial_lock(&p->mrp_serial);
     ap2_mrp_ready(p);
-    if (!p->mrp) return false;
+    if (!p->mrp) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return false;
+    }
     ap2_mrp_clear_artwork(p->mrp);
+    ap2_mrp_push_result_t result = ap2_mrp_push_unlocked(p);
+    if (mrp_push) *mrp_push = result;
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     return true;
 }
 
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
 {
     if (!p) return false;
+    ap2_mrp_serial_lock(&p->mrp_serial);
     ap2_mrp_ready(p);
     if (p->mrp)
         ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000,
                              p->state == AP2_STREAMING);
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* progress: <start>/<current>/<end>, all in the STREAM's RTP timestamp
          * units (the per-process timeline offset included, so the values match
