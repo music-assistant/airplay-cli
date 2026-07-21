@@ -86,6 +86,7 @@ struct ap2cl_s {
 
     /* Native AP2 flow */
     int sock_fd;                  /* TCP connection */
+    /* Nested lock order is lifecycle_lock -> mrp_serial -> rtsp_lock. */
     pthread_mutex_t lifecycle_lock; /* connect/disconnect cannot overlap */
     bool destroying;
     /* The RTSP socket carries whole request/response cycles from multiple
@@ -99,7 +100,7 @@ struct ap2cl_s {
     /* MRP now-playing over POST /command (path A, see DESIGN.md §8):
      * state carrier + body builder; only on pair-verified native sessions. */
     struct ap2_mrp_ctx *mrp;
-    ap2_mrp_serial_t mrp_serial;    /* whole registration/state push sequence */
+    ap2_mrp_serial_t mrp_serial;    /* MRP lifecycle and command sequences */
     bool mrp_commands_ready;        /* native connect completed */
     uint64_t mrp_generation;        /* invalidates cancelled/replaced connects */
     bool mrp_device_registered;
