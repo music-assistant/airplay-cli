@@ -2607,23 +2607,28 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
 
 static int ap2cl_mrp_register_serialized(struct ap2cl_s *p);
 
-static int ap2cl_mrp_push_serialized(struct ap2cl_s *p)
+static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
+    ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return result;
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
     pthread_mutex_unlock(&p->mrp_lock);
-    if (!have_mrp) return -1;
+    if (!have_mrp) return result;
 
-    if (!p->mrp_device_registered && ap2cl_mrp_register_serialized(p) != 1)
-        return 0;
+    if (!p->mrp_device_registered && ap2cl_mrp_register_serialized(p) != 1) {
+        result.overall_status = 0;
+        return result;
+    }
 
     uint64_t artwork_generation = 0;
     int status = ap2_mrp_post_command(
         p, ap2_mrp_build_nowplaying_command,
         "[MRP] /command updateMRNowPlayingInfo", &artwork_generation);
-    if (!ap2_mrp_status_ok(status)) return status;
+    result.nowplaying_status = status;
+    result.overall_status = status;
+    if (!ap2_mrp_status_ok(status)) return result;
     pthread_mutex_lock(&p->mrp_lock);
     if (p->mrp)
         ap2_mrp_mark_artwork_sent_if_generation(
@@ -2640,16 +2645,23 @@ static int ap2cl_mrp_push_serialized(struct ap2cl_s *p)
                                      AP2_MRP_PLAYBACK_STOPPED;
         ext_status = ap2_mrp_send_playback_state(p, state, false);
     }
-    return ap2_mrp_status_ok(ext_status) ? status : ext_status;
+    if (!ap2_mrp_status_ok(ext_status)) result.overall_status = ext_status;
+    return result;
+}
+
+ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p)
+{
+    ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
+    if (!p) return result;
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    result = ap2cl_mrp_push_serialized(p);
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+    return result;
 }
 
 int ap2cl_mrp_push(struct ap2cl_s *p)
 {
-    if (!p) return -1;
-    pthread_mutex_lock(&p->mrp_publish_lock);
-    int status = ap2cl_mrp_push_serialized(p);
-    pthread_mutex_unlock(&p->mrp_publish_lock);
-    return status;
+    return ap2cl_mrp_push_ex(p).overall_status;
 }
 
 /* MRP data-channel (path B) status for the [STATUS] mrp line:
@@ -2718,8 +2730,10 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
 }
 
 bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
-                       const char *data, ap2_mrp_artwork_info_t *mrp_info)
+                       const char *data, ap2_mrp_artwork_info_t *mrp_info,
+                       ap2_mrp_push_result_t *mrp_push)
 {
+    if (mrp_push) *mrp_push = ap2_mrp_push_result_empty();
     if (mrp_info) {
         memset(mrp_info, 0, sizeof(*mrp_info));
         mrp_info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
@@ -2729,11 +2743,12 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
     pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
+    bool have_mrp = p->mrp != NULL;
     if (p->mrp)
         ap2_mrp_set_artwork(p->mrp, content_type, (const uint8_t *)data,
                             size, mrp_info);
     pthread_mutex_unlock(&p->mrp_lock);
-    pthread_mutex_unlock(&p->mrp_publish_lock);
+    bool dmap_ok = false;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* Preserve the DMAP/SET_PARAMETER path for receivers such as Sonos;
          * pair-verified Apple sessions mirror validated artwork over MRP. */
@@ -2746,18 +2761,37 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
         free(resp);
         LOG_INFO("[AP2] native artwork SET_PARAMETER -> status %d (%d bytes, %s)",
                  status, size, content_type);
-        return status >= 200 && status < 300;
+        dmap_ok = status >= 200 && status < 300;
+    } else if (p->raopcl) {
+        dmap_ok = raopcl_set_artwork(
+            p->raopcl, (char *)content_type, size, (char *)data);
     }
-    if (!p->raopcl) return false;
-    return raopcl_set_artwork(p->raopcl, (char *)content_type, size, (char *)data);
+    if (have_mrp) {
+        ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
+        if (mrp_push) *mrp_push = result;
+    }
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+    return dmap_ok;
 }
 
-bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p)
+bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p,
+                             ap2_mrp_push_result_t *mrp_push)
 {
+    if (mrp_push) *mrp_push = ap2_mrp_push_result_empty();
     if (!p) return false;
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
-    if (!p->mrp) return false;
+    if (!p->mrp) {
+        pthread_mutex_unlock(&p->mrp_lock);
+        pthread_mutex_unlock(&p->mrp_publish_lock);
+        return false;
+    }
     ap2_mrp_clear_artwork(p->mrp);
+    pthread_mutex_unlock(&p->mrp_lock);
+    ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
+    if (mrp_push) *mrp_push = result;
+    pthread_mutex_unlock(&p->mrp_publish_lock);
     return true;
 }
 
