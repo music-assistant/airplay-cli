@@ -772,10 +772,10 @@ static int run_raop(cli_config_t *cfg, int infile)
 
     status_eof();
     request_command_stop();
-    client = atomic_exchange(&g_raopcl, NULL);
     free(buf);
     free(alac_buf);
     if (!join_command_thread()) return 1;
+    client = atomic_exchange(&g_raopcl, NULL);
     if (client) {
         raopcl_disconnect(client);
         raopcl_destroy(client);
@@ -1450,9 +1450,9 @@ int main(int argc, char *argv[])
 
     /* Cleanup */
     request_command_stop();
+    if (!join_command_thread()) return 1;
     struct ap2cl_s *ap2_client = atomic_exchange(&g_ap2cl, NULL);
     struct raopcl_s *raop_client = atomic_exchange(&g_raopcl, NULL);
-    if (!join_command_thread()) return 1;
     if (cfg.cmdpipe) {
         if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
         unlink(cfg.cmdpipe);
