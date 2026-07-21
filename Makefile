@@ -152,11 +152,13 @@ test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST)
 	$(IO_TEST)
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
+	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -Isrc $< $(EXTRA_LDFLAGS) -o $@
 
 $(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
 		$(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
 		$(BUILDDIR)/cross_log.o Makefile
+	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) \
 		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
 		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/cross_log.o \
