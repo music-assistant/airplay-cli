@@ -85,18 +85,19 @@ int main(void)
 
     /* Repeated starvation recovery preserves the RTP/head invariant and moves
      * the PTP anchor by exactly the same media duration on every re-anchor. */
-    uint64_t head = 100000;
-    uint32_t offset = 5000;
-    uint32_t rtp = 105000;
+    uint64_t repeat_head = 100000;
+    uint32_t repeat_offset = 5000;
+    uint32_t repeat_rtp = 105000;
     uint64_t anchor_ns = 7000000000ULL;
     for (int i = 0; i < 5; i++) {
         assert(ap2_timeline_plan_recovery(
-            head, rtp, offset, head + 20000, 11025, 77175, &plan));
+            repeat_head, repeat_rtp, repeat_offset,
+            repeat_head + 20000, 11025, 77175, &plan));
         anchor_ns += ap2_timeline_frames_to_ns(
             plan.shifted_frames, 44100);
-        head = plan.head;
-        offset = plan.offset;
-        assert((uint32_t)head + offset == rtp);
+        repeat_head = plan.head;
+        repeat_offset = plan.offset;
+        assert((uint32_t)repeat_head + repeat_offset == repeat_rtp);
     }
     assert(anchor_ns > 7000000000ULL);
     return 0;

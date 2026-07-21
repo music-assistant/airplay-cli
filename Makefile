@@ -95,8 +95,8 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c \
-	ap2_plist.c ap2_mrp.c
+AP2_SOURCES = ap2_client.c ap2_feedback.c ap2_hap.c ap2_io.c ap2_ptp.c \
+	ap2_ptp_shm.c ap2_plist.c ap2_mrp.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
@@ -125,10 +125,12 @@ OBJECTS_CLI += $(patsubst %.cpp,$(BUILDDIR)/%.o,$(filter %.cpp,$(CLI_SOURCES)))
 OBJECTS_ALL = $(OBJECTS_RAOP) $(OBJECTS_AP2) $(OBJECTS_CLI)
 FEEDBACK_CLIENT_OBJECT = $(BUILDDIR)/ap2_client_test.o
 FEEDBACK_TEST_MAIN = $(BUILDDIR)/test_ap2_feedback.o
+FEEDBACK_CROSS_SSL_OBJECT = $(BUILDDIR)/cross_ssl_test.o
 FEEDBACK_TEST_OBJECTS = $(OBJECTS_RAOP) \
 	$(filter-out $(BUILDDIR)/ap2_client.o,$(OBJECTS_AP2)) \
-	$(filter-out $(BUILDDIR)/cliairplay.o $(BUILDDIR)/artwork.o,$(OBJECTS_CLI)) \
-	$(FEEDBACK_CLIENT_OBJECT) $(FEEDBACK_TEST_MAIN)
+	$(filter-out $(BUILDDIR)/cliairplay.o $(BUILDDIR)/artwork.o \
+		$(BUILDDIR)/cross_ssl.o,$(OBJECTS_CLI)) \
+	$(FEEDBACK_CROSS_SSL_OBJECT) $(FEEDBACK_CLIENT_OBJECT) $(FEEDBACK_TEST_MAIN)
 
 all: directory $(EXECUTABLE)
 
@@ -178,8 +180,13 @@ $(FEEDBACK_CLIENT_OBJECT): src/ap2_client.c Makefile
 $(FEEDBACK_TEST_MAIN): tests/test_ap2_feedback.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DAP2_TESTING $< -c -o $@
 
+$(FEEDBACK_CROSS_SSL_OBJECT): $(TOOLS)/cross_ssl.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DSSL_STATIC_LIB $< -c -o $@
+
 $(FEEDBACK_TEST): $(FEEDBACK_TEST_OBJECTS) $(LIBCODECS_PATCHED)
-	$(CXX) $(FEEDBACK_TEST_OBJECTS) $(LIBRARY) $(LDFLAGS) -o $@
+	$(CXX) $(FEEDBACK_TEST_OBJECTS) \
+		$(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED)

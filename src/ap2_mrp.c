@@ -140,7 +140,6 @@ enum mrp_ext_field {
 
 /* Cadence of the defensive state re-push from ap2_mrp_tick (seconds). */
 #define MRP_STATE_REPUSH_S 15
-#define MRP_WRITE_TIMEOUT_MS 1000
 
 struct ap2_mrp_ctx {
     /* Target + identity */
@@ -178,8 +177,7 @@ struct ap2_mrp_ctx {
     int rx_msg_len;
 
     /* Encrypted reverse event channel. It has independent HKDF keys/counters
-     * from both RTSP control and the optional type-130 data channel. The socket
-     * remains owned by ap2_client. */
+     * from both RTSP control and the optional type-130 data channel. */
     int event_sock;
     _Atomic bool event_connected;
     bool event_attached;
@@ -719,6 +717,26 @@ static bool mrp_write_all(int fd, const uint8_t *data, int len)
         ap2_io_monotonic_ms() + MRP_WRITE_TIMEOUT_MS);
 }
 
+static void mrp_close_data_channel(struct ap2_mrp_ctx *m)
+{
+    m->connected = false;
+    if (m->sock >= 0) {
+        shutdown(m->sock, SHUT_RDWR);
+        close(m->sock);
+        m->sock = -1;
+    }
+}
+
+static void mrp_close_event_channel(struct ap2_mrp_ctx *m)
+{
+    atomic_store(&m->event_connected, false);
+    if (m->event_sock >= 0) {
+        shutdown(m->event_sock, SHUT_RDWR);
+        close(m->event_sock);
+        m->event_sock = -1;
+    }
+}
+
 /* Write the 32-byte big-endian data-frame header. */
 static void mrp_write_data_header(uint8_t hdr[MRP_DATA_HDR_LEN],
                                   const char msg_type4[4], const char cmd4[4],
@@ -753,9 +771,7 @@ static bool mrp_send_raw(struct ap2_mrp_ctx *m, const uint8_t *data, int len)
     free(enc);
     if (!ok) {
         LOG_ERROR("[MRP] data channel write failed: %s", strerror(errno));
-        m->connected = false;
-        close(m->sock);
-        m->sock = -1;
+        mrp_close_data_channel(m);
     }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
@@ -910,7 +926,7 @@ static void mrp_process_frames(struct ap2_mrp_ctx *m)
         if (memcmp(h + 4, "sync", 4) == 0) {
             LOG_DEBUG("[MRP] inbound sync frame (%u bytes, seq %llu)",
                       size, (unsigned long long)seqno);
-            mrp_send_reply(m, seqno);
+            if (!mrp_send_reply(m, seqno)) return;
         } else {
             LOG_DEBUG("[MRP] inbound frame %.4s (%u bytes)", (const char *)(h + 4), size);
         }
@@ -979,8 +995,7 @@ static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
     free(enc);
     if (!ok) {
         LOG_ERROR("[MRP] event channel write failed: %s", strerror(errno));
-        atomic_store(&m->event_connected, false);
-        shutdown(m->event_sock, SHUT_RDWR);
+        mrp_close_event_channel(m);
     }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
@@ -1433,6 +1448,7 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         }
         m->rx_enc_len += (int)n;
         mrp_drain_encrypted(m);
+        if (!m->connected) return;
         mrp_process_frames(m);
         if (!m->connected) return;
     }

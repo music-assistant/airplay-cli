@@ -380,8 +380,9 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 
 - **Keepalive** — every native AP2 session starts a dedicated worker that POSTs
   `/feedback` every ~2 s, including sessions without `--cmdpipe`. The same
-  worker is the sole owner of reverse-event and type-130 servicing. RAOP paths
-  use libraop's keepalive (~20 s).
+  worker is the sole owner of reverse-event and type-130 servicing; both native
+  workers are stopped and joined before encrypted channels are destroyed. RAOP
+  paths use libraop's keepalive (~20 s).
 - **MediaRemote publication** — a separate worker coalesces pending
   registration, metadata, and playback-state updates. Callers only mutate a
   locked state snapshot and queue work, so optional `/command` I/O never delays
@@ -404,10 +405,6 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
   to tear down a MediaRemote-active stream after roughly 30 seconds.
-- **Dedicated maintenance worker** — every native session, including sessions
-  without a command pipe, runs one monotonic ~2 s feedback worker. It is the
-  sole reverse-event/DataStream tick owner, serializes MediaRemote state, and is
-  stopped and joined before encrypted channels are torn down.
 - **Realtime send loop** — RTP data/control UDP sockets are non-blocking and
   distinguish a transient queue drop from a fatal encoder/key/socket failure.
   A dropped datagram advances sequence and RTP time, so local network

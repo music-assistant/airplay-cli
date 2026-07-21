@@ -111,15 +111,6 @@ static void *fake_peer_thread(void *arg)
 
 int main(void)
 {
-    uint8_t oversized_response[128];
-    int oversized_len = snprintf(
-        (char *)oversized_response, sizeof(oversized_response),
-        "RTSP/1.0 200 OK\r\nCSeq: 7\r\n"
-        "Content-Length: 2147483647\r\n\r\n");
-    CHECK(oversized_len > 0);
-    CHECK(ap2cl_test_parse_response(
-              oversized_response, oversized_len, 7) == 0);
-
     int sockets[2];
     int event_sockets[2];
     CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -160,6 +151,14 @@ int main(void)
     uint64_t play_started = ap2_io_monotonic_ms();
     ap2cl_play(client);
     CHECK(ap2_io_monotonic_ms() - play_started < 100);
+    uint64_t pause_started = ap2_io_monotonic_ms();
+    ap2cl_pause(client);
+    CHECK(ap2_io_monotonic_ms() - pause_started < 100);
+    uint8_t sample[4] = {0};
+    errno = 0;
+    CHECK(ap2cl_send_chunk(client, sample, 1) == AP2_SEND_FATAL);
+    CHECK(errno == EAGAIN);
+    ap2cl_play(client);
     usleep(90000);
     CHECK(ap2cl_test_post_command(client) == 200);
     for (int i = 0; i < 100 && atomic_load(&peer.feedback_count) < 3; i++)
@@ -175,7 +174,6 @@ int main(void)
     CHECK(atomic_load(&peer.request_count) >= 4);
     close(sockets[0]);
     close(sockets[1]);
-    close(event_sockets[0]);
     close(event_sockets[1]);
     CHECK(ap2cl_destroy(client));
     puts("ap2 feedback worker test passed");

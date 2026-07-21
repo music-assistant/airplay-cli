@@ -20,6 +20,7 @@
 #define HTTP_HEADER_MAX    (64 * 1024)
 #define ARTWORK_FETCH_TIMEOUT_MS 5000
 #define ARTWORK_DNS_TIMEOUT_MS   2000
+#define ARTWORK_CONNECT_ATTEMPT_MS 1000
 #define ARTWORK_IMAGEPROXY_SIZE  512
 
 typedef struct {
@@ -372,8 +373,11 @@ static int artwork_connect(const artwork_url_t *url, int64_t deadline_ms,
         }
         int status = connect(fd, addr->ai_addr, addr->ai_addrlen);
         if (status == 0) break;
+        int64_t attempt_deadline =
+            artwork_now_ms() + ARTWORK_CONNECT_ATTEMPT_MS;
+        if (attempt_deadline > deadline_ms) attempt_deadline = deadline_ms;
         if (errno == EINPROGRESS &&
-            artwork_wait_fd(fd, POLLOUT, deadline_ms)) {
+            artwork_wait_fd(fd, POLLOUT, attempt_deadline)) {
             int socket_error = 0;
             socklen_t error_len = sizeof(socket_error);
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR,

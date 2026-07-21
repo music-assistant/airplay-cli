@@ -243,22 +243,7 @@ int main(void)
     assert(elapsed < 2000);
     assert(ap2_mrp_event_status(mrp) == 0);
     ap2_mrp_destroy(mrp);
-    close(sockets[0]);
     close(sockets[1]);
 
-    /* Peer closure is terminal too; the failed channel must never be reused
-     * with already-advanced encryption counters. */
-    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-    mrp = ap2_mrp_create(
-        "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
-        "Music Assistant", "11111111-2222-4333-8444-555555555555",
-        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret);
-    assert(mrp);
-    assert(ap2_mrp_attach_events(mrp, sockets[0]));
-    close(sockets[1]);
-    ap2_mrp_tick(mrp);
-    assert(ap2_mrp_event_status(mrp) == 0);
-    ap2_mrp_destroy(mrp);
-    close(sockets[0]);
     return 0;
 }

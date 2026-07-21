@@ -6,10 +6,15 @@
 
 #include "ap2_io.h"
 
-static struct timespec ap2_realtime_after_ms(uint64_t delay_ms)
+static struct timespec ap2_after_ms(uint64_t delay_ms)
 {
     struct timespec deadline;
-    clock_gettime(CLOCK_REALTIME, &deadline);
+#ifdef __APPLE__
+    deadline.tv_sec = 0;
+    deadline.tv_nsec = 0;
+#else
+    clock_gettime(CLOCK_MONOTONIC, &deadline);
+#endif
     deadline.tv_sec += (time_t)(delay_ms / 1000);
     deadline.tv_nsec += (long)(delay_ms % 1000) * 1000000L;
     if (deadline.tv_nsec >= 1000000000L) {
@@ -30,8 +35,13 @@ static void *ap2_periodic_worker_main(void *arg)
         if (now < next_tick) {
             uint64_t delay = next_tick - now;
             if (delay > 100) delay = 100;
-            struct timespec deadline = ap2_realtime_after_ms(delay);
+            struct timespec deadline = ap2_after_ms(delay);
+#ifdef __APPLE__
+            pthread_cond_timedwait_relative_np(
+                &worker->wake, &worker->lock, &deadline);
+#else
             pthread_cond_timedwait(&worker->wake, &worker->lock, &deadline);
+#endif
             continue;
         }
 
@@ -58,10 +68,24 @@ bool ap2_periodic_worker_init(ap2_periodic_worker_t *worker,
     worker->callback = callback;
     worker->arg = arg;
     if (pthread_mutex_init(&worker->lock, NULL) != 0) return false;
-    if (pthread_cond_init(&worker->wake, NULL) != 0) {
+    pthread_condattr_t attr;
+    if (pthread_condattr_init(&attr) != 0) {
         pthread_mutex_destroy(&worker->lock);
         return false;
     }
+#ifndef __APPLE__
+    if (pthread_condattr_setclock(&attr, CLOCK_MONOTONIC) != 0) {
+        pthread_condattr_destroy(&attr);
+        pthread_mutex_destroy(&worker->lock);
+        return false;
+    }
+#endif
+    if (pthread_cond_init(&worker->wake, &attr) != 0) {
+        pthread_condattr_destroy(&attr);
+        pthread_mutex_destroy(&worker->lock);
+        return false;
+    }
+    pthread_condattr_destroy(&attr);
     return true;
 }
 

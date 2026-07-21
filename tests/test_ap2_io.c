@@ -35,6 +35,35 @@ static bool test_fake_peer_response(void)
     return true;
 }
 
+static bool test_rtsp_parser(void)
+{
+    static const uint8_t response[] =
+        "RTSP/1.0 200 OK\r\n"
+        "CSeq: 17\r\n"
+        "Content-Length: 4\r\n\r\n"
+        "test";
+    ap2_rtsp_response_t parsed;
+    CHECK(ap2_io_parse_rtsp_response(
+              response, sizeof(response) - 2, &parsed) == 0);
+    CHECK(ap2_io_parse_rtsp_response(
+              response, sizeof(response) - 1, &parsed) == 1);
+    CHECK(parsed.status == 200);
+    CHECK(parsed.cseq == 17);
+    CHECK(parsed.body_len == 4);
+    CHECK(parsed.message_len == sizeof(response) - 1);
+
+    static const uint8_t malformed[] =
+        "RTSP/1.0 200 OK\r\nCSeq: nope\r\nContent-Length: 0\r\n\r\n";
+    CHECK(ap2_io_parse_rtsp_response(
+              malformed, sizeof(malformed) - 1, &parsed) == -1);
+    static const uint8_t oversized[] =
+        "RTSP/1.0 200 OK\r\nCSeq: 18\r\n"
+        "Content-Length: 2147483647\r\n\r\n";
+    CHECK(ap2_io_parse_rtsp_response(
+              oversized, sizeof(oversized) - 1, &parsed) == 0);
+    return true;
+}
+
 static bool test_read_timeout_is_bounded(void)
 {
     int pair[2];
@@ -129,6 +158,7 @@ static bool test_datagram_outcomes(void)
 int main(void)
 {
     if (!test_fake_peer_response()) return 1;
+    if (!test_rtsp_parser()) return 1;
     if (!test_read_timeout_is_bounded()) return 1;
     if (!test_stalled_write_is_bounded()) return 1;
     if (!test_closed_peer_is_visible()) return 1;

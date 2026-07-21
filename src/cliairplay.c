@@ -812,6 +812,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     uint64_t last_diag = 0;
     uint64_t input_wait_since = 0;
     uint64_t last_input_warn = 0;
+    int pending_n = 0;
 
     /* Main audio loop */
     while (g_status != STATUS_STOPPED && (!got_eof || ap2cl_is_playing(g_ap2cl))) {
@@ -854,42 +855,41 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         /* Send audio chunk */
         if (atomic_load(&g_status) == STATUS_PLAYING &&
             ap2cl_accept_frames(g_ap2cl)) {
-            pthread_mutex_lock(&g_playback_lock);
-            if (atomic_load(&g_status) != STATUS_PLAYING) {
-                pthread_mutex_unlock(&g_playback_lock);
-                continue;
-            }
-            int n = input_ring_read(buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
-            if (n == INPUT_RING_WAIT) {
-                pthread_mutex_unlock(&g_playback_lock);
-                uint64_t wait_now = raopcl_get_ntp(NULL);
-                if (!input_wait_since) input_wait_since = wait_now;
-                uint64_t wait_ms = NTP2MS(wait_now - input_wait_since);
-                if (wait_ms >= 2000 &&
-                    wait_now - last_input_warn >= MS2NTP(5000)) {
-                    size_t ring_fill, ring_capacity;
-                    bool ring_eof;
-                    last_input_warn = wait_now;
-                    input_ring_stats(&ring_fill, &ring_capacity, &ring_eof);
-                    LOG_WARN("[AP2DIAG] PCM input starved for %" PRIu64
-                             "ms (fill=%zu/%zu eof=%d)",
-                             wait_ms, ring_fill, ring_capacity, ring_eof);
+            if (!pending_n) {
+                int n = input_ring_read(
+                    buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
+                if (n == INPUT_RING_WAIT) {
+                    uint64_t wait_now = raopcl_get_ntp(NULL);
+                    if (!input_wait_since) input_wait_since = wait_now;
+                    uint64_t wait_ms = NTP2MS(wait_now - input_wait_since);
+                    if (wait_ms >= 2000 &&
+                        wait_now - last_input_warn >= MS2NTP(5000)) {
+                        size_t ring_fill, ring_capacity;
+                        bool ring_eof;
+                        last_input_warn = wait_now;
+                        input_ring_stats(
+                            &ring_fill, &ring_capacity, &ring_eof);
+                        LOG_WARN("[AP2DIAG] PCM input starved for %" PRIu64
+                                 "ms (fill=%zu/%zu eof=%d)",
+                                 wait_ms, ring_fill, ring_capacity, ring_eof);
+                    }
+                    continue;
+                } else if (n < 0) {
+                    status_error("Error reading from audio source");
+                    failed = true;
+                    break;
+                } else if (n == 0) {
+                    if (!got_eof) {
+                        LOG_INFO("End of audio stream, draining buffer...");
+                        got_eof = true;
+                        eof_time = raopcl_get_ntp(NULL);
+                    }
+                    continue;
                 }
-                continue;
-            } else if (n < 0) {
-                pthread_mutex_unlock(&g_playback_lock);
-                status_error("Error reading from audio source");
-                failed = true;
-                break;
-            } else if (n == 0) {
-                if (!got_eof) {
-                    LOG_INFO("End of audio stream, draining buffer...");
-                    got_eof = true;
-                    eof_time = raopcl_get_ntp(NULL);
-                }
-                pthread_mutex_unlock(&g_playback_lock);
-                continue;
+                pending_n = n;
             }
+            if (atomic_load(&g_status) != STATUS_PLAYING) continue;
+
             if (input_wait_since) {
                 uint64_t waited_ms = NTP2MS(raopcl_get_ntp(NULL) -
                                             input_wait_since);
@@ -900,22 +900,25 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 input_wait_since = 0;
             }
 
-            int af = n / ap2_input_bpf;
+            int af = pending_n / ap2_input_bpf;
             uint8_t *send = buf;
             if (ap2_alac_buf && cfg->bit_depth > 16) {
-                truncate_32to24(buf, n, ap2_alac_buf);
+                truncate_32to24(buf, pending_n, ap2_alac_buf);
                 send = ap2_alac_buf;
             }
             ap2_send_result_t send_result =
                 ap2cl_send_chunk(g_ap2cl, send, af);
             if (send_result == AP2_SEND_FATAL) {
-                pthread_mutex_unlock(&g_playback_lock);
+                if (errno == EAGAIN) {
+                    usleep(1000);
+                    continue;
+                }
                 status_error("AirPlay audio send failed");
                 failed = true;
                 break;
             }
             frames += af;
-            pthread_mutex_unlock(&g_playback_lock);
+            pending_n = 0;
         } else {
             usleep(1000);
         }

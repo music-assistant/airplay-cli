@@ -18,7 +18,6 @@
 #include <stdbool.h>
 #include <stdint.h>
 
-#include "ap2_io.h"
 #include <netinet/in.h>
 
 struct ap2cl_s;
@@ -175,7 +174,6 @@ bool ap2cl_test_attach_mrp(struct ap2cl_s *p, int event_socket,
                            const uint8_t shared_secret[32]);
 void ap2cl_test_stop_feedback_worker(struct ap2cl_s *p);
 int ap2cl_test_post_command(struct ap2cl_s *p);
-int ap2cl_test_parse_response(uint8_t *data, int len, int expected_cseq);
 #endif
 
 /* Emit a debug-level snapshot of RTP pacing/timeline/send health. */

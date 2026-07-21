@@ -2,7 +2,12 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
 #include <poll.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <strings.h>
 #include <time.h>
 
 uint64_t ap2_io_monotonic_ms(void)
@@ -28,7 +33,8 @@ int ap2_io_poll_fd(int fd, short events, uint64_t deadline_ms)
             errno = ETIMEDOUT;
             return 0;
         }
-        int timeout = (int)(deadline_ms - now);
+        uint64_t remaining = deadline_ms - now;
+        int timeout = remaining > INT_MAX ? INT_MAX : (int)remaining;
         struct pollfd pfd = {.fd = fd, .events = events};
         int ret = poll(&pfd, 1, timeout);
         if (ret < 0 && errno == EINTR) continue;
@@ -53,7 +59,7 @@ static int ap2_io_send_flags(void)
     return flags;
 }
 
-bool ap2_io_write_all_deadline(int fd, const uint8_t *data, int len,
+bool ap2_io_write_all_deadline(int fd, const uint8_t *data, size_t len,
                                uint64_t deadline_ms)
 {
     int original_flags = fcntl(fd, F_GETFL);
@@ -64,15 +70,18 @@ bool ap2_io_write_all_deadline(int fd, const uint8_t *data, int len,
         return false;
 
     bool ok = false;
-    int off = 0;
+    size_t off = 0;
     while (off < len) {
+        if (ap2_io_monotonic_ms() >= deadline_ms) {
+            errno = ETIMEDOUT;
+            break;
+        }
         if (ap2_io_poll_fd(fd, POLLOUT, deadline_ms) <= 0) break;
-        ssize_t n = send(fd, data + off, (size_t)(len - off),
-                         ap2_io_send_flags());
+        ssize_t n = send(fd, data + off, len - off, ap2_io_send_flags());
         if (n > 0) {
-            off += (int)n;
+            off += (size_t)n;
         } else if (n < 0 && (errno == EINTR || errno == EAGAIN ||
-                             errno == EWOULDBLOCK)) {
+                             errno == EWOULDBLOCK || errno == ENOBUFS)) {
             continue;
         } else {
             if (n == 0) errno = EPIPE;
@@ -138,12 +147,113 @@ ap2_io_datagram_result_t ap2_io_send_datagram_deadline(
             }
             continue;
         }
-        if (errno == ENOBUFS) return AP2_IO_DATAGRAM_DROPPED;
-        if (errno != EAGAIN && errno != EWOULDBLOCK)
+        if (errno != EAGAIN && errno != EWOULDBLOCK && errno != ENOBUFS)
             return AP2_IO_DATAGRAM_FATAL;
         int ready = ap2_io_poll_fd(fd, POLLOUT, deadline_ms);
         if (ready > 0) continue;
         if (ready == 0) return AP2_IO_DATAGRAM_DROPPED;
         return AP2_IO_DATAGRAM_FATAL;
     }
+}
+
+static size_t ap2_find_header_end(const uint8_t *data, size_t len)
+{
+    for (size_t i = 0; i + 3 < len; i++) {
+        if (data[i] == '\r' && data[i + 1] == '\n' &&
+            data[i + 2] == '\r' && data[i + 3] == '\n')
+            return i + 4;
+    }
+    return 0;
+}
+
+static bool ap2_parse_decimal(const uint8_t *data, size_t len, long *value)
+{
+    if (!len || len >= 32) return false;
+    char text[32];
+    memcpy(text, data, len);
+    text[len] = '\0';
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(text, &end, 10);
+    if (errno || end == text || *end != '\0' || parsed < 0) return false;
+    *value = parsed;
+    return true;
+}
+
+int ap2_io_parse_rtsp_response(const uint8_t *data, size_t len,
+                               ap2_rtsp_response_t *response)
+{
+    if (!data || !response) return -1;
+    size_t header_len = ap2_find_header_end(data, len);
+    if (!header_len) return 0;
+
+    const uint8_t *line_end = NULL;
+    for (size_t i = 0; i + 1 < header_len; i++) {
+        if (data[i] == '\r' && data[i + 1] == '\n') {
+            line_end = data + i;
+            break;
+        }
+    }
+    if (!line_end) return -1;
+
+    int status = 0;
+    char status_line[128];
+    size_t status_len = (size_t)(line_end - data);
+    if (status_len >= sizeof(status_line)) return -1;
+    memcpy(status_line, data, status_len);
+    status_line[status_len] = '\0';
+    if (sscanf(status_line, "RTSP/%*s %d", &status) != 1 || status <= 0)
+        return -1;
+
+    size_t body_len = 0;
+    int cseq = -1;
+    size_t offset = status_len + 2;
+    while (offset + 2 <= header_len) {
+        size_t end = offset;
+        while (end + 1 < header_len &&
+               !(data[end] == '\r' && data[end + 1] == '\n'))
+            end++;
+        if (end == offset) break;
+
+        size_t colon = offset;
+        while (colon < end && data[colon] != ':') colon++;
+        if (colon == end) return -1;
+        size_t value = colon + 1;
+        while (value < end && (data[value] == ' ' || data[value] == '\t'))
+            value++;
+        size_t value_end = end;
+        while (value_end > value &&
+               (data[value_end - 1] == ' ' || data[value_end - 1] == '\t'))
+            value_end--;
+
+        long parsed = 0;
+        size_t name_len = colon - offset;
+        if (name_len == 14 &&
+            strncasecmp((const char *)data + offset,
+                        "Content-Length", 14) == 0) {
+            if (!ap2_parse_decimal(
+                    data + value, value_end - value, &parsed))
+                return -1;
+            body_len = (size_t)parsed;
+        } else if (name_len == 4 &&
+                   strncasecmp((const char *)data + offset,
+                               "CSeq", 4) == 0) {
+            if (!ap2_parse_decimal(
+                    data + value, value_end - value, &parsed) ||
+                parsed > INT_MAX)
+                return -1;
+            cseq = (int)parsed;
+        }
+        offset = end + 2;
+    }
+
+    if (body_len > SIZE_MAX - header_len) return -1;
+    size_t message_len = header_len + body_len;
+    if (len < message_len) return 0;
+    response->status = status;
+    response->cseq = cseq;
+    response->header_len = header_len;
+    response->body_len = body_len;
+    response->message_len = message_len;
+    return 1;
 }
