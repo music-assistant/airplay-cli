@@ -32,20 +32,20 @@ typedef enum {
 } ap2_mrp_playback_state_t;
 
 /*
- * Local allocation safety boundary, not an Apple TV receiver limit.
+ * Internal staging-allocation guard, not an Apple TV receiver limit.
  *
  * The actual tvOS artwork-size cutoff is not yet measured. Keep enough room
  * for the controlled 43-150 KiB hardware matrix while bounding retained local
  * input and binary-plist construction.
  */
-#define AP2_MRP_ARTWORK_SAFETY_MAX_BYTES (1024 * 1024)
+#define AP2_MRP_ARTWORK_STAGING_MAX_BYTES (1024 * 1024)
 
 typedef enum {
     AP2_MRP_ARTWORK_NOT_APPLICABLE = 0,
     AP2_MRP_ARTWORK_ACCEPTED,
     AP2_MRP_ARTWORK_INVALID_ARGUMENT,
     AP2_MRP_ARTWORK_UNSUPPORTED_TYPE,
-    AP2_MRP_ARTWORK_SAFETY_LIMIT,
+    AP2_MRP_ARTWORK_STAGING_LIMIT,
     AP2_MRP_ARTWORK_INVALID_JPEG,
     AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE,
     AP2_MRP_ARTWORK_NO_MEMORY,
@@ -147,11 +147,13 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
 /*
  * Set the now-playing artwork.
  *
- * Accepts structurally parsed 8-bit Huffman baseline (SOF0) and progressive
- * (SOF2) JPEGs within AP2_MRP_ARTWORK_SAFETY_MAX_BYTES. This is parser and
- * allocation policy only; it deliberately does not claim a receiver byte,
- * dimension, color-component, or progressive-JPEG limit. Invalid input clears
- * prior MRP artwork so a new track cannot retain stale cover art.
+ * Runs a bounded JPEG-container preflight for 8-bit Huffman baseline (SOF0)
+ * and progressive (SOF2) input within AP2_MRP_ARTWORK_STAGING_MAX_BYTES.
+ * This preflight does not entropy-decode image coefficients or pixels. The
+ * bound is internal staging/allocation policy only; it deliberately does not
+ * claim a receiver byte, dimension, component, or progressive-JPEG limit.
+ * Invalid input clears prior MRP artwork so a new track cannot retain stale
+ * cover art.
  *
  * :param mime: image MIME type; must be "image/jpeg".
  * :param data: image bytes (copied).

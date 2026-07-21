@@ -347,18 +347,19 @@ currently establishes a 64 KiB byte cutoff, a 600px rejection threshold, or a
 baseline/color-only rule.
 
 The local-file handler signature-detects JPEG/PNG/GIF/WebP and preserves the
-original bytes and correct MIME type for DMAP/Sonos. MRP performs bounded,
-structural JPEG parsing before retaining data: complete SOI/EOI, valid segment
+original bytes and correct MIME type for DMAP/Sonos. MRP performs a bounded
+JPEG-container preflight before retaining data: complete SOI/EOI, valid segment
 lengths, nonzero quantization tables, nonempty/non-oversubscribed Huffman
 tables, unique SOF component definitions, valid SOS table/component references,
 entropy stuffing/restart markers, and exactly one terminal EOI with no trailing
 structure. SOF0 baseline and SOF2 progressive, nonzero dimensions, 8-bit
-precision, and 1-4 components are supported. The parser reports the observed
-profile; those accepted profiles are not claims about what tvOS will render. A
-1 MiB local allocation/plist safety limit leaves room for the hardware matrix
-below and is explicitly not a receiver limit. Rejection clears previous MRP
-artwork, preventing stale cover art. No image encoder is embedded in production
-code.
+precision, and 1-4 components are supported. This preflight safely walks entropy
+markers but does not Huffman-decode coefficients or pixels; generated cases are
+separately decoded with Pillow. Reported profiles are not claims about what
+tvOS will render. A 1 MiB internal staging-allocation guard leaves room for the
+hardware matrix below and is explicitly not a receiver limit. Rejection clears
+previous MRP artwork, preventing stale cover art. No image codec is embedded in
+production code.
 
 Staged JPEG bytes ride only the *first* push for a given image, tagged with a
 fresh `ArtworkIdentifier`; later pushes carry the identifier without the bytes,
@@ -368,7 +369,7 @@ properties and command response:
 
 ```
 [STATUS] mrp artwork=posted status=200 bytes=65536 width=600 height=600 \
-precision=8 sof=0xc0 components=3 progressive=0 safety_max_bytes=1048576
+precision=8 sof=0xc0 components=3 progressive=0 staging_max_bytes=1048576
 ```
 
 **Controlled Apple TV matrix.** The test-only generator creates deterministic
@@ -393,6 +394,7 @@ make test STATIC=1
   /tmp/cliairplay-mrp-matrix/*.jpg
 /tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py send \
   --cmdpipe /path/to/cliairplay.fifo \
+  --record /tmp/rgb-baseline-65536.json \
   --artwork /tmp/cliairplay-mrp-matrix/rgb-baseline-65536.jpg
 ```
 
@@ -401,6 +403,25 @@ Apple TV Now Playing UI renders the image. Run byte cases in ascending order,
 then compare the progressive and grayscale controls at 65,536 bytes. Do not
 declare a receiver cap until a repeatable visible-artwork transition is
 measured independently of profile.
+
+COM padding isolates total `ArtworkData` length but not decoder complexity. Add
+at least one real, high-entropy MA thumbnail in the observed 100-175 KiB range.
+`inspect` and `send` accept arbitrary JPEG paths without copying them; with the
+Pillow venv above they record both a full decode result and the same metadata
+and SHA-256 fields as the generated manifest:
+
+```bash
+REAL_ARTWORK=/absolute/path/to/mass/cache/thumbnails/high-entropy.jpg
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py inspect \
+  --json --output /tmp/ma-real-artwork.json "$REAL_ARTWORK"
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py send \
+  --cmdpipe /path/to/cliairplay.fifo \
+  --record /tmp/ma-real-artwork-send.json \
+  --artwork "$REAL_ARTWORK"
+```
+
+Keep both JSON records with the corresponding
+`[STATUS] mrp artwork=posted ...` line and visible/not-visible result.
 
 **`updateMRSupportedCommands`** body:
 `{params:{mrSupportedCommandsFromSender:[<command-info>, ...]}}`, each element a

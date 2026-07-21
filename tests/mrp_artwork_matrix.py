@@ -82,6 +82,37 @@ def inspect_jpeg(data: bytes) -> dict[str, Any]:
     return result
 
 
+def pillow_decode(data: bytes) -> tuple[bool | None, str | None]:
+    try:
+        from PIL import Image
+    except ImportError:
+        return None, "Pillow is not installed"
+    try:
+        with Image.open(io.BytesIO(data)) as decoded:
+            decoded.load()
+    except Exception as err:
+        return False, str(err)
+    return True, None
+
+
+def describe_artwork(path: Path) -> dict[str, Any]:
+    resolved = path.resolve()
+    data = resolved.read_bytes()
+    details = inspect_jpeg(data)
+    decoded, decode_error = pillow_decode(data)
+    details.update(
+        {
+            "name": resolved.stem,
+            "path": str(resolved),
+            "sha256": hashlib.sha256(data).hexdigest(),
+            "pillow_decoded": decoded,
+        }
+    )
+    if decode_error:
+        details["pillow_error"] = decode_error
+    return details
+
+
 def pad_jpeg(data: bytes, target_size: int) -> bytes:
     if target_size == len(data):
         return data
@@ -168,20 +199,14 @@ def write_case(
     quality: int,
 ) -> dict[str, Any]:
     data = pad_jpeg(base, target_size)
-    from PIL import Image
-
-    with Image.open(io.BytesIO(data)) as decoded:
-        decoded.verify()
     path = output_dir / f"{name}-{target_size}.jpg"
     path.write_bytes(data)
-    details = inspect_jpeg(data)
+    details = describe_artwork(path)
+    if details["pillow_decoded"] is not True:
+        raise ValueError(f"Pillow rejected generated case: {path}")
     details.update(
         {
-            "name": path.stem,
-            "path": str(path.resolve()),
-            "sha256": hashlib.sha256(data).hexdigest(),
             "quality": quality,
-            "pillow_verified": True,
         }
     )
     return details
@@ -190,14 +215,17 @@ def write_case(
 def print_cases(cases: list[dict[str, Any]]) -> None:
     print(
         f"{'name':34} {'bytes':>8} {'size':>9} {'SOF':>5} "
-        f"{'comp':>4} {'progressive':>11}"
+        f"{'comp':>4} {'progressive':>11} {'Pillow':>7} {'sha256':>12}"
     )
     for case in cases:
         dimensions = f"{case['width']}x{case['height']}"
+        pillow = case["pillow_decoded"]
+        pillow_text = "n/a" if pillow is None else str(pillow)
         print(
             f"{case['name']:34} {case['bytes']:8} {dimensions:>9} "
             f"{case['sof_marker']:>5} {case['components']:4} "
-            f"{str(case['progressive']):>11}"
+            f"{str(case['progressive']):>11} {pillow_text:>7} "
+            f"{case['sha256'][:12]}"
         )
 
 
@@ -251,19 +279,21 @@ def generate(args: argparse.Namespace) -> int:
 
 
 def inspect_files(args: argparse.Namespace) -> int:
-    cases = []
-    for artwork in args.artwork:
-        path = artwork.resolve()
-        details = inspect_jpeg(path.read_bytes())
-        details.update({"name": path.stem, "path": str(path)})
-        cases.append(details)
-    print_cases(cases)
+    cases = [describe_artwork(artwork) for artwork in args.artwork]
+    if args.output:
+        output = args.output.resolve()
+        output.write_text(json.dumps(cases, indent=2) + "\n", encoding="utf-8")
+        print(f"Record: {output}", file=sys.stderr)
+    if args.json:
+        print(json.dumps(cases, indent=2))
+    else:
+        print_cases(cases)
     return 0
 
 
 def send(args: argparse.Namespace) -> int:
     artwork = args.artwork.resolve()
-    details = inspect_jpeg(artwork.read_bytes())
+    details = describe_artwork(artwork)
     title = args.title or f"MRP matrix {artwork.stem}"
     commands = (
         f"TITLE={title}\n"
@@ -273,9 +303,29 @@ def send(args: argparse.Namespace) -> int:
         "ACTION=SENDMETA\n"
     )
 
-    print(json.dumps({"artwork": str(artwork), **details}, indent=2))
+    record = {
+        **details,
+        "cmdpipe": str(args.cmdpipe.resolve()),
+        "commands": commands.splitlines(),
+    }
+    print(json.dumps(record, indent=2))
     print("\nCommands:")
     print(commands, end="")
+    if args.record:
+        record_path = args.record.resolve()
+        record_path.write_text(
+            json.dumps(record, indent=2) + "\n", encoding="utf-8"
+        )
+        print(f"\nRecord: {record_path}")
+    if details["pillow_decoded"] is False:
+        raise SystemExit(
+            f"Pillow rejected artwork: {details.get('pillow_error', artwork)}"
+        )
+    if details["pillow_decoded"] is None:
+        print(
+            "Warning: Pillow is unavailable; only JPEG-container metadata was checked.",
+            file=sys.stderr,
+        )
     if args.dry_run:
         return 0
 
@@ -311,6 +361,8 @@ def parser() -> argparse.ArgumentParser:
         "inspect", help="print JPEG dimensions and profile markers"
     )
     inspect_parser.add_argument("artwork", type=Path, nargs="+")
+    inspect_parser.add_argument("--json", action="store_true")
+    inspect_parser.add_argument("--output", type=Path)
     inspect_parser.set_defaults(func=inspect_files)
 
     send_parser = subparsers.add_parser(
@@ -319,6 +371,11 @@ def parser() -> argparse.ArgumentParser:
     send_parser.add_argument("--cmdpipe", type=Path, required=True)
     send_parser.add_argument("--artwork", type=Path, required=True)
     send_parser.add_argument("--title")
+    send_parser.add_argument(
+        "--record",
+        type=Path,
+        help="write the exact path/hash/profile/commands to JSON",
+    )
     send_parser.add_argument("--dry-run", action="store_true")
     send_parser.set_defaults(func=send)
     return root

@@ -195,20 +195,20 @@ static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info,
     if (info->result == AP2_MRP_ARTWORK_ACCEPTED) {
         status_print("[STATUS] mrp artwork=posted status=%d bytes=%zu "
                      "width=%u height=%u precision=%u sof=0x%02x "
-                     "components=%u progressive=%d safety_max_bytes=%d",
+                     "components=%u progressive=%d staging_max_bytes=%d",
                      command_status, info->bytes, info->width, info->height,
                      info->precision, info->sof_marker, info->components,
                      info->progressive,
-                     AP2_MRP_ARTWORK_SAFETY_MAX_BYTES);
+                     AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
         return;
     }
     status_print("[STATUS] mrp artwork=rejected reason=%s bytes=%zu "
                  "width=%u height=%u precision=%u sof=0x%02x components=%u "
-                 "progressive=%d clear_status=%d safety_max_bytes=%d",
+                 "progressive=%d clear_status=%d staging_max_bytes=%d",
                  ap2_mrp_artwork_result_name(info->result), info->bytes,
                  info->width, info->height, info->precision, info->sof_marker,
                  info->components, info->progressive, command_status,
-                 AP2_MRP_ARTWORK_SAFETY_MAX_BYTES);
+                 AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
 }
 
 static void mrp_artwork_reject_local(const char *reason)
