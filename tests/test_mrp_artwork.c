@@ -213,6 +213,40 @@ static bool test_mrp_probe_boundary(void)
     return true;
 }
 
+static bool test_decoder_valid_profile_fixtures(void)
+{
+    static const struct {
+        const char *path;
+        uint8_t sof_marker;
+        uint8_t precision;
+    } cases[] = {
+        {"tests/fixtures/sof1-8bit-dqt16.jpg", 0xC1, 8},
+        {"tests/fixtures/sof1-12bit.jpg", 0xC1, 12},
+        {"tests/fixtures/sof2-12bit.jpg", 0xC2, 12},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t *data = NULL;
+        size_t size = 0;
+        char content_type[ARTWORK_CONTENT_TYPE_SIZE];
+        char error[160];
+        CHECK(artwork_load_file(
+            cases[i].path, &data, &size, content_type, error, sizeof(error)));
+        ap2_mrp_artwork_info_t info;
+        CHECK(ap2_mrp_probe_artwork(
+                  content_type, data, size, &info) ==
+              AP2_MRP_ARTWORK_ACCEPTED);
+        CHECK(info.sof_marker == cases[i].sof_marker);
+        CHECK(info.precision == cases[i].precision);
+        if (i == 0) {
+            static const uint8_t dqt16[] = {0xFF, 0xDB, 0x00, 0x83, 0x10};
+            CHECK(bytes_contain(data, size, dqt16, sizeof(dqt16)));
+        }
+        free(data);
+    }
+    puts("Decoder-valid SOF1/12-bit/16-bit-DQT probes passed");
+    return true;
+}
+
 static bool test_nowplaying_command_payload(void)
 {
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
@@ -354,6 +388,7 @@ int main(int argc, char **argv)
 {
     if (!test_local_file_boundary() ||
         !test_mrp_probe_boundary() ||
+        !test_decoder_valid_profile_fixtures() ||
         !test_nowplaying_command_payload() ||
         !test_push_result_scope())
         return 1;

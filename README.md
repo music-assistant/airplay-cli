@@ -206,7 +206,7 @@ MRP artwork is omitted without withholding it from DMAP and clears stale state.
 
 `tests/mrp_artwork_matrix.py` generates the controlled Apple TV size/profile
 matrix or records/sends any existing JPEG cache path with its SHA-256, profile,
-dimensions, and optional Pillow decode result; see `DESIGN.md` §8.
+dimensions, and full Pillow/libjpeg decode result; see `DESIGN.md` §8.
 
 ## Building
 

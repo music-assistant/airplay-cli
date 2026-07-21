@@ -10,7 +10,9 @@ import json
 import os
 from pathlib import Path
 import shlex
+import shutil
 import stat
+import subprocess
 import sys
 from typing import Any
 
@@ -95,21 +97,52 @@ def pillow_decode(data: bytes) -> tuple[bool | None, str | None]:
     return True, None
 
 
+def djpeg_decode(path: Path) -> tuple[bool | None, str | None]:
+    decoder = shutil.which("djpeg")
+    if not decoder:
+        return None, "djpeg is not installed"
+    result = subprocess.run(
+        [decoder, "-outfile", os.devnull, str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        return False, result.stderr.strip() or f"djpeg exited {result.returncode}"
+    return True, None
+
+
 def describe_artwork(path: Path) -> dict[str, Any]:
     resolved = path.resolve()
     data = resolved.read_bytes()
     details = inspect_jpeg(data)
-    decoded, decode_error = pillow_decode(data)
+    pillow_decoded, pillow_error = pillow_decode(data)
+    decoder_verified = pillow_decoded is True
+    decoder = "pillow" if decoder_verified else None
+    decoder_error = pillow_error
+    if not decoder_verified:
+        djpeg_decoded, djpeg_error = djpeg_decode(resolved)
+        if djpeg_decoded is True:
+            decoder_verified = True
+            decoder = "djpeg"
+            decoder_error = None
+        elif djpeg_error:
+            decoder_error = djpeg_error
     details.update(
         {
             "name": resolved.stem,
             "path": str(resolved),
             "sha256": hashlib.sha256(data).hexdigest(),
-            "pillow_decoded": decoded,
+            "pillow_decoded": pillow_decoded,
+            "decoder_verified": decoder_verified,
+            "decoder": decoder,
         }
     )
-    if decode_error:
-        details["pillow_error"] = decode_error
+    if pillow_error:
+        details["pillow_error"] = pillow_error
+    if decoder_error:
+        details["decoder_error"] = decoder_error
     return details
 
 
@@ -202,8 +235,8 @@ def write_case(
     path = output_dir / f"{name}-{target_size}.jpg"
     path.write_bytes(data)
     details = describe_artwork(path)
-    if details["pillow_decoded"] is not True:
-        raise ValueError(f"Pillow rejected generated case: {path}")
+    if details["decoder_verified"] is not True:
+        raise ValueError(f"No decoder accepted generated case: {path}")
     details.update(
         {
             "quality": quality,
@@ -215,16 +248,15 @@ def write_case(
 def print_cases(cases: list[dict[str, Any]]) -> None:
     print(
         f"{'name':34} {'bytes':>8} {'size':>9} {'SOF':>5} "
-        f"{'comp':>4} {'progressive':>11} {'Pillow':>7} {'sha256':>12}"
+        f"{'comp':>4} {'progressive':>11} {'decoder':>7} {'sha256':>12}"
     )
     for case in cases:
         dimensions = f"{case['width']}x{case['height']}"
-        pillow = case["pillow_decoded"]
-        pillow_text = "n/a" if pillow is None else str(pillow)
+        decoder = case["decoder"] or "none"
         print(
             f"{case['name']:34} {case['bytes']:8} {dimensions:>9} "
             f"{case['sof_marker']:>5} {case['components']:4} "
-            f"{str(case['progressive']):>11} {pillow_text:>7} "
+            f"{str(case['progressive']):>11} {decoder:>7} "
             f"{case['sha256'][:12]}"
         )
 
@@ -317,10 +349,10 @@ def send(args: argparse.Namespace) -> int:
             json.dumps(record, indent=2) + "\n", encoding="utf-8"
         )
         print(f"\nRecord: {record_path}")
-    if details["pillow_decoded"] is not True:
+    if details["decoder_verified"] is not True:
         raise SystemExit(
-            "Pillow must fully decode artwork before sending: "
-            f"{details.get('pillow_error', artwork)}"
+            "Pillow or djpeg must fully decode artwork before sending: "
+            f"{details.get('decoder_error', artwork)}"
         )
     if args.dry_run:
         return 0

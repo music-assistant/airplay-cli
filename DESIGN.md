@@ -353,7 +353,9 @@ EOI. It walks length-delimited headers memory-safely to extract SOF dimensions,
 precision, component count, and profile when available, but those fields and
 all JPEG internals are telemetry rather than acceptance criteria. The receiver
 remains the decoder. Generated and arbitrary-cache test cases are separately
-decoded with Pillow before the harness sends them. A 1 MiB internal
+decoded with Pillow or `djpeg` before the harness sends them. Decoder-valid
+SOF1/12-bit/16-bit-DQT fixtures cover profiles outside typical Pillow output. A
+1 MiB internal
 staging-allocation guard leaves room for the hardware matrix below and is
 explicitly not a receiver limit. Rejection clears previous MRP artwork,
 preventing stale cover art. No image codec is embedded in production code.
@@ -407,7 +409,7 @@ measured independently of profile.
 COM padding isolates total `ArtworkData` length but not decoder complexity. Add
 at least one real, high-entropy MA thumbnail in the observed 100-175 KiB range.
 `inspect` and `send` accept arbitrary JPEG paths without copying them; with the
-Pillow venv above they record both a full decode result and the same metadata
+Pillow/`djpeg` setup above records both a full decode result and the same metadata
 and SHA-256 fields as the generated manifest:
 
 ```bash
