@@ -114,7 +114,10 @@ static void test_worker_without_cmdpipe(void)
     atomic_init(&worker_ticks, 0);
     assert(ap2_periodic_worker_init(&worker, 20, worker_tick, NULL));
     assert(ap2_periodic_worker_start(&worker));
-    usleep(85000);
+    uint64_t deadline_ms = ap2_io_monotonic_ms() + 1000;
+    while (atomic_load(&worker_ticks) < 3 &&
+           ap2_io_monotonic_ms() < deadline_ms)
+        usleep(5000);
     ap2_periodic_worker_stop(&worker);
     unsigned stopped_at = atomic_load(&worker_ticks);
     assert(stopped_at >= 3);
