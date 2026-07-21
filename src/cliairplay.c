@@ -326,7 +326,11 @@ static int input_ring_read(uint8_t *buf, size_t want)
     if (n) pthread_cond_broadcast(&g_inring.can_write);
     int error = g_inring.error;
     pthread_mutex_unlock(&g_inring.lock);
-    return n ? (int)n : (error ? -1 : 0);
+    if (!n && error) {
+        errno = error;
+        return -1;
+    }
+    return (int)n;
 }
 
 enum { INPUT_RING_TIMEOUT = -2 };
@@ -367,7 +371,11 @@ static int input_ring_read_timed(uint8_t *buf, size_t want, int timeout_ms)
     if (n) pthread_cond_broadcast(&g_inring.can_write);
     int error = g_inring.error;
     pthread_mutex_unlock(&g_inring.lock);
-    return n ? (int)n : (error ? -1 : 0);
+    if (!n && error) {
+        errno = error;
+        return -1;
+    }
+    return (int)n;
 }
 
 /* ---- Command pipe handler ---- */

@@ -31,6 +31,7 @@
 #include <pthread.h>
 #include <poll.h>
 #include <stdatomic.h>
+#include <inttypes.h>
 
 #include <openssl/rand.h>
 #include <openssl/evp.h>
