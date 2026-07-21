@@ -270,4 +270,23 @@ bool ap2cl_is_connected(struct ap2cl_s *p);
 /* Check if playing (has buffered or streaming data). */
 bool ap2cl_is_playing(struct ap2cl_s *p);
 
+#ifdef AP2_CLIENT_TESTING
+typedef struct {
+    void (*created)(struct ap2_mrp_ctx *mrp, void *opaque);
+    bool (*attach)(struct ap2_mrp_ctx *mrp, int data_port,
+                   uint64_t seed, void *opaque);
+    void (*destroying)(struct ap2_mrp_ctx *mrp, void *opaque);
+    bool (*is_connected)(struct ap2_mrp_ctx *mrp, void *opaque);
+    void (*serial_contended)(void *opaque);
+    void *opaque;
+} ap2cl_mrp_test_hooks_t;
+
+void ap2cl_test_set_mrp_hooks(const ap2cl_mrp_test_hooks_t *hooks);
+void ap2cl_test_set_mrp_phase(struct ap2cl_s *p, bool commands_ready);
+bool ap2cl_test_setup_mrp(struct ap2cl_s *p);
+void ap2cl_test_teardown_mrp(struct ap2cl_s *p);
+bool ap2cl_test_has_mrp(struct ap2cl_s *p);
+bool ap2cl_test_mrp_serial_locked(struct ap2cl_s *p);
+#endif
+
 #endif /* __AP2_CLIENT_H_ */

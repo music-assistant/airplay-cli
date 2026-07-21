@@ -35,6 +35,7 @@
 #include "cross_log.h"
 #include "ap2_client.h"
 #include "ap2_ptp.h"
+#include "cli_lifecycle.h"
 #include "ap2_hap.h"
 #include "artwork.h"
 
@@ -104,17 +105,16 @@ typedef struct {
 } cli_config_t;
 
 /* Globals */
-static bool g_running = true;
+static cli_lifecycle_t g_lifecycle = CLI_LIFECYCLE_INITIALIZER;
 static playback_status_t g_status = STATUS_STOPPED;
-static pthread_t g_cmdpipe_thread;
 static int g_cmdpipe_fd = -1;
 static char g_cmdpipe_buf[512];
 
 /* RAOP context (when using RAOP protocol) */
-static struct raopcl_s *g_raopcl = NULL;
+static _Atomic(void *) g_raopcl = NULL;
 
 /* AP2 context (when using AirPlay 2 protocol) */
-static struct ap2cl_s *g_ap2cl = NULL;
+static _Atomic(void *) g_ap2cl = NULL;
 
 /* Debug levels */
 log_level util_loglevel;
@@ -213,8 +213,10 @@ static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info,
 
 static void mrp_artwork_reject_local(const char *reason)
 {
+    struct ap2cl_s *ap2cl = atomic_load_explicit(
+        &g_ap2cl, memory_order_acquire);
     ap2_mrp_push_result_t push;
-    if (!g_ap2cl || !ap2cl_clear_mrp_artwork(g_ap2cl, &push)) return;
+    if (!ap2cl || !ap2cl_clear_mrp_artwork(ap2cl, &push)) return;
     status_print("[STATUS] mrp artwork=rejected reason=%s clear_status=%d",
                  reason, push.nowplaying_status);
     mrp_status_report(push.overall_status);
@@ -285,7 +287,7 @@ static void *input_ring_thread(void *arg)
 {
     (void)arg;
     uint8_t chunk[65536];
-    while (g_running) {
+    while (cli_lifecycle_is_running(&g_lifecycle)) {
         ssize_t n = read(g_inring.fd, chunk, sizeof(chunk));
         if (n < 0 && errno == EINTR) continue;
         pthread_mutex_lock(&g_inring.lock);
@@ -296,8 +298,9 @@ static void *input_ring_thread(void *arg)
             break;
         }
         size_t off = 0;
-        while (off < (size_t)n && g_running) {
-            while (g_inring.fill >= g_inring.max_fill && g_running)
+        while (off < (size_t)n && cli_lifecycle_is_running(&g_lifecycle)) {
+            while (g_inring.fill >= g_inring.max_fill &&
+                   cli_lifecycle_is_running(&g_lifecycle))
                 pthread_cond_wait(&g_inring.can_write, &g_inring.lock);
             size_t space = g_inring.max_fill - g_inring.fill;
             size_t chunk_len = (size_t)n - off;
@@ -334,7 +337,8 @@ static void input_ring_start(int fd, unsigned byte_rate, int cap_ms)
 static int input_ring_read(uint8_t *buf, size_t want)
 {
     pthread_mutex_lock(&g_inring.lock);
-    while (g_inring.fill == 0 && !g_inring.eof && g_running)
+    while (g_inring.fill == 0 && !g_inring.eof &&
+           cli_lifecycle_is_running(&g_lifecycle))
         pthread_cond_wait(&g_inring.can_read, &g_inring.lock);
     size_t n = g_inring.fill < want ? g_inring.fill : want;
     size_t got = 0;
@@ -364,6 +368,11 @@ static struct {
 
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
+    struct raopcl_s *raopcl = atomic_load_explicit(
+        &g_raopcl, memory_order_acquire);
+    struct ap2cl_s *ap2cl = atomic_load_explicit(
+        &g_ap2cl, memory_order_acquire);
+
     if (strcmp(key, "TITLE") == 0) {
         g_metadata.title = value ? (char*)value : "";
     } else if (strcmp(key, "ARTIST") == 0) {
@@ -374,11 +383,11 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         g_metadata.duration = atoi(value);
     } else if (strcmp(key, "PROGRESS") == 0) {
         g_metadata.progress = atoi(value);
-        if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-            raopcl_set_progress_ms(g_raopcl, g_metadata.progress * 1000, g_metadata.duration * 1000);
-        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-            ap2cl_set_progress(g_ap2cl, g_metadata.progress, g_metadata.duration);
-            mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+        if (cfg->protocol == PROTO_RAOP && raopcl) {
+            raopcl_set_progress_ms(raopcl, g_metadata.progress * 1000, g_metadata.duration * 1000);
+        } else if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl) {
+            ap2cl_set_progress(ap2cl, g_metadata.progress, g_metadata.duration);
+            mrp_status_report(ap2cl_mrp_push(ap2cl));
         }
     } else if (strcmp(key, "ARTWORK") == 0) {
         if (!value || !*value) {
@@ -400,14 +409,14 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                 LOG_WARN("Cannot load artwork: %s", error);
                 if (cfg->protocol == PROTO_AIRPLAY2)
                     mrp_artwork_reject_local("invalid_local_file");
-            } else if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-                raopcl_set_artwork(g_raopcl, content_type, (int)image_size,
+            } else if (cfg->protocol == PROTO_RAOP && raopcl) {
+                raopcl_set_artwork(raopcl, content_type, (int)image_size,
                                    (char *)image);
-            } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+            } else if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl) {
                 ap2_mrp_artwork_info_t mrp_info;
                 ap2_mrp_push_result_t push;
                 bool dmap_ok = ap2cl_set_artwork(
-                    g_ap2cl, content_type, (int)image_size,
+                    ap2cl, content_type, (int)image_size,
                     (const char *)image, &mrp_info, &push);
                 if (!dmap_ok)
                     LOG_WARN("Receiver rejected DMAP artwork (%zu bytes, %s)",
@@ -421,30 +430,30 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
     } else if (strcmp(key, "VOLUME") == 0) {
         int vol = atoi(value);
         LOG_INFO("Setting volume to: %d", vol);
-        if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-            raopcl_set_volume(g_raopcl, raopcl_float_volume(vol));
-        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-            ap2cl_set_volume(g_ap2cl, vol);
+        if (cfg->protocol == PROTO_RAOP && raopcl) {
+            raopcl_set_volume(raopcl, raopcl_float_volume(vol));
+        } else if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl) {
+            ap2cl_set_volume(ap2cl, vol);
         }
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "PAUSE") == 0) {
         if (g_status == STATUS_PLAYING) {
-            if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-                raopcl_pause(g_raopcl);
-                raopcl_flush(g_raopcl);
-            } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-                ap2cl_pause(g_ap2cl);
+            if (cfg->protocol == PROTO_RAOP && raopcl) {
+                raopcl_pause(raopcl);
+                raopcl_flush(raopcl);
+            } else if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl) {
+                ap2cl_pause(ap2cl);
             }
             g_status = STATUS_PAUSED;
             status_paused(0);
         }
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "PLAY") == 0) {
-        if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-            int latency = raopcl_latency(g_raopcl);
+        if (cfg->protocol == PROTO_RAOP && raopcl) {
+            int latency = raopcl_latency(raopcl);
             uint64_t now = raopcl_get_ntp(NULL);
-            uint64_t start_at = now + MS2NTP(200) - TS2NTP(latency, raopcl_sample_rate(g_raopcl));
-            raopcl_start_at(g_raopcl, start_at);
-        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-            ap2cl_play(g_ap2cl);
+            uint64_t start_at = now + MS2NTP(200) - TS2NTP(latency, raopcl_sample_rate(raopcl));
+            raopcl_start_at(raopcl, start_at);
+        } else if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl) {
+            ap2cl_play(ap2cl);
         }
         /* No status emission here: reporting elapsed_ms=0 would snap the
          * sender's position display backwards. The periodic reporter (gated on
@@ -452,22 +461,22 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         g_status = STATUS_PLAYING;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STOP") == 0) {
         g_status = STATUS_STOPPED;
-        if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-            raopcl_stop(g_raopcl);
-        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-            ap2cl_stop(g_ap2cl);
+        if (cfg->protocol == PROTO_RAOP && raopcl) {
+            raopcl_stop(raopcl);
+        } else if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl) {
+            ap2cl_stop(ap2cl);
         }
         status_print("[STATUS] stopped");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "SENDMETA") == 0) {
-        if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-            raopcl_set_daap(g_raopcl, 4, "minm", 's', g_metadata.title,
+        if (cfg->protocol == PROTO_RAOP && raopcl) {
+            raopcl_set_daap(raopcl, 4, "minm", 's', g_metadata.title,
                             "asar", 's', g_metadata.artist,
                             "asal", 's', g_metadata.album,
                             "astn", 'i', 1);
-        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-            ap2cl_set_metadata(g_ap2cl, g_metadata.title, g_metadata.artist,
+        } else if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl) {
+            ap2cl_set_metadata(ap2cl, g_metadata.title, g_metadata.artist,
                                g_metadata.album, g_metadata.duration);
-            mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+            mrp_status_report(ap2cl_mrp_push(ap2cl));
         }
     }
 }
@@ -477,17 +486,19 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
  * placeholder title) once the session is established, so audio starts regardless
  * of whether — or when — the caller sends a SENDMETA command. Any later metadata
  * from the caller simply overwrites this. */
-static void send_initial_metadata(const cli_config_t *cfg)
+static void send_initial_metadata(const cli_config_t *cfg,
+                                  struct raopcl_s *raopcl,
+                                  struct ap2cl_s *ap2cl)
 {
     const char *title = (g_metadata.title && *g_metadata.title) ? g_metadata.title : "cliairplay";
-    if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-        raopcl_set_daap(g_raopcl, 4, "minm", 's', title,
+    if (cfg->protocol == PROTO_RAOP && raopcl) {
+        raopcl_set_daap(raopcl, 4, "minm", 's', title,
                         "asar", 's', g_metadata.artist,
                         "asal", 's', g_metadata.album, "astn", 'i', 1);
-    } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-        ap2cl_set_metadata(g_ap2cl, title, g_metadata.artist,
+    } else if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl) {
+        ap2cl_set_metadata(ap2cl, title, g_metadata.artist,
                            g_metadata.album, g_metadata.duration);
-        mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+        mrp_status_report(ap2cl_mrp_push(ap2cl));
     }
 }
 
@@ -504,22 +515,28 @@ static void *cmdpipe_reader_thread(void *arg)
     }
     LOG_INFO("Command pipe ready: %s", cfg->cmdpipe);
 
-    while (g_running) {
+    while (cli_lifecycle_is_running(&g_lifecycle)) {
         struct pollfd pfds = {.fd = g_cmdpipe_fd, .events = POLLIN};
         int n = poll(&pfds, 1, 1000);
-        if (!g_running) break;
+        if (!cli_lifecycle_is_running(&g_lifecycle)) break;
 
         uint64_t now = raopcl_get_ntp(NULL);
-        if (cfg->protocol == PROTO_RAOP && g_raopcl && now - last_keepalive >= MS2NTP(20000)) {
-            raopcl_keepalive(g_raopcl);
+        struct raopcl_s *raopcl = atomic_load_explicit(
+            &g_raopcl, memory_order_acquire);
+        struct ap2cl_s *ap2cl = atomic_load_explicit(
+            &g_ap2cl, memory_order_acquire);
+        if (cfg->protocol == PROTO_RAOP && raopcl &&
+            now - last_keepalive >= MS2NTP(20000)) {
+            raopcl_keepalive(raopcl);
             last_keepalive = now;
         }
         /* Native AP2 keepalive: real senders POST /feedback about every 2 s
          * and long sessions can hit receiver-side idle timeouts without it
          * (no-op for the RAOP-compat flow, which libraop keeps alive). */
-        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl && ap2cl_is_connected(g_ap2cl) &&
+        if (cfg->protocol == PROTO_AIRPLAY2 && ap2cl &&
+            ap2cl_is_connected(ap2cl) &&
             now - last_feedback >= MS2NTP(2000)) {
-            ap2cl_feedback(g_ap2cl);
+            ap2cl_feedback(ap2cl);
             last_feedback = now;
         }
 
@@ -531,7 +548,7 @@ static void *cmdpipe_reader_thread(void *arg)
             char *save_ptr1, *save_ptr2;
             char *line = strtok_r(g_cmdpipe_buf, "\n", &save_ptr1);
             while (line != NULL) {
-                if (!g_running) break;
+                if (!cli_lifecycle_is_running(&g_lifecycle)) break;
                 char *key = strtok_r(line, "=", &save_ptr2);
                 if (!key || strlen(key) == 0) goto next_line;
                 char *value = strtok_r(NULL, "", &save_ptr2);
@@ -550,6 +567,33 @@ next_line:
 }
 
 /* ---- RAOP playback loop ---- */
+
+static void destroy_raop_client(void *client)
+{
+    raopcl_destroy((struct raopcl_s *)client);
+}
+
+static void disconnect_destroy_raop_client(void *client)
+{
+    struct raopcl_s *raopcl = client;
+    raopcl_disconnect(raopcl);
+    raopcl_destroy(raopcl);
+}
+
+static void destroy_ap2_client(void *client)
+{
+    ap2cl_destroy((struct ap2cl_s *)client);
+}
+
+static bool retire_client(_Atomic(void *) *published_client, void *client,
+                          cli_lifecycle_destroy_fn destroy_client)
+{
+    if (cli_lifecycle_retire_client(
+            &g_lifecycle, published_client, client, destroy_client))
+        return true;
+    LOG_ERROR("Cannot join command thread during client teardown");
+    return false;
+}
 
 static int run_raop(cli_config_t *cfg, int infile)
 {
@@ -609,7 +653,7 @@ static int run_raop(cli_config_t *cfg, int infile)
     LOG_INFO("RAOP codec: %s", use_alac ? "ALAC (compressed)" : "ALAC-raw (uncompressed)");
 
     /* Create RAOP client */
-    g_raopcl = raopcl_create(
+    struct raopcl_s *raopcl = raopcl_create(
         host_addr, 0, 0, cfg->dacp_id, cfg->active_remote,
         use_alac ? RAOP_ALAC : RAOP_ALAC_RAW,
         DEFAULT_FRAMES_PER_CHUNK, latency, crypto,
@@ -621,35 +665,35 @@ static int run_raop(cli_config_t *cfg, int infile)
         cfg->sample_rate, cfg->bit_depth, cfg->channels,
         cfg->volume > 0 ? raopcl_float_volume(cfg->volume) : -144.0f
     );
-    if (!g_raopcl) {
+    if (!raopcl) {
         status_error("Cannot init RAOP client");
         return 1;
     }
 
     /* Connect */
     LOG_INFO("Connecting to %s:%d via RAOP", inet_ntoa(player_addr), cfg->port);
-    if (!raopcl_connect(g_raopcl, player_addr, cfg->port, cfg->volume > 0)) {
+    if (!raopcl_connect(raopcl, player_addr, cfg->port, cfg->volume > 0)) {
         status_error("Cannot connect to AirPlay device");
-        raopcl_destroy(g_raopcl);
-        g_raopcl = NULL;
+        retire_client(&g_raopcl, raopcl, destroy_raop_client);
         return 1;
     }
 
-    latency = raopcl_latency(g_raopcl);
-    status_connected_legacy(inet_ntoa(player_addr), cfg->port,
-                            (int)TS2MS(latency, raopcl_sample_rate(g_raopcl)));
-    send_initial_metadata(cfg);
+    latency = raopcl_latency(raopcl);
+    send_initial_metadata(cfg, raopcl, NULL);
 
     /* Schedule start time */
     if (cfg->ntp_start) {
         /* Contract: the first sample is AUDIBLE exactly at the requested start
          * (RAOP renders a frame latency after its frame-clock position, so the
          * timeline starts latency early). */
-        raopcl_start_at(g_raopcl,
-                        cfg->ntp_start - TS2NTP(latency, raopcl_sample_rate(g_raopcl)));
+        raopcl_start_at(raopcl,
+                        cfg->ntp_start - TS2NTP(latency, raopcl_sample_rate(raopcl)));
     }
 
     g_status = STATUS_PLAYING;
+    atomic_store_explicit(&g_raopcl, raopcl, memory_order_release);
+    status_connected_legacy(inet_ntoa(player_addr), cfg->port,
+                            (int)TS2MS(latency, raopcl_sample_rate(raopcl)));
     /* Stdin audio format:
      * For 16-bit: s16le (2 bytes per sample, 4 bytes per frame stereo)
      * For 24-bit: s32le (4 bytes per sample, 8 bytes per frame stereo)
@@ -661,21 +705,21 @@ static int run_raop(cli_config_t *cfg, int infile)
     uint8_t *alac_buf = (cfg->bit_depth > 16) ? malloc(DEFAULT_FRAMES_PER_CHUNK * alac_bpf) : NULL;
 
     /* Main audio loop */
-    while (g_status != STATUS_STOPPED && (!got_eof || raopcl_is_playing(g_raopcl))) {
+    while (g_status != STATUS_STOPPED && (!got_eof || raopcl_is_playing(raopcl))) {
         uint64_t now = raopcl_get_ntp(NULL);
 
         /* Periodic status reporting (only while playing, so a pause does not keep
            emitting a "playing" status that would revive the sender's play state) */
         if (g_status == STATUS_PLAYING && now - last > MS2NTP(1000)) {
             last = now;
-            if (frames > (uint64_t)raopcl_latency(g_raopcl)) {
-                uint32_t elapsed = TS2MS(frames - raopcl_latency(g_raopcl), raopcl_sample_rate(g_raopcl));
-                status_elapsed_legacy(elapsed, frames, g_raopcl);
+            if (frames > (uint64_t)raopcl_latency(raopcl)) {
+                uint32_t elapsed = TS2MS(frames - raopcl_latency(raopcl), raopcl_sample_rate(raopcl));
+                status_elapsed_legacy(elapsed, frames, raopcl);
             }
         }
 
         /* Send audio chunk */
-        if (g_status == STATUS_PLAYING && raopcl_accept_frames(g_raopcl)) {
+        if (g_status == STATUS_PLAYING && raopcl_accept_frames(raopcl)) {
             int n = input_ring_read(buf, DEFAULT_FRAMES_PER_CHUNK * input_bpf);
             if (n < 0) {
                 status_error("Error reading from audio source");
@@ -696,7 +740,7 @@ static int run_raop(cli_config_t *cfg, int infile)
                 send_buf = alac_buf;
             }
             uint64_t playtime;
-            raopcl_send_chunk(g_raopcl, send_buf, audio_frames, &playtime);
+            raopcl_send_chunk(raopcl, send_buf, audio_frames, &playtime);
             frames += audio_frames;
         } else {
             usleep(1000);
@@ -704,13 +748,10 @@ static int run_raop(cli_config_t *cfg, int infile)
     }
 
     status_eof();
-    g_running = false;
     free(buf);
     free(alac_buf);
-    raopcl_disconnect(g_raopcl);
-    raopcl_destroy(g_raopcl);
-    g_raopcl = NULL;
-    return 0;
+    return retire_client(
+               &g_raopcl, raopcl, disconnect_destroy_raop_client) ? 0 : 1;
 }
 
 /* ---- AirPlay 2 playback loop ---- */
@@ -730,44 +771,40 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         .channels = cfg->channels,
     };
 
-    g_ap2cl = ap2cl_create(&device, &format,
-                            cfg->auth, cfg->password,
-                            cfg->dacp_id, cfg->active_remote,
-                            cfg->latency_ms, cfg->volume);
-    if (!g_ap2cl) {
+    struct ap2cl_s *ap2cl = ap2cl_create(
+        &device, &format, cfg->auth, cfg->password,
+        cfg->dacp_id, cfg->active_remote, cfg->latency_ms, cfg->volume);
+    if (!ap2cl) {
         status_error("Cannot create AirPlay 2 client");
         return 1;
     }
 
     /* Pass through mDNS properties and interface for RAOP-compatible flow */
-    ap2cl_set_raop_props(g_ap2cl, cfg->iface, cfg->secret,
+    ap2cl_set_raop_props(ap2cl, cfg->iface, cfg->secret,
                           cfg->et, cfg->md, cfg->am);
     /* Apply the resolved AirPlay 2 route (see ap2_resolve_route). force_native
      * is a no-op when stored credentials already select the native flow. */
     if (cfg->route.native)
-        ap2cl_force_native(g_ap2cl);
+        ap2cl_force_native(ap2cl);
     if (cfg->publish_ip)
-        ap2cl_set_publish_ip(g_ap2cl, cfg->publish_ip);
-    ap2cl_set_ptp(g_ap2cl, cfg->route.ptp);
-    ap2cl_set_ptp_shared(g_ap2cl, cfg->ptp_shared);
-    ap2cl_set_buffered(g_ap2cl, cfg->route.buffered);
+        ap2cl_set_publish_ip(ap2cl, cfg->publish_ip);
+    ap2cl_set_ptp(ap2cl, cfg->route.ptp);
+    ap2cl_set_ptp_shared(ap2cl, cfg->ptp_shared);
+    ap2cl_set_buffered(ap2cl, cfg->route.buffered);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
-    if (!ap2cl_connect(g_ap2cl)) {
+    if (!ap2cl_connect(ap2cl)) {
         status_error("Cannot connect to AirPlay 2 device");
-        ap2cl_destroy(g_ap2cl);
-        g_ap2cl = NULL;
+        retire_client(&g_ap2cl, ap2cl, destroy_ap2_client);
         return 1;
     }
-
-    status_connected();
 
     /* Report the MRP now-playing path so MA can log which one is active. The
      * type-130 data channel (path B) is opt-in; -1 means it was not attempted
      * (default) or the session is not an Apple/pair-verified target. */
     {
-        int mrp_ch = ap2cl_mrp_channel_status(g_ap2cl);
+        int mrp_ch = ap2cl_mrp_channel_status(ap2cl);
         if (mrp_ch >= 0) {
             printf("[STATUS] mrp path=channel status=%d\n", mrp_ch);
             fflush(stdout);
@@ -777,41 +814,43 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     /* Register the sender identity before the first now-playing update. The
      * supported commands, playback state and NowPlayingClient follow that first
      * update inside ap2cl_mrp_push(), matching Apple's AirPlaySender ordering. */
-    ap2cl_mrp_register(g_ap2cl);
+    ap2cl_mrp_register(ap2cl);
 
     /* Surface the effective lead and the receiver-reported buffering window so
      * the caller (MA) can plan group starts from real device capabilities. */
     {
         int lead_ms = 0;
         uint32_t dev_min = 0, dev_max = 0;
-        ap2cl_latency_info(g_ap2cl, &lead_ms, &dev_min, &dev_max);
+        ap2cl_latency_info(ap2cl, &lead_ms, &dev_min, &dev_max);
         printf("[STATUS] latency lead_ms=%d device_min_frames=%u device_max_frames=%u "
                "device_render_ms=%d\n",
-               lead_ms, dev_min, dev_max, ap2cl_render_latency_ms(g_ap2cl));
+               lead_ms, dev_min, dev_max, ap2cl_render_latency_ms(ap2cl));
         fflush(stdout);
     }
 
     /* Set volume */
     if (cfg->volume > 0) {
-        ap2cl_set_volume(g_ap2cl, cfg->volume);
+        ap2cl_set_volume(ap2cl, cfg->volume);
     }
 
     /* Schedule start time */
     if (cfg->ntp_start) {
-        ap2cl_start_at(g_ap2cl, cfg->ntp_start);
+        ap2cl_start_at(ap2cl, cfg->ntp_start);
     } else {
         uint64_t now = raopcl_get_ntp(NULL);
         uint64_t start_at = now + MS2NTP(cfg->latency_ms);
-        ap2cl_start_at(g_ap2cl, start_at);
+        ap2cl_start_at(ap2cl, start_at);
     }
 
     /* Placeholder metadata must follow ap2cl_start_at: that call sets the RTP
      * timeline the metadata's RTP-Info anchors to. Sent earlier it anchors to
      * rtptime=0 — metadata-gated receivers (Sonos) then show the title but do
      * not treat it as the audio timeline's metadata and keep audio muted. */
-    send_initial_metadata(cfg);
+    send_initial_metadata(cfg, NULL, ap2cl);
 
     g_status = STATUS_PLAYING;
+    atomic_store_explicit(&g_ap2cl, ap2cl, memory_order_release);
+    status_connected();
     uint64_t last = 0, frames = 0;
     int ap2_input_bpf = (cfg->bit_depth <= 16 ? 2 : 4) * cfg->channels;
     int ap2_alac_bpf = (cfg->bit_depth <= 16 ? 2 : 3) * cfg->channels;
@@ -822,7 +861,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     uint64_t eof_time = 0;
 
     /* Main audio loop */
-    while (g_status != STATUS_STOPPED && (!got_eof || ap2cl_is_playing(g_ap2cl))) {
+    while (g_status != STATUS_STOPPED && (!got_eof || ap2cl_is_playing(ap2cl))) {
         uint64_t now = raopcl_get_ntp(NULL);
 
         /* After EOF, drain for at most latency + 2 seconds then stop */
@@ -843,7 +882,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         }
 
         /* Send audio chunk */
-        if (g_status == STATUS_PLAYING && ap2cl_accept_frames(g_ap2cl)) {
+        if (g_status == STATUS_PLAYING && ap2cl_accept_frames(ap2cl)) {
             int n = input_ring_read(buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
             if (n < 0) {
                 status_error("Error reading from audio source");
@@ -863,7 +902,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 truncate_32to24(buf, n, ap2_alac_buf);
                 send = ap2_alac_buf;
             }
-            ap2cl_send_chunk(g_ap2cl, send, af);
+            ap2cl_send_chunk(ap2cl, send, af);
             frames += af;
         } else {
             usleep(1000);
@@ -871,12 +910,9 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     }
 
     status_eof();
-    g_running = false;
     free(buf);
     free(ap2_alac_buf);
-    ap2cl_destroy(g_ap2cl);
-    g_ap2cl = NULL;
-    return 0;
+    return retire_client(&g_ap2cl, ap2cl, destroy_ap2_client) ? 0 : 1;
 }
 
 
@@ -885,7 +921,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
 static void signal_handler(int sig)
 {
     (void)sig;
-    g_running = false;
+    cli_lifecycle_request_stop(&g_lifecycle);
     g_status = STATUS_STOPPED;
 }
 
@@ -1314,7 +1350,11 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
-        pthread_create(&g_cmdpipe_thread, NULL, cmdpipe_reader_thread, &cfg);
+        int thread_result = cli_lifecycle_start_command_thread(
+            &g_lifecycle, cmdpipe_reader_thread, &cfg);
+        if (thread_result != 0)
+            LOG_ERROR("Failed to start command pipe thread: %s",
+                      strerror(thread_result));
     }
 
     /* Drain the audio source eagerly from here on (see the input ring note),
@@ -1332,9 +1372,11 @@ int main(int argc, char *argv[])
     }
 
     /* Cleanup */
-    g_running = false;
+    if (!cli_lifecycle_stop_command_thread(&g_lifecycle)) {
+        status_error("Cannot join command pipe thread");
+        result = 1;
+    }
     if (cfg.cmdpipe) {
-        pthread_join(g_cmdpipe_thread, NULL);
         if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
         unlink(cfg.cmdpipe);
     }

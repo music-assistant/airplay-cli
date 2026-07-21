@@ -123,11 +123,16 @@ TEST_EXECUTABLE = $(BUILDDIR)/test-mrp-artwork
 TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
 	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_plist.o \
 	$(BUILDDIR)/artwork.o $(BUILDDIR)/cross_log.o
+LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-lifecycle
+LIFECYCLE_TEST_OBJECTS = $(BUILDDIR)/test_ap2_lifecycle.o \
+	$(BUILDDIR)/ap2_client_lifecycle_test.o \
+	$(filter-out $(BUILDDIR)/ap2_client.o $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL))
 
 all: directory $(EXECUTABLE)
 
-test: directory $(TEST_EXECUTABLE)
+test: directory $(TEST_EXECUTABLE) $(LIFECYCLE_TEST_EXECUTABLE)
 	$(TEST_EXECUTABLE)
+	$(LIFECYCLE_TEST_EXECUTABLE)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 
 directory:
@@ -145,8 +150,19 @@ $(EXECUTABLE): $(OBJECTS_ALL) $(LIBCODECS_PATCHED)
 $(TEST_EXECUTABLE): $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a
 	$(CC) $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
+$(LIFECYCLE_TEST_EXECUTABLE): $(LIFECYCLE_TEST_OBJECTS) $(LIBCODECS_PATCHED) $(OPENSSL)/libopenssl.a
+	$(CXX) $(LIFECYCLE_TEST_OBJECTS) \
+		$(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) $(OPENSSL)/libopenssl.a \
+		$(LDFLAGS) -o $@
+
 $(BUILDDIR)/test_mrp_artwork.o: tests/test_mrp_artwork.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
+$(BUILDDIR)/test_ap2_lifecycle.o: tests/test_ap2_lifecycle.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DAP2_CLIENT_TESTING $< -c -o $@
+
+$(BUILDDIR)/ap2_client_lifecycle_test.o: $(SRC)/ap2_client.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DAP2_CLIENT_TESTING $< -c -o $@
 
 $(BUILDDIR)/%.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
