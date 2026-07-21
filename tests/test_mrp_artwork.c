@@ -344,7 +344,7 @@ static bool test_mrp_validation_boundary(void)
     return true;
 }
 
-static bool test_malformed_jpeg_structures(void)
+static bool test_empty_table_repro(void)
 {
     ap2_mrp_artwork_info_t info;
     static const uint8_t empty_tables[] = {
@@ -361,7 +361,13 @@ static bool test_malformed_jpeg_structures(void)
     CHECK(ap2_mrp_validate_artwork(
               "image/jpeg", empty_tables, sizeof(empty_tables), &info) ==
           AP2_MRP_ARTWORK_INVALID_JPEG);
+    puts("45-byte empty-DQT/DHT JPEG rejected");
+    return true;
+}
 
+static bool test_malformed_jpeg_structures(void)
+{
+    ap2_mrp_artwork_info_t info;
     uint8_t changed[sizeof(k_baseline_jpeg)];
     size_t dqt = jpeg_marker_offset(k_baseline_jpeg,
                                     sizeof(k_baseline_jpeg), 0xDB);
@@ -516,6 +522,7 @@ static bool test_malformed_jpeg_structures(void)
               "image/jpeg", restart, restart_size, &info) ==
           AP2_MRP_ARTWORK_INVALID_JPEG);
     free(restart);
+    puts("Malformed table/reference/scan/EOI JPEGs rejected");
     return true;
 }
 
@@ -648,6 +655,7 @@ int main(int argc, char **argv)
 {
     if (!test_local_file_boundary() ||
         !test_mrp_validation_boundary() ||
+        !test_empty_table_repro() ||
         !test_malformed_jpeg_structures() ||
         !test_nowplaying_command_payload())
         return 1;
