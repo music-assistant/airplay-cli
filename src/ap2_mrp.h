@@ -92,9 +92,9 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m);
 bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed);
 
 /*
- * Attach the session event socket. The socket stays owned by ap2_client; this
- * derives the independent Events-Salt keys and services encrypted reverse HTTP
- * requests with 200 responses from ap2_mrp_tick().
+ * Attach the session event socket. Ownership transfers to the MRP context on
+ * success. This derives the independent Events-Salt keys and services encrypted
+ * reverse HTTP requests with 200 responses from ap2_mrp_tick().
  */
 bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock);
 

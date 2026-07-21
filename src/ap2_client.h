@@ -17,6 +17,8 @@
 
 #include <stdbool.h>
 #include <stdint.h>
+
+#include "ap2_io.h"
 #include <netinet/in.h>
 
 struct ap2cl_s;
@@ -128,11 +130,13 @@ bool ap2cl_disconnect(struct ap2cl_s *p);
 bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start);
 
 /* Send a chunk of PCM audio data.
- * Returns true on success.
+ * Returns AP2_SEND_SENT, AP2_SEND_DROPPED for transient realtime UDP
+ * backpressure (the timeline still advances), or AP2_SEND_FATAL.
  * :param sample: Raw PCM audio bytes (interleaved, little-endian).
  * :param frames: Number of audio frames in the sample buffer.
  */
-bool ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample, int frames);
+ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
+                                   int frames);
 
 /* Check if the client is ready to accept more audio frames. */
 bool ap2cl_accept_frames(struct ap2cl_s *p);
@@ -150,15 +154,9 @@ void ap2cl_play(struct ap2cl_s *p);
 /* Stop playback. */
 void ap2cl_stop(struct ap2cl_s *p);
 
-/* Session keepalive: POST /feedback over the encrypted RTSP channel, as real
- * Apple senders do every ~2 s (long sessions can otherwise hit receiver-side
- * idle timeouts). Native AP2 flow only; a no-op returning false otherwise.
- * Returns true when the receiver answered 200. */
+/* Issue one immediate native-session feedback request. Normal session
+ * maintenance is owned by the client's dedicated worker. */
 bool ap2cl_feedback(struct ap2cl_s *p);
-
-/* Service non-RTSP session channels without blocking on a feedback request.
- * Call regularly (about once per second) for native AP2 sessions. */
-void ap2cl_tick(struct ap2cl_s *p);
 
 /* False when the encrypted RTSP channel is unusable or feedback repeatedly
  * fails. The caller should terminate so its supervisor can reconnect. */

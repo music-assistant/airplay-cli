@@ -251,7 +251,6 @@ static void *artwork_resolver_thread(void *arg)
 static bool artwork_resolve(const artwork_url_t *url,
                             struct addrinfo **addresses,
                             int64_t deadline_ms,
-                            artwork_pump_cb pump, void *pump_arg,
                             char *error, size_t error_size)
 {
     artwork_resolver_t *job = calloc(1, sizeof(*job));
@@ -314,7 +313,6 @@ static bool artwork_resolve(const artwork_url_t *url,
             artwork_error(error, error_size, "artwork DNS lookup failed");
             return false;
         }
-        if (pump) pump(pump_arg);
     }
     pthread_join(thread, NULL);
 
@@ -331,8 +329,7 @@ static bool artwork_resolve(const artwork_url_t *url,
     return ok;
 }
 
-static bool artwork_wait_fd(int fd, short events, int64_t deadline_ms,
-                            artwork_pump_cb pump, void *pump_arg)
+static bool artwork_wait_fd(int fd, short events, int64_t deadline_ms)
 {
     while (true) {
         int remaining = artwork_remaining_ms(deadline_ms);
@@ -348,17 +345,14 @@ static bool artwork_wait_fd(int fd, short events, int64_t deadline_ms,
         }
         if (status < 0 && errno == EINTR) continue;
         if (status < 0) return false;
-        if (pump) pump(pump_arg);
     }
 }
 
 static int artwork_connect(const artwork_url_t *url, int64_t deadline_ms,
-                           artwork_pump_cb pump, void *pump_arg,
                            char *error, size_t error_size)
 {
     struct addrinfo *addresses = NULL;
-    if (!artwork_resolve(url, &addresses, deadline_ms, pump, pump_arg,
-                         error, error_size))
+    if (!artwork_resolve(url, &addresses, deadline_ms, error, error_size))
         return -1;
 
     int fd = -1;
@@ -379,7 +373,7 @@ static int artwork_connect(const artwork_url_t *url, int64_t deadline_ms,
         int status = connect(fd, addr->ai_addr, addr->ai_addrlen);
         if (status == 0) break;
         if (errno == EINPROGRESS &&
-            artwork_wait_fd(fd, POLLOUT, deadline_ms, pump, pump_arg)) {
+            artwork_wait_fd(fd, POLLOUT, deadline_ms)) {
             int socket_error = 0;
             socklen_t error_len = sizeof(socket_error);
             if (getsockopt(fd, SOL_SOCKET, SO_ERROR,
@@ -397,12 +391,11 @@ static int artwork_connect(const artwork_url_t *url, int64_t deadline_ms,
 }
 
 static bool artwork_write_all(int fd, const uint8_t *data, size_t size,
-                              int64_t deadline_ms,
-                              artwork_pump_cb pump, void *pump_arg)
+                              int64_t deadline_ms)
 {
     size_t off = 0;
     while (off < size) {
-        if (!artwork_wait_fd(fd, POLLOUT, deadline_ms, pump, pump_arg))
+        if (!artwork_wait_fd(fd, POLLOUT, deadline_ms))
             return false;
 #ifdef MSG_NOSIGNAL
         ssize_t written = send(fd, data + off, size - off, MSG_NOSIGNAL);
@@ -508,14 +501,12 @@ malformed:
 
 static bool artwork_fetch_http(const char *source, uint8_t **data, size_t *size,
                                char content_type[32],
-                               artwork_pump_cb pump, void *pump_arg,
                                char *error, size_t error_size)
 {
     artwork_url_t url = {0};
     if (!artwork_parse_url(source, &url, error, error_size)) return false;
     int64_t deadline_ms = artwork_now_ms() + ARTWORK_FETCH_TIMEOUT_MS;
-    int fd = artwork_connect(&url, deadline_ms, pump, pump_arg,
-                             error, error_size);
+    int fd = artwork_connect(&url, deadline_ms, error, error_size);
     if (fd < 0) return false;
 
     char request[4608];
@@ -529,8 +520,7 @@ static bool artwork_fetch_http(const char *source, uint8_t **data, size_t *size,
         url.path, url.host_header);
     if (request_len <= 0 || request_len >= (int)sizeof(request) ||
         !artwork_write_all(fd, (const uint8_t *)request,
-                           (size_t)request_len, deadline_ms,
-                           pump, pump_arg)) {
+                           (size_t)request_len, deadline_ms)) {
         artwork_error(error, error_size, "cannot send artwork request");
         close(fd);
         return false;
@@ -551,7 +541,7 @@ static bool artwork_fetch_http(const char *source, uint8_t **data, size_t *size,
             response = grown;
             cap = next;
         }
-        if (!artwork_wait_fd(fd, POLLIN, deadline_ms, pump, pump_arg)) break;
+        if (!artwork_wait_fd(fd, POLLIN, deadline_ms)) break;
         ssize_t got = recv(fd, response + used, cap - used, 0);
         if (got > 0) {
             used += (size_t)got;
@@ -692,7 +682,7 @@ read_error:
 }
 
 bool artwork_load(const char *source, uint8_t **data, size_t *size,
-                  char content_type[32], artwork_pump_cb pump, void *pump_arg,
+                  char content_type[32],
                   char *error, size_t error_size)
 {
     if (!source || !*source || !data || !size || !content_type) {
@@ -704,7 +694,6 @@ bool artwork_load(const char *source, uint8_t **data, size_t *size,
     content_type[0] = '\0';
     if (strncmp(source, "http://", 7) == 0)
         return artwork_fetch_http(source, data, size, content_type,
-                                  pump, pump_arg,
                                   error, error_size);
     if (strncmp(source, "https://", 8) == 0) {
         artwork_error(error, error_size,

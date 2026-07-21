@@ -205,7 +205,7 @@ make STATIC=1
 # Linux cross-compile (example)
 make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
 
-# Focused timeline/event-channel tests
+# Focused timeline, event-channel, deadline, and worker tests
 make test
 ```
 

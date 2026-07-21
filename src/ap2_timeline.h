@@ -10,6 +10,13 @@ typedef struct {
     uint32_t offset;
 } ap2_timeline_recovery_t;
 
+static inline uint64_t ap2_timeline_frames_to_ns(uint64_t frames,
+                                                 uint32_t sample_rate)
+{
+    return (frames / sample_rate) * 1000000000ULL +
+           ((frames % sample_rate) * 1000000000ULL) / sample_rate;
+}
+
 /*
  * Plan a recovery after PCM starvation exhausted the realtime lead.
  *

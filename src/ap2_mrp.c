@@ -38,6 +38,7 @@
 #include <openssl/crypto.h>
 
 #include "cross_log.h"
+#include "ap2_io.h"
 #include "ap2_plist.h"
 #include "ap2_mrp.h"
 
@@ -138,6 +139,7 @@ enum mrp_ext_field {
 
 /* Cadence of the defensive state re-push from ap2_mrp_tick (seconds). */
 #define MRP_STATE_REPUSH_S 15
+#define MRP_WRITE_TIMEOUT_MS 1000
 
 struct ap2_mrp_ctx {
     /* Target + identity */
@@ -179,6 +181,7 @@ struct ap2_mrp_ctx {
      * remains owned by ap2_client. */
     int event_sock;
     _Atomic bool event_connected;
+    bool event_attached;
     uint8_t event_out_key[MRP_KEY_SIZE]; /* Events-Read-Encryption-Key */
     uint8_t event_in_key[MRP_KEY_SIZE];  /* Events-Write-Encryption-Key */
     uint64_t event_out_counter;
@@ -675,6 +678,8 @@ static int mrp_channel_encrypt_with(const uint8_t key[MRP_KEY_SIZE],
         memcpy(*out + out_off, len_bytes, 2);
         out_off += 2;
 
+        /* Encryption consumes the nonce even if the eventual write fails.
+         * Callers close the channel on failure rather than retrying ciphertext. */
         uint8_t nonce[MRP_NONCE_SIZE];
         mrp_make_nonce((*counter)++, nonce);
 
@@ -705,18 +710,29 @@ static int mrp_channel_encrypt(struct ap2_mrp_ctx *m, const uint8_t *in,
 
 static bool mrp_write_all(int fd, const uint8_t *data, int len)
 {
-    int off = 0;
-    while (off < len) {
-        ssize_t n = write(fd, data + off, (size_t)(len - off));
-        if (n > 0) {
-            off += (int)n;
-        } else if (n < 0 && errno == EINTR) {
-            continue;
-        } else {
-            return false;
-        }
+    return ap2_io_write_all_deadline(
+        fd, data, (size_t)len,
+        ap2_io_monotonic_ms() + MRP_WRITE_TIMEOUT_MS);
+}
+
+static void mrp_close_data_channel(struct ap2_mrp_ctx *m)
+{
+    m->connected = false;
+    if (m->sock >= 0) {
+        shutdown(m->sock, SHUT_RDWR);
+        close(m->sock);
+        m->sock = -1;
     }
-    return true;
+}
+
+static void mrp_close_event_channel(struct ap2_mrp_ctx *m)
+{
+    atomic_store(&m->event_connected, false);
+    if (m->event_sock >= 0) {
+        shutdown(m->event_sock, SHUT_RDWR);
+        close(m->event_sock);
+        m->event_sock = -1;
+    }
 }
 
 /* Write the 32-byte big-endian data-frame header. */
@@ -740,14 +756,21 @@ static void mrp_write_data_header(uint8_t hdr[MRP_DATA_HDR_LEN],
 /* Send raw bytes through the encrypted channel (holds send_lock). */
 static bool mrp_send_raw(struct ap2_mrp_ctx *m, const uint8_t *data, int len)
 {
-    if (m->sock < 0) return false;
     pthread_mutex_lock(&m->send_lock);
+    if (m->sock < 0) {
+        pthread_mutex_unlock(&m->send_lock);
+        return false;
+    }
     uint8_t *enc = NULL;
     int enc_len = mrp_channel_encrypt(m, data, len, &enc);
     bool ok = false;
     if (enc_len > 0 && enc)
         ok = mrp_write_all(m->sock, enc, enc_len);
     free(enc);
+    if (!ok) {
+        LOG_ERROR("[MRP] data channel write failed: %s", strerror(errno));
+        mrp_close_data_channel(m);
+    }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
 }
@@ -870,7 +893,7 @@ static void mrp_drain_encrypted(struct ap2_mrp_ctx *m)
                                   m->rx_msg, &m->rx_msg_len,
                                   (int)sizeof(m->rx_msg),
                                   m->in_key, &m->in_counter, "data channel"))
-        m->connected = false;
+        mrp_close_data_channel(m);
 }
 
 /* Consume complete 32-byte-header data frames from rx_msg. Incoming protobufs
@@ -953,6 +976,10 @@ static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
                                     const uint8_t *response, int response_len)
 {
     pthread_mutex_lock(&m->send_lock);
+    if (!atomic_load(&m->event_connected) || m->event_sock < 0) {
+        pthread_mutex_unlock(&m->send_lock);
+        return false;
+    }
     uint8_t *enc = NULL;
     int enc_len = mrp_channel_encrypt_with(
         m->event_out_key, &m->event_out_counter,
@@ -960,6 +987,10 @@ static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
     bool ok = enc_len > 0 && enc &&
               mrp_write_all(m->event_sock, enc, enc_len);
     free(enc);
+    if (!ok) {
+        LOG_ERROR("[MRP] event channel write failed: %s", strerror(errno));
+        mrp_close_event_channel(m);
+    }
     pthread_mutex_unlock(&m->send_lock);
     return ok;
 }
@@ -1054,13 +1085,13 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
     while (poll(&pfd, 1, 0) > 0) {
         if (pfd.revents & (POLLERR | POLLNVAL)) {
             LOG_WARN("[MRP] event channel socket error");
-            atomic_store(&m->event_connected, false);
+            mrp_close_event_channel(m);
             return;
         }
         if (!(pfd.revents & POLLIN)) {
             if (pfd.revents & POLLHUP) {
                 LOG_WARN("[MRP] event channel closed by receiver");
-                atomic_store(&m->event_connected, false);
+                mrp_close_event_channel(m);
             }
             return;
         }
@@ -1068,7 +1099,7 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
         int space = (int)sizeof(m->event_rx_enc) - m->event_rx_enc_len;
         if (space <= 0) {
             LOG_ERROR("[MRP] event encrypted buffer full");
-            atomic_store(&m->event_connected, false);
+            mrp_close_event_channel(m);
             return;
         }
         ssize_t n = read(m->event_sock,
@@ -1077,7 +1108,7 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
         if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return;
         if (n <= 0) {
             LOG_WARN("[MRP] event channel closed by receiver");
-            atomic_store(&m->event_connected, false);
+            mrp_close_event_channel(m);
             return;
         }
         m->event_rx_enc_len += (int)n;
@@ -1087,7 +1118,7 @@ static void mrp_tick_events(struct ap2_mrp_ctx *m)
                 (int)sizeof(m->event_plain),
                 m->event_in_key, &m->event_in_counter, "event channel") ||
             !mrp_process_event_requests(m)) {
-            atomic_store(&m->event_connected, false);
+            mrp_close_event_channel(m);
             return;
         }
         pfd.revents = 0;
@@ -1180,6 +1211,7 @@ bool ap2_mrp_attach_events(struct ap2_mrp_ctx *m, int event_sock)
     }
     m->event_sock = event_sock;
     atomic_store(&m->event_connected, true);
+    m->event_attached = true;
     m->event_out_counter = 0;
     m->event_in_counter = 0;
     m->event_rx_enc_len = 0;
@@ -1284,12 +1316,8 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
         mbuf_free(&msg);
         m->connected = false;
     }
-    if (m->sock >= 0) {
-        close(m->sock);
-        m->sock = -1;
-    }
-    atomic_store(&m->event_connected, false);
-    m->event_sock = -1;
+    mrp_close_data_channel(m);
+    mrp_close_event_channel(m);
     m->rx_enc_len = 0;
     m->rx_msg_len = 0;
     m->event_rx_enc_len = 0;
@@ -1396,9 +1424,7 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         ssize_t n = read(m->sock, m->rx_enc + m->rx_enc_len, (size_t)space);
         if (n <= 0) {
             LOG_WARN("[MRP] data channel closed by receiver");
-            m->connected = false;
-            close(m->sock);
-            m->sock = -1;
+            mrp_close_data_channel(m);
             return;
         }
         m->rx_enc_len += (int)n;
@@ -1421,7 +1447,7 @@ bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m)
 
 int ap2_mrp_event_status(struct ap2_mrp_ctx *m)
 {
-    if (!m || m->event_sock < 0) return -1;
+    if (!m || !m->event_attached) return -1;
     return atomic_load(&m->event_connected) ? 1 : 0;
 }
 

@@ -43,6 +43,7 @@ BINDIR      = bin
 EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
 TIMELINE_TEST = $(BUILDDIR)/test-ap2-timeline
 EVENT_TEST = $(BUILDDIR)/test-ap2-event
+IO_TEST = $(BUILDDIR)/test-ap2-io
 
 # Compiler flags
 DEFINES  = -DNDEBUG -D_GNU_SOURCE -DOPENSSL_SUPPRESS_DEPRECATED
@@ -93,7 +94,8 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 	alac.c
 
 # AirPlay 2 sources (new)
-AP2_SOURCES = ap2_client.c ap2_hap.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c
+AP2_SOURCES = ap2_client.c ap2_feedback.c ap2_hap.c ap2_io.c ap2_ptp.c \
+	ap2_ptp_shm.c ap2_plist.c ap2_mrp.c
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
@@ -123,9 +125,10 @@ OBJECTS_ALL = $(OBJECTS_RAOP) $(OBJECTS_AP2) $(OBJECTS_CLI)
 
 all: directory $(EXECUTABLE)
 
-test: directory $(TIMELINE_TEST) $(EVENT_TEST)
+test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
+	$(IO_TEST)
 
 directory:
 	@mkdir -p $(BUILDDIR)
@@ -149,10 +152,18 @@ $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) -Isrc $< -o $@
 
 $(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
+		$(BUILDDIR)/ap2_io.o \
 		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/cross_log.o Makefile
 	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(INCLUDE) \
-		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_plist.o \
+		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
+		$(BUILDDIR)/ap2_plist.o \
 		$(BUILDDIR)/cross_log.o $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+$(IO_TEST): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h \
+		src/ap2_feedback.c src/ap2_feedback.h Makefile
+	$(CC) -Wall -Wextra -Werror -O2 $(CPPFLAGS) -Isrc \
+		tests/test_ap2_io.c src/ap2_io.c src/ap2_feedback.c \
+		-lpthread -o $@
 
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED)

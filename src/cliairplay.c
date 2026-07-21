@@ -360,11 +360,6 @@ static struct {
     int progress;
 } g_metadata = {"", "", "", 0, 0};
 
-static void artwork_pump_events(void *arg)
-{
-    ap2cl_tick((struct ap2cl_s *)arg);
-}
-
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
     if (strcmp(key, "TITLE") == 0) {
@@ -388,16 +383,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         size_t image_size = 0;
         char content_type[32];
         char error[160];
-        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
-            ap2cl_is_connected(g_ap2cl))
-            ap2cl_feedback(g_ap2cl);
-        artwork_pump_cb pump =
-            cfg->protocol == PROTO_AIRPLAY2 ? artwork_pump_events : NULL;
         bool loaded = artwork_load(value, &image, &image_size, content_type,
-                                   pump, g_ap2cl, error, sizeof(error));
-        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
-            ap2cl_is_connected(g_ap2cl))
-            ap2cl_feedback(g_ap2cl);
+                                   error, sizeof(error));
         if (!loaded) {
             LOG_WARN("Cannot load artwork: %s", error);
         } else {
@@ -489,7 +476,6 @@ static void *cmdpipe_reader_thread(void *arg)
 {
     cli_config_t *cfg = (cli_config_t *)arg;
     uint64_t last_keepalive = raopcl_get_ntp(NULL);
-    uint64_t last_feedback = last_keepalive;
 
     g_cmdpipe_fd = open(cfg->cmdpipe, O_RDWR | O_NONBLOCK);
     if (g_cmdpipe_fd == -1) {
@@ -508,18 +494,6 @@ static void *cmdpipe_reader_thread(void *arg)
             raopcl_keepalive(g_raopcl);
             last_keepalive = now;
         }
-        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl &&
-            ap2cl_is_connected(g_ap2cl))
-            ap2cl_tick(g_ap2cl);
-        /* Native AP2 keepalive: real senders POST /feedback about every 2 s
-         * and long sessions can hit receiver-side idle timeouts without it
-         * (no-op for the RAOP-compat flow, which libraop keeps alive). */
-        if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl && ap2cl_is_connected(g_ap2cl) &&
-            now - last_feedback >= MS2NTP(2000)) {
-            ap2cl_feedback(g_ap2cl);
-            last_feedback = now;
-        }
-
         if (n <= 0 || !(pfds.revents & POLLIN)) continue;
 
         ssize_t bytes_read = read(g_cmdpipe_fd, g_cmdpipe_buf, sizeof(g_cmdpipe_buf) - 1);
@@ -790,11 +764,17 @@ static int run_airplay2(cli_config_t *cfg, int infile)
 
     /* Schedule start time */
     if (cfg->ntp_start) {
-        ap2cl_start_at(g_ap2cl, cfg->ntp_start);
+        if (!ap2cl_start_at(g_ap2cl, cfg->ntp_start)) {
+            status_error("Cannot start AirPlay 2 stream");
+            return 1;
+        }
     } else {
         uint64_t now = raopcl_get_ntp(NULL);
         uint64_t start_at = now + MS2NTP(cfg->latency_ms);
-        ap2cl_start_at(g_ap2cl, start_at);
+        if (!ap2cl_start_at(g_ap2cl, start_at)) {
+            status_error("Cannot start AirPlay 2 stream");
+            return 1;
+        }
     }
 
     /* Placeholder metadata must follow ap2cl_start_at: that call sets the RTP
@@ -901,7 +881,13 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 truncate_32to24(buf, n, ap2_alac_buf);
                 send = ap2_alac_buf;
             }
-            ap2cl_send_chunk(g_ap2cl, send, af);
+            ap2_send_result_t send_result =
+                ap2cl_send_chunk(g_ap2cl, send, af);
+            if (send_result == AP2_SEND_FATAL) {
+                status_error("AirPlay audio send failed");
+                failed = true;
+                break;
+            }
             frames += af;
         } else {
             usleep(1000);

@@ -5,8 +5,6 @@
 #include <stddef.h>
 #include <stdint.h>
 
-typedef void (*artwork_pump_cb)(void *arg);
-
 /*
  * Load artwork from a local path or an http:// URL.
  *
@@ -14,7 +12,7 @@ typedef void (*artwork_pump_cb)(void *arg);
  * from the image signature rather than a filename or HTTP header.
  */
 bool artwork_load(const char *source, uint8_t **data, size_t *size,
-                  char content_type[32], artwork_pump_cb pump, void *pump_arg,
+                  char content_type[32],
                   char *error, size_t error_size);
 
 #endif /* __ARTWORK_H_ */
