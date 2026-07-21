@@ -194,18 +194,20 @@ Metadata strings are encoded as Unicode binary-plist strings; artwork is
 signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
 
-The DMAP path receives the detected image type and original bytes. MediaRemote
-requires a structurally parsed JPEG, but no Apple TV byte or profile cutoff is
-assumed. Quantization/Huffman definitions, frame/scan component references,
-entropy marker escaping, and one terminal EOI are validated.
+The DMAP path receives the detected image type and original bytes. Before MRP
+staging, a bounded JPEG-container preflight checks quantization/Huffman
+definitions, frame/scan component references, entropy marker escaping, and one
+terminal EOI; it does not decode coefficients or pixels. No Apple TV byte or
+profile cutoff is assumed.
 Baseline/progressive and grayscale/color cases are logged with exact bytes,
 dimensions, SOF marker, component count, and `/command` response. A
-1 MiB local safety limit bounds retained input and plist construction; it is
-not a receiver capability claim. Invalid MRP artwork is omitted without
+1 MiB internal staging-allocation guard bounds the copied input and plist; it
+is not a receiver capability claim. Invalid MRP artwork is omitted without
 withholding it from DMAP and clears stale MRP state.
 
 `tests/mrp_artwork_matrix.py` generates the controlled Apple TV size/profile
-matrix and sends one case to a running command pipe; see `DESIGN.md` §8.
+matrix or records/sends any existing JPEG cache path with its SHA-256, profile,
+dimensions, and optional Pillow decode result; see `DESIGN.md` §8.
 
 ## Building
 

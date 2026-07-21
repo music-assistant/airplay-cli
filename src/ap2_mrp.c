@@ -235,7 +235,7 @@ const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result)
     case AP2_MRP_ARTWORK_ACCEPTED:          return "accepted";
     case AP2_MRP_ARTWORK_INVALID_ARGUMENT:  return "invalid_argument";
     case AP2_MRP_ARTWORK_UNSUPPORTED_TYPE:  return "unsupported_type";
-    case AP2_MRP_ARTWORK_SAFETY_LIMIT:      return "safety_limit";
+    case AP2_MRP_ARTWORK_STAGING_LIMIT:     return "staging_limit";
     case AP2_MRP_ARTWORK_INVALID_JPEG:      return "invalid_jpeg";
     case AP2_MRP_ARTWORK_UNSUPPORTED_JPEG_PROFILE:
         return "unsupported_jpeg_profile";
@@ -388,8 +388,8 @@ ap2_mrp_validate_artwork(const char *mime, const uint8_t *data, size_t len,
         return AP2_MRP_ARTWORK_INVALID_ARGUMENT;
     if (strcmp(mime, "image/jpeg") != 0)
         return mrp_artwork_result(info, AP2_MRP_ARTWORK_UNSUPPORTED_TYPE);
-    if (len > AP2_MRP_ARTWORK_SAFETY_MAX_BYTES)
-        return mrp_artwork_result(info, AP2_MRP_ARTWORK_SAFETY_LIMIT);
+    if (len > AP2_MRP_ARTWORK_STAGING_MAX_BYTES)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_STAGING_LIMIT);
     if (len < 6 || data[0] != 0xFF || data[1] != 0xD8 ||
         data[len - 2] != 0xFF || data[len - 1] != 0xD9) {
         return mrp_artwork_result(info, AP2_MRP_ARTWORK_INVALID_JPEG);
@@ -1788,10 +1788,10 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     if (result != AP2_MRP_ARTWORK_ACCEPTED) {
         mrp_reset_artwork(m);
         LOG_WARN("[MRP] artwork rejected: reason=%s bytes=%d width=%u height=%u "
-                 "sof=0x%02x components=%u progressive=%d safety_max_bytes=%d",
+                 "sof=0x%02x components=%u progressive=%d staging_max_bytes=%d",
                  ap2_mrp_artwork_result_name(result), len,
                  info->width, info->height, info->sof_marker, info->components,
-                 info->progressive, AP2_MRP_ARTWORK_SAFETY_MAX_BYTES);
+                 info->progressive, AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
         return false;
     }
 

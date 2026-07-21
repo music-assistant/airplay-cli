@@ -93,7 +93,7 @@ static uint8_t *make_noninterleaved_jpeg(size_t *out_size)
         out[pos++] = 0;
         out[pos++] = 63;
         out[pos++] = 0;
-        out[pos++] = 1; /* one structural entropy byte */
+        out[pos++] = 1; /* one entropy byte for the container preflight */
     }
     out[pos++] = 0xFF;
     out[pos++] = 0xD9;
@@ -333,13 +333,13 @@ static bool test_mrp_validation_boundary(void)
     }
 
     uint8_t *oversize =
-        calloc(AP2_MRP_ARTWORK_SAFETY_MAX_BYTES + 1, 1);
+        calloc(AP2_MRP_ARTWORK_STAGING_MAX_BYTES + 1, 1);
     CHECK(oversize != NULL);
     memcpy(oversize, k_baseline_jpeg, sizeof(k_baseline_jpeg));
     CHECK(ap2_mrp_validate_artwork(
               "image/jpeg", oversize,
-              AP2_MRP_ARTWORK_SAFETY_MAX_BYTES + 1, &info) ==
-          AP2_MRP_ARTWORK_SAFETY_LIMIT);
+              AP2_MRP_ARTWORK_STAGING_MAX_BYTES + 1, &info) ==
+          AP2_MRP_ARTWORK_STAGING_LIMIT);
     free(oversize);
     return true;
 }
