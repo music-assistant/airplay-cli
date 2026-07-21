@@ -317,10 +317,14 @@ def send(args: argparse.Namespace) -> int:
             json.dumps(record, indent=2) + "\n", encoding="utf-8"
         )
         print(f"\nRecord: {record_path}")
-    if details["pillow_decoded"] is not True:
+    if details["pillow_decoded"] is False:
         raise SystemExit(
-            "Pillow must fully decode artwork before sending: "
-            f"{details.get('pillow_error', artwork)}"
+            f"Pillow rejected artwork: {details.get('pillow_error', artwork)}"
+        )
+    if details["pillow_decoded"] is None:
+        print(
+            "Warning: Pillow is unavailable; only JPEG-container metadata was checked.",
+            file=sys.stderr,
         )
     if args.dry_run:
         return 0

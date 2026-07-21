@@ -98,6 +98,7 @@ struct ap2cl_s {
      * state carrier + body builder; only on pair-verified native sessions. */
     struct ap2_mrp_ctx *mrp;
     ap2_mrp_serial_t mrp_serial;    /* whole registration/state push sequence */
+    bool mrp_init_enabled;
     bool mrp_device_registered;
     bool mrp_extended_registered;
     int mrp_last_playback_state;
@@ -154,6 +155,7 @@ static void ap2_mrp_update_playback(
     bool send_command, bool disconnect);
 static int ap2_mrp_register_unlocked(struct ap2cl_s *p);
 static ap2_mrp_push_result_t ap2_mrp_push_unlocked(struct ap2cl_s *p);
+static void ap2_mrp_ready_unlocked(struct ap2cl_s *p);
 
 /* ---- Native AP2 RTSP I/O ---- */
 
@@ -562,19 +564,25 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
 
     /* Bind the sender to THIS session's pair-verify shared secret and open the
      * channel (TCP connect + DEVICE_INFO-first handshake). */
+    ap2_mrp_serial_lock(&p->mrp_serial);
     if (!p->mrp)
         p->mrp = ap2_mrp_create(p->device.address, p->device.port,
                                 p->auth_credentials, p->dacp_id, p->device.name,
                                 p->session_uuid, p->group_uuid,
                                 ap2_hap_get_shared_secret(p->hap));
-    if (!p->mrp) return;
+    if (!p->mrp) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return;
+    }
 
     if (!ap2_mrp_attach(p->mrp, data_port, seed)) {
         LOG_WARN("[MRP] data-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
+        ap2_mrp_serial_unlock(&p->mrp_serial);
         return;
     }
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     LOG_INFO("[MRP] remote-control data channel established (now-playing active)");
 }
 
@@ -1559,14 +1567,14 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->state != AP2_DOWN || p->sock_fd >= 0)
         ap2cl_disconnect(p);
     if (p->raopcl) raopcl_destroy(p->raopcl);
-    if (p->hap) ap2_hap_destroy(p->hap);
-    if (p->ptp) ap2_ptp_destroy(p->ptp);
     ap2_mrp_serial_lock(&p->mrp_serial);
     if (p->mrp) {
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
     }
     ap2_mrp_serial_unlock(&p->mrp_serial);
+    if (p->hap) ap2_hap_destroy(p->hap);
+    if (p->ptp) ap2_ptp_destroy(p->ptp);
     ap2_mrp_serial_destroy(&p->mrp_serial);
     if (p->alac) alac_delete_encoder(p->alac);
     /* Close the RTSP socket under the lock so an in-flight request/response
@@ -1644,7 +1652,12 @@ bool ap2cl_connect(struct ap2cl_s *p)
     if (p->flow == FLOW_NATIVE_AP2) {
         LOG_INFO("[AP2] Connecting via native AP2 flow to %s:%d",
                  p->device.address, p->device.port);
-        return ap2_native_connect(p);
+        bool connected = ap2_native_connect(p);
+        ap2_mrp_serial_lock(&p->mrp_serial);
+        p->mrp_init_enabled = connected;
+        if (connected) ap2_mrp_ready_unlocked(p);
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return connected;
     } else {
         LOG_INFO("[AP2] Connecting via RAOP-compatible flow to %s:%d",
                  p->device.address, p->device.port);
@@ -1936,9 +1949,10 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
  * metadata path; the optional type-130 channel supplies the secret itself.
  * Transient-paired third-party speakers never receive these Apple-specific
  * messages. Set CLIAIRPLAY_MRP=0 to disable the path for diagnosis. */
-static void ap2_mrp_ready(struct ap2cl_s *p)
+static void ap2_mrp_ready_unlocked(struct ap2cl_s *p)
 {
-    if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
+    if (p->mrp || !p->mrp_init_enabled ||
+        p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
         p->sock_fd < 0 || !p->session_uuid[0])
         return;
     const char *setting = getenv("CLIAIRPLAY_MRP");
@@ -1991,6 +2005,24 @@ static int ap2_mrp_post_command(struct ap2cl_s *p,
     LOG_INFO("[MRP] /command %s -> %d (%d-byte body)", tag, status, body_len);
     if (status < 200 || status >= 300)
         ap2_log_response_body(tag, resp, resp_len);
+    free(resp);
+    return status;
+}
+
+static int ap2_mrp_send_nowplaying_body(void *opaque,
+                                        const uint8_t *body, int body_len)
+{
+    struct ap2cl_s *p = opaque;
+    uint8_t *resp = NULL;
+    int resp_len = 0;
+    int status = ap2_rtsp_send(
+        p, "POST", "/command", body, body_len,
+        "application/x-apple-binary-plist", &resp, &resp_len);
+    LOG_INFO("[MRP] /command updateMRNowPlayingInfo -> %d (%d-byte body)",
+             status, body_len);
+    if (status < 200 || status >= 300)
+        ap2_log_response_body(
+            "[MRP] /command updateMRNowPlayingInfo", resp, resp_len);
     free(resp);
     return status;
 }
@@ -2070,21 +2102,19 @@ static ap2_mrp_push_result_t ap2_mrp_push_unlocked(struct ap2cl_s *p)
 {
     ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return result;
-    ap2_mrp_ready(p);
-    if (!p->mrp) return result;
+    ap2_mrp_ready_unlocked(p);
+    if (!p->mrp_init_enabled || !p->mrp) return result;
 
     if (!p->mrp_device_registered && ap2_mrp_register_unlocked(p) != 1) {
         result.overall_status = 0;
         return result;
     }
 
-    int status = ap2_mrp_post_command(
-        p, ap2_mrp_build_nowplaying_command,
-        "[MRP] /command updateMRNowPlayingInfo");
+    int status = ap2_mrp_send_nowplaying_command(
+        p->mrp, ap2_mrp_send_nowplaying_body, p);
     result.nowplaying_status = status;
     result.overall_status = status;
     if (!ap2_mrp_status_ok(status)) return result;
-    ap2_mrp_mark_artwork_sent(p->mrp);
 
     int ext_status;
     if (!p->mrp_extended_registered) {
@@ -2126,7 +2156,12 @@ int ap2cl_mrp_channel_status(struct ap2cl_s *p)
      * not attempted, report "not applicable" so the [STATUS] path=channel line
      * is suppressed and only path=command (the active now-playing path) shows. */
     if (!getenv("CLIAIRPLAY_MRP_TYPE130")) return -1;
-    return (p->mrp && ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    int status =
+        (p->mrp_init_enabled && p->mrp &&
+         ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+    return status;
 }
 
 /* Register the sender identity before the first now-playing update. The
@@ -2135,8 +2170,8 @@ int ap2cl_mrp_channel_status(struct ap2cl_s *p)
 static int ap2_mrp_register_unlocked(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
-    ap2_mrp_ready(p);
-    if (!p->mrp) return -1;
+    ap2_mrp_ready_unlocked(p);
+    if (!p->mrp_init_enabled || !p->mrp) return -1;
     if (p->mrp_device_registered) return 1;
 
     int status = ap2_mrp_post_command(
@@ -2160,7 +2195,7 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
 {
     if (!p) return false;
     ap2_mrp_serial_lock(&p->mrp_serial);
-    ap2_mrp_ready(p);
+    ap2_mrp_ready_unlocked(p);
     if (p->mrp)
         ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000);
     ap2_mrp_serial_unlock(&p->mrp_serial);
@@ -2186,11 +2221,17 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
     }
     if (!p) return false;
     ap2_mrp_serial_lock(&p->mrp_serial);
-    ap2_mrp_ready(p);
+    ap2_mrp_ready_unlocked(p);
     bool have_mrp = p->mrp != NULL;
     if (have_mrp)
         ap2_mrp_set_artwork(p->mrp, content_type, (const uint8_t *)data,
                             size, mrp_info);
+    if (have_mrp) {
+        ap2_mrp_push_result_t result = ap2_mrp_push_unlocked(p);
+        if (mrp_push) *mrp_push = result;
+    }
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+
     bool dmap_ok = false;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* Preserve the DMAP/SET_PARAMETER path for receivers such as Sonos;
@@ -2209,11 +2250,6 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
         dmap_ok = raopcl_set_artwork(
             p->raopcl, (char *)content_type, size, (char *)data);
     }
-    if (have_mrp) {
-        ap2_mrp_push_result_t result = ap2_mrp_push_unlocked(p);
-        if (mrp_push) *mrp_push = result;
-    }
-    ap2_mrp_serial_unlock(&p->mrp_serial);
     return dmap_ok;
 }
 
@@ -2225,7 +2261,7 @@ bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p,
     }
     if (!p) return false;
     ap2_mrp_serial_lock(&p->mrp_serial);
-    ap2_mrp_ready(p);
+    ap2_mrp_ready_unlocked(p);
     if (!p->mrp) {
         ap2_mrp_serial_unlock(&p->mrp_serial);
         return false;
@@ -2241,7 +2277,7 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
 {
     if (!p) return false;
     ap2_mrp_serial_lock(&p->mrp_serial);
-    ap2_mrp_ready(p);
+    ap2_mrp_ready_unlocked(p);
     if (p->mrp)
         ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000,
                              p->state == AP2_STREAMING);

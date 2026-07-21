@@ -347,16 +347,15 @@ currently establishes a 64 KiB byte cutoff, a 600px rejection threshold, or a
 baseline/color-only rule.
 
 The local-file handler signature-detects JPEG/PNG/GIF/WebP and preserves the
-original bytes and correct MIME type for DMAP/Sonos. MRP applies only a bounded
-metadata probe before retaining data: canonical `image/jpeg`, SOI, and terminal
-EOI. It walks length-delimited headers memory-safely to extract SOF dimensions,
-precision, component count, and profile when available, but those fields and
-all JPEG internals are telemetry rather than acceptance criteria. The receiver
-remains the decoder. Generated and arbitrary-cache test cases are separately
-decoded with Pillow before the harness sends them. A 1 MiB internal
-staging-allocation guard leaves room for the hardware matrix below and is
-explicitly not a receiver limit. Rejection clears previous MRP artwork,
-preventing stale cover art. No image codec is embedded in production code.
+original bytes and correct MIME type for DMAP/Sonos. MRP strictly validates the
+8-bit Huffman SOF0/SOF2 profiles understood locally. Other profiles use a
+bounded generic marker and scan-container preflight and are staged when
+structurally valid; this does not claim receiver support. Neither path decodes
+coefficients or pixels. Generated cases are separately decoder-verified. A
+1 MiB internal staging-allocation guard leaves room for the hardware matrix
+below and is explicitly not a receiver limit. Rejection clears previous MRP
+artwork, preventing stale cover art. No image codec is embedded in production
+code.
 
 Staged JPEG bytes ride only the *first* push for a given image, tagged with a
 fresh `ArtworkIdentifier`; later pushes carry the identifier without the bytes,

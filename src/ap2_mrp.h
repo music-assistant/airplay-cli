@@ -59,7 +59,11 @@ typedef struct {
     uint8_t components;
     uint8_t sof_marker;
     bool progressive;
+    bool parsed_strictly;
 } ap2_mrp_artwork_info_t;
+
+typedef int (*ap2_mrp_command_sender_t)(void *opaque,
+                                         const uint8_t *body, int body_len);
 
 /* Remote-control (MRP) data-channel stream SETUP constants (DESIGN.md §8,
  * pyatv ap2_session.py _setup_data_channel). The audio session issues a SETUP
@@ -146,12 +150,13 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
 /*
  * Set the now-playing artwork.
  *
- * Stages any bounded image/jpeg with a basic SOI/terminal-EOI envelope.
- * Dimensions, precision, SOF marker, components, and progressive shape are
- * best-effort telemetry only and never acceptance criteria. The bound is
- * internal staging/allocation policy; it does not claim a receiver byte,
- * dimension, component, or JPEG-profile limit. Rejected input clears prior
- * MRP artwork so a new track cannot retain stale cover art.
+ * Runs a bounded strict JPEG preflight for the 8-bit Huffman SOF0/SOF2
+ * profiles understood locally. Other profiles use a bounded generic marker
+ * and scan-container preflight and are staged when structurally valid; this
+ * does not claim receiver support. Neither path entropy-decodes coefficients
+ * or pixels. The byte bound is internal staging/allocation policy only.
+ * Rejected input clears prior MRP artwork so a new track cannot retain stale
+ * cover art.
  *
  * :param mime: image MIME type; must be "image/jpeg".
  * :param data: image bytes (copied).
@@ -165,7 +170,7 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
 /* Clear retained artwork (used when a replacement local file cannot load). */
 void ap2_mrp_clear_artwork(struct ap2_mrp_ctx *m);
 
-/* Probe the staging envelope and best-effort metadata without mutating state. */
+/* Validate the bounded staging container without mutating MRP state. */
 ap2_mrp_artwork_result_t
 ap2_mrp_probe_artwork(const char *mime, const uint8_t *data, size_t len,
                       ap2_mrp_artwork_info_t *info);
@@ -220,8 +225,14 @@ bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
-/* Mark the one-shot artwork bytes as accepted after a successful POST. */
-void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
+/*
+ * Build and send updateMRNowPlayingInfo. The caller must hold its MRP serial
+ * mutex across this operation. The exact sender status is returned; artwork is
+ * marked sent only when the generation included in this request got a 2xx.
+ */
+int ap2_mrp_send_nowplaying_command(struct ap2_mrp_ctx *m,
+                                    ap2_mrp_command_sender_t sender,
+                                    void *opaque);
 
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before

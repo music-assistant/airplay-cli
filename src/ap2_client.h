@@ -177,7 +177,7 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
 /*
  * Set artwork on the existing DMAP path and, when applicable, stage it for
  * MediaRemote. DMAP receives the original detected image type and bytes even
- * when the bounded MRP MIME/envelope probe rejects them. Staging and the
+ * when the bounded MRP container preflight rejects them. Staging and the
  * complete MRP push are serialized; mrp_push receives request-scoped statuses.
  */
 bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,

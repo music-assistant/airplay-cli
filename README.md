@@ -189,14 +189,15 @@ MediaRemote `POST /command`, including explicit play/pause/stop state. Set
 `CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
 
 The DMAP path receives the detected image type and original bytes. Before MRP
-staging, a bounded metadata probe requires `image/jpeg`, SOI, and a terminal
-EOI, then extracts dimensions/profile best-effort without decoding or rejecting
-JPEG internals. No Apple TV byte or profile cutoff is assumed.
+staging, a bounded strict preflight validates the understood 8-bit SOF0/SOF2
+profiles; other profiles use a bounded generic marker/scan-container preflight
+and are staged when structurally valid. Neither path decodes coefficients or
+pixels, and no Apple TV byte or profile cutoff is assumed.
 Baseline/progressive and grayscale/color cases are logged with exact bytes,
 dimensions, SOF marker, component count, and `/command` response. A
 1 MiB internal staging-allocation guard bounds the copied input and plist; it
-is not a receiver capability claim. Non-JPEG, over-bound, or incomplete-envelope
-MRP artwork is omitted without withholding it from DMAP and clears stale state.
+is not a receiver capability claim. Malformed or unsupported-MIME MRP artwork
+is omitted without withholding it from DMAP and clears stale state.
 
 `tests/mrp_artwork_matrix.py` generates the controlled Apple TV size/profile
 matrix or records/sends any existing JPEG cache path with its SHA-256, profile,

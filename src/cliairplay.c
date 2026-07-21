@@ -107,6 +107,7 @@ typedef struct {
 static bool g_running = true;
 static playback_status_t g_status = STATUS_STOPPED;
 static pthread_t g_cmdpipe_thread;
+static bool g_cmdpipe_started;
 static int g_cmdpipe_fd = -1;
 static char g_cmdpipe_buf[512];
 
@@ -195,19 +196,24 @@ static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info,
     if (info->result == AP2_MRP_ARTWORK_ACCEPTED) {
         status_print("[STATUS] mrp artwork=posted status=%d bytes=%zu "
                      "width=%u height=%u precision=%u sof=0x%02x "
-                     "components=%u progressive=%d staging_max_bytes=%d",
+                     "components=%u progressive=%d local_parser=%s "
+                     "staging_max_bytes=%d",
                      command_status, info->bytes, info->width, info->height,
                      info->precision, info->sof_marker, info->components,
                      info->progressive,
+                     info->parsed_strictly ? "strict" : "generic_container",
                      AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
         return;
     }
     status_print("[STATUS] mrp artwork=rejected reason=%s bytes=%zu "
                  "width=%u height=%u precision=%u sof=0x%02x components=%u "
-                 "progressive=%d clear_status=%d staging_max_bytes=%d",
+                 "progressive=%d local_parser=%s clear_status=%d "
+                 "staging_max_bytes=%d",
                  ap2_mrp_artwork_result_name(info->result), info->bytes,
                  info->width, info->height, info->precision, info->sof_marker,
-                 info->components, info->progressive, command_status,
+                 info->components, info->progressive,
+                 info->parsed_strictly ? "strict" : "generic_container",
+                 command_status,
                  AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
 }
 
@@ -549,6 +555,14 @@ next_line:
     return NULL;
 }
 
+static void stop_cmdpipe_thread(void)
+{
+    g_running = false;
+    if (!g_cmdpipe_started) return;
+    pthread_join(g_cmdpipe_thread, NULL);
+    g_cmdpipe_started = false;
+}
+
 /* ---- RAOP playback loop ---- */
 
 static int run_raop(cli_config_t *cfg, int infile)
@@ -630,6 +644,7 @@ static int run_raop(cli_config_t *cfg, int infile)
     LOG_INFO("Connecting to %s:%d via RAOP", inet_ntoa(player_addr), cfg->port);
     if (!raopcl_connect(g_raopcl, player_addr, cfg->port, cfg->volume > 0)) {
         status_error("Cannot connect to AirPlay device");
+        stop_cmdpipe_thread();
         raopcl_destroy(g_raopcl);
         g_raopcl = NULL;
         return 1;
@@ -704,7 +719,7 @@ static int run_raop(cli_config_t *cfg, int infile)
     }
 
     status_eof();
-    g_running = false;
+    stop_cmdpipe_thread();
     free(buf);
     free(alac_buf);
     raopcl_disconnect(g_raopcl);
@@ -756,6 +771,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
     if (!ap2cl_connect(g_ap2cl)) {
         status_error("Cannot connect to AirPlay 2 device");
+        stop_cmdpipe_thread();
         ap2cl_destroy(g_ap2cl);
         g_ap2cl = NULL;
         return 1;
@@ -871,7 +887,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     }
 
     status_eof();
-    g_running = false;
+    stop_cmdpipe_thread();
     free(buf);
     free(ap2_alac_buf);
     ap2cl_destroy(g_ap2cl);
@@ -1314,7 +1330,11 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
-        pthread_create(&g_cmdpipe_thread, NULL, cmdpipe_reader_thread, &cfg);
+        if (pthread_create(
+                &g_cmdpipe_thread, NULL, cmdpipe_reader_thread, &cfg) == 0)
+            g_cmdpipe_started = true;
+        else
+            LOG_ERROR("Failed to start command pipe thread");
     }
 
     /* Drain the audio source eagerly from here on (see the input ring note),
@@ -1332,9 +1352,8 @@ int main(int argc, char *argv[])
     }
 
     /* Cleanup */
-    g_running = false;
+    stop_cmdpipe_thread();
     if (cfg.cmdpipe) {
-        pthread_join(g_cmdpipe_thread, NULL);
         if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
         unlink(cfg.cmdpipe);
     }
