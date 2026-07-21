@@ -182,6 +182,7 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                                      ap2_mrp_playback_state_t state,
                                      bool force);
 static bool ap2_set_nonblocking(int fd, const char *name);
+static void ap2_raop_session_cleanup(struct ap2cl_s *p);
 
 /* ---- Native AP2 RTSP I/O ---- */
 
@@ -1866,8 +1867,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
     if (!p->raopcl) return false;
 
     if (!raopcl_connect(p->raopcl, player_addr, p->device.port, p->volume > 0)) {
-        raopcl_destroy(p->raopcl);
-        p->raopcl = NULL;
+        ap2_raop_session_cleanup(p);
         return false;
     }
 
@@ -1922,6 +1922,14 @@ struct ap2cl_s *ap2cl_create(
     return p;
 }
 
+static void ap2_raop_session_cleanup(struct ap2cl_s *p)
+{
+    if (p->raopcl) {
+        raopcl_destroy(p->raopcl);
+        p->raopcl = NULL;
+    }
+}
+
 bool ap2cl_destroy(struct ap2cl_s *p)
 {
     if (!p) return false;
@@ -1930,7 +1938,7 @@ bool ap2cl_destroy(struct ap2cl_s *p)
      * MRP disconnect, RTSP TEARDOWN) on the normal EOF path too. */
     if (p->state != AP2_DOWN || p->sock_fd >= 0)
         ap2cl_disconnect(p);
-    if (p->raopcl) raopcl_destroy(p->raopcl);
+    ap2_raop_session_cleanup(p);
     if (p->hap) ap2_hap_destroy(p->hap);
     if (p->ptp) ap2_ptp_destroy(p->ptp);
     if (p->mrp) ap2_mrp_destroy(p->mrp);
@@ -2008,12 +2016,14 @@ void ap2cl_set_buffered(struct ap2cl_s *p, bool enable)
 bool ap2cl_connect(struct ap2cl_s *p)
 {
     if (!p) return false;
-
     if (p->flow == FLOW_NATIVE_AP2) {
         LOG_INFO("[AP2] Connecting via native AP2 flow to %s:%d",
                  p->device.address, p->device.port);
         return ap2_native_connect(p);
     } else {
+        if (p->state != AP2_DOWN && p->raopcl)
+            ap2cl_disconnect(p);
+        ap2_raop_session_cleanup(p);
         LOG_INFO("[AP2] Connecting via RAOP-compatible flow to %s:%d",
                  p->device.address, p->device.port);
         return ap2_raop_compat_connect(p);
