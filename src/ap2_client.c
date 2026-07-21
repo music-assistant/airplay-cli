@@ -86,6 +86,8 @@ struct ap2cl_s {
 
     /* Native AP2 flow */
     int sock_fd;                  /* TCP connection */
+    pthread_mutex_t lifecycle_lock; /* connect/disconnect cannot overlap */
+    bool destroying;
     /* The RTSP socket carries whole request/response cycles from multiple
      * threads (streaming thread: SETRATEANCHORTIME/FLUSHBUFFERED/TEARDOWN;
      * cmdpipe thread: SET_PARAMETER volume/metadata, /feedback keepalive).
@@ -98,6 +100,8 @@ struct ap2cl_s {
      * state carrier + body builder; only on pair-verified native sessions. */
     struct ap2_mrp_ctx *mrp;
     ap2_mrp_serial_t mrp_serial;    /* whole registration/state push sequence */
+    bool mrp_commands_ready;        /* native connect completed */
+    uint64_t mrp_generation;        /* invalidates cancelled/replaced connects */
     bool mrp_device_registered;
     bool mrp_extended_registered;
     int mrp_last_playback_state;
@@ -154,6 +158,7 @@ static void ap2_mrp_update_playback(
     bool send_command, bool disconnect);
 static int ap2_mrp_register_unlocked(struct ap2cl_s *p);
 static ap2_mrp_push_result_t ap2_mrp_push_unlocked(struct ap2cl_s *p);
+static bool ap2cl_disconnect_unlocked(struct ap2cl_s *p);
 
 /* ---- Native AP2 RTSP I/O ---- */
 
@@ -503,7 +508,8 @@ static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, cons
  * handshake failure) logs and leaves p->mrp NULL / audio untouched. Reachable
  * only on a pair-verified session (Apple devices) — the DataStream keys derive
  * from this session's pair-verify shared secret. */
-static void ap2_native_setup_mrp(struct ap2cl_s *p)
+static void ap2_native_setup_mrp(struct ap2cl_s *p,
+                                 uint64_t connect_generation)
 {
     if (!p->hap || !p->auth_credentials) return;   /* pair-verified only */
 
@@ -562,19 +568,29 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
 
     /* Bind the sender to THIS session's pair-verify shared secret and open the
      * channel (TCP connect + DEVICE_INFO-first handshake). */
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    if (p->mrp_generation != connect_generation) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return;
+    }
     if (!p->mrp)
         p->mrp = ap2_mrp_create(p->device.address, p->device.port,
                                 p->auth_credentials, p->dacp_id, p->device.name,
                                 p->session_uuid, p->group_uuid,
                                 ap2_hap_get_shared_secret(p->hap));
-    if (!p->mrp) return;
+    if (!p->mrp) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return;
+    }
 
     if (!ap2_mrp_attach(p->mrp, data_port, seed)) {
         LOG_WARN("[MRP] data-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
+        ap2_mrp_serial_unlock(&p->mrp_serial);
         return;
     }
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     LOG_INFO("[MRP] remote-control data channel established (now-playing active)");
 }
 
@@ -582,6 +598,19 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
 
 static bool ap2_native_connect(struct ap2cl_s *p)
 {
+    uint64_t connect_generation;
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    connect_generation = ++p->mrp_generation;
+    p->mrp_commands_ready = false;
+    if (p->mrp) {
+        ap2_mrp_destroy(p->mrp);
+        p->mrp = NULL;
+    }
+    p->mrp_device_registered = false;
+    p->mrp_extended_registered = false;
+    p->mrp_last_playback_state = 0;
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+
     struct addrinfo hints = {0}, *res;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
@@ -1081,7 +1110,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * Set CLIAIRPLAY_MRP_TYPE130=1 to re-enable the channel (future remote-
      * control RX). Best-effort; audio is up regardless. */
     if (getenv("CLIAIRPLAY_MRP_TYPE130"))
-        ap2_native_setup_mrp(p);
+        ap2_native_setup_mrp(p, connect_generation);
 
     /* Create ALAC encoder */
     p->alac = alac_create_encoder(AP2_FRAMES_PER_CHUNK,
@@ -1090,7 +1119,15 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                                    p->format.channels);
 
     p->first_packet = true;
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    if (p->mrp_generation != connect_generation) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        LOG_WARN("[MRP] native connect generation was cancelled");
+        return false;
+    }
     p->state = AP2_CONNECTED;
+    p->mrp_commands_ready = true;
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     LOG_INFO("[AP2] Native AP2 session ready");
     return true;
 }
@@ -1533,6 +1570,7 @@ struct ap2cl_s *ap2cl_create(
     p->events_sock = -1;
     p->buffered_sock = -1;
     pthread_mutex_init(&p->rtsp_lock, NULL);
+    pthread_mutex_init(&p->lifecycle_lock, NULL);
     ap2_mrp_serial_init(&p->mrp_serial);
     if (dacp_id) p->dacp_id = strdup(dacp_id);
     if (active_remote) p->active_remote = strdup(active_remote);
@@ -1551,38 +1589,54 @@ struct ap2cl_s *ap2cl_create(
     return p;
 }
 
-bool ap2cl_destroy(struct ap2cl_s *p)
+static void ap2_native_session_cleanup(struct ap2cl_s *p)
 {
-    if (!p) return false;
-    /* Preserve the on-wire shutdown sequence (final MediaRemote stopped state,
-     * MRP disconnect, RTSP TEARDOWN) on the normal EOF path too. */
-    if (p->state != AP2_DOWN || p->sock_fd >= 0)
-        ap2cl_disconnect(p);
-    if (p->raopcl) raopcl_destroy(p->raopcl);
-    if (p->hap) ap2_hap_destroy(p->hap);
-    if (p->ptp) ap2_ptp_destroy(p->ptp);
     ap2_mrp_serial_lock(&p->mrp_serial);
+    p->mrp_generation++;
+    p->mrp_commands_ready = false;
     if (p->mrp) {
         ap2_mrp_destroy(p->mrp);
         p->mrp = NULL;
     }
+    p->mrp_device_registered = false;
+    p->mrp_extended_registered = false;
+    p->mrp_last_playback_state = 0;
     ap2_mrp_serial_unlock(&p->mrp_serial);
-    ap2_mrp_serial_destroy(&p->mrp_serial);
-    if (p->alac) alac_delete_encoder(p->alac);
-    /* Close the RTSP socket under the lock so an in-flight request/response
-     * cycle on another thread finishes first and a later cycle sees -1
-     * instead of writing into a reused descriptor. */
+
+    if (p->events_sock >= 0) { close(p->events_sock); p->events_sock = -1; }
+    if (p->buffered_sock >= 0) { close(p->buffered_sock); p->buffered_sock = -1; }
+    if (p->data_sock >= 0) { close(p->data_sock); p->data_sock = -1; }
+    if (p->ctrl_sock >= 0) { close(p->ctrl_sock); p->ctrl_sock = -1; }
+    memset(&p->data_addr, 0, sizeof(p->data_addr));
+    memset(&p->ctrl_addr, 0, sizeof(p->ctrl_addr));
     pthread_mutex_lock(&p->rtsp_lock);
     if (p->sock_fd >= 0) { close(p->sock_fd); p->sock_fd = -1; }
     pthread_mutex_unlock(&p->rtsp_lock);
+    if (p->hap) { ap2_hap_destroy(p->hap); p->hap = NULL; }
+    if (p->ptp) { ap2_ptp_destroy(p->ptp); p->ptp = NULL; }
+    if (p->alac) { alac_delete_encoder(p->alac); p->alac = NULL; }
+    p->anchored = false;
+    p->rt_anchor_valid = false;
+    p->use_ptp = false;
+    p->use_buffered = false;
+    p->state = AP2_DOWN;
+}
+
+bool ap2cl_destroy(struct ap2cl_s *p)
+{
+    if (!p) return false;
+    pthread_mutex_lock(&p->lifecycle_lock);
+    p->destroying = true;
+    ap2cl_disconnect_unlocked(p);
+    if (p->raopcl) raopcl_destroy(p->raopcl);
+    p->raopcl = NULL;
+    ap2_mrp_serial_destroy(&p->mrp_serial);
     pthread_mutex_destroy(&p->rtsp_lock);
-    if (p->data_sock >= 0) close(p->data_sock);
-    if (p->ctrl_sock >= 0) close(p->ctrl_sock);
-    if (p->events_sock >= 0) close(p->events_sock);
-    if (p->buffered_sock >= 0) close(p->buffered_sock);
     free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
     free(p->secret); free(p->password); free(p->et); free(p->md); free(p->am);
     free(p->auth_credentials);
+    pthread_mutex_unlock(&p->lifecycle_lock);
+    pthread_mutex_destroy(&p->lifecycle_lock);
     free(p);
     return true;
 }
@@ -1640,19 +1694,36 @@ void ap2cl_set_buffered(struct ap2cl_s *p, bool enable)
 bool ap2cl_connect(struct ap2cl_s *p)
 {
     if (!p) return false;
-
+    pthread_mutex_lock(&p->lifecycle_lock);
+    if (p->destroying) {
+        pthread_mutex_unlock(&p->lifecycle_lock);
+        return false;
+    }
+    if (p->flow == FLOW_NATIVE_AP2) {
+        if (p->state != AP2_DOWN || p->sock_fd >= 0)
+            ap2cl_disconnect_unlocked(p);
+        else
+            ap2_native_session_cleanup(p);
+    } else if (p->state != AP2_DOWN) {
+        ap2cl_disconnect_unlocked(p);
+    }
+    bool result;
     if (p->flow == FLOW_NATIVE_AP2) {
         LOG_INFO("[AP2] Connecting via native AP2 flow to %s:%d",
                  p->device.address, p->device.port);
-        return ap2_native_connect(p);
+        result = ap2_native_connect(p);
     } else {
         LOG_INFO("[AP2] Connecting via RAOP-compatible flow to %s:%d",
                  p->device.address, p->device.port);
-        return ap2_raop_compat_connect(p);
+        result = ap2_raop_compat_connect(p);
     }
+    if (!result && p->flow == FLOW_NATIVE_AP2)
+        ap2_native_session_cleanup(p);
+    pthread_mutex_unlock(&p->lifecycle_lock);
+    return result;
 }
 
-bool ap2cl_disconnect(struct ap2cl_s *p)
+static bool ap2cl_disconnect_unlocked(struct ap2cl_s *p)
 {
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
@@ -1660,28 +1731,26 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
          * while the encrypted RTSP session is still live. */
         ap2_mrp_update_playback(
             p, AP2_DOWN, AP2_MRP_PLAYBACK_STOPPED, true, true);
-        if (p->events_sock >= 0) {
-            close(p->events_sock);
-            p->events_sock = -1;
-        }
-        if (p->buffered_sock >= 0) {
-            close(p->buffered_sock);
-            p->buffered_sock = -1;
-        }
         if (p->sock_fd >= 0) {
             uint8_t *resp = NULL; int resp_len = 0;
             ap2_rtsp_send(p, "TEARDOWN", p->session_url, NULL, 0, NULL, &resp, &resp_len);
             free(resp);
-            /* Under the lock: see ap2cl_destroy. */
-            pthread_mutex_lock(&p->rtsp_lock);
-            close(p->sock_fd); p->sock_fd = -1;
-            pthread_mutex_unlock(&p->rtsp_lock);
         }
+        ap2_native_session_cleanup(p);
     } else if (p->raopcl) {
         raopcl_disconnect(p->raopcl);
+        p->state = AP2_DOWN;
     }
-    if (p->flow != FLOW_NATIVE_AP2) p->state = AP2_DOWN;
     return true;
+}
+
+bool ap2cl_disconnect(struct ap2cl_s *p)
+{
+    if (!p) return false;
+    pthread_mutex_lock(&p->lifecycle_lock);
+    bool result = p->destroying ? false : ap2cl_disconnect_unlocked(p);
+    pthread_mutex_unlock(&p->lifecycle_lock);
+    return result;
 }
 
 bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
@@ -1846,12 +1915,16 @@ bool ap2cl_feedback(struct ap2cl_s *p)
      * periodically to hold the now-playing session open. Separate socket from
      * the RTSP /feedback POST; best-effort, harmless when no channel is up. */
     ap2_mrp_serial_lock(&p->mrp_serial);
+    if (!p->mrp_commands_ready) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return false;
+    }
     if (p->mrp) ap2_mrp_tick(p->mrp);
-    ap2_mrp_serial_unlock(&p->mrp_serial);
     uint8_t *resp = NULL; int resp_len = 0;
     int status = ap2_rtsp_send(p, "POST", "/feedback", NULL, 0, NULL, &resp, &resp_len);
     free(resp);
     LOG_DEBUG("[AP2] /feedback keepalive -> %d", status);
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     return status == 200;
 }
 
@@ -1938,7 +2011,8 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
  * messages. Set CLIAIRPLAY_MRP=0 to disable the path for diagnosis. */
 static void ap2_mrp_ready(struct ap2cl_s *p)
 {
-    if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
+    if (p->mrp || !p->mrp_commands_ready ||
+        p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
         p->sock_fd < 0 || !p->session_uuid[0])
         return;
     const char *setting = getenv("CLIAIRPLAY_MRP");
@@ -2022,6 +2096,15 @@ static void ap2_mrp_update_playback(
 {
     if (!p) return;
     ap2_mrp_serial_lock(&p->mrp_serial);
+    if (p->flow == FLOW_NATIVE_AP2 &&
+        !p->mrp_commands_ready && !disconnect) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return;
+    }
+    if (disconnect) {
+        p->mrp_generation++;
+        p->mrp_commands_ready = false;
+    }
     p->state = client_state;
     if (p->mrp) {
         if (mrp_state == AP2_MRP_PLAYBACK_STOPPED)
@@ -2069,7 +2152,9 @@ static int ap2_mrp_send_extended_registration_unlocked(struct ap2cl_s *p)
 static ap2_mrp_push_result_t ap2_mrp_push_unlocked(struct ap2cl_s *p)
 {
     ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
-    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return result;
+    if (!p || !p->mrp_commands_ready ||
+        p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
+        return result;
     ap2_mrp_ready(p);
     if (!p->mrp) return result;
 
@@ -2126,7 +2211,11 @@ int ap2cl_mrp_channel_status(struct ap2cl_s *p)
      * not attempted, report "not applicable" so the [STATUS] path=channel line
      * is suppressed and only path=command (the active now-playing path) shows. */
     if (!getenv("CLIAIRPLAY_MRP_TYPE130")) return -1;
-    return (p->mrp && ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
+    ap2_mrp_serial_lock(&p->mrp_serial);
+    int status = p->mrp_commands_ready &&
+                 p->mrp && ap2_mrp_is_connected(p->mrp) ? 1 : 0;
+    ap2_mrp_serial_unlock(&p->mrp_serial);
+    return status;
 }
 
 /* Register the sender identity before the first now-playing update. The
@@ -2134,7 +2223,9 @@ int ap2cl_mrp_channel_status(struct ap2cl_s *p)
  * ap2cl_mrp_push(), matching Apple's current AirPlaySender implementation. */
 static int ap2_mrp_register_unlocked(struct ap2cl_s *p)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return -1;
+    if (!p || !p->mrp_commands_ready ||
+        p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0)
+        return -1;
     ap2_mrp_ready(p);
     if (!p->mrp) return -1;
     if (p->mrp_device_registered) return 1;
@@ -2160,12 +2251,19 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
 {
     if (!p) return false;
     ap2_mrp_serial_lock(&p->mrp_serial);
+    if (p->flow == FLOW_NATIVE_AP2 && !p->mrp_commands_ready) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return false;
+    }
     ap2_mrp_ready(p);
     if (p->mrp)
         ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000);
+    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
+        bool result = ap2_native_send_metadata(p, title, artist, album);
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return result;
+    }
     ap2_mrp_serial_unlock(&p->mrp_serial);
-    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
-        return ap2_native_send_metadata(p, title, artist, album);
     if (p->raopcl)
         return raopcl_set_daap(p->raopcl, 4, "minm", 's', title,
                                 "asar", 's', artist, "asal", 's', album, "astn", 'i', 1);
@@ -2186,6 +2284,10 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
     }
     if (!p) return false;
     ap2_mrp_serial_lock(&p->mrp_serial);
+    if (p->flow == FLOW_NATIVE_AP2 && !p->mrp_commands_ready) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return false;
+    }
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
     if (have_mrp)
@@ -2225,6 +2327,10 @@ bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p,
     }
     if (!p) return false;
     ap2_mrp_serial_lock(&p->mrp_serial);
+    if (p->flow == FLOW_NATIVE_AP2 && !p->mrp_commands_ready) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return false;
+    }
     ap2_mrp_ready(p);
     if (!p->mrp) {
         ap2_mrp_serial_unlock(&p->mrp_serial);
@@ -2241,11 +2347,14 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
 {
     if (!p) return false;
     ap2_mrp_serial_lock(&p->mrp_serial);
+    if (p->flow == FLOW_NATIVE_AP2 && !p->mrp_commands_ready) {
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return false;
+    }
     ap2_mrp_ready(p);
     if (p->mrp)
         ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000,
                              p->state == AP2_STREAMING);
-    ap2_mrp_serial_unlock(&p->mrp_serial);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* progress: <start>/<current>/<end>, all in the STREAM's RTP timestamp
          * units (the per-process timeline offset included, so the values match
@@ -2265,8 +2374,11 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
                                    &resp, &resp_len);
         free(resp);
         LOG_DEBUG("[AP2] native progress SET_PARAMETER -> status %d", status);
-        return status >= 200 && status < 300;
+        bool result = status >= 200 && status < 300;
+        ap2_mrp_serial_unlock(&p->mrp_serial);
+        return result;
     }
+    ap2_mrp_serial_unlock(&p->mrp_serial);
     if (!p->raopcl) return false;
     return raopcl_set_progress_ms(p->raopcl, elapsed_s * 1000, duration_s * 1000);
 }

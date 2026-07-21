@@ -730,36 +730,35 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         .channels = cfg->channels,
     };
 
-    g_ap2cl = ap2cl_create(&device, &format,
-                            cfg->auth, cfg->password,
-                            cfg->dacp_id, cfg->active_remote,
-                            cfg->latency_ms, cfg->volume);
-    if (!g_ap2cl) {
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, cfg->auth, cfg->password,
+        cfg->dacp_id, cfg->active_remote, cfg->latency_ms, cfg->volume);
+    if (!client) {
         status_error("Cannot create AirPlay 2 client");
         return 1;
     }
 
     /* Pass through mDNS properties and interface for RAOP-compatible flow */
-    ap2cl_set_raop_props(g_ap2cl, cfg->iface, cfg->secret,
-                          cfg->et, cfg->md, cfg->am);
+    ap2cl_set_raop_props(client, cfg->iface, cfg->secret,
+                         cfg->et, cfg->md, cfg->am);
     /* Apply the resolved AirPlay 2 route (see ap2_resolve_route). force_native
      * is a no-op when stored credentials already select the native flow. */
     if (cfg->route.native)
-        ap2cl_force_native(g_ap2cl);
+        ap2cl_force_native(client);
     if (cfg->publish_ip)
-        ap2cl_set_publish_ip(g_ap2cl, cfg->publish_ip);
-    ap2cl_set_ptp(g_ap2cl, cfg->route.ptp);
-    ap2cl_set_ptp_shared(g_ap2cl, cfg->ptp_shared);
-    ap2cl_set_buffered(g_ap2cl, cfg->route.buffered);
+        ap2cl_set_publish_ip(client, cfg->publish_ip);
+    ap2cl_set_ptp(client, cfg->route.ptp);
+    ap2cl_set_ptp_shared(client, cfg->ptp_shared);
+    ap2cl_set_buffered(client, cfg->route.buffered);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
-    if (!ap2cl_connect(g_ap2cl)) {
+    if (!ap2cl_connect(client)) {
         status_error("Cannot connect to AirPlay 2 device");
-        ap2cl_destroy(g_ap2cl);
-        g_ap2cl = NULL;
+        ap2cl_destroy(client);
         return 1;
     }
+    g_ap2cl = client;
 
     status_connected();
 
@@ -874,8 +873,6 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     g_running = false;
     free(buf);
     free(ap2_alac_buf);
-    ap2cl_destroy(g_ap2cl);
-    g_ap2cl = NULL;
     return 0;
 }
 
@@ -1337,6 +1334,10 @@ int main(int argc, char *argv[])
         pthread_join(g_cmdpipe_thread, NULL);
         if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
         unlink(cfg.cmdpipe);
+    }
+    if (g_ap2cl) {
+        ap2cl_destroy(g_ap2cl);
+        g_ap2cl = NULL;
     }
     if (infile >= 0 && infile != fileno(stdin)) close(infile);
     netsock_close();
