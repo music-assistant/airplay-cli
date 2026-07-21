@@ -349,13 +349,16 @@ baseline/color-only rule.
 The local-file handler signature-detects JPEG/PNG/GIF/WebP and preserves the
 original bytes and correct MIME type for DMAP/Sonos. MRP performs bounded,
 structural JPEG parsing before retaining data: complete SOI/EOI, valid segment
-lengths, quantization/Huffman tables, SOF0 baseline or SOF2 progressive,
-nonzero dimensions, 8-bit precision, and 1-4 components. The parser reports
-the observed profile; those accepted profiles are not claims about what tvOS
-will render. A 1 MiB local allocation/plist safety limit leaves room for the
-hardware matrix below and is explicitly not a receiver limit. Rejection clears
-previous MRP artwork, preventing stale cover art. No image encoder is embedded
-in production code.
+lengths, nonzero quantization tables, nonempty/non-oversubscribed Huffman
+tables, unique SOF component definitions, valid SOS table/component references,
+entropy stuffing/restart markers, and exactly one terminal EOI with no trailing
+structure. SOF0 baseline and SOF2 progressive, nonzero dimensions, 8-bit
+precision, and 1-4 components are supported. The parser reports the observed
+profile; those accepted profiles are not claims about what tvOS will render. A
+1 MiB local allocation/plist safety limit leaves room for the hardware matrix
+below and is explicitly not a receiver limit. Rejection clears previous MRP
+artwork, preventing stale cover art. No image encoder is embedded in production
+code.
 
 Staged JPEG bytes ride only the *first* push for a given image, tagged with a
 fresh `ArtworkIdentifier`; later pushes carry the identifier without the bytes,
