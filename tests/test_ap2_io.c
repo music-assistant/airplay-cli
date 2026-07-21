@@ -157,16 +157,24 @@ static bool test_rtsp_lock_timeout_preserves_request_state(void)
         .rtsp_lock = &rtsp_lock,
         .channel_fd = channel[0],
     };
-    pthread_t thread;
-    CHECK(pthread_create(
-              &thread, NULL, run_rtsp_transaction, &transaction) == 0);
-    CHECK(pthread_join(thread, NULL) == 0);
-    CHECK(transaction.lock_result == 0);
-    CHECK(transaction.lock_errno == ETIMEDOUT);
-    CHECK(transaction.elapsed_ms >= 30 && transaction.elapsed_ms < 500);
-    CHECK(transaction.cseq == 0);
-    CHECK(transaction.nonce == 0);
-    CHECK(transaction.channel_touches == 0);
+    unsigned feedback_failures = 0;
+    for (int tick = 0; tick < 3; tick++) {
+        pthread_t thread;
+        CHECK(pthread_create(
+                  &thread, NULL, run_rtsp_transaction, &transaction) == 0);
+        CHECK(pthread_join(thread, NULL) == 0);
+        CHECK(transaction.lock_result == 0);
+        CHECK(transaction.lock_errno == ETIMEDOUT);
+        CHECK(transaction.elapsed_ms >= 30 && transaction.elapsed_ms < 500);
+        CHECK(transaction.cseq == 0);
+        CHECK(transaction.nonce == 0);
+        CHECK(transaction.channel_touches == 0);
+        ap2_feedback_result_t result =
+            ap2_io_feedback_result(-ETIMEDOUT, false);
+        if (result == AP2_FEEDBACK_FAILED) feedback_failures++;
+        CHECK(result == AP2_FEEDBACK_SKIPPED);
+        CHECK(feedback_failures == 0);
+    }
 
     uint8_t byte;
     errno = 0;
@@ -179,6 +187,8 @@ static bool test_rtsp_lock_timeout_preserves_request_state(void)
     CHECK(transaction.cseq == 1);
     CHECK(transaction.nonce == 1);
     CHECK(transaction.channel_touches == 1);
+    CHECK(ap2_io_feedback_result(200, true) ==
+          AP2_FEEDBACK_SUCCEEDED);
     CHECK(recv(channel[1], &byte, 1, MSG_DONTWAIT) == 1);
     CHECK(byte == 'R');
 
@@ -214,6 +224,26 @@ static bool test_datagram_outcomes(void)
     return true;
 }
 
+static bool test_feedback_lock_timeouts_are_skipped(void)
+{
+    unsigned failures = 2;
+    for (int tick = 0; tick < 4; tick++) {
+        ap2_feedback_result_t result =
+            ap2_io_feedback_result(-ETIMEDOUT, false);
+        CHECK(result == AP2_FEEDBACK_SKIPPED);
+        if (result == AP2_FEEDBACK_FAILED) failures++;
+        CHECK(failures == 2);
+    }
+
+    CHECK(ap2_io_feedback_result(-ETIMEDOUT, true) ==
+          AP2_FEEDBACK_FAILED);
+    CHECK(ap2_io_feedback_result(500, true) == AP2_FEEDBACK_FAILED);
+    CHECK(ap2_io_feedback_result(200, true) == AP2_FEEDBACK_SUCCEEDED);
+    failures = 0;
+    CHECK(failures == 0);
+    return true;
+}
+
 int main(void)
 {
     if (!test_fake_peer_response()) return 1;
@@ -230,6 +260,8 @@ int main(void)
     fprintf(stderr, "RTSP lock deadline passed\n");
     if (!test_datagram_outcomes()) return 1;
     fprintf(stderr, "datagram outcomes passed\n");
+    if (!test_feedback_lock_timeouts_are_skipped()) return 1;
+    fprintf(stderr, "feedback contention accounting passed\n");
     puts("ap2_io tests passed");
     return 0;
 }

@@ -111,7 +111,7 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m);
 
 /*
  * Set the now-playing track metadata. Values are copied; NULL is treated as
- * empty. Takes effect on the next state push (immediate when connected).
+ * empty. Takes effect on the next feedback-worker state push.
  *
  * :param duration_ms: track duration in milliseconds (0 = unknown/live).
  */
@@ -143,7 +143,7 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
  * Flip the play/pause state without a fresh elapsed position (pause/resume).
  * Advances the stored elapsed to now so the receiver's extrapolated position
  * (elapsedTime + timestamp + playbackRate) is accurate across the transition.
- * Takes effect on the next state push (immediate when connected).
+ * Takes effect on the next feedback-worker state push.
  *
  * :param playing: true = Playing, false = Paused.
  */
@@ -154,12 +154,23 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing);
 bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m);
 
 /*
- * Keep-alive tick: answer encrypted event-channel HTTP requests, drain any
- * type-130 frames (answering sync/heartbeat requests), and re-push the current
- * type-130 state when applicable. Call about every 2 s from the caller's
- * existing loop.
+ * Keep-alive tick: answer encrypted event-channel HTTP requests and drain any
+ * type-130 frames (answering sync/heartbeat requests). Call only from the
+ * feedback worker.
  */
 void ap2_mrp_tick(struct ap2_mrp_ctx *m);
+
+/*
+ * Snapshot a pending/periodic type-130 state push while the caller protects
+ * mutable MRP state, then send the owned payload without that state lock.
+ * The feedback worker is the sole sender for these snapshots.
+ */
+bool ap2_mrp_prepare_state_push(struct ap2_mrp_ctx *m, uint8_t **out,
+                                int *out_len, uint64_t *generation);
+bool ap2_mrp_send_state_push(struct ap2_mrp_ctx *m,
+                             const uint8_t *data, int len);
+void ap2_mrp_complete_state_push(struct ap2_mrp_ctx *m,
+                                 uint64_t generation, bool success);
 
 /* True once the data channel is established. */
 bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m);
@@ -181,6 +192,9 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
 
 /* Mark the one-shot artwork bytes as accepted after a successful POST. */
 void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
+uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m);
+void ap2_mrp_mark_artwork_sent_if_generation(
+    struct ap2_mrp_ctx *m, uint64_t generation);
 
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before

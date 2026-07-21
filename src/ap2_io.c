@@ -147,6 +147,7 @@ ap2_send_result_t ap2_io_send_datagram_deadline(
             errno = ETIMEDOUT;
             return AP2_SEND_DROPPED;
         }
+
         ssize_t sent = addr
                            ? sendto(fd, data, len, MSG_DONTWAIT, addr, addr_len)
                            : send(fd, data, len, MSG_DONTWAIT);
@@ -165,6 +166,15 @@ ap2_send_result_t ap2_io_send_datagram_deadline(
         if (ready == 0) return AP2_SEND_DROPPED;
         return AP2_SEND_FATAL;
     }
+}
+
+ap2_feedback_result_t ap2_io_feedback_result(int rtsp_status,
+                                             bool request_started)
+{
+    if (rtsp_status == 200) return AP2_FEEDBACK_SUCCEEDED;
+    if (rtsp_status == -ETIMEDOUT && !request_started)
+        return AP2_FEEDBACK_SKIPPED;
+    return AP2_FEEDBACK_FAILED;
 }
 
 static size_t ap2_find_header_end(const uint8_t *data, size_t len)

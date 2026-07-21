@@ -44,6 +44,7 @@ EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
 IO_TEST       = build/tests/test_ap2_io
 TIMELINE_TEST = build/tests/test_ap2_timeline
 EVENT_TEST    = build/tests/test_ap2_event
+CLIENT_TEST   = build/tests/test_ap2_client
 TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
@@ -122,6 +123,8 @@ OBJECTS_CLI  = $(patsubst %.c,$(BUILDDIR)/%.o,$(filter %.c,$(CLI_SOURCES)))
 OBJECTS_CLI += $(patsubst %.cpp,$(BUILDDIR)/%.o,$(filter %.cpp,$(CLI_SOURCES)))
 
 OBJECTS_ALL = $(OBJECTS_RAOP) $(OBJECTS_AP2) $(OBJECTS_CLI)
+CLIENT_TEST_OBJECTS = $(filter-out $(BUILDDIR)/ap2_client.o \
+	$(BUILDDIR)/cliairplay.o $(BUILDDIR)/cross_ssl.o,$(OBJECTS_ALL))
 
 all: directory $(EXECUTABLE)
 
@@ -146,10 +149,11 @@ $(BUILDDIR)/%.o: %.cpp
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
-test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST)
+test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
+	$(CLIENT_TEST)
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)
@@ -168,5 +172,27 @@ $(IO_TEST): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_ap2_io.c src/ap2_io.c \
 		$(EXTRA_LDFLAGS) -lpthread -o $@
+
+build/tests/ap2_client.o: src/ap2_client.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DAP2_TESTING $< -c -o $@
+
+build/tests/cross_ssl.o: $(TOOLS)/cross_ssl.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -DSSL_STATIC_LIB $< -c -o $@
+
+build/tests/test_ap2_client_main.o: tests/test_ap2_client.c Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) $< -c -o $@
+
+$(CLIENT_TEST): build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
+		build/tests/cross_ssl.o \
+		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) Makefile
+	@mkdir -p $(dir $@)
+	$(CXX) build/tests/test_ap2_client_main.o build/tests/ap2_client.o \
+		build/tests/cross_ssl.o \
+		$(CLIENT_TEST_OBJECTS) $(LIBCODECS_PATCHED) \
+		$(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a \
+		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 .PHONY: all directory clean test

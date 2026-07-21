@@ -390,7 +390,9 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   absolute deadlines appropriate to the request: 1.5 seconds for feedback,
   2 seconds for control, 5 seconds for metadata, and 15 seconds for artwork.
   The deadline also bounds waiting for the RTSP serialization lock, so a long
-  artwork transaction cannot silently extend a feedback request's budget.
+  artwork transaction cannot silently extend a feedback request's budget. A
+  feedback tick that exhausts its budget before acquiring that lock is skipped:
+  it consumes no CSeq/nonce and does not count as a receiver failure.
   Event/DataStream writes have a one-second deadline, while realtime RTP/control
   UDP sends are nonblocking with a short bounded retry. A dead encrypted channel
   is fail-closed and terminal so an advanced nonce is never reused.
@@ -419,8 +421,10 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
   commands, explicit playback state, and a serialized NowPlayingClient.
   Start/pause/resume/stop transitions stay synchronized with the audio state.
   This path is enabled by default (`CLIAIRPLAY_MRP=0` is the diagnostic opt-out);
-  its state is mutex-protected from the feedback worker, and metadata remains
-  best-effort so audio never gates on it (§8).
+  mutable state is snapshotted under a short lock, while RTSP/DataStream I/O
+  runs afterward under a separate publication serializer. The feedback worker
+  is the sole DataStream state sender, and realtime health reads an atomic event
+  snapshot, so best-effort metadata never gates audio (§8).
 - **Metadata inputs** — UTF-8 strings become UTF-16BE binary-plist strings when
   needed. `ARTWORK` accepts local files and MA's local HTTP imageproxy URLs;
   imageproxy requests are normalized to supported `size=512&fmt=jpeg` values,

@@ -203,9 +203,13 @@ struct ap2_mrp_ctx {
     int artwork_len;
     char artwork_id[17];      /* 16-hex ArtworkIdentifier for the current art */
     bool artwork_sent;        /* bytes already pushed once (then ref by id) */
+    uint64_t artwork_generation;
     uint64_t np_uid;          /* per-track now-playing UniqueIdentifier */
 
     time_t last_state_push;
+    uint64_t state_generation;
+    bool state_dirty;
+    bool state_include_artwork;
 };
 
 /* ---- Small helpers ---- */
@@ -1148,6 +1152,8 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
     mrp_identity_uuid(m->dacp_id, m->device_uuid);
     m->playback_state = AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
+    m->state_generation = 1;
+    m->state_dirty = true;
     m->sock = -1;
     m->event_sock = -1;
     pthread_mutex_init(&m->send_lock, NULL);
@@ -1281,6 +1287,10 @@ bool ap2_mrp_attach(struct ap2_mrp_ctx *m, int data_port, uint64_t seed)
     ok = ok && build_set_now_playing_client(m, &msg) && mrp_send_protobuf(m, &msg);
     mbuf_free(&msg);
     ok = ok && mrp_push_state(m, m->artwork_len > 0);
+    if (ok) {
+        m->state_dirty = false;
+        m->state_include_artwork = false;
+    }
 
     if (!ok) {
         LOG_ERROR("[MRP] handshake push failed");
@@ -1339,8 +1349,9 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
     uint64_t uid = 0;
     RAND_bytes((uint8_t *)&uid, sizeof(uid));
     m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_generation++;
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
@@ -1363,8 +1374,11 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
              "%02x%02x%02x%02x%02x%02x%02x%02x",
              idb[0], idb[1], idb[2], idb[3], idb[4], idb[5], idb[6], idb[7]);
     m->artwork_sent = false;
-    if (!m->connected) return true;
-    return mrp_push_state(m, true);
+    m->artwork_generation++;
+    m->state_generation++;
+    m->state_dirty = true;
+    m->state_include_artwork = true;
+    return true;
 }
 
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
@@ -1376,10 +1390,9 @@ bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = mrp_cf_now();
-    if (!m->connected) return true;
-    /* The receiver extrapolates position from elapsedTime + timestamp +
-     * playbackRate, so a progress change is a state push, not a stream. */
-    return mrp_push_state(m, false);
+    m->state_generation++;
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
@@ -1397,8 +1410,9 @@ bool ap2_mrp_set_playing(struct ap2_mrp_ctx *m, bool playing)
     m->playback_state = playing ? AP2_MRP_PLAYBACK_PLAYING
                                 : AP2_MRP_PLAYBACK_PAUSED;
     m->elapsed_set_at = now;
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_generation++;
+    m->state_dirty = true;
+    return true;
 }
 
 bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
@@ -1406,8 +1420,9 @@ bool ap2_mrp_set_stopped(struct ap2_mrp_ctx *m)
     if (!m) return false;
     m->playback_state = AP2_MRP_PLAYBACK_STOPPED;
     m->elapsed_set_at = mrp_cf_now();
-    if (!m->connected) return true;
-    return mrp_push_state(m, false);
+    m->state_generation++;
+    m->state_dirty = true;
+    return true;
 }
 
 void ap2_mrp_tick(struct ap2_mrp_ctx *m)
@@ -1433,11 +1448,47 @@ void ap2_mrp_tick(struct ap2_mrp_ctx *m)
         if (!m->connected) return;
     }
 
-    /* Defensive periodic re-push: keeps the system now-playing session warm
-     * (standby prevention hinges on it, DESIGN.md §8). */
-    if (m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
-        time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S)
-        mrp_push_state(m, false);
+}
+
+bool ap2_mrp_prepare_state_push(struct ap2_mrp_ctx *m, uint8_t **out,
+                                int *out_len, uint64_t *generation)
+{
+    if (!m || !out || !out_len || !generation || !m->connected) return false;
+    bool periodic =
+        m->playback_state == AP2_MRP_PLAYBACK_PLAYING &&
+        time(NULL) - m->last_state_push >= MRP_STATE_REPUSH_S;
+    if (!m->state_dirty && !periodic) return false;
+
+    mbuf msg = {0};
+    if (!build_set_state(m, m->state_include_artwork, &msg)) {
+        mbuf_free(&msg);
+        return false;
+    }
+    *out = msg.p;
+    *out_len = (int)msg.len;
+    *generation = m->state_generation;
+    return true;
+}
+
+bool ap2_mrp_send_state_push(struct ap2_mrp_ctx *m,
+                             const uint8_t *data, int len)
+{
+    if (!m || !data || len <= 0 || !m->connected) return false;
+    mbuf msg = { .p = (uint8_t *)data, .len = (size_t)len, .cap = (size_t)len };
+    bool ok = mrp_send_protobuf(m, &msg);
+    LOG_DEBUG("[MRP] queued SET_STATE push -> %s", ok ? "sent" : "failed");
+    return ok;
+}
+
+void ap2_mrp_complete_state_push(struct ap2_mrp_ctx *m,
+                                 uint64_t generation, bool success)
+{
+    if (!m || !success) return;
+    m->last_state_push = time(NULL);
+    if (m->state_generation == generation) {
+        m->state_dirty = false;
+        m->state_include_artwork = false;
+    }
 }
 
 bool ap2_mrp_is_connected(struct ap2_mrp_ctx *m)
@@ -1525,6 +1576,18 @@ void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m)
 {
     if (m && m->artwork && m->artwork_len > 0)
         m->artwork_sent = true;
+}
+
+uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m)
+{
+    return m ? m->artwork_generation : 0;
+}
+
+void ap2_mrp_mark_artwork_sent_if_generation(
+    struct ap2_mrp_ctx *m, uint64_t generation)
+{
+    if (m && m->artwork_generation == generation)
+        ap2_mrp_mark_artwork_sent(m);
 }
 
 /* Wrap a serialized protobuf as the bplist {"params": {"data": <varint length +

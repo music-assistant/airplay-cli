@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -152,6 +153,65 @@ static void read_response(int fd, const uint8_t key[KEY_SIZE],
     assert(strstr((char *)response, expected_cseq));
 }
 
+static bool contains_bytes(const uint8_t *haystack, int haystack_len,
+                           const uint8_t *needle, int needle_len)
+{
+    for (int i = 0; i + needle_len <= haystack_len; i++) {
+        if (memcmp(haystack + i, needle, (size_t)needle_len) == 0)
+            return true;
+    }
+    return false;
+}
+
+static void test_artwork_snapshot_generation(const uint8_t secret[KEY_SIZE])
+{
+    static const uint8_t first_art[] =
+        {0xf1, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x7f};
+    static const uint8_t second_art[] =
+        {0xe2, 0x91, 0x82, 0x73, 0x64, 0x55, 0x46, 0x3e};
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
+        "Music Assistant", "11111111-2222-4333-8444-555555555555",
+        "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret);
+    assert(mrp);
+
+    assert(ap2_mrp_set_artwork(
+        mrp, "image/test", first_art, (int)sizeof(first_art)));
+    uint64_t first_generation = ap2_mrp_artwork_generation(mrp);
+    uint8_t *first_snapshot = NULL;
+    int first_len = 0;
+    assert(ap2_mrp_build_nowplaying_command(
+        mrp, &first_snapshot, &first_len));
+    assert(contains_bytes(
+        first_snapshot, first_len, first_art, (int)sizeof(first_art)));
+
+    assert(ap2_mrp_set_artwork(
+        mrp, "image/test", second_art, (int)sizeof(second_art)));
+    ap2_mrp_mark_artwork_sent_if_generation(mrp, first_generation);
+
+    uint8_t *second_snapshot = NULL;
+    int second_len = 0;
+    assert(ap2_mrp_build_nowplaying_command(
+        mrp, &second_snapshot, &second_len));
+    assert(contains_bytes(
+        second_snapshot, second_len, second_art, (int)sizeof(second_art)));
+
+    uint64_t second_generation = ap2_mrp_artwork_generation(mrp);
+    ap2_mrp_mark_artwork_sent_if_generation(mrp, second_generation);
+    uint8_t *reference_snapshot = NULL;
+    int reference_len = 0;
+    assert(ap2_mrp_build_nowplaying_command(
+        mrp, &reference_snapshot, &reference_len));
+    assert(!contains_bytes(
+        reference_snapshot, reference_len,
+        second_art, (int)sizeof(second_art)));
+
+    free(first_snapshot);
+    free(second_snapshot);
+    free(reference_snapshot);
+    ap2_mrp_destroy(mrp);
+}
+
 int main(void)
 {
     uint8_t secret[KEY_SIZE];
@@ -159,6 +219,7 @@ int main(void)
     uint8_t receiver_key[KEY_SIZE], sender_key[KEY_SIZE];
     derive_key(secret, "Events-Write-Encryption-Key", receiver_key);
     derive_key(secret, "Events-Read-Encryption-Key", sender_key);
+    test_artwork_snapshot_generation(secret);
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
