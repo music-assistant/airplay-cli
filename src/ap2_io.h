@@ -4,6 +4,7 @@
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
+#include <pthread.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 
@@ -22,6 +23,8 @@ typedef struct {
 } ap2_rtsp_response_t;
 
 uint64_t ap2_io_monotonic_ms(void);
+/* Returns 1 when acquired, 0 on deadline expiry, and -1 on mutex error. */
+int ap2_io_mutex_lock_deadline(pthread_mutex_t *mutex, uint64_t deadline_ms);
 int ap2_io_poll_fd(int fd, short events, uint64_t deadline_ms);
 bool ap2_io_write_all_deadline(int fd, const uint8_t *data, size_t len,
                                uint64_t deadline_ms);

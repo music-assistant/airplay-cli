@@ -167,6 +167,6 @@ $(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
 $(IO_TEST): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_ap2_io.c src/ap2_io.c \
-		$(EXTRA_LDFLAGS) -o $@
+		$(EXTRA_LDFLAGS) -lpthread -o $@
 
 .PHONY: all directory clean test

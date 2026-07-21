@@ -17,6 +17,35 @@ uint64_t ap2_io_monotonic_ms(void)
     return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)ts.tv_nsec / 1000000ULL;
 }
 
+int ap2_io_mutex_lock_deadline(pthread_mutex_t *mutex, uint64_t deadline_ms)
+{
+    if (!mutex) {
+        errno = EINVAL;
+        return -1;
+    }
+    for (;;) {
+        uint64_t now = ap2_io_monotonic_ms();
+        if (now >= deadline_ms) {
+            errno = ETIMEDOUT;
+            return 0;
+        }
+
+        int err = pthread_mutex_trylock(mutex);
+        if (err == 0) return 1;
+        if (err != EBUSY) {
+            errno = err;
+            return -1;
+        }
+
+        uint64_t remaining_ms = deadline_ms - now;
+        long sleep_ns = remaining_ms > 1
+                            ? 1000000L
+                            : (long)remaining_ms * 1000000L;
+        struct timespec delay = {.tv_nsec = sleep_ns};
+        while (nanosleep(&delay, &delay) < 0 && errno == EINTR) {}
+    }
+}
+
 int ap2_io_poll_fd(int fd, short events, uint64_t deadline_ms)
 {
     for (;;) {

@@ -389,6 +389,8 @@ not rendered — iOS buffered streams carry AAC). Reachable only via
 - **Socket deadlines** — established RTSP request/response cycles use cumulative
   absolute deadlines appropriate to the request: 1.5 seconds for feedback,
   2 seconds for control, 5 seconds for metadata, and 15 seconds for artwork.
+  The deadline also bounds waiting for the RTSP serialization lock, so a long
+  artwork transaction cannot silently extend a feedback request's budget.
   Event/DataStream writes have a one-second deadline, while realtime RTP/control
   UDP sends are nonblocking with a short bounded retry. A dead encrypted channel
   is fail-closed and terminal so an advanced nonce is never reused.

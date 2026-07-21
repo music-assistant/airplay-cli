@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <pthread.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -116,6 +117,77 @@ static bool test_closed_peer_is_visible(void)
     return true;
 }
 
+typedef struct {
+    pthread_mutex_t *rtsp_lock;
+    int channel_fd;
+    int cseq;
+    uint64_t nonce;
+    int channel_touches;
+    int lock_result;
+    int lock_errno;
+    uint64_t elapsed_ms;
+} rtsp_transaction_t;
+
+static void *run_rtsp_transaction(void *arg)
+{
+    rtsp_transaction_t *transaction = arg;
+    uint64_t started = ap2_io_monotonic_ms();
+    transaction->lock_result = ap2_io_mutex_lock_deadline(
+        transaction->rtsp_lock, started + 50);
+    transaction->lock_errno = errno;
+    transaction->elapsed_ms = ap2_io_monotonic_ms() - started;
+    if (transaction->lock_result != 1) return NULL;
+
+    transaction->cseq++;
+    transaction->nonce++;
+    if (send(transaction->channel_fd, "R", 1, 0) == 1)
+        transaction->channel_touches++;
+    pthread_mutex_unlock(transaction->rtsp_lock);
+    return NULL;
+}
+
+static bool test_rtsp_lock_timeout_preserves_request_state(void)
+{
+    pthread_mutex_t rtsp_lock = PTHREAD_MUTEX_INITIALIZER;
+    int channel[2];
+    CHECK(socketpair(AF_UNIX, SOCK_STREAM, 0, channel) == 0);
+    CHECK(pthread_mutex_lock(&rtsp_lock) == 0);
+
+    rtsp_transaction_t transaction = {
+        .rtsp_lock = &rtsp_lock,
+        .channel_fd = channel[0],
+    };
+    pthread_t thread;
+    CHECK(pthread_create(
+              &thread, NULL, run_rtsp_transaction, &transaction) == 0);
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(transaction.lock_result == 0);
+    CHECK(transaction.lock_errno == ETIMEDOUT);
+    CHECK(transaction.elapsed_ms >= 30 && transaction.elapsed_ms < 500);
+    CHECK(transaction.cseq == 0);
+    CHECK(transaction.nonce == 0);
+    CHECK(transaction.channel_touches == 0);
+
+    uint8_t byte;
+    errno = 0;
+    CHECK(recv(channel[1], &byte, 1, MSG_DONTWAIT) < 0);
+    CHECK(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    CHECK(pthread_mutex_unlock(&rtsp_lock) == 0);
+    run_rtsp_transaction(&transaction);
+    CHECK(transaction.lock_result == 1);
+    CHECK(transaction.cseq == 1);
+    CHECK(transaction.nonce == 1);
+    CHECK(transaction.channel_touches == 1);
+    CHECK(recv(channel[1], &byte, 1, MSG_DONTWAIT) == 1);
+    CHECK(byte == 'R');
+
+    CHECK(pthread_mutex_destroy(&rtsp_lock) == 0);
+    close(channel[0]);
+    close(channel[1]);
+    return true;
+}
+
 static bool test_datagram_outcomes(void)
 {
     int pair[2];
@@ -154,6 +226,8 @@ int main(void)
     fprintf(stderr, "stalled write passed\n");
     if (!test_closed_peer_is_visible()) return 1;
     fprintf(stderr, "closed peer passed\n");
+    if (!test_rtsp_lock_timeout_preserves_request_state()) return 1;
+    fprintf(stderr, "RTSP lock deadline passed\n");
     if (!test_datagram_outcomes()) return 1;
     fprintf(stderr, "datagram outcomes passed\n");
     puts("ap2_io tests passed");

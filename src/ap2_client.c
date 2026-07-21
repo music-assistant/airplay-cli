@@ -207,12 +207,19 @@ static int ap2_rtsp_timeout_ms(struct ap2cl_s *p, const char *method,
 static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, const char *uri,
                           const uint8_t *body, int body_len, const char *ct,
                           const char *extra_hdr,
-                          uint8_t **resp_body, int *resp_len)
+                          uint8_t **resp_body, int *resp_len,
+                          uint64_t started_ms, uint64_t deadline_ms)
 {
     if (atomic_load(&p->rtsp_dead)) {
         *resp_body = NULL;
         *resp_len = 0;
         return 0;
+    }
+    if (ap2_io_monotonic_ms() >= deadline_ms) {
+        *resp_body = NULL;
+        *resp_len = 0;
+        errno = ETIMEDOUT;
+        return -ETIMEDOUT;
     }
     int cseq = p->cseq++;
     char hdr[1024];
@@ -266,11 +273,9 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
         if (body && body_len > 0) memcpy(msg + hdr_len, body, body_len);
     }
 
-    int timeout_ms = ap2_rtsp_timeout_ms(p, method, uri, ct);
-    uint64_t started_ms = ap2_io_monotonic_ms();
-    uint64_t deadline_ms = started_ms + (uint64_t)timeout_ms;
     LOG_DEBUG("[AP2] RTSP TX cseq=%d %s %s body=%d wire=%d timeout=%dms",
-              cseq, method, uri, body_len, msg_len, timeout_ms);
+              cseq, method, uri, body_len, msg_len,
+              (int)(deadline_ms - started_ms));
     if (!ap2_io_write_all_deadline(p->sock_fd, msg, msg_len, deadline_ms)) {
         free(msg);
         ap2_mark_rtsp_dead(p, method, uri, "write",
@@ -388,14 +393,35 @@ static int ap2_rtsp_send_ex(struct ap2cl_s *p, const char *method, const char *u
                           const char *extra_hdr,
                           uint8_t **resp_body, int *resp_len)
 {
-    uint64_t wait_started = ap2_io_monotonic_ms();
-    pthread_mutex_lock(&p->rtsp_lock);
-    uint64_t waited_ms = ap2_io_monotonic_ms() - wait_started;
-    if (waited_ms >= 250)
-        LOG_DEBUG("[AP2] RTSP %s %s waited %" PRIu64 "ms for control lock",
-                  method, uri, waited_ms);
+    int timeout_ms = ap2_rtsp_timeout_ms(p, method, uri, ct);
+    uint64_t started_ms = ap2_io_monotonic_ms();
+    uint64_t deadline_ms = started_ms + (uint64_t)timeout_ms;
+    int lock_status =
+        ap2_io_mutex_lock_deadline(&p->rtsp_lock, deadline_ms);
+    uint64_t waited_ms = ap2_io_monotonic_ms() - started_ms;
+    if (lock_status <= 0) {
+        int lock_errno = errno;
+        *resp_body = NULL;
+        *resp_len = 0;
+        if (lock_status == 0) {
+            LOG_SDEBUG("[AP2] RTSP %s %s control lock timed out after "
+                      "%" PRIu64 "ms (budget=%dms)",
+                      method, uri, waited_ms, timeout_ms);
+            errno = ETIMEDOUT;
+            return -ETIMEDOUT;
+        }
+        LOG_ERROR("[AP2] RTSP %s %s control lock failed after %" PRIu64
+                  "ms: %s",
+                  method, uri, waited_ms, strerror(lock_errno));
+        errno = lock_errno;
+        return -lock_errno;
+    }
+    LOG_SDEBUG("[AP2] RTSP %s %s acquired control lock after %" PRIu64
+               "ms (budget=%dms)",
+               method, uri, waited_ms, timeout_ms);
     int status = ap2_rtsp_send_ex_unlocked(p, method, uri, body, body_len, ct,
-                                           extra_hdr, resp_body, resp_len);
+                                           extra_hdr, resp_body, resp_len,
+                                           started_ms, deadline_ms);
     pthread_mutex_unlock(&p->rtsp_lock);
     return status;
 }
@@ -1174,7 +1200,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     resp = NULL; resp_len = 0;
     status = ap2_rtsp_send(p, "RECORD", p->session_url, NULL, 0, NULL, &resp, &resp_len);
     free(resp);
-    if (status == 0) {
+    if (status <= 0) {
         return false;
     } else if (status != 200) {
         LOG_WARN("[AP2] RECORD returned %d", status);
@@ -1198,7 +1224,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         free(sp_data);
         free(resp);
         LOG_INFO("[AP2] SETPEERS [%s, %s] -> %d", p->device.address, our_addr, sp_status);
-        if (sp_status == 0) return false;
+        if (sp_status <= 0) return false;
 
         const char *peers[2] = { p->device.address, our_addr };
         ap2_ptp_set_peers(p->ptp, peers, 2);
