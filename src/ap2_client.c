@@ -61,6 +61,7 @@ extern log_level *loglevel;
 #define AP2_RTSP_METADATA_TIMEOUT_MS 5000
 #define AP2_RTSP_ARTWORK_TIMEOUT_MS  15000
 #define AP2_FEEDBACK_INTERVAL_MS     2000
+#define AP2_EVENT_POLL_INTERVAL_MS   100
 #define AP2_UDP_SEND_TIMEOUT_MS      20
 #define AP2_BUFFERED_WRITE_TIMEOUT_MS 8000
 
@@ -124,6 +125,8 @@ struct ap2cl_s {
     bool mrp_device_registered;
     bool mrp_extended_registered;
     int mrp_last_playback_state;
+    ap2_remote_command_cb_t remote_command_cb;
+    void *remote_command_userdata;
     int data_sock;                /* UDP audio */
     int ctrl_sock;                /* UDP control */
     int events_sock;              /* reverse TCP events connection (kept open) */
@@ -183,6 +186,14 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                                      bool force);
 static bool ap2_set_nonblocking(int fd, const char *name);
 static void ap2_raop_session_cleanup(struct ap2cl_s *p);
+
+static void ap2_remote_command_received(
+    ap2_remote_command_t command, void *userdata)
+{
+    struct ap2cl_s *p = userdata;
+    if (p && p->remote_command_cb)
+        p->remote_command_cb(command, p->remote_command_userdata);
+}
 
 /* ---- Native AP2 RTSP I/O ---- */
 
@@ -468,6 +479,21 @@ static int ap2_rtsp_send_tracked(
         resp_body, resp_len, request_started);
 }
 
+static void ap2_service_mrp_input(struct ap2cl_s *p)
+{
+    if (!p || atomic_load(&p->rtsp_dead)) return;
+    pthread_mutex_lock(&p->mrp_lock);
+    struct ap2_mrp_ctx *mrp = p->mrp;
+    pthread_mutex_unlock(&p->mrp_lock);
+    if (!mrp) return;
+
+    ap2_mrp_tick(mrp);
+    pthread_mutex_lock(&p->mrp_lock);
+    if (p->mrp == mrp)
+        atomic_store(&p->mrp_event_health, ap2_mrp_event_status(mrp));
+    pthread_mutex_unlock(&p->mrp_lock);
+}
+
 static void *ap2_feedback_thread_main(void *arg)
 {
     struct ap2cl_s *p = arg;
@@ -478,10 +504,12 @@ static void *ap2_feedback_thread_main(void *arg)
               AP2_FEEDBACK_INTERVAL_MS);
     while (!atomic_load(&p->feedback_stop) &&
            !atomic_load(&p->rtsp_dead)) {
+        ap2_service_mrp_input(p);
         uint64_t now_ms = ap2_io_monotonic_ms();
         if (now_ms < next_tick_ms) {
             uint64_t sleep_ms = next_tick_ms - now_ms;
-            if (sleep_ms > 100) sleep_ms = 100;
+            if (sleep_ms > AP2_EVENT_POLL_INTERVAL_MS)
+                sleep_ms = AP2_EVENT_POLL_INTERVAL_MS;
             usleep((useconds_t)sleep_ms * 1000);
             continue;
         }
@@ -774,6 +802,8 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
                                 p->session_uuid, p->group_uuid,
                                 ap2_hap_get_shared_secret(p->hap));
     if (!p->mrp) return;
+    ap2_mrp_set_remote_command_callback(
+        p->mrp, ap2_remote_command_received, p);
     if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
         LOG_WARN("[MRP] event-channel attach failed; degrading to no-MRP");
         ap2_mrp_destroy(p->mrp);
@@ -2013,6 +2043,14 @@ void ap2cl_set_buffered(struct ap2cl_s *p, bool enable)
     LOG_INFO("[AP2] Buffered audio (type 103) %s", enable ? "requested" : "disabled");
 }
 
+void ap2cl_set_remote_command_callback(
+    struct ap2cl_s *p, ap2_remote_command_cb_t callback, void *userdata)
+{
+    if (!p) return;
+    p->remote_command_cb = callback;
+    p->remote_command_userdata = userdata;
+}
+
 bool ap2cl_connect(struct ap2cl_s *p)
 {
     if (!p) return false;
@@ -2483,6 +2521,8 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
                             p->session_uuid, p->group_uuid,
                             ap2_hap_get_shared_secret(p->hap));
     if (!p->mrp) return;
+    ap2_mrp_set_remote_command_callback(
+        p->mrp, ap2_remote_command_received, p);
     if (!ap2_mrp_attach_events(p->mrp, p->events_sock)) {
         LOG_WARN("[MRP] event-channel attach failed; MediaRemote disabled");
         ap2_mrp_destroy(p->mrp);

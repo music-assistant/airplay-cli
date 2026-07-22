@@ -129,6 +129,7 @@ CLIENT_TEST_OBJECTS = $(filter-out $(BUILDDIR)/ap2_client.o \
 TEST_EXECUTABLE = $(BUILDDIR)/test-mrp-artwork
 TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
 	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
+	$(BUILDDIR)/ap2_bplist.o $(BUILDDIR)/bplist.o \
 	$(BUILDDIR)/artwork.o $(BUILDDIR)/cross_log.o
 RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-raop-lifecycle
 RAOP_LIFECYCLE_TEST_OBJECTS = $(BUILDDIR)/test_ap2_raop_lifecycle.o \
@@ -155,7 +156,7 @@ $(EXECUTABLE): $(OBJECTS_ALL) $(LIBCODECS_PATCHED)
 	$(CXX) $(OBJECTS_ALL) $(LIBRARY) $(LDFLAGS) -o $@
 
 $(TEST_EXECUTABLE): $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a
-	$(CC) $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+	$(CXX) $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 $(RAOP_LIFECYCLE_TEST_EXECUTABLE): $(RAOP_LIFECYCLE_TEST_OBJECTS) $(LIBCODECS_PATCHED) $(OPENSSL)/libopenssl.a
 	$(CXX) $(RAOP_LIFECYCLE_TEST_OBJECTS) \
@@ -196,11 +197,13 @@ $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 
 $(EVENT_TEST): tests/test_ap2_event.c $(BUILDDIR)/ap2_mrp.o \
 		$(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
+		$(BUILDDIR)/ap2_bplist.o $(BUILDDIR)/bplist.o \
 		$(BUILDDIR)/cross_log.o Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) \
 		$< $(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o \
-		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/cross_log.o \
+		$(BUILDDIR)/ap2_plist.o $(BUILDDIR)/ap2_bplist.o \
+		$(BUILDDIR)/bplist.o $(BUILDDIR)/cross_log.o \
 		$(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
 
 $(IO_TEST): tests/test_ap2_io.c src/ap2_io.c src/ap2_io.h Makefile
