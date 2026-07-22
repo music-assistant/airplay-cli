@@ -151,15 +151,25 @@ void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip);
 void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip);
 
 /*
+ * Ask the daemon to send timing to the current peer set immediately, instead
+ * of waiting out the announce/sync intervals. Called right after SETPEERS so
+ * a freshly registered receiver starts measuring the clock without delay.
+ * No-op unless shared mode is active.
+ */
+void ap2_ptp_shared_kick(struct ap2_ptp_ctx *ctx);
+
+/*
  * Run the PTP daemon: own UDP 319/320, run the grandmaster+BMCA+slave engine,
  * publish the elected-master clock to shared memory, and serve the control
  * channel (streams register their receiver IPs). Blocks until *stop becomes
  * true (set from a signal handler). This is the body of `--ptp-daemon`.
  *
  * :param bind_addr: multicast egress/join interface (INADDR_ANY for default).
+ * :param clock_id: grandmaster identity to advertise; 0 keeps the default.
  * :param stop: pointer to a flag polled for shutdown.
  * :returns: 0 on clean shutdown; non-zero if the engine could not bind 319/320.
  */
-int ap2_ptp_run_daemon(struct in_addr bind_addr, volatile bool *stop);
+int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
+                       volatile bool *stop);
 
 #endif /* __AP2_PTP_H_ */

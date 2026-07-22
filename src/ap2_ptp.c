@@ -171,6 +171,7 @@ struct ap2_ptp_ctx {
     bool hold_master;
     bool hold_notice_logged;        /* one INFO line per session about an ignored peer GM */
     bool unicast_granted;           /* a peer negotiated unicast PTP via Signaling */
+    bool peer_kick;                 /* send timing immediately after peer registration */
     uint64_t master_clock_id;       /* elected GM identity (peer's grandmasterIdentity when slaving) */
     int64_t master_offset_ns;       /* smoothed local->master offset (add to local for master time) */
     bool have_offset;               /* at least one offset sample folded in */
@@ -313,14 +314,23 @@ static void ptp_write_hdr(uint8_t *b, int msg_type, uint16_t msg_len, uint16_t f
 static void ptp_send(struct ap2_ptp_ctx *ctx, int sock, uint16_t port,
                      const uint8_t *buf, int len)
 {
+    /* Snapshot the peer list under the lock: SETPEERS mutates it from the
+     * session thread while this runs on the PTP thread. */
+    struct in_addr peers[PTP_MAX_PEERS];
+    int npeers = 0;
+    pthread_mutex_lock(&ctx->lock);
+    bool unicast_mirror = ctx->unicast_mirror;
+    for (int i = 0; i < ctx->npeers && npeers < PTP_MAX_PEERS; i++)
+        if (inet_pton(AF_INET, ctx->peers[i], &peers[npeers]) == 1) npeers++;
+    pthread_mutex_unlock(&ctx->lock);
+
     bool sent = false;
-    if (ctx->unicast_mirror) {
-        for (int i = 0; i < ctx->npeers; i++) {
+    if (unicast_mirror) {
+        for (int i = 0; i < npeers; i++) {
             struct sockaddr_in u = {.sin_family = AF_INET, .sin_port = htons(port)};
-            if (inet_pton(AF_INET, ctx->peers[i], &u.sin_addr) == 1) {
-                sendto(sock, buf, len, 0, (struct sockaddr *)&u, sizeof(u));
-                sent = true;
-            }
+            u.sin_addr = peers[i];
+            sendto(sock, buf, len, 0, (struct sockaddr *)&u, sizeof(u));
+            sent = true;
         }
     }
     if (!sent) {
@@ -844,20 +854,25 @@ static void *ptp_thread_func(void *arg)
             reclaimed = true;
         }
         bool gm = ctx->is_grandmaster;
+        bool peer_kick = ctx->peer_kick;
+        ctx->peer_kick = false;
         pthread_mutex_unlock(&ctx->lock);
         if (reclaimed)
             LOG_INFO("[PTP] peer silent > %llu ms; reclaiming GRANDMASTER",
                      (unsigned long long)(PTP_PEER_SILENCE_NS / 1000000ULL));
 
         /* Emit Announce/Sync/Follow_Up only while we hold the timeline. A slaved
-         * clock stays quiet so it does not compete with the elected master. */
+         * clock stays quiet so it does not compete with the elected master.
+         * A peer kick bypasses the intervals once so a freshly registered
+         * receiver measures the clock immediately instead of waiting out the
+         * announce/sync cadence. */
         if (gm) {
-            if (now - last_announce >= PTP_ANNOUNCE_INTERVAL_NS) {
+            if (peer_kick || now - last_announce >= PTP_ANNOUNCE_INTERVAL_NS) {
                 ptp_send_announce(ctx);
                 ptp_send_signaling(ctx);      /* iOS pairs these at 1/s */
                 last_announce = now;
             }
-            if (now - last_sync >= PTP_SYNC_INTERVAL_NS) {
+            if (peer_kick || now - last_sync >= PTP_SYNC_INTERVAL_NS) {
                 ptp_send_sync(ctx);
                 last_sync = now;
             }
@@ -1095,6 +1110,7 @@ uint64_t ap2_ptp_now_ns(struct ap2_ptp_ctx *ctx)
 void ap2_ptp_set_peers(struct ap2_ptp_ctx *ctx, const char *const *ips, int count)
 {
     if (!ctx) return;
+    pthread_mutex_lock(&ctx->lock);
     for (int i = 0; i < ctx->npeers; i++) { free(ctx->peers[i]); ctx->peers[i] = NULL; }
     ctx->npeers = 0;
     for (int i = 0; i < count && ctx->npeers < PTP_MAX_PEERS; i++) {
@@ -1102,6 +1118,8 @@ void ap2_ptp_set_peers(struct ap2_ptp_ctx *ctx, const char *const *ips, int coun
     }
     for (int i = 0; i < ctx->npeers; i++)
         LOG_DEBUG("[PTP] peer[%d] = %s", i, ctx->peers[i]);
+    ctx->peer_kick = ctx->npeers > 0;
+    pthread_mutex_unlock(&ctx->lock);
 }
 
 bool ap2_ptp_engine_active(struct ap2_ptp_ctx *ctx)
@@ -1309,6 +1327,12 @@ void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip)
     LOG_DEBUG("[PTP] Unregistered receiver %s from daemon", ip);
 }
 
+void ap2_ptp_shared_kick(struct ap2_ptp_ctx *ctx)
+{
+    if (!ctx || !ctx->shm_active) return;
+    ap2_ptp_ctrl_send("K", 100, NULL, 0);
+}
+
 /* ---- PTP daemon ---- */
 
 /* Aggregate receiver peer set, refcounted so independent streams to the SAME
@@ -1412,6 +1436,11 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
         }
         break;
     }
+    case 'K': /* session is active: send timing to current peers immediately */
+        pthread_mutex_lock(&ctx->lock);
+        ctx->peer_kick = true;
+        pthread_mutex_unlock(&ctx->lock);
+        break;
     case 'B': case 'E': case 'P':   /* begin/end/pause: no-ops for a sender GM */
     case '?':                        /* liveness probe */
         break;
@@ -1433,10 +1462,12 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
     sendto(sock, ack, an, 0, (struct sockaddr *)&src, sl);
 }
 
-int ap2_ptp_run_daemon(struct in_addr bind_addr, volatile bool *stop)
+int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
+                       volatile bool *stop)
 {
     struct ap2_ptp_ctx *ctx = ap2_ptp_create();
     if (!ctx) { LOG_ERROR("[PTP] daemon: cannot create context"); return 1; }
+    if (clock_id) ap2_ptp_set_clock_id(ctx, clock_id);
 
     struct ap2_ptp_shm_writer w;
     if (!ap2_ptp_shm_writer_open(&w)) {

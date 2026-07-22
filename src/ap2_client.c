@@ -1291,6 +1291,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
 
         const char *peers[2] = { p->device.address, our_addr };
         ap2_ptp_set_peers(p->ptp, peers, 2);
+        /* Kick timing at the fresh peer so it measures our clock right away
+         * (no-op without a shared daemon; the in-process engine kicks itself
+         * from ap2_ptp_set_peers). */
+        ap2_ptp_shared_kick(p->ptp);
     }
 
     /* 6c. Buffered audio: open the TCP data connection to the receiver's

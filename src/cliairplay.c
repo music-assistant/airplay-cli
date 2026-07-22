@@ -1104,7 +1104,16 @@ static int run_ptp_daemon(cli_config_t *cfg)
     signal(SIGTERM, ptp_daemon_signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    return ap2_ptp_run_daemon(bind_addr, &g_ptp_daemon_stop);
+    /* Advertise the caller's identity as the grandmaster when given, so the
+     * daemon and the per-stream sessions present one clock identity. Without
+     * --dacp the default engine identity is kept (existing callers). */
+    unsigned long long clock_id = 0;
+    if (cfg->dacp_id && sscanf(cfg->dacp_id, "%16llx", &clock_id) == 1)
+        LOG_INFO("[PTP] daemon grandmaster identity %016llx (from --dacp)", clock_id);
+    else
+        clock_id = 0;
+
+    return ap2_ptp_run_daemon(bind_addr, (uint64_t)clock_id, &g_ptp_daemon_stop);
 }
 
 /* ---- Usage ---- */
