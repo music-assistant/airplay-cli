@@ -875,6 +875,21 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         fflush(stdout);
     }
 
+    /* Surface the /info-advertised format tables so the caller can pick the
+     * best format per device (e.g. auto-selecting 24-bit) instead of relying
+     * on a static configuration. Masks use the audioFormat bit space; known=0
+     * means the device did not publish that table. */
+    {
+        ap2_format_capabilities_t caps;
+        ap2cl_format_capabilities(g_ap2cl, &caps);
+        printf("[STATUS] capabilities requested=0x%llx realtime_formats=0x%llx "
+               "realtime_known=%d buffered_formats=0x%llx buffered_known=%d\n",
+               (unsigned long long)caps.requested,
+               (unsigned long long)caps.realtime_formats, caps.realtime_known ? 1 : 0,
+               (unsigned long long)caps.buffered_formats, caps.buffered_known ? 1 : 0);
+        fflush(stdout);
+    }
+
     /* Set volume */
     if (cfg->volume > 0) {
         ap2cl_set_volume(g_ap2cl, cfg->volume);

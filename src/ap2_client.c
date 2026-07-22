@@ -55,6 +55,12 @@ extern log_level *loglevel;
 
 #define AP2_FRAMES_PER_CHUNK 352
 #define AP2_CHACHA_TAG_SIZE  16
+
+/* audioFormat codes (bit positions shared with the /info format tables). */
+#define AP2_FMT_ALAC_44100_16_2 (1ULL << 18)
+#define AP2_FMT_ALAC_44100_24_2 (1ULL << 19)
+#define AP2_FMT_ALAC_48000_16_2 (1ULL << 20)
+#define AP2_FMT_ALAC_48000_24_2 (1ULL << 21)
 #define AP2_RTSP_SETUP_TIMEOUT_MS    8000
 #define AP2_RTSP_CONTROL_TIMEOUT_MS  2000
 #define AP2_RTSP_FEEDBACK_TIMEOUT_MS 1500
@@ -158,6 +164,16 @@ struct ap2cl_s {
     uint64_t start_ntp;            /* shared group start (NTP fixed-point), 0 = none */
     _Atomic uint32_t rtp_offset;   /* per-process timeline offset (see start_at) */
     uint64_t audio_nonce_counter;
+    /* Requested audioFormat and the /info-advertised per-stream format tables
+     * (bit masks in the audioFormat bit space; "known" = the table was present,
+     * "extended" = from supportedAudioFormatsExtended vs the legacy mask). */
+    uint64_t audio_format;
+    uint64_t realtime_formats;
+    uint64_t buffered_formats;
+    bool realtime_formats_known;
+    bool buffered_formats_known;
+    bool realtime_formats_extended;
+    bool buffered_formats_extended;
     char session_url[128];
     char session_uuid[40];
     char group_uuid[40];
@@ -716,6 +732,42 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     return r;
 }
 
+static uint64_t ap2_audio_format_code(const ap2_audio_format_t *format)
+{
+    if (format->bit_depth > 16 && format->sample_rate >= 48000)
+        return AP2_FMT_ALAC_48000_24_2;
+    if (format->bit_depth > 16)
+        return AP2_FMT_ALAC_44100_24_2;
+    if (format->sample_rate >= 48000)
+        return AP2_FMT_ALAC_48000_16_2;
+    return AP2_FMT_ALAC_44100_16_2;
+}
+
+/* Read one stream type's advertised format table from the GET /info reply:
+ * supportedAudioFormatsExtended.<stream> (array of bit indices) when present,
+ * else the legacy supportedFormats.<stream> mask. The tables are advisory —
+ * hardware both understates (Apple TV renders unadvertised 24-bit) and
+ * overstates (a SETUP 200 can still render silence); see DESIGN.md §11. */
+static void ap2_parse_format_capability(const uint8_t *data, size_t len,
+                                        const char *stream_key,
+                                        uint64_t *formats, bool *known,
+                                        bool *extended)
+{
+    *formats = 0;
+    *known = false;
+    *extended = false;
+    if (ap2_bplist_find_dict_uint_array_mask(data, len,
+                                              "supportedAudioFormatsExtended",
+                                              stream_key, formats)) {
+        *known = true;
+        *extended = true;
+        return;
+    }
+    if (ap2_bplist_find_dict_uint(data, len, "supportedFormats",
+                                  stream_key, formats))
+        *known = true;
+}
+
 /* Build one timing-peer dict {ID, DeviceType, ClockID, SupportsClockPort..., Addresses:[addr]}. */
 static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, const char *addr)
 {
@@ -889,8 +941,34 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     /* 1. GET /info */
     uint8_t *resp = NULL; int resp_len = 0;
     int status = ap2_rtsp_send(p, "GET", "/info", NULL, 0, NULL, &resp, &resp_len);
+    if (status != 200) {
+        LOG_ERROR("[AP2] /info failed: %d", status);
+        free(resp);
+        return false;
+    }
+    p->audio_format = ap2_audio_format_code(&p->format);
+    if (resp && resp_len > 0) {
+        ap2_parse_format_capability(resp, (size_t)resp_len, "audioStream",
+                                    &p->realtime_formats,
+                                    &p->realtime_formats_known,
+                                    &p->realtime_formats_extended);
+        ap2_parse_format_capability(resp, (size_t)resp_len, "bufferStream",
+                                    &p->buffered_formats,
+                                    &p->buffered_formats_known,
+                                    &p->buffered_formats_extended);
+    }
+    LOG_INFO("[AP2] Formats requested=0x%" PRIx64
+             " realtime=%s0x%" PRIx64 " buffered=%s0x%" PRIx64,
+             p->audio_format,
+             p->realtime_formats_known
+                 ? (p->realtime_formats_extended ? "extended:" : "mask:")
+                 : "unknown:",
+             p->realtime_formats,
+             p->buffered_formats_known
+                 ? (p->buffered_formats_extended ? "extended:" : "mask:")
+                 : "unknown:",
+             p->buffered_formats);
     free(resp);
-    if (status != 200) { LOG_ERROR("[AP2] /info failed: %d", status); return false; }
 
     /* 2. HAP pairing: pair-verify with stored credentials (Apple TV/HomePod),
      * transient pair-setup otherwise (Sonos and most third-party receivers) */
@@ -1127,15 +1205,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     int local_ctrl_port = ntohs(cs_local.sin_port);
 
     /* Determine audio format */
-    uint64_t audio_format;
-    if (p->format.bit_depth > 16 && p->format.sample_rate >= 48000)
-        audio_format = 0x200000;  /* ALAC 48000/24/2 */
-    else if (p->format.bit_depth > 16)
-        audio_format = 0x80000;   /* ALAC 44100/24/2 */
-    else if (p->format.sample_rate >= 48000)
-        audio_format = 0x100000;  /* ALAC 48000/16/2 */
-    else
-        audio_format = 0x40000;   /* ALAC 44100/16/2 */
+    uint64_t audio_format = ap2_audio_format_code(&p->format);
 
     /* Realtime (type 96) streams the audio over UDP and carries our data port in
      * the SETUP; buffered (type 103) pushes RTP over a TCP connection to the
@@ -2878,6 +2948,19 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
     }
     if (!p->raopcl) return false;
     return raopcl_set_progress_ms(p->raopcl, elapsed_s * 1000, duration_s * 1000);
+}
+
+void ap2cl_format_capabilities(struct ap2cl_s *p,
+                               ap2_format_capabilities_t *caps)
+{
+    if (!caps) return;
+    memset(caps, 0, sizeof(*caps));
+    if (!p) return;
+    caps->requested = p->audio_format;
+    caps->realtime_formats = p->realtime_formats;
+    caps->buffered_formats = p->buffered_formats;
+    caps->realtime_known = p->realtime_formats_known;
+    caps->buffered_known = p->buffered_formats_known;
 }
 
 void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint32_t *dev_max)

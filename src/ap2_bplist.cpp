@@ -129,6 +129,114 @@ static uint64_t bp_read_be(const uint8_t *p, size_t n)
     return v;
 }
 
+/* Bounds-checked view over a raw bplist for keyed traversal into nested
+ * containers (dict -> child value, dict -> array of ints). */
+struct bp_raw_view {
+    const uint8_t *data;
+    size_t table_ofs;
+    uint64_t num_objects;
+    uint8_t ofs_size;
+    uint8_t ref_size;
+};
+
+static bool bp_view_init(const uint8_t *data, size_t len, bp_raw_view *view)
+{
+    if (!data || !view || len < 40 || memcmp(data, "bplist00", 8) != 0) return false;
+
+    const uint8_t *tr = data + len - 32;
+    view->data = data;
+    view->ofs_size = tr[6];
+    view->ref_size = tr[7];
+    view->num_objects = bp_read_be(tr + 8, 8);
+    view->table_ofs = (size_t)bp_read_be(tr + 24, 8);
+    if (!view->ofs_size || view->ofs_size > 8 ||
+        !view->ref_size || view->ref_size > 8)
+        return false;
+    if (view->table_ofs > len - 32 ||
+        view->num_objects > (len - 32 - view->table_ofs) / view->ofs_size)
+        return false;
+    return true;
+}
+
+static size_t bp_view_obj_ofs(const bp_raw_view *view, uint64_t ref)
+{
+    if (!view || ref >= view->num_objects) return 0;
+    return (size_t)bp_read_be(view->data + view->table_ofs +
+                             ref * view->ofs_size, view->ofs_size);
+}
+
+static bool bp_ascii_key_equals(const bp_raw_view *view, uint64_t ref,
+                                const char *key)
+{
+    size_t pos = bp_view_obj_ofs(view, ref);
+    if (!pos || pos >= view->table_ofs ||
+        (view->data[pos] & 0xF0) != 0x50)
+        return false;
+
+    size_t count;
+    if (!bp_read_count(view->data, view->table_ofs, &pos, &count)) return false;
+    size_t keylen = strlen(key);
+    return count == keylen && pos + count <= view->table_ofs &&
+           memcmp(view->data + pos, key, keylen) == 0;
+}
+
+static bool bp_dict_find_value_ref(const bp_raw_view *view, uint64_t dict_ref,
+                                   const char *key, uint64_t *value_ref)
+{
+    size_t pos = bp_view_obj_ofs(view, dict_ref);
+    if (!pos || pos >= view->table_ofs ||
+        (view->data[pos] & 0xF0) != 0xD0)
+        return false;
+
+    size_t count;
+    if (!bp_read_count(view->data, view->table_ofs, &pos, &count)) return false;
+    if (count > (view->table_ofs - pos) / (2 * view->ref_size)) return false;
+
+    for (size_t i = 0; i < count; i++) {
+        uint64_t key_ref = bp_read_be(view->data + pos + i * view->ref_size,
+                                      view->ref_size);
+        if (!bp_ascii_key_equals(view, key_ref, key)) continue;
+        *value_ref = bp_read_be(view->data + pos +
+                                (count + i) * view->ref_size,
+                                view->ref_size);
+        return true;
+    }
+    return false;
+}
+
+static bool bp_find_value_ref(const bp_raw_view *view, const char *key,
+                              uint64_t *value_ref)
+{
+    for (uint64_t ref = 0; ref < view->num_objects; ref++) {
+        if (bp_dict_find_value_ref(view, ref, key, value_ref)) return true;
+    }
+    return false;
+}
+
+static bool bp_read_uint_ref(const bp_raw_view *view, uint64_t ref, uint64_t *out)
+{
+    size_t pos = bp_view_obj_ofs(view, ref);
+    if (!pos || pos >= view->table_ofs ||
+        (view->data[pos] & 0xF0) != 0x10)
+        return false;
+
+    size_t bytes;
+    if (!bp_read_count(view->data, view->table_ofs, &pos, &bytes) ||
+        bytes > 8 || pos + bytes > view->table_ofs)
+        return false;
+    *out = bp_read_be(view->data + pos, bytes);
+    return true;
+}
+
+static bool bp_find_dict_child_ref(const bp_raw_view *view,
+                                   const char *dict_key, const char *key,
+                                   uint64_t *value_ref)
+{
+    uint64_t dict_ref;
+    return bp_find_value_ref(view, dict_key, &dict_ref) &&
+           bp_dict_find_value_ref(view, dict_ref, key, value_ref);
+}
+
 int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
                                char *out, size_t out_size)
 {
@@ -254,6 +362,49 @@ int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint6
         }
     }
     return 0;
+}
+
+int ap2_bplist_find_dict_uint(const uint8_t *data, size_t len,
+                              const char *dict_key, const char *key,
+                              uint64_t *out)
+{
+    bp_raw_view view;
+    uint64_t value_ref;
+    return bp_view_init(data, len, &view) &&
+           bp_find_dict_child_ref(&view, dict_key, key, &value_ref) &&
+           bp_read_uint_ref(&view, value_ref, out);
+}
+
+int ap2_bplist_find_dict_uint_array_mask(const uint8_t *data, size_t len,
+                                         const char *dict_key, const char *key,
+                                         uint64_t *out)
+{
+    bp_raw_view view;
+    uint64_t array_ref;
+    if (!out || !bp_view_init(data, len, &view) ||
+        !bp_find_dict_child_ref(&view, dict_key, key, &array_ref))
+        return 0;
+
+    size_t pos = bp_view_obj_ofs(&view, array_ref);
+    if (!pos || pos >= view.table_ofs ||
+        (view.data[pos] & 0xF0) != 0xA0)
+        return 0;
+
+    size_t count;
+    if (!bp_read_count(view.data, view.table_ofs, &pos, &count) ||
+        count > (view.table_ofs - pos) / view.ref_size)
+        return 0;
+
+    uint64_t mask = 0;
+    for (size_t i = 0; i < count; i++) {
+        uint64_t value_ref = bp_read_be(view.data + pos + i * view.ref_size,
+                                        view.ref_size);
+        uint64_t bit;
+        if (!bp_read_uint_ref(&view, value_ref, &bit)) return 0;
+        if (bit < 64) mask |= 1ULL << bit;
+    }
+    *out = mask;
+    return 1;
 }
 
 } /* extern "C" */
