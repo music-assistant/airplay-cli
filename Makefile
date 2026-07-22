@@ -126,6 +126,20 @@ OBJECTS_ALL = $(OBJECTS_RAOP) $(OBJECTS_AP2) $(OBJECTS_CLI)
 CLIENT_TEST_OBJECTS = $(filter-out $(BUILDDIR)/ap2_client.o \
 	$(BUILDDIR)/cliairplay.o $(BUILDDIR)/cross_ssl.o,$(OBJECTS_ALL))
 
+TEST_EXECUTABLE = $(BUILDDIR)/test-mrp-artwork
+TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
+	$(BUILDDIR)/ap2_mrp.o $(BUILDDIR)/ap2_io.o $(BUILDDIR)/ap2_plist.o \
+	$(BUILDDIR)/artwork.o $(BUILDDIR)/cross_log.o
+RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-raop-lifecycle
+RAOP_LIFECYCLE_TEST_OBJECTS = $(BUILDDIR)/test_ap2_raop_lifecycle.o \
+	$(BUILDDIR)/ap2_client_raop_lifecycle_test.o \
+	$(filter-out $(BUILDDIR)/ap2_client.o $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL))
+RAOP_LIFECYCLE_TEST_DEFINES = \
+	-Draopcl_create=ap2_test_raopcl_create \
+	-Draopcl_connect=ap2_test_raopcl_connect \
+	-Draopcl_disconnect=ap2_test_raopcl_disconnect \
+	-Draopcl_destroy=ap2_test_raopcl_destroy
+
 all: directory $(EXECUTABLE)
 
 directory:
@@ -140,6 +154,23 @@ $(LIBCODECS_PATCHED): $(CODECS)/$(HOST)/$(PLATFORM)/libcodecs.a
 $(EXECUTABLE): $(OBJECTS_ALL) $(LIBCODECS_PATCHED)
 	$(CXX) $(OBJECTS_ALL) $(LIBRARY) $(LDFLAGS) -o $@
 
+$(TEST_EXECUTABLE): $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a
+	$(CC) $(TEST_OBJECTS) $(OPENSSL)/libopenssl.a $(LDFLAGS) -o $@
+
+$(RAOP_LIFECYCLE_TEST_EXECUTABLE): $(RAOP_LIFECYCLE_TEST_OBJECTS) $(LIBCODECS_PATCHED) $(OPENSSL)/libopenssl.a
+	$(CXX) $(RAOP_LIFECYCLE_TEST_OBJECTS) \
+		$(filter-out $(OPENSSL)/libopenssl.a,$(LIBRARY)) $(OPENSSL)/libopenssl.a \
+		$(LDFLAGS) -o $@
+
+$(BUILDDIR)/test_mrp_artwork.o: tests/test_mrp_artwork.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
+$(BUILDDIR)/test_ap2_raop_lifecycle.o: tests/test_ap2_raop_lifecycle.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
+$(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
+
 $(BUILDDIR)/%.o: %.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
@@ -149,11 +180,15 @@ $(BUILDDIR)/%.o: %.cpp
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
-test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST)
+test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
+		$(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
 	$(CLIENT_TEST)
+	$(TEST_EXECUTABLE)
+	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
+	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

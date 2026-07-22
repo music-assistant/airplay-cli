@@ -212,6 +212,122 @@ struct ap2_mrp_ctx {
     bool state_include_artwork;
 };
 
+static void mrp_artwork_info_init(ap2_mrp_artwork_info_t *info, size_t bytes)
+{
+    if (!info) return;
+    memset(info, 0, sizeof(*info));
+    info->result = AP2_MRP_ARTWORK_INVALID_ARGUMENT;
+    info->bytes = bytes;
+}
+
+static ap2_mrp_artwork_result_t
+mrp_artwork_result(ap2_mrp_artwork_info_t *info,
+                   ap2_mrp_artwork_result_t result)
+{
+    if (info) info->result = result;
+    return result;
+}
+
+const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result)
+{
+    switch (result) {
+    case AP2_MRP_ARTWORK_NOT_APPLICABLE:    return "not_applicable";
+    case AP2_MRP_ARTWORK_ACCEPTED:          return "accepted";
+    case AP2_MRP_ARTWORK_INVALID_ARGUMENT:  return "invalid_argument";
+    case AP2_MRP_ARTWORK_UNSUPPORTED_TYPE:  return "unsupported_type";
+    case AP2_MRP_ARTWORK_STAGING_LIMIT:     return "staging_limit";
+    case AP2_MRP_ARTWORK_INVALID_JPEG_ENVELOPE:
+        return "invalid_jpeg_envelope";
+    case AP2_MRP_ARTWORK_NO_MEMORY:         return "no_memory";
+    }
+    return "unknown";
+}
+
+static bool mrp_jpeg_is_sof(uint8_t marker)
+{
+    switch (marker) {
+    case 0xC0: case 0xC1: case 0xC2: case 0xC3:
+    case 0xC5: case 0xC6: case 0xC7:
+    case 0xC9: case 0xCA: case 0xCB:
+    case 0xCD: case 0xCE: case 0xCF:
+        return true;
+    default:
+        return false;
+    }
+}
+
+static bool mrp_jpeg_is_progressive_sof(uint8_t marker)
+{
+    return marker == 0xC2 || marker == 0xC6 ||
+           marker == 0xCA || marker == 0xCE;
+}
+
+static void mrp_jpeg_probe_metadata(const uint8_t *data, size_t len,
+                                    ap2_mrp_artwork_info_t *info)
+{
+    size_t pos = 2;
+    while (pos + 3 < len - 2) {
+        if (data[pos++] != 0xFF) return;
+        while (pos < len - 2 && data[pos] == 0xFF) pos++;
+        if (pos >= len - 2) return;
+        uint8_t marker = data[pos++];
+        if (marker == 0xD9 || marker == 0xDA) return;
+        if (marker == 0x01 || (marker >= 0xD0 && marker <= 0xD7))
+            continue;
+        if (marker == 0x00 || marker == 0xD8 || pos + 2 > len) return;
+
+        size_t segment_len = ((size_t)data[pos] << 8) | data[pos + 1];
+        if (segment_len < 2 || segment_len > len - pos) return;
+        if (mrp_jpeg_is_sof(marker) && segment_len >= 8) {
+            const uint8_t *sof = data + pos + 2;
+            uint8_t components = sof[5];
+            if (segment_len < (size_t)(8 + 3 * components)) return;
+            info->precision = sof[0];
+            info->height = ((uint16_t)sof[1] << 8) | sof[2];
+            info->width = ((uint16_t)sof[3] << 8) | sof[4];
+            info->components = components;
+            info->sof_marker = marker;
+            info->progressive = mrp_jpeg_is_progressive_sof(marker);
+            return;
+        }
+        pos += segment_len;
+    }
+}
+
+ap2_mrp_artwork_result_t
+ap2_mrp_probe_artwork(const char *mime, const uint8_t *data, size_t len,
+                      ap2_mrp_artwork_info_t *info)
+{
+    ap2_mrp_artwork_info_t local_info;
+    if (!info) info = &local_info;
+    mrp_artwork_info_init(info, len);
+    if (!mime || !data || len == 0)
+        return AP2_MRP_ARTWORK_INVALID_ARGUMENT;
+    if (strcmp(mime, "image/jpeg") != 0)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_UNSUPPORTED_TYPE);
+    if (len > AP2_MRP_ARTWORK_STAGING_MAX_BYTES)
+        return mrp_artwork_result(info, AP2_MRP_ARTWORK_STAGING_LIMIT);
+    if (len < 4 || data[0] != 0xFF || data[1] != 0xD8 ||
+        data[len - 2] != 0xFF || data[len - 1] != 0xD9)
+        return mrp_artwork_result(
+            info, AP2_MRP_ARTWORK_INVALID_JPEG_ENVELOPE);
+
+    mrp_jpeg_probe_metadata(data, len, info);
+    return mrp_artwork_result(info, AP2_MRP_ARTWORK_ACCEPTED);
+}
+
+static void mrp_reset_artwork(struct ap2_mrp_ctx *m)
+{
+    if (!m) return;
+    free(m->artwork);
+    m->artwork = NULL;
+    m->artwork_len = 0;
+    free(m->artwork_mime);
+    m->artwork_mime = NULL;
+    m->artwork_id[0] = '\0';
+    m->artwork_sent = false;
+}
+
 /* ---- Small helpers ---- */
 
 static double mrp_cf_now(void)
@@ -1355,16 +1471,43 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
 }
 
 bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
-                         const uint8_t *data, int len)
+                         const uint8_t *data, int len,
+                         ap2_mrp_artwork_info_t *info)
 {
-    if (!m || !data || len <= 0) return false;
+    ap2_mrp_artwork_info_t local_info;
+    if (!info) info = &local_info;
+    if (!m) {
+        mrp_artwork_info_init(info, len > 0 ? (size_t)len : 0);
+        return false;
+    }
+    ap2_mrp_artwork_result_t result =
+        ap2_mrp_probe_artwork(mime, data, len > 0 ? (size_t)len : 0, info);
+    if (result != AP2_MRP_ARTWORK_ACCEPTED) {
+        mrp_reset_artwork(m);
+        LOG_WARN("[MRP] artwork rejected: reason=%s bytes=%d width=%u height=%u "
+                 "sof=0x%02x components=%u progressive=%d staging_max_bytes=%d",
+                 ap2_mrp_artwork_result_name(result), len,
+                 info->width, info->height, info->sof_marker, info->components,
+                 info->progressive, AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
+        return false;
+    }
+
     uint8_t *copy = malloc((size_t)len);
-    if (!copy) return false;
+    char *mime_copy = mrp_strdup(mime);
+    if (!copy || !mime_copy) {
+        free(copy);
+        free(mime_copy);
+        mrp_reset_artwork(m);
+        info->result = AP2_MRP_ARTWORK_NO_MEMORY;
+        LOG_ERROR("[MRP] cannot retain artwork: out of memory");
+        return false;
+    }
     memcpy(copy, data, (size_t)len);
     free(m->artwork);
     m->artwork = copy;
     m->artwork_len = len;
-    mrp_replace_str(&m->artwork_mime, mime ? mime : "image/jpeg");
+    free(m->artwork_mime);
+    m->artwork_mime = mime_copy;
     /* Fresh artwork: new ArtworkIdentifier and re-arm the one-shot byte send.
      * Like a real sender, the /command push carries the bytes once and then
      * references them by identifier (ap2_mrp_build_nowplaying_command). */
@@ -1379,6 +1522,13 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     m->state_dirty = true;
     m->state_include_artwork = true;
     return true;
+}
+
+void ap2_mrp_clear_artwork(struct ap2_mrp_ctx *m)
+{
+    if (!m) return;
+    mrp_reset_artwork(m);
+    if (m->connected) mrp_push_state(m, false);
 }
 
 bool ap2_mrp_set_progress(struct ap2_mrp_ctx *m, int elapsed_ms,

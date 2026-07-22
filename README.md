@@ -194,6 +194,20 @@ Metadata strings are encoded as Unicode binary-plist strings; artwork is
 signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
 
+The DMAP path receives the detected image type and original bytes. Before MRP
+staging, a bounded metadata probe requires `image/jpeg`, SOI, and a terminal
+EOI, then extracts dimensions/profile best-effort without decoding or rejecting
+JPEG internals. No Apple TV byte or profile cutoff is assumed.
+Baseline/progressive and grayscale/color cases are logged with exact bytes,
+dimensions, SOF marker, component count, and `/command` response. A
+1 MiB internal staging-allocation guard bounds the copied input and plist; it
+is not a receiver capability claim. Non-JPEG, over-bound, or incomplete-envelope
+MRP artwork is omitted without withholding it from DMAP and clears stale state.
+
+`tests/mrp_artwork_matrix.py` generates the controlled Apple TV size/profile
+matrix or records/sends any existing JPEG cache path with its SHA-256, profile,
+dimensions, and full Pillow/libjpeg decode result; see `DESIGN.md` §8.
+
 ## Building
 
 ```bash
@@ -202,6 +216,9 @@ make STATIC=1
 
 # Linux cross-compile (example)
 make HOST=linux PLATFORM=aarch64 CC=aarch64-linux-gnu-gcc STATIC=1
+
+# Focused native regression tests
+make test STATIC=1
 ```
 
 Requires the libraop submodule with pre-built static libraries (OpenSSL,

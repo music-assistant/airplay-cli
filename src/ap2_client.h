@@ -20,8 +20,22 @@
 #include <netinet/in.h>
 
 #include "ap2_io.h"
+#include "ap2_mrp.h"
 
 struct ap2cl_s;
+
+typedef struct {
+    int overall_status;
+    int nowplaying_status;
+} ap2_mrp_push_result_t;
+
+static inline ap2_mrp_push_result_t ap2_mrp_push_result_empty(void)
+{
+    ap2_mrp_push_result_t result;
+    result.overall_status = -1;
+    result.nowplaying_status = 0;
+    return result;
+}
 
 /* AP2 session states */
 typedef enum {
@@ -172,8 +186,19 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
                         const char *album, int duration);
 
-/* Set artwork. */
-bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size, const char *data);
+/*
+ * Set artwork on the existing DMAP path and, when applicable, stage it for
+ * MediaRemote. DMAP receives the original detected image type and bytes even
+ * when the bounded MRP MIME/envelope probe rejects them. Staging and the
+ * complete MRP push are serialized; mrp_push receives request-scoped statuses.
+ */
+bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
+                       const char *data, ap2_mrp_artwork_info_t *mrp_info,
+                       ap2_mrp_push_result_t *mrp_push);
+
+/* Clear only MRP artwork and push that state as one serialized operation. */
+bool ap2cl_clear_mrp_artwork(struct ap2cl_s *p,
+                             ap2_mrp_push_result_t *mrp_push);
 
 /* Set playback progress. */
 bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
@@ -183,6 +208,9 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
  * CLIAIRPLAY_MRP=0 disables it. Returns the HTTP status, 0 on registration
  * failure, or -1 when the push does not apply to this session. */
 int ap2cl_mrp_push(struct ap2cl_s *p);
+
+/* Serialized push with request-scoped overall and now-playing statuses. */
+ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p);
 
 /* Status of the type-130 MRP data channel (path B) for the [STATUS] mrp line:
  * -1 = not attempted (non-Apple / not pair-verified), 0 = attempted but not up,

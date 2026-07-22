@@ -25,6 +25,7 @@
 #include <sys/time.h>
 #include <poll.h>
 #include <errno.h>
+#include <stdatomic.h>
 
 #include "../libraop/crosstools/src/platform.h"
 #include "../libraop/crosstools/src/cross_thread.h"
@@ -104,17 +105,18 @@ typedef struct {
 } cli_config_t;
 
 /* Globals */
-static bool g_running = true;
+static atomic_bool g_running = true;
 static playback_status_t g_status = STATUS_STOPPED;
 static pthread_t g_cmdpipe_thread;
+static bool g_cmdpipe_started = false;
 static int g_cmdpipe_fd = -1;
 static char g_cmdpipe_buf[512];
 
 /* RAOP context (when using RAOP protocol) */
-static struct raopcl_s *g_raopcl = NULL;
+static _Atomic(struct raopcl_s *) g_raopcl = NULL;
 
 /* AP2 context (when using AirPlay 2 protocol) */
-static struct ap2cl_s *g_ap2cl = NULL;
+static _Atomic(struct ap2cl_s *) g_ap2cl = NULL;
 
 /* Debug levels */
 log_level util_loglevel;
@@ -186,6 +188,38 @@ static void mrp_status_report(int status)
     last = status;
     printf("[STATUS] mrp path=command status=%d\n", status);
     fflush(stdout);
+}
+
+static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info,
+                                      int command_status)
+{
+    if (!info || info->result == AP2_MRP_ARTWORK_NOT_APPLICABLE) return;
+    if (info->result == AP2_MRP_ARTWORK_ACCEPTED) {
+        status_print("[STATUS] mrp artwork=posted status=%d bytes=%zu "
+                     "width=%u height=%u precision=%u sof=0x%02x "
+                     "components=%u progressive=%d staging_max_bytes=%d",
+                     command_status, info->bytes, info->width, info->height,
+                     info->precision, info->sof_marker, info->components,
+                     info->progressive,
+                     AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
+        return;
+    }
+    status_print("[STATUS] mrp artwork=rejected reason=%s bytes=%zu "
+                 "width=%u height=%u precision=%u sof=0x%02x components=%u "
+                 "progressive=%d clear_status=%d staging_max_bytes=%d",
+                 ap2_mrp_artwork_result_name(info->result), info->bytes,
+                 info->width, info->height, info->precision, info->sof_marker,
+                 info->components, info->progressive, command_status,
+                 AP2_MRP_ARTWORK_STAGING_MAX_BYTES);
+}
+
+static void mrp_artwork_reject_local(const char *reason)
+{
+    ap2_mrp_push_result_t push;
+    if (!g_ap2cl || !ap2cl_clear_mrp_artwork(g_ap2cl, &push)) return;
+    status_print("[STATUS] mrp artwork=rejected reason=%s clear_status=%d",
+                 reason, push.nowplaying_status);
+    mrp_status_report(push.overall_status);
 }
 
 /* Also emit the older human-readable status line; the [STATUS] lines from
@@ -415,15 +449,25 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                                    error, sizeof(error));
         if (!loaded) {
             LOG_WARN("Cannot load artwork: %s", error);
+            if (cfg->protocol == PROTO_AIRPLAY2)
+                mrp_artwork_reject_local("invalid_artwork");
         } else {
             LOG_INFO("Loaded artwork (%zu bytes, %s)", image_size, content_type);
             if (cfg->protocol == PROTO_RAOP && g_raopcl) {
                 raopcl_set_artwork(g_raopcl, content_type,
                                    (int)image_size, (char *)image);
             } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-                ap2cl_set_artwork(g_ap2cl, content_type,
-                                  (int)image_size, (const char *)image);
-                mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+                ap2_mrp_artwork_info_t mrp_info;
+                ap2_mrp_push_result_t push;
+                bool dmap_ok = ap2cl_set_artwork(
+                    g_ap2cl, content_type, (int)image_size,
+                    (const char *)image, &mrp_info, &push);
+                if (!dmap_ok)
+                    LOG_WARN("Receiver rejected DMAP artwork (%zu bytes, %s)",
+                             image_size, content_type);
+                mrp_artwork_status_report(
+                    &mrp_info, push.nowplaying_status);
+                mrp_status_report(push.overall_status);
             }
             free(image);
         }
@@ -548,6 +592,27 @@ next_line:
     return NULL;
 }
 
+static void request_command_stop(void)
+{
+    atomic_store(&g_running, false);
+}
+
+static bool join_command_thread(void)
+{
+    if (!g_cmdpipe_started) return true;
+    if (pthread_equal(pthread_self(), g_cmdpipe_thread)) {
+        LOG_ERROR("Refusing to join command pipe thread from itself");
+        return false;
+    }
+    int result = pthread_join(g_cmdpipe_thread, NULL);
+    if (result != 0) {
+        LOG_ERROR("Failed to join command pipe thread: %s", strerror(result));
+        return false;
+    }
+    g_cmdpipe_started = false;
+    return true;
+}
+
 /* ---- RAOP playback loop ---- */
 
 static int run_raop(cli_config_t *cfg, int infile)
@@ -608,7 +673,7 @@ static int run_raop(cli_config_t *cfg, int infile)
     LOG_INFO("RAOP codec: %s", use_alac ? "ALAC (compressed)" : "ALAC-raw (uncompressed)");
 
     /* Create RAOP client */
-    g_raopcl = raopcl_create(
+    struct raopcl_s *client = raopcl_create(
         host_addr, 0, 0, cfg->dacp_id, cfg->active_remote,
         use_alac ? RAOP_ALAC : RAOP_ALAC_RAW,
         DEFAULT_FRAMES_PER_CHUNK, latency, crypto,
@@ -620,17 +685,22 @@ static int run_raop(cli_config_t *cfg, int infile)
         cfg->sample_rate, cfg->bit_depth, cfg->channels,
         cfg->volume > 0 ? raopcl_float_volume(cfg->volume) : -144.0f
     );
-    if (!g_raopcl) {
+    if (!client) {
         status_error("Cannot init RAOP client");
         return 1;
     }
 
     /* Connect */
     LOG_INFO("Connecting to %s:%d via RAOP", inet_ntoa(player_addr), cfg->port);
-    if (!raopcl_connect(g_raopcl, player_addr, cfg->port, cfg->volume > 0)) {
+    if (!raopcl_connect(client, player_addr, cfg->port, cfg->volume > 0)) {
         status_error("Cannot connect to AirPlay device");
+        request_command_stop();
+        atomic_store(&g_raopcl, NULL);
+        if (!join_command_thread()) return 1;
+        raopcl_destroy(client);
         return 1;
     }
+    atomic_store(&g_raopcl, client);
 
     latency = raopcl_latency(g_raopcl);
     status_connected_legacy(inet_ntoa(player_addr), cfg->port,
@@ -701,9 +771,15 @@ static int run_raop(cli_config_t *cfg, int infile)
     }
 
     status_eof();
-    g_running = false;
+    request_command_stop();
     free(buf);
     free(alac_buf);
+    if (!join_command_thread()) return 1;
+    client = atomic_exchange(&g_raopcl, NULL);
+    if (client) {
+        raopcl_disconnect(client);
+        raopcl_destroy(client);
+    }
     return 0;
 }
 
@@ -724,34 +800,38 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         .channels = cfg->channels,
     };
 
-    g_ap2cl = ap2cl_create(&device, &format,
-                            cfg->auth, cfg->password,
-                            cfg->dacp_id, cfg->active_remote,
-                            cfg->latency_ms, cfg->volume);
-    if (!g_ap2cl) {
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, cfg->auth, cfg->password,
+        cfg->dacp_id, cfg->active_remote, cfg->latency_ms, cfg->volume);
+    if (!client) {
         status_error("Cannot create AirPlay 2 client");
         return 1;
     }
 
     /* Pass through mDNS properties and interface for RAOP-compatible flow */
-    ap2cl_set_raop_props(g_ap2cl, cfg->iface, cfg->secret,
+    ap2cl_set_raop_props(client, cfg->iface, cfg->secret,
                           cfg->et, cfg->md, cfg->am);
     /* Apply the resolved AirPlay 2 route (see ap2_resolve_route). force_native
      * is a no-op when stored credentials already select the native flow. */
     if (cfg->route.native)
-        ap2cl_force_native(g_ap2cl);
+        ap2cl_force_native(client);
     if (cfg->publish_ip)
-        ap2cl_set_publish_ip(g_ap2cl, cfg->publish_ip);
-    ap2cl_set_ptp(g_ap2cl, cfg->route.ptp);
-    ap2cl_set_ptp_shared(g_ap2cl, cfg->ptp_shared);
-    ap2cl_set_buffered(g_ap2cl, cfg->route.buffered);
+        ap2cl_set_publish_ip(client, cfg->publish_ip);
+    ap2cl_set_ptp(client, cfg->route.ptp);
+    ap2cl_set_ptp_shared(client, cfg->ptp_shared);
+    ap2cl_set_buffered(client, cfg->route.buffered);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
-    if (!ap2cl_connect(g_ap2cl)) {
+    if (!ap2cl_connect(client)) {
         status_error("Cannot connect to AirPlay 2 device");
+        request_command_stop();
+        atomic_store(&g_ap2cl, NULL);
+        if (!join_command_thread()) return 1;
+        ap2cl_destroy(client);
         return 1;
     }
+    atomic_store(&g_ap2cl, client);
 
     status_connected();
 
@@ -1345,7 +1425,13 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
-        pthread_create(&g_cmdpipe_thread, NULL, cmdpipe_reader_thread, &cfg);
+        int thread_result = pthread_create(
+            &g_cmdpipe_thread, NULL, cmdpipe_reader_thread, &cfg);
+        if (thread_result == 0)
+            g_cmdpipe_started = true;
+        else
+            LOG_ERROR("Failed to start command pipe thread: %s",
+                      strerror(thread_result));
     }
 
     /* Drain the audio source eagerly from here on (see the input ring note),
@@ -1363,21 +1449,18 @@ int main(int argc, char *argv[])
     }
 
     /* Cleanup */
-    g_running = false;
+    request_command_stop();
+    if (!join_command_thread()) return 1;
+    struct ap2cl_s *ap2_client = atomic_exchange(&g_ap2cl, NULL);
+    struct raopcl_s *raop_client = atomic_exchange(&g_raopcl, NULL);
     if (cfg.cmdpipe) {
-        pthread_join(g_cmdpipe_thread, NULL);
         if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
         unlink(cfg.cmdpipe);
     }
-    /* The command thread owns metadata/feedback/event-channel calls. Destroy
-     * protocol clients only after it is fully quiesced. */
-    if (g_ap2cl) {
-        ap2cl_destroy(g_ap2cl);
-        g_ap2cl = NULL;
-    }
-    if (g_raopcl) {
-        raopcl_destroy(g_raopcl);
-        g_raopcl = NULL;
+    if (ap2_client) ap2cl_destroy(ap2_client);
+    if (raop_client) {
+        raopcl_disconnect(raop_client);
+        raopcl_destroy(raop_client);
     }
     if (infile >= 0 && infile != fileno(stdin)) close(infile);
     netsock_close();

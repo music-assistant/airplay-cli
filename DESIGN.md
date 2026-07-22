@@ -339,10 +339,91 @@ Inner keys: `Title`, `Artist`, `Album`, `Duration`, `ElapsedTime`,
 track's progress pushes), `ArtworkData` (JPEG bytes), `ArtworkMIMEType`,
 `ArtworkIdentifier`.
 
-**Artwork — send-once.** The JPEG bytes ride only the *first* push for a given
-image, tagged with a fresh `ArtworkIdentifier`; later pushes carry the
-identifier without the bytes, so a ~40 KB image is not re-sent on every
-progress tick over the shared RTSP channel.
+**Artwork evidence, probing, and send-once behavior.** AirPlaySender requests
+600x600 artwork from MediaRemote, and the captured iPhone command used a
+600x600, three-component baseline JPEG of about 43 KB. These establish a known
+sender shape, not a receiver maximum. No Apple source or hardware measurement
+currently establishes a 64 KiB byte cutoff, a 600px rejection threshold, or a
+baseline/color-only rule.
+
+The local-file handler signature-detects JPEG/PNG/GIF/WebP and preserves the
+original bytes and correct MIME type for DMAP/Sonos. MRP applies only a bounded
+metadata probe before retaining data: canonical `image/jpeg`, SOI, and terminal
+EOI. It walks length-delimited headers memory-safely to extract SOF dimensions,
+precision, component count, and profile when available, but those fields and
+all JPEG internals are telemetry rather than acceptance criteria. The receiver
+remains the decoder. Generated and arbitrary-cache test cases are separately
+decoded with Pillow or `djpeg` before the harness sends them. Decoder-valid
+SOF1/12-bit/16-bit-DQT fixtures cover profiles outside typical Pillow output. A
+1 MiB internal
+staging-allocation guard leaves room for the hardware matrix below and is
+explicitly not a receiver limit. Rejection clears previous MRP artwork,
+preventing stale cover art. No image codec is embedded in production code.
+
+Staged JPEG bytes ride only the *first* push for a given image, tagged with a
+fresh `ArtworkIdentifier`; later pushes carry the identifier without the bytes,
+so artwork is not re-sent on every progress tick over the shared RTSP channel.
+The complete registration/now-playing/extended-state sequence is serialized;
+its return value carries request-scoped overall and `updateMRNowPlayingInfo`
+statuses, so concurrent pushes cannot overwrite the artwork response.
+Every artwork attempt emits a non-deduplicated result with the exact source
+properties and command response:
+
+```
+[STATUS] mrp artwork=posted status=200 bytes=65536 width=600 height=600 \
+precision=8 sof=0xc0 components=3 progressive=0 staging_max_bytes=1048576
+```
+
+**Controlled Apple TV matrix.** The test-only generator creates deterministic
+600x600 JPEGs and pads them with legal COM segments, so the RGB-baseline size
+cases have identical image/encoding bytes aside from padding:
+
+| Variable | Cases |
+|---|---|
+| Byte size, RGB baseline | 44,032; 61,440; 65,535; 65,536; 66,560; 102,400; 153,600 |
+| Encoding at 65,536 bytes | SOF0 baseline; SOF2 progressive |
+| Components at 65,536 bytes | 3-component color; 1-component grayscale |
+
+Generate, inspect, and send a case:
+
+```bash
+python3 -m venv /tmp/cliairplay-mrp-venv
+/tmp/cliairplay-mrp-venv/bin/pip install Pillow
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py \
+  generate --output /tmp/cliairplay-mrp-matrix
+make test STATIC=1
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py inspect \
+  /tmp/cliairplay-mrp-matrix/*.jpg
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py send \
+  --cmdpipe /path/to/cliairplay.fifo \
+  --record /tmp/rgb-baseline-65536.json \
+  --artwork /tmp/cliairplay-mrp-matrix/rgb-baseline-65536.jpg
+```
+
+For each case, record the artwork-specific status/HTTP response and whether the
+Apple TV Now Playing UI renders the image. Run byte cases in ascending order,
+then compare the progressive and grayscale controls at 65,536 bytes. Do not
+declare a receiver cap until a repeatable visible-artwork transition is
+measured independently of profile.
+
+COM padding isolates total `ArtworkData` length but not decoder complexity. Add
+at least one real, high-entropy MA thumbnail in the observed 100-175 KiB range.
+`inspect` and `send` accept arbitrary JPEG paths without copying them; with the
+Pillow/`djpeg` setup above records both a full decode result and the same metadata
+and SHA-256 fields as the generated manifest:
+
+```bash
+REAL_ARTWORK=/absolute/path/to/mass/cache/thumbnails/high-entropy.jpg
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py inspect \
+  --json --output /tmp/ma-real-artwork.json "$REAL_ARTWORK"
+/tmp/cliairplay-mrp-venv/bin/python tests/mrp_artwork_matrix.py send \
+  --cmdpipe /path/to/cliairplay.fifo \
+  --record /tmp/ma-real-artwork-send.json \
+  --artwork "$REAL_ARTWORK"
+```
+
+Keep both JSON records with the corresponding
+`[STATUS] mrp artwork=posted ...` line and visible/not-visible result.
 
 **`updateMRSupportedCommands`** body:
 `{params:{mrSupportedCommandsFromSender:[<command-info>, ...]}}`, each element a
