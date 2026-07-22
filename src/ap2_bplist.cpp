@@ -129,8 +129,11 @@ static uint64_t bp_read_be(const uint8_t *p, size_t n)
     return v;
 }
 
-int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint64_t *out)
+int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
+                               char *out, size_t out_size)
 {
+    if (!key || !out || !out_size) return 0;
+    out[0] = '\0';
     if (!data || len < 40 || memcmp(data, "bplist00", 8) != 0) return 0;
 
     const uint8_t *tr = data + len - 32;
@@ -138,38 +141,114 @@ int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint6
     uint64_t num_objects = bp_read_be(tr + 8, 8);
     uint64_t table_ofs = bp_read_be(tr + 24, 8);
     if (!ofs_size || ofs_size > 8 || !ref_size || ref_size > 8) return 0;
-    if (table_ofs + num_objects * ofs_size > len - 32) return 0;
+    size_t object_end = len - 32;
+    if (!num_objects || table_ofs < 8 || table_ofs > object_end) return 0;
+    if (num_objects > (object_end - table_ofs) / ofs_size) return 0;
+    size_t keylen = strlen(key);
+
+    auto obj_ofs = [&](uint64_t ref, size_t *pos) -> bool {
+        if (ref >= num_objects) return false;
+        uint64_t ofs = bp_read_be(
+            data + table_ofs + ref * ofs_size, ofs_size);
+        if (ofs < 8 || ofs >= table_ofs) return false;
+        *pos = (size_t)ofs;
+        return true;
+    };
+
+    uint64_t root_ref = bp_read_be(tr + 16, 8);
+    size_t pos;
+    if (!obj_ofs(root_ref, &pos) || (data[pos] & 0xf0) != 0xd0) return 0;
+    size_t count;
+    if (!bp_read_count(data, (size_t)table_ofs, &pos, &count) ||
+        count > (table_ofs - pos) / (2 * ref_size))
+        return 0;
+
+    for (size_t i = 0; i < count; i++) {
+        uint64_t kref = bp_read_be(data + pos + i * ref_size, ref_size);
+        size_t kpos;
+        if (!obj_ofs(kref, &kpos) || (data[kpos] & 0xf0) != 0x50)
+            continue;
+        size_t kcount;
+        if (!bp_read_count(data, (size_t)table_ofs, &kpos, &kcount) ||
+            kcount != keylen || kcount > table_ofs - kpos ||
+            memcmp(data + kpos, key, keylen) != 0)
+            continue;
+
+        uint64_t vref = bp_read_be(
+            data + pos + (count + i) * ref_size, ref_size);
+        size_t vpos;
+        if (!obj_ofs(vref, &vpos) || (data[vpos] & 0xf0) != 0x50)
+            return 0;
+        size_t chars;
+        if (!bp_read_count(data, (size_t)table_ofs, &vpos, &chars) ||
+            chars > table_ofs - vpos || chars >= out_size ||
+            memchr(data + vpos, '\0', chars))
+            return 0;
+        memcpy(out, data + vpos, chars);
+        out[chars] = '\0';
+        return 1;
+    }
+    return 0;
+}
+
+int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint64_t *out)
+{
+    if (!data || !key || !out || len < 40 ||
+        memcmp(data, "bplist00", 8) != 0)
+        return 0;
+
+    const uint8_t *tr = data + len - 32;
+    uint8_t ofs_size = tr[6], ref_size = tr[7];
+    uint64_t num_objects = bp_read_be(tr + 8, 8);
+    uint64_t table_ofs = bp_read_be(tr + 24, 8);
+    if (!ofs_size || ofs_size > 8 || !ref_size || ref_size > 8) return 0;
+    size_t object_end = len - 32;
+    if (!num_objects || table_ofs < 8 || table_ofs > object_end) return 0;
+    if (num_objects > (object_end - table_ofs) / ofs_size) return 0;
     size_t keylen = strlen(key);
 
     /* Object offset lookup */
-    auto obj_ofs = [&](uint64_t ref) -> size_t {
-        if (ref >= num_objects) return 0;
-        return (size_t)bp_read_be(data + table_ofs + ref * ofs_size, ofs_size);
+    auto obj_ofs = [&](uint64_t ref, size_t *pos) -> bool {
+        if (ref >= num_objects) return false;
+        uint64_t ofs = bp_read_be(
+            data + table_ofs + ref * ofs_size, ofs_size);
+        if (ofs < 8 || ofs >= table_ofs) return false;
+        *pos = (size_t)ofs;
+        return true;
     };
 
     for (uint64_t o = 0; o < num_objects; o++) {
-        size_t pos = obj_ofs(o);
-        if (!pos || pos >= table_ofs || (data[pos] & 0xF0) != 0xD0) continue;
+        size_t pos;
+        if (!obj_ofs(o, &pos) || (data[pos] & 0xF0) != 0xD0) continue;
 
         size_t count;
-        if (!bp_read_count(data, table_ofs, &pos, &count)) continue;
-        if (pos + 2 * count * ref_size > table_ofs) continue;
+        if (!bp_read_count(data, (size_t)table_ofs, &pos, &count)) continue;
+        if (count > (table_ofs - pos) / (2 * ref_size)) continue;
 
         for (size_t i = 0; i < count; i++) {
             uint64_t kref = bp_read_be(data + pos + i * ref_size, ref_size);
-            size_t kpos = obj_ofs(kref);
-            if (!kpos || (data[kpos] & 0xF0) != 0x50) continue;   /* ASCII string key */
+            size_t kpos;
+            if (!obj_ofs(kref, &kpos) ||
+                (data[kpos] & 0xF0) != 0x50)
+                continue;   /* ASCII string key */
             size_t kcount;
-            if (!bp_read_count(data, table_ofs, &kpos, &kcount)) continue;
-            if (kcount != keylen || kpos + kcount > table_ofs) continue;
+            if (!bp_read_count(
+                    data, (size_t)table_ofs, &kpos, &kcount))
+                continue;
+            if (kcount != keylen || kcount > table_ofs - kpos) continue;
             if (memcmp(data + kpos, key, keylen) != 0) continue;
 
             uint64_t vref = bp_read_be(data + pos + (count + i) * ref_size, ref_size);
-            size_t vpos = obj_ofs(vref);
-            if (!vpos || (data[vpos] & 0xF0) != 0x10) return 0;   /* not an integer */
+            size_t vpos;
+            if (!obj_ofs(vref, &vpos) ||
+                (data[vpos] & 0xF0) != 0x10)
+                return 0;   /* not an integer */
             size_t vbytes;
-            if (!bp_read_count(data, table_ofs, &vpos, &vbytes)) return 0;
-            if (vpos + vbytes > table_ofs) return 0;
+            if (!bp_read_count(
+                    data, (size_t)table_ofs, &vpos, &vbytes))
+                return 0;
+            if (!vbytes || vbytes > 8 || vbytes > table_ofs - vpos)
+                return 0;
             *out = bp_read_be(data + vpos, vbytes);
             return 1;
         }

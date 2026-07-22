@@ -21,6 +21,7 @@
 #include <strings.h>
 #include <stdbool.h>
 #include <stdatomic.h>
+#include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
 #include <time.h>
@@ -38,6 +39,7 @@
 #include <openssl/crypto.h>
 
 #include "cross_log.h"
+#include "ap2_bplist.h"
 #include "ap2_io.h"
 #include "ap2_plist.h"
 #include "ap2_mrp.h"
@@ -140,6 +142,8 @@ enum mrp_ext_field {
 /* Cadence of the defensive state re-push from ap2_mrp_tick (seconds). */
 #define MRP_STATE_REPUSH_S 15
 #define MRP_WRITE_TIMEOUT_MS 1000
+#define MRP_EVENT_LOG_TEXT_MAX 96
+#define MRP_EVENT_LOG_HEX_MAX  32
 
 struct ap2_mrp_ctx {
     /* Target + identity */
@@ -151,6 +155,8 @@ struct ap2_mrp_ctx {
     char *session_uuid;       /* active AirPlay session */
     char *group_uuid;         /* active AirPlay group */
     char device_uuid[37];     /* stable UUID derived from dacp_id */
+    ap2_remote_command_cb_t remote_command_cb;
+    void *remote_command_userdata;
 
     /* Channel crypto. The DataStream keys derive from the pairing shared
      * secret of the RTSP session that performed the type-130 SETUP. */
@@ -1091,6 +1097,107 @@ static bool mrp_http_header_value(const char *header, const char *name,
     return false;
 }
 
+static void mrp_event_log_text(char out[MRP_EVENT_LOG_TEXT_MAX + 1],
+                               const char *in)
+{
+    size_t i = 0;
+    if (in) {
+        for (; i < MRP_EVENT_LOG_TEXT_MAX && in[i]; i++) {
+            unsigned char c = (unsigned char)in[i];
+            out[i] = isprint(c) ? (char)c : '.';
+        }
+    }
+    out[i] = '\0';
+}
+
+void ap2_mrp_set_remote_command_callback(
+    struct ap2_mrp_ctx *m, ap2_remote_command_cb_t callback, void *userdata)
+{
+    if (!m) return;
+    m->remote_command_cb = callback;
+    m->remote_command_userdata = userdata;
+}
+
+static void mrp_emit_remote_command(
+    struct ap2_mrp_ctx *m, ap2_remote_command_t command)
+{
+    if (m->remote_command_cb)
+        m->remote_command_cb(command, m->remote_command_userdata);
+}
+
+static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
+                                     ap2_remote_command_t *command)
+{
+    if (!body || body_len < 8 || !command ||
+        memcmp(body, "bplist00", 8) != 0)
+        return false;
+
+    char type[64];
+    char value[64];
+    if (!ap2_bplist_get_root_string(
+            body, (size_t)body_len, "type", type, sizeof(type)) ||
+        strcmp(type, "sendMediaRemoteCommand") != 0 ||
+        !ap2_bplist_get_root_string(
+            body, (size_t)body_len, "value", value, sizeof(value)))
+        return false;
+
+    if (strcmp(value, "play") == 0)
+        *command = AP2_REMOTE_COMMAND_PLAY;
+    else if (strcmp(value, "paus") == 0)
+        *command = AP2_REMOTE_COMMAND_PAUSE;
+    else if (strcmp(value, "plps") == 0)
+        *command = AP2_REMOTE_COMMAND_PLAY_PAUSE;
+    else if (strcmp(value, "nitm") == 0)
+        *command = AP2_REMOTE_COMMAND_NEXT;
+    else if (strcmp(value, "pitm") == 0)
+        *command = AP2_REMOTE_COMMAND_PREVIOUS;
+    else
+        return false;
+    return true;
+}
+
+static void mrp_log_event_command_body(const char *header,
+                                      const uint8_t *body, int body_len)
+{
+    char content_type[256] = "<missing>";
+    char safe_content_type[MRP_EVENT_LOG_TEXT_MAX + 1];
+    if (!mrp_http_header_value(header, "Content-Type",
+                               content_type, sizeof(content_type)))
+        snprintf(content_type, sizeof(content_type), "%s", "<missing>");
+    mrp_event_log_text(safe_content_type, content_type);
+
+    if (body_len >= 8 && memcmp(body, "bplist00", 8) == 0) {
+        char type[256];
+        char value[256];
+        char safe_type[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
+        char safe_value[MRP_EVENT_LOG_TEXT_MAX + 1] = "";
+        if (ap2_bplist_get_root_string(
+                body, (size_t)body_len, "type", type, sizeof(type)))
+            mrp_event_log_text(safe_type, type);
+        if (ap2_bplist_get_root_string(
+                body, (size_t)body_len, "value", value, sizeof(value)))
+            mrp_event_log_text(safe_value, value);
+        if (safe_type[0] && safe_value[0]) {
+            LOG_DEBUG("[MRP] event command content_type=%s content_length=%d "
+                      "type=%s value=%s",
+                      safe_content_type, body_len, safe_type, safe_value);
+            return;
+        }
+    }
+
+    int shown = body_len < MRP_EVENT_LOG_HEX_MAX
+                    ? body_len : MRP_EVENT_LOG_HEX_MAX;
+    char hex[MRP_EVENT_LOG_HEX_MAX * 2 + 1];
+    for (int i = 0; i < shown; i++)
+        snprintf(hex + i * 2, sizeof(hex) - (size_t)i * 2,
+                 "%02x", body[i]);
+    hex[shown * 2] = '\0';
+    LOG_DEBUG("[MRP] event command body parse failed content_type=%s "
+              "content_length=%d hex=%s%s",
+              safe_content_type, body_len, hex,
+              body_len > shown ? "..." : "");
+}
+
 static bool mrp_event_send_response(struct ap2_mrp_ctx *m,
                                     const uint8_t *response, int response_len)
 {
@@ -1152,6 +1259,18 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             LOG_ERROR("[MRP] malformed event request line");
             return false;
         }
+        bool is_command = content_len > 0 &&
+                          strcasecmp(method, "POST") == 0 &&
+                          strcmp(path, "/command") == 0;
+        ap2_remote_command_t remote_command;
+        bool have_remote_command = false;
+        if (is_command) {
+            const uint8_t *body = m->event_plain + off + header_len;
+            have_remote_command =
+                mrp_parse_remote_command(body, content_len, &remote_command);
+            if (*loglevel >= lDEBUG)
+                mrp_log_event_command_body(header, body, content_len);
+        }
 
         char cseq[64] = "";
         char server[256] = "";
@@ -1173,9 +1292,13 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             have_server ? "\r\n" : "",
             have_cseq ? "CSeq: " : "", have_cseq ? cseq : "",
             have_cseq ? "\r\n" : "");
-        if (response_len <= 0 || response_len >= (int)sizeof(response) ||
-            !mrp_event_send_response(m, (const uint8_t *)response,
-                                     response_len)) {
+        bool response_ok =
+            response_len > 0 && response_len < (int)sizeof(response) &&
+            mrp_event_send_response(
+                m, (const uint8_t *)response, response_len);
+        if (have_remote_command)
+            mrp_emit_remote_command(m, remote_command);
+        if (!response_ok) {
             LOG_ERROR("[MRP] event response send failed");
             return false;
         }

@@ -257,6 +257,11 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip);
  * ap2cl_connect(). */
 void ap2cl_set_buffered(struct ap2cl_s *p, bool enable);
 
+/* Set the callback for validated receiver MediaRemote commands. Must be called
+ * before ap2cl_connect(); the callback remains fixed for that session. */
+void ap2cl_set_remote_command_callback(
+    struct ap2cl_s *p, ap2_remote_command_cb_t callback, void *userdata);
+
 /*
  * Get the effective playback lead and the receiver-reported buffering window.
  *

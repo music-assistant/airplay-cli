@@ -23,7 +23,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include "ap2_remote.h"
+
 struct ap2_mrp_ctx;
+
+/* Receive validated event-channel MediaRemote commands. Set before attaching
+ * the event socket; the callback remains fixed for that session. */
+void ap2_mrp_set_remote_command_callback(
+    struct ap2_mrp_ctx *m, ap2_remote_command_cb_t callback, void *userdata);
 
 typedef enum {
     AP2_MRP_PLAYBACK_PLAYING = 1,

@@ -11,13 +11,27 @@
 #include <openssl/kdf.h>
 
 #include "ap2_mrp.h"
+#include "ap2_plist.h"
 #include "cross_log.h"
 
 #define KEY_SIZE 32
 #define TAG_SIZE 16
 
+struct command_capture {
+    ap2_remote_command_t commands[16];
+    int count;
+};
+
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
+
+static void capture_remote_command(
+    ap2_remote_command_t command, void *userdata)
+{
+    struct command_capture *capture = userdata;
+    assert(capture && capture->count < 16);
+    capture->commands[capture->count++] = command;
+}
 
 static void derive_key(const uint8_t secret[KEY_SIZE], const char *info,
                        uint8_t key[KEY_SIZE])
@@ -100,35 +114,132 @@ static int decrypt_frame(const uint8_t key[KEY_SIZE], uint64_t counter,
     return total;
 }
 
-static struct ap2_mrp_ctx *create_mrp(const uint8_t secret[KEY_SIZE],
-                                      int event_sock)
+static struct ap2_mrp_ctx *create_mrp_with_callback(
+    const uint8_t secret[KEY_SIZE], int event_sock,
+    ap2_remote_command_cb_t callback, void *userdata)
 {
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
         "127.0.0.1", 7000, NULL, "1A2B3D4EA1B2C3D4",
         "Music Assistant", "11111111-2222-4333-8444-555555555555",
         "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", secret);
     assert(mrp);
+    ap2_mrp_set_remote_command_callback(mrp, callback, userdata);
     assert(ap2_mrp_attach_events(mrp, event_sock));
     assert(ap2_mrp_event_status(mrp) == 1);
     return mrp;
 }
 
-static void send_request(int fd, const uint8_t key[KEY_SIZE],
-                         uint64_t counter, int cseq)
+static struct ap2_mrp_ctx *create_mrp(const uint8_t secret[KEY_SIZE],
+                                      int event_sock)
 {
-    char request[256];
-    int request_len = snprintf(
-        request, sizeof(request),
+    return create_mrp_with_callback(secret, event_sock, NULL, NULL);
+}
+
+static int build_event_request(uint8_t *encrypted, size_t encrypted_size,
+                               const uint8_t key[KEY_SIZE],
+                               uint64_t counter, int cseq,
+                               const uint8_t *body, int body_len)
+{
+    uint8_t request[1024];
+    int header_len = snprintf(
+        (char *)request, sizeof(request),
         "POST /command RTSP/1.0\r\n"
         "CSeq: %d\r\n"
         "Server: AirTunes/1.0\r\n"
-        "Content-Length: 4\r\n\r\n"
-        "test",
-        cseq);
-    assert(request_len > 0 && request_len < (int)sizeof(request));
-    uint8_t encrypted[512];
-    int encrypted_len = encrypt_frame(
-        key, counter, (const uint8_t *)request, request_len, encrypted);
+        "Content-Type: application/x-apple-binary-plist\r\n"
+        "Content-Length: %d\r\n\r\n",
+        cseq, body_len);
+    assert(header_len > 0 && header_len + body_len < (int)sizeof(request));
+    memcpy(request + header_len, body, (size_t)body_len);
+
+    int request_len = header_len + body_len;
+    assert((size_t)(request_len + 2 + TAG_SIZE) <= encrypted_size);
+    return encrypt_frame(
+        key, counter, request, request_len, encrypted);
+}
+
+static int build_typed_command_request(
+    uint8_t *encrypted, size_t encrypted_size,
+    const uint8_t key[KEY_SIZE], uint64_t counter, int cseq,
+    const char *type, const char *value)
+{
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string(type));
+    ap2_pl_dict_set(root, "value", ap2_pl_string(value));
+    uint8_t *body = NULL;
+    int body_len = ap2_pl_serialize(root, &body);
+    ap2_pl_free(root);
+    assert(body_len > 0 && body);
+    int encrypted_len = build_event_request(
+        encrypted, encrypted_size, key, counter, cseq, body, body_len);
+    free(body);
+    return encrypted_len;
+}
+
+static int build_command_request(uint8_t *encrypted, size_t encrypted_size,
+                                 const uint8_t key[KEY_SIZE],
+                                 uint64_t counter, int cseq,
+                                 const char *value)
+{
+    return build_typed_command_request(
+        encrypted, encrypted_size, key, counter, cseq,
+        "sendMediaRemoteCommand", value);
+}
+
+static int build_embedded_nul_request(
+    uint8_t *encrypted, size_t encrypted_size,
+    const uint8_t key[KEY_SIZE], uint64_t counter, int cseq)
+{
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type",
+                    ap2_pl_string("sendMediaRemoteCommand"));
+    ap2_pl_dict_set(root, "value", ap2_pl_string("playXjunk"));
+    uint8_t *body = NULL;
+    int body_len = ap2_pl_serialize(root, &body);
+    ap2_pl_free(root);
+    assert(body_len > 0 && body);
+
+    bool replaced = false;
+    for (int i = 0; i + 9 <= body_len; i++) {
+        if (memcmp(body + i, "playXjunk", 9) == 0) {
+            body[i + 4] = '\0';
+            replaced = true;
+            break;
+        }
+    }
+    assert(replaced);
+    int encrypted_len = build_event_request(
+        encrypted, encrypted_size, key, counter, cseq, body, body_len);
+    free(body);
+    return encrypted_len;
+}
+
+static int build_nested_command_request(
+    uint8_t *encrypted, size_t encrypted_size,
+    const uint8_t key[KEY_SIZE], uint64_t counter, int cseq)
+{
+    ap2_pl_node *nested = ap2_pl_dict();
+    ap2_pl_dict_set(nested, "type",
+                    ap2_pl_string("sendMediaRemoteCommand"));
+    ap2_pl_dict_set(nested, "value", ap2_pl_string("play"));
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "payload", nested);
+    uint8_t *body = NULL;
+    int body_len = ap2_pl_serialize(root, &body);
+    ap2_pl_free(root);
+    assert(body_len > 0 && body);
+    int encrypted_len = build_event_request(
+        encrypted, encrypted_size, key, counter, cseq, body, body_len);
+    free(body);
+    return encrypted_len;
+}
+
+static void send_request(int fd, const uint8_t key[KEY_SIZE],
+                         uint64_t counter, int cseq, const char *value)
+{
+    uint8_t encrypted[1200];
+    int encrypted_len = build_command_request(
+        encrypted, sizeof(encrypted), key, counter, cseq, value);
     assert(write(fd, encrypted, (size_t)encrypted_len) == encrypted_len);
 }
 
@@ -226,24 +337,116 @@ int main(void)
     struct timeval timeout = {.tv_sec = 2};
     assert(setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO,
                       &timeout, sizeof(timeout)) == 0);
-    struct ap2_mrp_ctx *mrp = create_mrp(secret, sockets[0]);
+    struct command_capture capture = {0};
+    struct ap2_mrp_ctx *mrp = create_mrp_with_callback(
+        secret, sockets[0], capture_remote_command, &capture);
 
-    char request[256];
-    int request_len = snprintf(
-        request, sizeof(request),
-        "POST /command RTSP/1.0\r\nCSeq: 42\r\n"
-        "Server: AirTunes/1.0\r\nContent-Length: 4\r\n\r\ntest");
-    uint8_t encrypted[512];
-    int encrypted_len = encrypt_frame(
-        receiver_key, 0, (const uint8_t *)request, request_len, encrypted);
+    int saved_stderr = dup(STDERR_FILENO);
+    FILE *log_capture = tmpfile();
+    assert(saved_stderr >= 0 && log_capture);
+    assert(dup2(fileno(log_capture), STDERR_FILENO) >= 0);
+    test_log_level = lDEBUG;
+
+    uint8_t encrypted[1200];
+    int encrypted_len = build_command_request(
+        encrypted, sizeof(encrypted), receiver_key, 0, 42, "play");
     assert(write(sockets[1], encrypted, 1) == 1);
     ap2_mrp_tick(mrp);
     assert(write(sockets[1], encrypted + 1,
                  (size_t)(encrypted_len - 1)) == encrypted_len - 1);
-    send_request(sockets[1], receiver_key, 1, 43);
+    send_request(sockets[1], receiver_key, 1, 43, "paus");
     ap2_mrp_tick(mrp);
     read_response(sockets[1], sender_key, 0, 42);
     read_response(sockets[1], sender_key, 1, 43);
+
+    static const char *values[] = {"plps", "nitm", "pitm"};
+    for (int i = 0; i < 3; i++) {
+        send_request(sockets[1], receiver_key, (uint64_t)i + 2,
+                     i + 44, values[i]);
+        ap2_mrp_tick(mrp);
+        read_response(sockets[1], sender_key, (uint64_t)i + 2, i + 44);
+    }
+
+    send_request(sockets[1], receiver_key, 5, 47, "unknown");
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 5, 47);
+
+    encrypted_len = build_typed_command_request(
+        encrypted, sizeof(encrypted), receiver_key, 6, 48,
+        "updateInfo", "play");
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 6, 48);
+
+    encrypted_len = build_embedded_nul_request(
+        encrypted, sizeof(encrypted), receiver_key, 7, 49);
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 7, 49);
+
+    encrypted_len = build_nested_command_request(
+        encrypted, sizeof(encrypted), receiver_key, 8, 50);
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 8, 50);
+
+    uint8_t corrupt_bplist[40] = {0};
+    memcpy(corrupt_bplist, "bplist00", 8);
+    corrupt_bplist[14] = 1;  /* offset size */
+    corrupt_bplist[15] = 1;  /* object-reference size */
+    corrupt_bplist[23] = 1;  /* object count */
+    corrupt_bplist[39] = 8;  /* invalid offset-table location */
+    encrypted_len = build_event_request(
+        encrypted, sizeof(encrypted), receiver_key, 9, 51,
+        corrupt_bplist, (int)sizeof(corrupt_bplist));
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 9, 51);
+
+    static const uint8_t invalid_body[] = {'t', 'e', 's', 't'};
+    encrypted_len = build_event_request(
+        encrypted, sizeof(encrypted), receiver_key, 10, 52,
+        invalid_body, (int)sizeof(invalid_body));
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    ap2_mrp_tick(mrp);
+    read_response(sockets[1], sender_key, 10, 52);
+
+    static const ap2_remote_command_t expected_commands[] = {
+        AP2_REMOTE_COMMAND_PLAY,
+        AP2_REMOTE_COMMAND_PAUSE,
+        AP2_REMOTE_COMMAND_PLAY_PAUSE,
+        AP2_REMOTE_COMMAND_NEXT,
+        AP2_REMOTE_COMMAND_PREVIOUS,
+    };
+    static const char *expected_names[] = {
+        "play", "pause", "play_pause", "next", "previous",
+    };
+    assert(capture.count == 5);
+    for (int i = 0; i < capture.count; i++) {
+        assert(capture.commands[i] == expected_commands[i]);
+        assert(strcmp(
+                   ap2_remote_command_name(capture.commands[i]),
+                   expected_names[i]) == 0);
+    }
+
+    fflush(stderr);
+    test_log_level = lSILENCE;
+    assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
+    close(saved_stderr);
+    assert(fseek(log_capture, 0, SEEK_SET) == 0);
+    char logs[8192];
+    size_t logs_len = fread(logs, 1, sizeof(logs) - 1, log_capture);
+    logs[logs_len] = '\0';
+    fclose(log_capture);
+    assert(strstr(logs, "content_type=application/x-apple-binary-plist"));
+    assert(strstr(logs, "type=sendMediaRemoteCommand value=play"));
+    assert(strstr(logs, "type=sendMediaRemoteCommand value=paus"));
+    assert(strstr(logs, "type=sendMediaRemoteCommand value=plps"));
+    assert(strstr(logs, "type=sendMediaRemoteCommand value=nitm"));
+    assert(strstr(logs, "type=sendMediaRemoteCommand value=pitm"));
+    assert(strstr(logs, "body parse failed"));
+    assert(strstr(logs, "content_length=4 hex=74657374"));
+
     ap2_mrp_destroy(mrp);
     close(sockets[1]);
 
@@ -267,7 +470,7 @@ int main(void)
          batch++) {
         for (int i = 0; i < 10; i++, counter++)
             send_request(sockets[1], receiver_key, counter,
-                         100 + (int)counter);
+                         100 + (int)counter, "play");
         ap2_mrp_tick(mrp);
     }
     assert(ap2_mrp_event_status(mrp) == 0);

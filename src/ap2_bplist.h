@@ -61,6 +61,10 @@ const uint8_t *ap2_bplist_get_data(struct ap2_bplist *bp, const char *key, size_
  */
 int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint64_t *out);
 
+/* Find a string value by key in the root dictionary only. */
+int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
+                               char *out, size_t out_size);
+
 #ifdef __cplusplus
 }
 #endif

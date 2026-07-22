@@ -179,6 +179,16 @@ static void status_error(const char *msg)
     status_print("[ERROR] %s", msg);
 }
 
+static void remote_command_event(
+    ap2_remote_command_t command, void *userdata)
+{
+    (void)userdata;
+    const char *name = ap2_remote_command_name(command);
+    if (!name) return;
+    printf("[EVENT] remote command=%s\n", name);
+    fflush(stdout);
+}
+
 /* Path-A MRP experiment: surface the POST /command response on stdout when it
  * changes, so the caller can log whether the device accepts the push. */
 static void mrp_status_report(int status)
@@ -820,6 +830,8 @@ static int run_airplay2(cli_config_t *cfg, int infile)
     ap2cl_set_ptp(client, cfg->route.ptp);
     ap2cl_set_ptp_shared(client, cfg->ptp_shared);
     ap2cl_set_buffered(client, cfg->route.buffered);
+    ap2cl_set_remote_command_callback(
+        client, remote_command_event, NULL);
 
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
