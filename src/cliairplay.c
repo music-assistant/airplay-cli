@@ -110,7 +110,10 @@ static playback_status_t g_status = STATUS_STOPPED;
 static pthread_t g_cmdpipe_thread;
 static bool g_cmdpipe_started = false;
 static int g_cmdpipe_fd = -1;
-static char g_cmdpipe_buf[512];
+/* Command-line reassembly buffer: sized for the longest single command
+ * (an ARTWORK= imageproxy URL or full metadata line stays well under this). */
+static char g_cmdpipe_buf[8192];
+static size_t g_cmdpipe_used = 0;
 
 /* RAOP context (when using RAOP protocol) */
 static _Atomic(struct raopcl_s *) g_raopcl = NULL;
@@ -425,21 +428,36 @@ static int input_ring_read_timed(uint8_t *buf, size_t want, int timeout_ms)
 /* ---- Command pipe handler ---- */
 
 static struct {
-    char *title;
+    char *title;    /* owned (strdup'd); NULL until first set */
     char *artist;
     char *album;
     int duration;
     int progress;
-} g_metadata = {"", "", "", 0, 0};
+} g_metadata;
+
+/* Store an owned copy: the value points into the cmdpipe read buffer, which
+ * is overwritten by the next read. */
+static void metadata_set(char **field, const char *value)
+{
+    char *copy = strdup(value ? value : "");
+    if (!copy) return;
+    free(*field);
+    *field = copy;
+}
+
+static const char *metadata_str(const char *value)
+{
+    return value ? value : "";
+}
 
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
     if (strcmp(key, "TITLE") == 0) {
-        g_metadata.title = value ? (char*)value : "";
+        metadata_set(&g_metadata.title, value);
     } else if (strcmp(key, "ARTIST") == 0) {
-        g_metadata.artist = value ? (char*)value : "";
+        metadata_set(&g_metadata.artist, value);
     } else if (strcmp(key, "ALBUM") == 0) {
-        g_metadata.album = value ? (char*)value : "";
+        metadata_set(&g_metadata.album, value);
     } else if (strcmp(key, "DURATION") == 0) {
         g_metadata.duration = atoi(value);
     } else if (strcmp(key, "PROGRESS") == 0) {
@@ -523,13 +541,14 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         status_print("[STATUS] stopped");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "SENDMETA") == 0) {
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-            raopcl_set_daap(g_raopcl, 4, "minm", 's', g_metadata.title,
-                            "asar", 's', g_metadata.artist,
-                            "asal", 's', g_metadata.album,
+            raopcl_set_daap(g_raopcl, 4, "minm", 's', metadata_str(g_metadata.title),
+                            "asar", 's', metadata_str(g_metadata.artist),
+                            "asal", 's', metadata_str(g_metadata.album),
                             "astn", 'i', 1);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-            ap2cl_set_metadata(g_ap2cl, g_metadata.title, g_metadata.artist,
-                               g_metadata.album, g_metadata.duration);
+            ap2cl_set_metadata(g_ap2cl, metadata_str(g_metadata.title),
+                               metadata_str(g_metadata.artist),
+                               metadata_str(g_metadata.album), g_metadata.duration);
             mrp_status_report(ap2cl_mrp_push(g_ap2cl));
         }
     }
@@ -545,11 +564,11 @@ static void send_initial_metadata(const cli_config_t *cfg)
     const char *title = (g_metadata.title && *g_metadata.title) ? g_metadata.title : "cliairplay";
     if (cfg->protocol == PROTO_RAOP && g_raopcl) {
         raopcl_set_daap(g_raopcl, 4, "minm", 's', title,
-                        "asar", 's', g_metadata.artist,
-                        "asal", 's', g_metadata.album, "astn", 'i', 1);
+                        "asar", 's', metadata_str(g_metadata.artist),
+                        "asal", 's', metadata_str(g_metadata.album), "astn", 'i', 1);
     } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-        ap2cl_set_metadata(g_ap2cl, title, g_metadata.artist,
-                           g_metadata.album, g_metadata.duration);
+        ap2cl_set_metadata(g_ap2cl, title, metadata_str(g_metadata.artist),
+                           metadata_str(g_metadata.album), g_metadata.duration);
         mrp_status_report(ap2cl_mrp_push(g_ap2cl));
     }
 }
@@ -578,23 +597,39 @@ static void *cmdpipe_reader_thread(void *arg)
         }
         if (n <= 0 || !(pfds.revents & POLLIN)) continue;
 
-        ssize_t bytes_read = read(g_cmdpipe_fd, g_cmdpipe_buf, sizeof(g_cmdpipe_buf) - 1);
+        /* Append to the reassembly buffer and execute only complete
+         * (newline-terminated) lines: one command can arrive split across
+         * reads, and executing a partial line corrupts it. The unterminated
+         * tail stays buffered for the next read. */
+        if (g_cmdpipe_used == sizeof(g_cmdpipe_buf) - 1) {
+            LOG_ERROR("Command pipe line exceeds %zu bytes; discarding",
+                      sizeof(g_cmdpipe_buf) - 1);
+            g_cmdpipe_used = 0;
+        }
+        ssize_t bytes_read = read(g_cmdpipe_fd, g_cmdpipe_buf + g_cmdpipe_used,
+                                  sizeof(g_cmdpipe_buf) - 1 - g_cmdpipe_used);
         if (bytes_read > 0) {
-            g_cmdpipe_buf[bytes_read] = '\0';
-            char *save_ptr1, *save_ptr2;
-            char *line = strtok_r(g_cmdpipe_buf, "\n", &save_ptr1);
-            while (line != NULL) {
+            g_cmdpipe_used += (size_t)bytes_read;
+            g_cmdpipe_buf[g_cmdpipe_used] = '\0';
+            char *line = g_cmdpipe_buf;
+            char *end;
+            while ((end = memchr(line, '\n',
+                                 g_cmdpipe_buf + g_cmdpipe_used - line)) != NULL) {
                 if (!g_running) break;
-                char *key = strtok_r(line, "=", &save_ptr2);
-                if (!key || strlen(key) == 0) goto next_line;
-                char *value = strtok_r(NULL, "", &save_ptr2);
-                if (!value) value = "";
-                handle_command(key, value, cfg);
-next_line:
-                line = strtok_r(NULL, "\n", &save_ptr1);
+                *end = '\0';
+                char *separator = strchr(line, '=');
+                if (separator && separator != line) {
+                    *separator = '\0';
+                    handle_command(line, separator + 1, cfg);
+                }
+                line = end + 1;
             }
-            memset(g_cmdpipe_buf, 0, sizeof(g_cmdpipe_buf));
+            size_t remaining = g_cmdpipe_used - (size_t)(line - g_cmdpipe_buf);
+            memmove(g_cmdpipe_buf, line, remaining);
+            g_cmdpipe_used = remaining;
+            g_cmdpipe_buf[g_cmdpipe_used] = '\0';
         } else if (bytes_read < 0) {
+            if (errno == EAGAIN || errno == EWOULDBLOCK) continue;
             LOG_ERROR("Error reading from command pipe: %s", strerror(errno));
             usleep(250 * 1000);
         }
@@ -1474,6 +1509,10 @@ int main(int argc, char *argv[])
         raopcl_disconnect(raop_client);
         raopcl_destroy(raop_client);
     }
+    free(g_metadata.title);
+    free(g_metadata.artist);
+    free(g_metadata.album);
+    g_metadata.title = g_metadata.artist = g_metadata.album = NULL;
     if (infile >= 0 && infile != fileno(stdin)) close(infile);
     netsock_close();
     cross_ssl_free();
