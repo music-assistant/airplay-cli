@@ -97,6 +97,7 @@ typedef struct {
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
+    bool ptp_follow;        /* solo session: yield the timeline to an announcing receiver */
 
     /* Audio format */
     int sample_rate;
@@ -877,6 +878,48 @@ static int run_raop(cli_config_t *cfg, int infile)
 
 /* ---- AirPlay 2 playback loop ---- */
 
+/* Collect 12 hex nibbles from a MAC-ish string (colons/dashes skipped),
+ * stopping at '@' (UDN form "MACHEX@Name"). Returns true on exactly 6 bytes. */
+static bool parse_mac_hex(const char *s, uint8_t mac[6])
+{
+    int n = 0;
+    for (; s && *s && *s != '@' && *s != ' '; s++) {
+        int v;
+        if (*s == ':' || *s == '-') continue;
+        if (*s >= '0' && *s <= '9') v = *s - '0';
+        else if (*s >= 'a' && *s <= 'f') v = *s - 'a' + 10;
+        else if (*s >= 'A' && *s <= 'F') v = *s - 'A' + 10;
+        else return false;
+        if (n >= 12) return false;
+        if (n % 2 == 0) mac[n / 2] = (uint8_t)(v << 4);
+        else mac[n / 2] |= (uint8_t)v;
+        n++;
+    }
+    return n == 12;
+}
+
+/* EUI-64 receiver clock hint for PTP follow mode, derived the way AirPlay
+ * receivers derive their own clock identity: the device MAC with ff:fe
+ * inserted. Only master-or-mute receiver models (Samsung) get the hint
+ * pre-declared as the SETUP timeline; everyone else negotiates normally.
+ * MAC sources: the RAOP UDN ("MACHEX@Name"), else deviceid= in the TXT. */
+static uint64_t receiver_clock_hint(const cli_config_t *cfg)
+{
+    const char *am = cfg->am ? cfg->am : "";
+    if (strncasecmp(am, "HW-", 3) != 0 && !strcasestr(am, "samsung"))
+        return 0;
+    uint8_t mac[6];
+    bool have_mac = cfg->udn && parse_mac_hex(cfg->udn, mac);
+    if (!have_mac && cfg->ap2_txt) {
+        const char *devid = strcasestr(cfg->ap2_txt, "deviceid=");
+        have_mac = devid && parse_mac_hex(devid + 9, mac);
+    }
+    if (!have_mac) return 0;
+    return ((uint64_t)mac[0] << 56) | ((uint64_t)mac[1] << 48) |
+           ((uint64_t)mac[2] << 40) | (0xffULL << 32) | (0xfeULL << 24) |
+           ((uint64_t)mac[3] << 16) | ((uint64_t)mac[4] << 8) | (uint64_t)mac[5];
+}
+
 static int run_airplay2(cli_config_t *cfg, int infile)
 {
     ap2_device_info_t device = {
@@ -911,6 +954,8 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         ap2cl_set_publish_ip(client, cfg->publish_ip);
     ap2cl_set_ptp(client, cfg->route.ptp);
     ap2cl_set_ptp_shared(client, cfg->ptp_shared);
+    if (cfg->ptp_follow)
+        ap2cl_set_ptp_follow(client, true, receiver_clock_hint(cfg));
     ap2cl_set_remote_command_callback(
         client, remote_command_event, NULL);
 
@@ -1325,6 +1370,8 @@ static void print_usage(const char *name)
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
     printf("                             SupportsPTP feature bit)\n");
+    printf("  --ptp-follow               Solo session: yield the PTP timeline to a receiver\n");
+    printf("                             that announces itself as a master (e.g. Samsung)\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
     printf("                             read the elected clock from shared memory and do\n");
     printf("                             not bind 319/320 when a daemon is present; else\n");
@@ -1403,6 +1450,7 @@ int main(int argc, char *argv[])
         {"ptp",          no_argument,       0, 1009},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
+        {"ptp-follow",   no_argument,       0, 1015},
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
         {"pair-setup",   no_argument,       0, 1013},
@@ -1463,6 +1511,7 @@ int main(int argc, char *argv[])
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
+        case 1015: cfg.ptp_follow = true; break;
         case 1002:
             printf("cliairplay v%s check\n", VERSION);
             return 0;

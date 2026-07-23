@@ -130,6 +130,14 @@ uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx);
  */
 uint64_t ap2_ptp_unix_to_master_ns(struct ap2_ptp_ctx *ctx, uint64_t unix_ns);
 
+/*
+ * Follow mode (solo sessions): yield the timeline to the session's own
+ * receiver when it announces itself as a master — some receivers (Samsung)
+ * only render audio anchored on their own clock. Other announcers are still
+ * held off, and grandmaster is reclaimed if the receiver goes silent.
+ */
+void ap2_ptp_set_follow(struct ap2_ptp_ctx *ctx, bool follow);
+
 /* ---- shared daemon clock (multi-room: one engine, many streams) ---- */
 
 /*

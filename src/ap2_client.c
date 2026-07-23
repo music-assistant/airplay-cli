@@ -188,6 +188,8 @@ struct ap2cl_s {
     bool ptp_forced;   /* ap2cl_set_ptp() was called (overrides auto-detect) */
     bool ptp_enabled;  /* value passed to ap2cl_set_ptp() */
     bool ptp_shared;   /* prefer a shared PTP daemon clock (multi-room) if present */
+    bool ptp_follow;   /* solo session: yield the timeline to an announcing receiver */
+    uint64_t ptp_follow_hint;   /* receiver clock id (EUI-64) to pre-declare in SETUP, 0=none */
 };
 
 static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
@@ -1042,7 +1044,11 @@ static bool ap2_native_connect(struct ap2cl_s *p)
          * than running our own engine (only one process per host can bind
          * 319/320). Without --ptp-shared, or with no live daemon, fall through to
          * the in-process engine — the single-device path, byte-for-byte. */
-        if (p->ptp_shared && ap2_ptp_attach_shared(p->ptp)) {
+        if (p->ptp_follow)
+            /* Follow mode never rides the shared daemon: the daemon always
+             * holds grandmaster, and yielding is the whole point here. */
+            ap2_ptp_set_follow(p->ptp, true);
+        if (!p->ptp_follow && p->ptp_shared && ap2_ptp_attach_shared(p->ptp)) {
             p->use_ptp = true;
             ap2_ptp_shared_register(p->ptp, p->device.address);
             ap2_ptp_engine_settle(p->ptp, 400);
@@ -1068,11 +1074,15 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_gen_uuid(peer_id);
         const char *name = (p->device.name && *p->device.name) ? p->device.name : "cliairplay";
 
-        /* Advertise OUR clock as the session timeline (the engine holds
-         * grandmaster): receivers only follow masters from the timing-peer
-         * list — us — and cannot anchor to their own clock. The media anchor
-         * below is expressed against this same clock domain. */
+        /* Advertise the elected clock as the session timeline. Normally that
+         * is OUR clock (the engine holds grandmaster). In follow mode against
+         * a master-or-mute receiver (Samsung), declare the RECEIVER's clock
+         * up front — it has not announced yet at SETUP time, and it only
+         * renders audio anchored on its own timeline; the engine yields as
+         * soon as its Announce arrives. */
         uint64_t timeline_id = ap2_ptp_master_clock_id(p->ptp);
+        if (p->ptp_follow && p->ptp_follow_hint && timeline_id == clock_id)
+            timeline_id = p->ptp_follow_hint;
 
         ap2_pl_node *root = ap2_pl_dict();
         ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
@@ -1877,6 +1887,16 @@ void ap2cl_set_ptp_shared(struct ap2cl_s *p, bool enable)
     if (!p) return;
     p->ptp_shared = enable;
     LOG_INFO("[AP2] Shared PTP daemon clock %s", enable ? "preferred" : "disabled");
+}
+
+void ap2cl_set_ptp_follow(struct ap2cl_s *p, bool enable, uint64_t receiver_clock_hint)
+{
+    if (!p) return;
+    p->ptp_follow = enable;
+    p->ptp_follow_hint = receiver_clock_hint;
+    LOG_INFO("[AP2] PTP follow mode %s (receiver clock hint %016llx)",
+             enable ? "enabled" : "disabled",
+             (unsigned long long)receiver_clock_hint);
 }
 
 void ap2cl_set_remote_command_callback(

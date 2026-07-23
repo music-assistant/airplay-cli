@@ -268,6 +268,15 @@ void ap2cl_set_ptp(struct ap2cl_s *p, bool enable);
  * before ap2cl_connect(). */
 void ap2cl_set_ptp_shared(struct ap2cl_s *p, bool enable);
 
+/*
+ * Follow mode for solo sessions: run honest clock negotiation and yield the
+ * session timeline to the receiver when it announces itself as a master
+ * (Samsung receivers only render audio anchored on their own clock).
+ * receiver_clock_hint (EUI-64 from the receiver MAC, 0 = unknown) is
+ * pre-declared as the SETUP timeline for master-or-mute receivers.
+ */
+void ap2cl_set_ptp_follow(struct ap2cl_s *p, bool enable, uint64_t receiver_clock_hint);
+
 /* Set the address we advertise to the device (multi-homed hosts), used
  * wherever the protocol carries our own address (e.g. timing peer lists).
  * Defaults to the bind/source address when unset. */

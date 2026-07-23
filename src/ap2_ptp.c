@@ -169,6 +169,7 @@ struct ap2_ptp_ctx {
      * wins the election; the BMCA/slave machinery below stays available for
      * diagnostics and the synthetic harness. */
     bool hold_master;
+    bool follow_receiver;           /* solo session: yield the timeline to an announcing receiver */
     bool hold_notice_logged;        /* one INFO line per session about an ignored peer GM */
     bool unicast_granted;           /* a peer negotiated unicast PTP via Signaling */
     bool peer_kick;                 /* send timing immediately after peer registration */
@@ -734,9 +735,23 @@ static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int
     ctx->have_peer = true;
     ctx->last_peer_announce_ns = rx_ns;
     bool was_gm = ctx->is_grandmaster;
+    /* Follow mode: the session's own receiver announcing at all means it
+     * wants the timeline (some receivers, notably Samsung, only render on
+     * their own clock). Yield to IT regardless of dataset rank — our
+     * competitive dataset would otherwise always win the election it
+     * expects to win. Every other announcer is still held off. */
+    bool peer_is_receiver = false;
+    if (ctx->follow_receiver) {
+        for (int i = 0; i < ctx->npeers; i++) {
+            if (ctx->peers[i] && strcmp(ctx->peers[i], srcip) == 0) {
+                peer_is_receiver = true;
+                break;
+            }
+        }
+    }
     /* We keep the timeline unless the peer is strictly better (cmp > 0). */
-    bool now_gm = ptp_dataset_compare(&own, &peer) <= 0;
-    if (ctx->hold_master && !now_gm) {
+    bool now_gm = peer_is_receiver ? false : ptp_dataset_compare(&own, &peer) <= 0;
+    if ((ctx->hold_master || ctx->follow_receiver) && !peer_is_receiver && !now_gm) {
         /* Sender stays the timing authority: note the competing GM once, keep
          * announcing our own timeline. */
         if (!ctx->hold_notice_logged) {
@@ -1121,6 +1136,14 @@ uint64_t ap2_ptp_unix_to_master_ns(struct ap2_ptp_ctx *ctx, uint64_t unix_ns)
     clock_gettime(CLOCK_REALTIME, &ts);
     uint64_t unix_now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
     return ap2_ptp_master_now_ns(ctx) + unix_ns - unix_now;
+}
+
+void ap2_ptp_set_follow(struct ap2_ptp_ctx *ctx, bool follow)
+{
+    if (!ctx) return;
+    pthread_mutex_lock(&ctx->lock);
+    ctx->follow_receiver = follow;
+    pthread_mutex_unlock(&ctx->lock);
 }
 
 void ap2_ptp_set_peers(struct ap2_ptp_ctx *ctx, const char *const *ips, int count)
