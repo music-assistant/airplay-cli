@@ -1,10 +1,14 @@
 /*
- * Persistent session mode - generation state machine
+ * Persistent session - generation state machine
  *
- * Separates connection lifetime from media lifetime. In --session mode the
- * binary connects once (HAP, RTSP, timing, MRP) and then plays a sequence of
- * numbered media GENERATIONS over one connection, so seek/next/resume never
- * pay the connect cost again:
+ * Separates connection lifetime from media lifetime: the binary connects once
+ * (HAP, RTSP, timing, MRP) and plays a sequence of numbered media GENERATIONS
+ * over that one connection, so seek/next/resume never pay the connect cost
+ * again. This is not a mode: the argv invocation defines generation 0, and
+ * whenever a command pipe is attached the connection simply outlives the
+ * generation (bounded by the idle timeout) awaiting the next PREPARE. Without
+ * a command pipe there is no way to receive further generations, so input EOF
+ * drains and exits - the classic one-shot behavior, by construction.
  *
  *   PREPARE(gen, audio pipe, position)  ->  ready  ->  primed
  *   START(gen, start time)              ->  flush old + swap + anchor -> playing
