@@ -1150,7 +1150,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         }
     }
 
-    /* 5. Stream SETUP with streams array (BEFORE RECORD per Apple TV expectations) */
+    /* 5. RECORD (on the session URL, below), then stream SETUP with the
+     * streams array. RECORD before the stream SETUP matches the order used
+     * by Apple senders and owntone, and is REQUIRED by Samsung AirPlay 2
+     * receivers (e.g. Music Frame HW-LS60D), which 200-ACK the entire session
+     * but render silence otherwise; verified on hardware 2026-07-24 (A/B/A on
+     * the Frame; no regression on Apple TV 4K or Sonos Era, warm seek
+     * intact). */
     /* The shk audio key must be the first 32 bytes of the pairing shared
      * secret: that is also the key the audio sender encrypts with, and the
      * receiver uses shk to decrypt the RTP payloads. */
@@ -1213,6 +1219,21 @@ static bool ap2_native_connect(struct ap2cl_s *p)
 
     plist_len = ap2_plist_serialize(ssp, &plist_data);
     ap2_plist_free(ssp);
+
+    /* RECORD on the session URL, before the stream SETUP (see the note
+     * above): required for Samsung AirPlay 2 receivers to actually render
+     * audio. */
+    resp = NULL; resp_len = 0;
+    status = ap2_rtsp_send(p, "RECORD", p->session_url, NULL, 0, NULL, &resp, &resp_len);
+    free(resp);
+    if (status <= 0) {
+        free(plist_data);
+        return false;
+    } else if (status != 200) {
+        LOG_WARN("[AP2] RECORD returned %d", status);
+    } else {
+        LOG_INFO("[AP2] RECORD OK");
+    }
 
     resp = NULL; resp_len = 0;
     status = ap2_rtsp_send(p, "SETUP", p->session_url, plist_data, plist_len,
@@ -1308,19 +1329,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     LOG_INFO("[AP2] Stream SETUP OK");
     free(resp);
 
-    /* 6. RECORD to begin streaming */
-    resp = NULL; resp_len = 0;
-    status = ap2_rtsp_send(p, "RECORD", p->session_url, NULL, 0, NULL, &resp, &resp_len);
-    free(resp);
-    if (status <= 0) {
-        return false;
-    } else if (status != 200) {
-        LOG_WARN("[AP2] RECORD returned %d", status);
-    } else {
-        LOG_INFO("[AP2] RECORD OK");
-    }
-
-    /* 6b. SETPEERS (PTP only): a bare binary-plist array of IP strings
+    /* 6. SETPEERS (PTP only): a bare binary-plist array of IP strings
      * [receiver, us] so the receiver knows the timing group members. */
     if (p->use_ptp) {
         ap2_pl_node *arr = ap2_pl_array();
@@ -1346,7 +1355,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_ptp_shared_kick(p->ptp);
     }
 
-    /* 6c. MRP now-playing. Ground-truth capture (DESIGN.md §8) shows a real
+    /* 6b. MRP now-playing. Ground-truth capture (DESIGN.md §8) shows a real
      * sender delivers now-playing over POST /command, NOT the type-130 channel
      * (its type-130 SETUPs never completed a data connection), and pushing state
      * over type-130 competes with /command. So the type-130 channel is OFF by
