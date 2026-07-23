@@ -53,6 +53,18 @@ typedef struct {
     int channels;       /* 2 (stereo) */
 } ap2_audio_format_t;
 
+/* The requested audioFormat and the /info-advertised per-stream format tables
+ * (bit masks in the audioFormat bit space). The tables are advisory: hardware
+ * both understates and overstates them (DESIGN.md §11), so callers must treat
+ * them as evidence, not proof. */
+typedef struct {
+    uint64_t requested;          /* audioFormat selected for this session */
+    uint64_t realtime_formats;   /* advertised audioStream mask */
+    uint64_t buffered_formats;   /* advertised bufferStream mask */
+    bool realtime_known;
+    bool buffered_known;
+} ap2_format_capabilities_t;
+
 /* AP2 device info (from mDNS TXT records) */
 typedef struct {
     char *name;         /* Device display name */
@@ -256,6 +268,11 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip);
  * the client falls back to the realtime (type 96) stream. Must be called before
  * ap2cl_connect(). */
 void ap2cl_set_buffered(struct ap2cl_s *p, bool enable);
+
+/* Return the requested format and the /info-advertised format capabilities
+ * (populated by the native flow's GET /info; zeroed otherwise). */
+void ap2cl_format_capabilities(struct ap2cl_s *p,
+                               ap2_format_capabilities_t *caps);
 
 /* Set the callback for validated receiver MediaRemote commands. Must be called
  * before ap2cl_connect(); the callback remains fixed for that session. */
