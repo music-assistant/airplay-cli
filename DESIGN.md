@@ -96,17 +96,20 @@ Connect sequence (`ap2_native_connect()`):
    clock ID and advertised address. NTP sessions carry
    `timingProtocol=NTP` + `timingPort`. The response's `eventPort` is opened
    as a keep-open reverse TCP connection.
-6. **Stream SETUP** — a `streams` array entry: `type` 96,
-   `audioFormat` (§7), `ct=2` (ALAC), `spf=352`, `shk` (the 32-byte audio
-   key), our `controlPort` and `dataPort`,
+6. **RECORD, then Stream SETUP** — RECORD is sent first, on the session URL
+   with an empty body, before the stream SETUP; this matches the order used
+   by Apple senders and owntone, and some third-party receivers render
+   silence without it (§11). The stream SETUP is a `streams` array entry:
+   `type` 96, `audioFormat` (§7), `ct=2` (ALAC), `spf=352`, `shk` (the
+   32-byte audio key), our `controlPort` and `dataPort`,
    `latencyMin`/`latencyMax`. The response is parsed **by key** with a real
    binary-plist reader (`ap2_bplist`) — receivers typically serialize
    `controlPort` before `dataPort`, so positional parsing would send audio to
    the control port and mute the device. The receiver's reported
    `latencyMin`/`latencyMax` (when present) clamp our lead and size the
    pacing window (§6).
-7. **RECORD**, then for PTP sessions **SETPEERS** (a bare plist array
-   `[receiver, us]`) and the same peer list handed to the PTP engine.
+7. For PTP sessions, **SETPEERS** (a bare plist array `[receiver, us]`) and
+   the same peer list handed to the PTP engine.
 
 The audio key (`shk`) is the first 32 bytes of the pairing shared secret —
 the raw X25519 secret for pair-verify, `SHA512(S)[:32]` for transient.
@@ -549,3 +552,8 @@ callers:
 - **Sonos withholds audio until metadata arrives** (§10).
 - **Cross-VLAN**: HomeKit pairing and PTP do not survive subnet boundaries;
   same-L2 is assumed.
+- **Samsung AirPlay 2 receivers require RECORD before the stream SETUP.** The
+  Music Frame (HW-LS60D) 200-ACKs the session-SETUP → stream-SETUP → RECORD
+  order but renders silence; moving RECORD immediately before the stream
+  SETUP — the order Apple senders and owntone already use — fixes it, with
+  no regression seen on Apple TV 4K or Sonos Era 100 (§3).
