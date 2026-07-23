@@ -2262,6 +2262,81 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
     return true;
 }
 
+/* Warm-flush experiment (Phase 1 research; PLAN-seek-performance.md).
+ * Runs on the cmdpipe thread like PAUSE/PLAY: RTSP is serialized by rtsp_lock;
+ * the timeline fields race the send path by at most one chunk, which the
+ * fresh anchor line absorbs. Sequence numbers are deliberately untouched so
+ * the per-packet nonce sequence can never repeat within the session. */
+bool ap2cl_experiment_flush(struct ap2cl_s *p, const char *mode, int lead_ms,
+                            ap2_xflush_result_t *out)
+{
+    if (out) memset(out, 0, sizeof(*out));
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->use_buffered ||
+        p->state != AP2_STREAMING || !mode || lead_ms < 0)
+        return false;
+
+    uint64_t t0 = ap2_io_monotonic_ms();
+    if (out) {
+        out->old_rtp = p->rtp_timestamp;
+        out->seq = p->seq_number;
+    }
+
+    if (strcmp(mode, "rtsp") == 0) {
+        char hdr[64];
+        snprintf(hdr, sizeof(hdr), "RTP-Info: seq=%u;rtptime=%u\r\n",
+                 (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
+        uint8_t *resp = NULL;
+        int resp_len = 0;
+        int status = ap2_rtsp_send_ex(p, "FLUSH", p->session_url, NULL, 0,
+                                      NULL, hdr, &resp, &resp_len);
+        free(resp);
+        if (out) out->flush_status = status;
+        LOG_INFO("[XP] FLUSH (RTP-Info seq=%u rtptime=%u) -> %d",
+                 (unsigned)p->seq_number, (unsigned)p->rtp_timestamp, status);
+    } else if (strcmp(mode, "anchor") == 0) {
+        uint64_t now_ns = ap2_ptp_master_now_ns(p->ptp);
+        bool rate0 = ap2_send_setrateanchortime(p, p->rtp_timestamp, now_ns, 0);
+        bool flushed = ap2_send_flushbuffered(p);
+        bool rate1 = ap2_send_setrateanchortime(
+            p, p->rtp_timestamp, now_ns + (uint64_t)lead_ms * 1000000ULL, 1);
+        if (out) {
+            out->rate0_ok = rate0;
+            out->flushed_ok = flushed;
+            out->rate1_ok = rate1;
+        }
+    } else if (strcmp(mode, "jump") == 0) {
+        /* Skip the on-wire timeline 10 s ahead of everything delivered; the
+         * anchor line carries the same offset, so the audible schedule is
+         * intact while stale buffered frames land far in the receiver's past. */
+        atomic_store(&p->rtp_offset,
+                     atomic_load(&p->rtp_offset) +
+                         (uint32_t)(p->format.sample_rate * 10));
+    } else {
+        return false;
+    }
+    if (out) out->t_flush_ms = ap2_io_monotonic_ms() - t0;
+
+    /* Re-base the frozen line: first sample of the continuing stream audible
+     * at now + lead_ms. head_ts moves in the scheduling domain, the wire
+     * timestamp follows it plus the (possibly jumped) offset, and the next
+     * sync packet freezes the new line from start_ntp. */
+    uint64_t start = raopcl_get_ntp(NULL) + MS2NTP(lead_ms);
+    p->start_ntp = start;
+    p->head_ts = NTP2TS(start, p->format.sample_rate);
+    p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
+    p->rt_anchor_valid = false;
+
+    bool announced = true;
+    if (p->use_ptp && p->ctrl_sock >= 0)
+        announced = ap2_send_sync_packet_ptp(p, true) != AP2_SEND_FATAL;
+    if (out) {
+        out->announced = announced;
+        out->new_rtp = p->rtp_timestamp;
+        out->t_total_ms = ap2_io_monotonic_ms() - t0;
+    }
+    return announced;
+}
+
 ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
                                    int frames)
 {

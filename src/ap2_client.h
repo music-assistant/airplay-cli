@@ -274,6 +274,34 @@ void ap2cl_set_buffered(struct ap2cl_s *p, bool enable);
 void ap2cl_format_capabilities(struct ap2cl_s *p,
                                ap2_format_capabilities_t *caps);
 
+/* Outcome of one warm-flush experiment step (Phase 1 research). */
+typedef struct {
+    int flush_status;      /* mode rtsp: RTSP status of the FLUSH request */
+    bool rate0_ok;         /* mode anchor: SETRATEANCHORTIME rate 0 accepted */
+    bool flushed_ok;       /* mode anchor: FLUSHBUFFERED accepted */
+    bool rate1_ok;         /* mode anchor: SETRATEANCHORTIME rate 1 accepted */
+    bool announced;        /* fresh frozen-line sync packet went out */
+    uint32_t old_rtp;
+    uint32_t new_rtp;
+    unsigned seq;          /* sequence number at the boundary (never reset) */
+    uint64_t t_flush_ms;   /* time spent in the receiver-flush step */
+    uint64_t t_total_ms;   /* time for the whole operation */
+} ap2_xflush_result_t;
+
+/*
+ * Warm-flush experiment: on a LIVE native realtime (type 96) session, discard
+ * receiver-buffered audio via the selected mechanism and re-anchor the frozen
+ * timeline lead_ms in the future. mode is one of:
+ *   "rtsp"   - classic RTSP FLUSH with RTP-Info (the RAOP seek semantic)
+ *   "jump"   - sender-only: jump the on-wire RTP timeline past everything
+ *              delivered, so stale frames become unschedulable under the new line
+ *   "anchor" - buffered-style SETRATEANCHORTIME(0) + FLUSHBUFFERED +
+ *              SETRATEANCHORTIME(1) issued against the realtime stream
+ * Sequence numbers (and thus audio nonces) are never reset.
+ */
+bool ap2cl_experiment_flush(struct ap2cl_s *p, const char *mode, int lead_ms,
+                            ap2_xflush_result_t *out);
+
 /* Set the callback for validated receiver MediaRemote commands. Must be called
  * before ap2cl_connect(); the callback remains fixed for that session. */
 void ap2cl_set_remote_command_callback(

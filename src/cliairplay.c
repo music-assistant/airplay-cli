@@ -507,6 +507,30 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_set_volume(g_ap2cl, vol);
         }
+    } else if (strcmp(key, "XFLUSH") == 0) {
+        /* Warm-flush experiment: XFLUSH=<rtsp|jump|anchor>,<lead_ms>.
+         * Discards receiver-buffered audio via the selected mechanism and
+         * re-anchors the live realtime timeline lead_ms in the future. The
+         * [XP] result line on stdout is the experiment's measurement. */
+        char mode[16] = {0};
+        int lead_ms = -1;
+        if (sscanf(value, "%15[a-z],%d", mode, &lead_ms) == 2 &&
+            cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+            ap2_xflush_result_t r;
+            bool ok = ap2cl_experiment_flush(g_ap2cl, mode, lead_ms, &r);
+            printf("[XP] xflush mode=%s lead_ms=%d ok=%d flush_status=%d "
+                   "rate0=%d flushed=%d rate1=%d announced=%d old_rtp=%u "
+                   "new_rtp=%u seq=%u t_flush_ms=%llu t_total_ms=%llu\n",
+                   mode, lead_ms, ok ? 1 : 0, r.flush_status,
+                   r.rate0_ok ? 1 : 0, r.flushed_ok ? 1 : 0,
+                   r.rate1_ok ? 1 : 0, r.announced ? 1 : 0,
+                   (unsigned)r.old_rtp, (unsigned)r.new_rtp, r.seq,
+                   (unsigned long long)r.t_flush_ms,
+                   (unsigned long long)r.t_total_ms);
+            fflush(stdout);
+        } else {
+            LOG_WARN("Ignoring malformed XFLUSH command: %s", value);
+        }
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "PAUSE") == 0) {
         if (g_status == STATUS_PLAYING) {
             if (cfg->protocol == PROTO_RAOP && g_raopcl) {
