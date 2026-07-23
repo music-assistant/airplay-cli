@@ -40,7 +40,7 @@
 #include "ap2_hap.h"
 #include "artwork.h"
 
-#define VERSION "0.3.0"
+#define VERSION "0.3.1"
 #define AP2_FRAMES_PER_CHUNK 352
 
 /* Protocol selection (resolved, concrete protocol used for dispatch). */
