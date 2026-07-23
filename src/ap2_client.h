@@ -5,7 +5,6 @@
  * - HomeKit (HAP) pair-verify authentication
  * - ChaCha20-Poly1305 encrypted channels (control, timing, audio)
  * - PTP clock synchronization
- * - Buffered audio streaming
  * - 24-bit/48kHz ALAC support
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
@@ -88,7 +87,6 @@ typedef struct {
     bool native;        /* AirPlay 2: native flow (else RAOP-compatible) */
     bool transient;     /* native AP2: transient pairing (else pair-verify) */
     bool ptp;           /* native AP2: PTP grandmaster timing (else NTP) */
-    bool buffered;      /* native AP2: buffered stream, type 103 (else realtime 96) */
     uint64_t features;  /* parsed mDNS features bitmask (for logging) */
     uint64_t flags;     /* parsed mDNS status flags bitmask (for logging) */
     const char *reason; /* short human-readable summary of the decision */
@@ -109,15 +107,14 @@ uint64_t ap2_txt_flags(const char *txt);
  * :param pw: mDNS pw field ("true" when a device password is required), or NULL.
  * :param have_credentials: stored HAP credentials are available (--auth).
  * :param bit_depth: requested output bit depth (informational; hi-res rides
- *                   the realtime stream, not buffered).
+ *                   the realtime stream).
  * :param force_native: --ap2-native was given (forces the native AP2 flow).
- * :param force_buffered: --buffered was given (forces buffered + native + PTP).
  * :param ptp_forced: --ptp was given (overrides the SupportsPTP auto-detect).
  * :param ptp_enabled: the value passed to --ptp.
  */
 ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char *pw,
                               bool have_credentials, int bit_depth,
-                              bool force_native, bool force_buffered,
+                              bool force_native,
                               bool ptp_forced, bool ptp_enabled);
 
 /*
@@ -262,12 +259,6 @@ void ap2cl_set_ptp_shared(struct ap2cl_s *p, bool enable);
  * wherever the protocol carries our own address (e.g. timing peer lists).
  * Defaults to the bind/source address when unset. */
 void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip);
-
-/* Select the buffered audio stream (type 103, RTP over TCP + SETRATEANCHORTIME)
- * for the native AP2 flow. Requires PTP timing; when PTP cannot be established
- * the client falls back to the realtime (type 96) stream. Must be called before
- * ap2cl_connect(). */
-void ap2cl_set_buffered(struct ap2cl_s *p, bool enable);
 
 /* Return the requested format and the /info-advertised format capabilities
  * (populated by the native flow's GET /info; zeroed otherwise). */

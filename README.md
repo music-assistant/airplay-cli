@@ -162,7 +162,6 @@ cliairplay [options] <host_ip> <filename ('-' for stdin)>
 | `--hostname <host>` | Device hostname (native flow). |
 | `--ptp` | Force PTP grandmaster timing (binds UDP 319/320, needs privilege). Default: auto by the SupportsPTP feature bit. |
 | `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. |
-| `--buffered` | Force the buffered audio stream (type 103, RTP over TCP + PTP anchor). Parked — see `DESIGN.md`; realtime covers hi-res. |
 
 ### Utility / daemon modes
 
@@ -241,7 +240,7 @@ server `dev` branch with both Dockerfile pins. That step requires the
 src/cliairplay.c      CLI entry, route dispatch, playback loops, input ring,
                       cmdpipe, --pair-setup and --ptp-daemon modes
 src/ap2_client.c      AP2 orchestrator: route resolution, RAOP-compat + native
-                      flows, realtime/buffered senders, anchor & pacing
+                      flows, the realtime sender, anchor & pacing
 src/ap2_hap.c         HAP pair-verify, transient and PIN pair-setup, encrypted
                       RTSP framing (ChaCha20-Poly1305)
 src/ap2_io.c          Absolute-deadline socket I/O shared by RTSP and MRP

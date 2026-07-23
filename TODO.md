@@ -12,11 +12,6 @@ Genuinely open work only. Completed work lives in git history.
 - [ ] **MediaRemote follow-ups.** Metadata-only display mode (an Apple TV as a
       now-playing screen for audio playing elsewhere) and Companion-protocol
       wake/power tracking.
-- [ ] **Buffered (type 103) playback anchoring on Apple TV.** Framing and
-      anchoring are implemented and verified against a reference receiver, but
-      the Apple TV never measures our clock on a buffered stream so its rate
-      anchor never clears. Parked (realtime carries hi-res); revisiting needs a
-      capture of an iOS → Apple TV buffered session.
 - [ ] **Parse `audioLatencies` from GET /info.** The SETUP echo of
       `latencyMin`/`latencyMax` is receiver-optional (Sonos omits it); the
       /info table would populate the pacing window and the reported

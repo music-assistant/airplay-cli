@@ -96,7 +96,6 @@ typedef struct {
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
-    bool buffered;          /* force buffered audio stream (type 103) */
 
     /* Audio format */
     int sample_rate;
@@ -864,7 +863,6 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         ap2cl_set_publish_ip(client, cfg->publish_ip);
     ap2cl_set_ptp(client, cfg->route.ptp);
     ap2cl_set_ptp_shared(client, cfg->ptp_shared);
-    ap2cl_set_buffered(client, cfg->route.buffered);
     ap2cl_set_remote_command_callback(
         client, remote_command_event, NULL);
 
@@ -1221,9 +1219,6 @@ static void print_usage(const char *name)
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
     printf("                             SupportsPTP feature bit)\n");
-    printf("  --buffered                 Force the buffered audio stream (type 103,\n");
-    printf("                             native AP2, RTP over TCP + PTP anchor); else\n");
-    printf("                             auto when SupportsBufferedAudio + 24-bit\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
     printf("                             read the elected clock from shared memory and do\n");
     printf("                             not bind 319/320 when a daemon is present; else\n");
@@ -1300,7 +1295,6 @@ int main(int argc, char *argv[])
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
-        {"buffered",     no_argument,       0, 1010},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
         {"check",        no_argument,       0, 1002},
@@ -1360,7 +1354,6 @@ int main(int argc, char *argv[])
         case 1007: cfg.force_native = true; break;
         case 1008: cfg.publish_ip = optarg; break;
         case 1009: cfg.ptp = true; break;
-        case 1010: cfg.buffered = true; break;
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
@@ -1434,13 +1427,13 @@ int main(int argc, char *argv[])
 
     /* Resolve the streaming route from the discovery TXT and any overrides.
      * --protocol auto (the default) picks RAOP vs AirPlay 2 from the mDNS
-     * features; explicit raop/airplay2 force the protocol; --ap2-native,
-     * --buffered and --ptp are forcing overrides. This is the single decision
-     * point: cfg.protocol becomes the concrete protocol used for dispatch and
+     * features; explicit raop/airplay2 force the protocol; --ap2-native and
+     * --ptp are forcing overrides. This is the single decision point:
+     * cfg.protocol becomes the concrete protocol used for dispatch and
      * cfg.route carries the AirPlay 2 sub-decisions applied in run_airplay2(). */
     bool have_creds = cfg.auth && strlen(cfg.auth) == 192;
     cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
-                                  cfg.bit_depth, cfg.force_native, cfg.buffered,
+                                  cfg.bit_depth, cfg.force_native,
                                   cfg.ptp, cfg.ptp);
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
@@ -1450,12 +1443,13 @@ int main(int argc, char *argv[])
              (unsigned long long)cfg.route.flags,
              cfg.bit_depth);
     /* Machine-parseable route report on stdout so the caller (MA) can log and
-     * surface which route this stream actually took. */
-    printf("[STATUS] route protocol=%s flow=%s timing=%s buffered=%d\n",
+     * surface which route this stream actually took. The literal buffered=0
+     * keeps the line shape stable for existing parsers; buffered playback
+     * itself was investigated and removed (DESIGN.md). */
+    printf("[STATUS] route protocol=%s flow=%s timing=%s buffered=0\n",
            cfg.route.use_raop ? "raop" : "airplay2",
            cfg.route.use_raop ? "legacy" : (cfg.route.native ? "native" : "raop-compat"),
-           (!cfg.route.use_raop && cfg.route.ptp) ? "ptp" : "ntp",
-           cfg.route.buffered ? 1 : 0);
+           (!cfg.route.use_raop && cfg.route.ptp) ? "ptp" : "ntp");
     fflush(stdout);
 
     /* Setup signal handlers */
