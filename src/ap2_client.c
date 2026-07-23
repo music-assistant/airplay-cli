@@ -259,13 +259,17 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
     if (request_started) *request_started = true;
     int cseq = p->cseq++;
     char hdr[1024];
+    /* Client-Instance and X-Apple-Client-Name ride on every request like
+     * owntone/iOS senders do; some receivers key sender state off them. */
     int hdr_len = snprintf(hdr, sizeof(hdr),
         "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: AirPlay/670.6.2\r\n"
-        "DACP-ID: %s\r\nActive-Remote: %s\r\n%s%s%s%s"
+        "DACP-ID: %s\r\nActive-Remote: %s\r\n"
+        "Client-Instance: %s\r\nX-Apple-Client-Name: Music Assistant\r\n%s%s%s%s"
         "Content-Length: %d\r\n\r\n",
         method, uri, cseq,
         p->dacp_id ? p->dacp_id : "0",
         p->active_remote ? p->active_remote : "0",
+        p->dacp_id ? p->dacp_id : "0",
         ct ? "Content-Type: " : "", ct ? ct : "", ct ? "\r\n" : "",
         extra_hdr ? extra_hdr : "",
         body_len);
@@ -508,6 +512,31 @@ static void ap2_service_mrp_input(struct ap2cl_s *p)
     pthread_mutex_unlock(&p->mrp_lock);
 }
 
+/* Drain and acknowledge the reverse event channel. Real senders service this
+ * connection (owntone: airplay_events.c); a receiver that posts an event and
+ * never gets an answer may wedge parts of its pipeline. Without MRP attached
+ * (transient pairing) nothing else reads this socket, so answer any RTSP
+ * request with a bare 200 echoing its CSeq. */
+static void ap2_service_events_channel(struct ap2cl_s *p)
+{
+    if (p->events_sock < 0) return;
+    char buf[2048];
+    for (;;) {
+        ssize_t n = recv(p->events_sock, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+        if (n <= 0) break;
+        buf[n] = '\0';
+        int cseq = 0;
+        const char *c = strcasestr(buf, "CSeq:");
+        if (c) cseq = atoi(c + 5);
+        LOG_DEBUG("[AP2] events channel RX %zd bytes (CSeq %d)", n, cseq);
+        char resp[96];
+        int rlen = snprintf(resp, sizeof(resp),
+                            "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
+                            cseq);
+        send(p->events_sock, resp, (size_t)rlen, MSG_DONTWAIT);
+    }
+}
+
 static void *ap2_feedback_thread_main(void *arg)
 {
     struct ap2cl_s *p = arg;
@@ -519,6 +548,7 @@ static void *ap2_feedback_thread_main(void *arg)
     while (!atomic_load(&p->feedback_stop) &&
            !atomic_load(&p->rtsp_dead)) {
         ap2_service_mrp_input(p);
+        ap2_service_events_channel(p);
         uint64_t now_ms = ap2_io_monotonic_ms();
         if (now_ms < next_tick_ms) {
             uint64_t sleep_ms = next_tick_ms - now_ms;
@@ -1209,7 +1239,9 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     ap2_plist_stream_add_string(ssp, "audioMode", "default");
     ap2_plist_stream_add_int(ssp, "controlPort", local_ctrl_port);
     ap2_plist_stream_add_int(ssp, "ct", 2);  /* ALAC */
-    ap2_plist_stream_add_int(ssp, "dataPort", local_data_port);
+    /* No request-side dataPort: real senders (owntone/iOS) let the RECEIVER
+     * assign the data port in its SETUP response; ours is only local. */
+    (void)local_data_port;
     ap2_plist_stream_add_bool(ssp, "isMedia", true);
     ap2_plist_stream_add_int(ssp, "latencyMax", 88200);
     ap2_plist_stream_add_int(ssp, "latencyMin", 11025);
@@ -1376,6 +1408,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     if (atomic_load(&p->rtsp_dead)) return false;
     p->rtsp_established = true;
     p->state = AP2_CONNECTED;
+    /* Volume is the mandatory final step of the connect sequence for real
+     * senders (owntone/iOS) — even "no volume yet" goes out as an explicit
+     * value. Some receivers do not unmute their render path without it. */
+    ap2cl_set_volume(p, p->volume);
     if (!ap2_feedback_start(p)) {
         atomic_store(&p->rtsp_dead, true);
         return false;
