@@ -1456,13 +1456,13 @@ static ap2_send_result_t ap2_send_sync_packet(struct ap2cl_s *p, bool first)
 }
 
 /* Send AP2 PTP sync (anchor) packet (28 bytes) to the control port.
- * Format (owntone rtp_common.c sync_packet_ptp, realtime use_ptp path):
+ * Format (owntone rtp_common.c sync_packet_ptp_make, verified 2026-07-23):
  *   bytes 0-1:   header (0x90d7 first / 0x80d7 subsequent)
  *   bytes 2-3:   fixed 0x0006
- *   bytes 4-7:   current RTP timestamp (network order)
- *   bytes 8-15:  wall-clock time in nanoseconds on the PTP master timebase (BE64)
- *   bytes 16-19: RTP timestamp - latency (the sample currently rendering)
- *   bytes 20-27: our PTP clock identity (BE64)
+ *   bytes 4-7:   CURRENT playing rtptime, paired with the wall time below
+ *   bytes 8-15:  wall-clock ns on the PTP master timebase (BE64)
+ *   bytes 16-19: play gate: send head - 11025 (earliest playable rtptime)
+ *   bytes 20-27: the elected PTP clock identity (BE64)
  * The wall-clock ns and the clock identity come from the PTP grandmaster so the
  * receiver, slaved to that clock, can place the anchor precisely. */
 static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
@@ -1516,8 +1516,14 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
                        - (int64_t)p->latency_ms * 1000000LL;
     uint32_t play_pos = p->rt_anchor_pos0
                       + (uint32_t)((elapsed_ns * p->format.sample_rate) / 1000000000LL);
-    uint32_t frame_1 = play_pos + 11035;
-    uint32_t frame_2 = frame_1 + 77175;
+    /* owntone sender semantics (proven on Sonos, Apple TV AND Samsung): pair
+     * the wall time with the CURRENT playing rtptime, and put the play-gate
+     * ("earliest rtptime the device may play") a fixed 11025 frames behind
+     * the send head. Our previous shairport-derived shape put the gate at
+     * play_pos+88210 — ~2 s ahead of the head, forever — which a receiver
+     * honoring the gate answers with eternal, ACK-everything silence. */
+    uint32_t frame_1 = play_pos;
+    uint32_t frame_2 = p->rtp_timestamp - 11025;
 
     uint32_t be = htonl(frame_1);
     memcpy(pkt + 4, &be, 4);
