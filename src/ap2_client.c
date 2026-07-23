@@ -1940,9 +1940,21 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     return true;
 }
 
-bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
+static uint64_t commanded_start_ntp(uint64_t start_unix_ms)
+{
+    uint64_t start_ntp = start_unix_ms
+        ? ((start_unix_ms / 1000) << 32) |
+              (((start_unix_ms % 1000) << 32) / 1000)
+        : 0;
+    uint64_t min_start =
+        raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+    return start_ntp < min_start ? min_start : start_ntp;
+}
+
+bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms)
 {
     if (!p) return false;
+    uint64_t ntp_start = commanded_start_ntp(start_unix_ms);
     if (p->flow == FLOW_NATIVE_AP2) {
         /* Offset the RTP timeline per process: streams in one group share
          * ntpstart, and with identical pos0 two sessions from one host are
@@ -2027,13 +2039,7 @@ bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms)
 {
     if (!p || p->state == AP2_DOWN) return false;
 
-    uint64_t now_ntp = raopcl_get_ntp(NULL);
-    uint64_t start_ntp = start_unix_ms
-        ? ((start_unix_ms / 1000) << 32) |
-              (((start_unix_ms % 1000) << 32) / 1000)
-        : 0;
-    uint64_t min_start = now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
-    if (start_ntp < min_start) start_ntp = min_start;
+    uint64_t start_ntp = commanded_start_ntp(start_unix_ms);
 
     if (p->flow != FLOW_NATIVE_AP2) {
         if (!p->raopcl) return false;

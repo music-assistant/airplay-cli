@@ -177,9 +177,9 @@ grandmaster — but MA spawns one cliairplay per device. The split
 
 ## 6. Timing and the start contract
 
-**Contract: `--start-unix-ms T` means the first sample is AUDIBLE at exactly
-T, on every protocol path.** Group members — including mixed RAOP + native-AP2
-groups — are handed the same T and align by construction.
+**Contract: cmdpipe `START_UNIX_MS=T` means the first sample is AUDIBLE at
+exactly T.** AirPlay 2 group members are handed the same T after each one has
+reported its generation primed, then align by construction.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its

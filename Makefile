@@ -181,7 +181,7 @@ $(BUILDDIR)/%.o: %.cpp
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
-test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
+test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 		$(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
@@ -190,6 +190,13 @@ test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
+	@! $(EXECUTABLE) --help | grep -q -- '--start-unix-ms'
+	@removed="$$($(EXECUTABLE) --start-unix-ms 1 2>&1 || true)"; \
+		printf '%s\n' "$$removed" | grep -q "unrecognized option.*start-unix-ms"
+	@argv_audio="$$($(EXECUTABLE) --protocol airplay2 --cmdpipe \
+		/tmp/cliairplay-test-unused 127.0.0.1 - 2>&1 || true)"; \
+		printf '%s\n' "$$argv_audio" | \
+		grep -q "AirPlay 2 audio must be provided by cmdpipe PREPARE"
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

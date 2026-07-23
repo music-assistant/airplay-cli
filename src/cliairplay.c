@@ -72,8 +72,7 @@ typedef struct {
     char *active_remote;
     char *cmdpipe;
     char *udn;
-    uint64_t ntp_start;
-    char *audio_source;  /* filename or "-" for stdin */
+    char *audio_source;  /* RAOP filename or "-" for stdin */
 
     /* RAOP-specific */
     bool encrypt;
@@ -162,25 +161,28 @@ static void status_connected(void)
     status_print("[STATUS] connected");
 }
 
-/* Persistent-session engine (native AP2): generation 0 adopts the argv
- * input; further generations arrive over the command pipe. */
+/* Persistent-session engine: every AirPlay 2 generation is commanded through
+ * the command pipe, including generation 0. */
 #define SESSION_PREFILL_MS        500     /* staging fill that emits `primed` */
-#define SESSION_IDLE_TIMEOUT_MS   120000  /* orphan safety net (cmdpipe only) */
+#define SESSION_IDLE_TIMEOUT_MS   120000  /* orphan safety net */
 static struct ap2_session_s *g_session = NULL;
+static pthread_mutex_t g_audio_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_first_start_done = false;
 static uint64_t g_pend_generation = 0;
 static char g_pend_audio[512];
 static uint64_t g_pend_position_ms = 0;
 static uint64_t g_pend_start_unix_ms = 0;
 
-static uint64_t unix_ms_to_ntp(uint64_t ms)
+static void session_quiesce(void *transport)
 {
-    return ((ms / 1000) << 32) | (((ms % 1000) << 32) / 1000);
+    (void)transport;
+    pthread_mutex_lock(&g_audio_send_lock);
 }
 
-static uint64_t ntp_to_unix_ms(uint64_t ntp)
+static void session_resume(void *transport)
 {
-    return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
+    (void)transport;
+    pthread_mutex_unlock(&g_audio_send_lock);
 }
 
 static void status_playing(uint64_t elapsed_ms)
@@ -503,7 +505,6 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         ap2_generation_t gen = {
             .number = g_pend_generation,
             .audio_path = g_pend_audio[0] ? g_pend_audio : NULL,
-            .audio_fd = -1,
             .position_ms = g_pend_position_ms,
         };
         if (!g_session || !ap2_session_prepare(g_session, &gen))
@@ -599,11 +600,8 @@ static bool session_commit(void *transport, uint64_t start_unix_ms)
     if (!client) return false;
     if (!g_first_start_done) {
         /* First start: full timeline init (pid RTP offset, sequence seed).
-         * With no commanded instant, keep the classic one-lead default. */
-        uint64_t ntp = start_unix_ms
-            ? unix_ms_to_ntp(start_unix_ms)
-            : raopcl_get_ntp(NULL) + MS2NTP(cfg->latency_ms);
-        if (!ap2cl_start_at(client, ntp)) return false;
+         * The client clamps stale commands to its minimum safe lead. */
+        if (!ap2cl_start(client, start_unix_ms)) return false;
         /* Placeholder metadata must follow the first start: it anchors to the
          * RTP timeline that call establishes (metadata-gated receivers keep
          * audio muted otherwise). */
@@ -633,11 +631,6 @@ static void *cmdpipe_reader_thread(void *arg)
     cli_config_t *cfg = (cli_config_t *)arg;
     uint64_t last_keepalive = raopcl_get_ntp(NULL);
 
-    g_cmdpipe_fd = open(cfg->cmdpipe, O_RDWR | O_NONBLOCK);
-    if (g_cmdpipe_fd == -1) {
-        LOG_ERROR("Failed to open command pipe: %s (errno=%d)", cfg->cmdpipe, errno);
-        return NULL;
-    }
     LOG_INFO("Command pipe ready: %s", cfg->cmdpipe);
 
     while (g_running) {
@@ -710,6 +703,29 @@ static bool join_command_thread(void)
         return false;
     }
     g_cmdpipe_started = false;
+    return true;
+}
+
+static bool start_command_thread(cli_config_t *cfg)
+{
+    if (!cfg->cmdpipe || g_cmdpipe_started) return true;
+    g_cmdpipe_fd = open(cfg->cmdpipe, O_RDWR | O_NONBLOCK);
+    if (g_cmdpipe_fd == -1) {
+        LOG_ERROR("Failed to open command pipe: %s (errno=%d)",
+                  cfg->cmdpipe, errno);
+        status_error("Failed to open command pipe");
+        return false;
+    }
+    int result = pthread_create(
+        &g_cmdpipe_thread, NULL, cmdpipe_reader_thread, cfg);
+    if (result != 0) {
+        LOG_ERROR("Failed to start command pipe thread: %s", strerror(result));
+        status_error("Failed to start command pipe thread");
+        close(g_cmdpipe_fd);
+        g_cmdpipe_fd = -1;
+        return false;
+    }
+    g_cmdpipe_started = true;
     return true;
 }
 
@@ -807,15 +823,6 @@ static int run_raop(cli_config_t *cfg, int infile)
                             (int)TS2MS(latency, raopcl_sample_rate(g_raopcl)));
     send_initial_metadata(cfg);
 
-    /* Schedule start time */
-    if (cfg->ntp_start) {
-        /* Contract: the first sample is AUDIBLE exactly at the requested start
-         * (RAOP renders a frame latency after its frame-clock position, so the
-         * timeline starts latency early). */
-        raopcl_start_at(g_raopcl,
-                        cfg->ntp_start - TS2NTP(latency, raopcl_sample_rate(g_raopcl)));
-    }
-
     g_status = STATUS_PLAYING;
     /* Stdin audio format:
      * For 16-bit: s16le (2 bytes per sample, 4 bytes per frame stereo)
@@ -885,7 +892,7 @@ static int run_raop(cli_config_t *cfg, int infile)
 
 /* ---- AirPlay 2 playback loop ---- */
 
-static int run_airplay2(cli_config_t *cfg, int infile)
+static int run_airplay2(cli_config_t *cfg)
 {
     ap2_device_info_t device = {
         .name = cfg->ap2_name,
@@ -933,8 +940,6 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         return 1;
     }
     atomic_store(&g_ap2cl, client);
-
-    status_connected();
 
     /* Report the MRP now-playing path so MA can log which one is active. The
      * type-130 data channel (path B) is opt-in; -1 means it was not attempted
@@ -984,48 +989,32 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         ap2cl_set_volume(g_ap2cl, cfg->volume);
     }
 
-    /* Persistent session: generation 0 adopts the argv input; further
-     * generations arrive over the command pipe. Start times are commanded -
-     * an argv --start-unix-ms (or the absence of a command pipe) acts as the
-     * implicit START for generation 0; otherwise the caller sends START after
-     * seeing `connected` and `primed`, so it never guesses a setup lead. */
+    /* The session starts empty. Every generation, including generation 0, is
+     * prepared and started by the command-pipe thread after connection setup. */
     int ap2_input_bpf = (cfg->bit_depth <= 16 ? 2 : 4) * cfg->channels;
     int ap2_alac_bpf = (cfg->bit_depth <= 16 ? 2 : 3) * cfg->channels;
     ap2_session_ops_t ops = {
+        .quiesce = session_quiesce,
         .commit = session_commit,
+        .resume = session_resume,
         .stop = session_stop_op,
         .status = session_status_line,
         .transport = cfg,
     };
     g_session = ap2_session_create(
         &ops, (unsigned)cfg->sample_rate * (unsigned)ap2_input_bpf,
-        SESSION_PREFILL_MS, cfg->cmdpipe ? SESSION_IDLE_TIMEOUT_MS : 0);
+        SESSION_PREFILL_MS, SESSION_IDLE_TIMEOUT_MS);
     if (!g_session) {
         status_error("Cannot create session engine");
         return 1;
     }
-    ap2_generation_t gen0 = {
-        .number = 0,
-        .audio_path = NULL,
-        .audio_fd = infile,
-        .position_ms = 0,
-    };
-    if (!ap2_session_prepare(g_session, &gen0)) {
-        status_error("Cannot stage the initial generation");
+    g_status = STATUS_PAUSED;
+    if (!start_command_thread(cfg)) {
         ap2_session_destroy(g_session);
         g_session = NULL;
         return 1;
     }
-    if (cfg->ntp_start || !cfg->cmdpipe) {
-        if (!ap2_session_start(g_session, 0,
-                               cfg->ntp_start ? ntp_to_unix_ms(cfg->ntp_start)
-                                              : 0)) {
-            status_error("Cannot start AirPlay 2 stream");
-            ap2_session_destroy(g_session);
-            g_session = NULL;
-            return 1;
-        }
-    }
+    status_connected();
 
     uint64_t last = 0, frames = 0;
     uint64_t current_gen = ap2_session_active_generation(g_session);
@@ -1076,9 +1065,8 @@ static int run_airplay2(cli_config_t *cfg, int infile)
         }
 
         if (gen_eof) {
-            /* Input consumed: let the receiver drain, report once, then either
-             * exit (one-shot: no command pipe means nothing further can
-             * arrive) or idle awaiting the next generation / idle timeout. */
+            /* Input consumed: let the receiver drain, report once, then idle
+             * awaiting the next commanded generation or idle timeout. */
             bool drained = !ap2cl_is_playing(g_ap2cl) ||
                            now - eof_time > MS2NTP(cfg->latency_ms + 2000);
             if (drained && !eof_reported) {
@@ -1086,7 +1074,6 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 status_print("[STATUS] eof generation=%llu",
                              (unsigned long long)current_gen);
                 status_eof();
-                if (!cfg->cmdpipe) break;
             }
             usleep(drained ? 50000 : 10000);
             continue;
@@ -1094,6 +1081,20 @@ static int run_airplay2(cli_config_t *cfg, int infile)
 
         /* Send audio chunk */
         if (g_status == STATUS_PLAYING && ap2cl_accept_frames(g_ap2cl)) {
+            pthread_mutex_lock(&g_audio_send_lock);
+            if (g_status != STATUS_PLAYING) {
+                pthread_mutex_unlock(&g_audio_send_lock);
+                continue;
+            }
+            active = ap2_session_active_generation(g_session);
+            if (active != current_gen) {
+                current_gen = active;
+                frames = 0;
+                gen_eof = false;
+                eof_reported = false;
+                eof_time = 0;
+                pcm_carry = 0;
+            }
             int n = ap2_session_read(
                 g_session, buf + pcm_carry,
                 AP2_FRAMES_PER_CHUNK * ap2_input_bpf - pcm_carry, 250);
@@ -1104,15 +1105,20 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                 pcm_carry = n % ap2_input_bpf;
                 n -= pcm_carry;
                 if (n == 0) {
+                    pthread_mutex_unlock(&g_audio_send_lock);
                     continue;   /* only a partial frame arrived so far */
                 }
             }
-            if (n == -2) break;
+            if (n == -2) {
+                pthread_mutex_unlock(&g_audio_send_lock);
+                break;
+            }
             if (n == -1) {
                 LOG_INFO("End of generation %llu input, draining buffer...",
                          (unsigned long long)current_gen);
                 gen_eof = true;
                 eof_time = raopcl_get_ntp(NULL);
+                pthread_mutex_unlock(&g_audio_send_lock);
                 continue;
             }
             if (n == 0) {
@@ -1123,6 +1129,7 @@ static int run_airplay2(cli_config_t *cfg, int infile)
                     ap2cl_log_diagnostics(g_ap2cl);
                 }
                 ap2cl_recover_input_gap(g_ap2cl);
+                pthread_mutex_unlock(&g_audio_send_lock);
                 continue;
             }
             if (starving) {
@@ -1145,22 +1152,25 @@ static int run_airplay2(cli_config_t *cfg, int infile)
             if (result == AP2_SEND_FATAL) {
                 status_error("AirPlay 2 realtime send failed");
                 playback_failed = true;
+                pthread_mutex_unlock(&g_audio_send_lock);
                 break;
             }
             frames += af;
             if (pcm_carry) memmove(buf, buf + n, (size_t)pcm_carry);
+            pthread_mutex_unlock(&g_audio_send_lock);
         } else {
             /* Paused, or connected and awaiting the commanded first START. */
             usleep(1000);
         }
     }
 
-    g_running = false;
+    request_command_stop();
+    bool command_joined = join_command_thread();
     ap2_session_destroy(g_session);
     g_session = NULL;
     free(buf);
     free(ap2_alac_buf);
-    return playback_failed ? 1 : 0;
+    return playback_failed || !command_joined ? 1 : 0;
 }
 
 
@@ -1283,7 +1293,7 @@ static int run_ptp_daemon(cli_config_t *cfg)
 static void print_usage(const char *name)
 {
     printf("cliairplay v%s - Unified AirPlay streaming CLI\n\n", VERSION);
-    printf("Usage: %s [options] <host_ip> <filename ('-' for stdin)>\n\n", name);
+    printf("Usage: %s [options] <host_ip> [filename ('-' for RAOP stdin)]\n\n", name);
     printf("Protocol selection:\n");
     printf("  --protocol <auto|raop|airplay2>  Protocol to use (default: auto).\n");
     printf("                             auto picks RAOP vs AirPlay 2 from the mDNS\n");
@@ -1293,9 +1303,6 @@ static void print_usage(const char *name)
     printf("  --volume <0-100>           Initial volume level\n");
     printf("  --latency <ms>             Playback lead / buffer in ms (default: 2000,\n");
     printf("                             clamped into the device-reported window)\n");
-    printf("  --start-unix-ms <ms>       Start at unix epoch milliseconds (preferred:\n");
-    printf("                             the caller never handles NTP formats; pass the\n");
-    printf("                             SAME value to every member of a sync group)\n");
     printf("  --dacp <id>                DACP ID\n");
     printf("  --activeremote <id>        Active Remote ID\n");
     printf("  --cmdpipe <path>           Named pipe for metadata/commands\n");
@@ -1344,9 +1351,9 @@ static void print_usage(const char *name)
     printf("Examples:\n");
     printf("  # RAOP streaming from stdin:\n");
     printf("  ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | %s 192.168.1.50 -\n\n", name);
-    printf("  # AirPlay 2 streaming:\n");
-    printf("  ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | \\\n");
-    printf("    %s --protocol airplay2 --auth <creds> --name \"HomePod\" 192.168.1.50 -\n", name);
+    printf("  # AirPlay 2 persistent session (audio starts through --cmdpipe):\n");
+    printf("  %s --protocol airplay2 --auth <creds> --name \"HomePod\" \\\n", name);
+    printf("    --cmdpipe /tmp/cap 192.168.1.50\n");
 }
 
 /* ---- Main ---- */
@@ -1382,7 +1389,6 @@ int main(int argc, char *argv[])
         {"port",         required_argument, 0, 'p'},
         {"volume",       required_argument, 0, 'v'},
         {"latency",      required_argument, 0, 'l'},
-        {"start-unix-ms", required_argument, 0, 1014},
         {"dacp",         required_argument, 0, 'D'},
         {"activeremote", required_argument, 0, 'R'},
         {"cmdpipe",      required_argument, 0, 'C'},
@@ -1433,15 +1439,6 @@ int main(int argc, char *argv[])
         case 'p': cfg.port = atoi(optarg); break;
         case 'v': cfg.volume = atoi(optarg); break;
         case 'l': cfg.latency_ms = atoi(optarg); break;
-        case 1014: {
-            /* Group start as plain unix epoch milliseconds; converted to the
-             * NTP fixed-point (unix seconds << 32 | frac) used internally so
-             * callers never handle NTP formats. */
-            uint64_t ms = 0;
-            sscanf(optarg, "%" PRIu64, &ms);
-            cfg.ntp_start = ((ms / 1000) << 32) | (((ms % 1000) << 32) / 1000);
-            break;
-        }
         case 'D': cfg.dacp_id = optarg; break;
         case 'R': cfg.active_remote = optarg; break;
         case 'C': cfg.cmdpipe = optarg; break;
@@ -1533,8 +1530,8 @@ int main(int argc, char *argv[])
         return rc;
     }
 
-    /* Validate required args */
-    if (!cfg.host || !cfg.audio_source) {
+    /* Validate the common positional argument before route resolution. */
+    if (!cfg.host) {
         print_usage(argv[0]);
         return 1;
     }
@@ -1566,16 +1563,30 @@ int main(int argc, char *argv[])
            (!cfg.route.use_raop && cfg.route.ptp) ? "ptp" : "ntp");
     fflush(stdout);
 
+    if (cfg.protocol == PROTO_RAOP && !cfg.audio_source) {
+        status_error("RAOP requires an audio filename or '-' for stdin");
+        return 1;
+    }
+    if (cfg.protocol == PROTO_AIRPLAY2 && !cfg.cmdpipe) {
+        status_error("AirPlay 2 requires --cmdpipe");
+        return 1;
+    }
+    if (cfg.protocol == PROTO_AIRPLAY2 && cfg.audio_source) {
+        status_error("AirPlay 2 audio must be provided by cmdpipe PREPARE");
+        return 1;
+    }
+
     /* Setup signal handlers */
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Open audio source */
-    if (strcmp(cfg.audio_source, "-") == 0) {
+    /* RAOP retains its direct audio input. AirPlay 2 receives every generation
+     * from the AUDIO path supplied with cmdpipe PREPARE. */
+    if (cfg.protocol == PROTO_RAOP && strcmp(cfg.audio_source, "-") == 0) {
         infile = fileno(stdin);
-        LOG_INFO("Reading audio from stdin");
-    } else {
+        LOG_INFO("Reading RAOP audio from stdin");
+    } else if (cfg.protocol == PROTO_RAOP) {
         struct stat st;
         bool is_fifo = false;
         if (stat(cfg.audio_source, &st) == 0) {
@@ -1604,30 +1615,27 @@ int main(int argc, char *argv[])
                 return 1;
             }
         }
-        int thread_result = pthread_create(
-            &g_cmdpipe_thread, NULL, cmdpipe_reader_thread, &cfg);
-        if (thread_result == 0)
-            g_cmdpipe_started = true;
-        else
-            LOG_ERROR("Failed to start command pipe thread: %s",
-                      strerror(thread_result));
     }
 
-    /* Run the selected protocol. The RAOP path drains the audio source into
-     * the legacy input ring; the AirPlay 2 path hands the source to the
-     * session engine as generation 0 instead. */
+    /* RAOP starts its command reader before connecting, preserving its existing
+     * behavior. AirPlay 2 starts it only after its session engine is ready. */
     int result;
     if (cfg.protocol == PROTO_RAOP) {
+        if (!start_command_thread(&cfg)) {
+            result = 1;
+            goto cleanup;
+        }
         unsigned in_byte_rate =
             (unsigned)((cfg.bit_depth <= 16 ? 2 : 4) * cfg.channels *
                        cfg.sample_rate);
         input_ring_start(infile, in_byte_rate, cfg.latency_ms + 2000);
         result = run_raop(&cfg, infile);
     } else {
-        result = run_airplay2(&cfg, infile);
+        result = run_airplay2(&cfg);
     }
 
     /* Cleanup */
+cleanup:
     request_command_stop();
     if (!join_command_thread()) return 1;
     struct ap2cl_s *ap2_client = atomic_exchange(&g_ap2cl, NULL);
