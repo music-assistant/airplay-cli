@@ -165,6 +165,9 @@ static void *reader_thread(void *arg)
     uint8_t buf[16384];
     for (;;) {
         ssize_t n = read(fd, buf, sizeof(buf));
+        if (n < 0 && errno == EINTR)
+            continue;  /* interrupted syscall, not an error — retry the read */
+        int read_errno = errno;
         pthread_mutex_lock(&s->lock);
         if (slot->ring.abort) {
             pthread_mutex_unlock(&s->lock);
@@ -172,8 +175,16 @@ static void *reader_thread(void *arg)
         }
         if (n <= 0) {
             slot->ring.eof = true;
-            emit(s, "[STATUS] input_eof generation=%llu",
-                 (unsigned long long)slot->gen.number);
+            /* A clean EOF (0) is the normal retirement path; a negative return
+             * is a real read error (e.g. a broken pipe) and is surfaced
+             * distinctly instead of being hidden as end-of-input. */
+            if (n < 0)
+                emit(s, "[STATUS] input_error generation=%llu errno=%d (%s)",
+                     (unsigned long long)slot->gen.number, read_errno,
+                     strerror(read_errno));
+            else
+                emit(s, "[STATUS] input_eof generation=%llu",
+                     (unsigned long long)slot->gen.number);
             pthread_cond_broadcast(&s->can_read);
             pthread_mutex_unlock(&s->lock);
             break;
@@ -343,6 +354,19 @@ bool ap2_session_start(struct ap2_session_s *s, uint64_t generation,
     }
 
     pthread_mutex_lock(&s->lock);
+    /* commit() ran without the lock held, so a concurrent PREPARE (e.g. an
+     * argv gen-0 START on the main thread racing a cmdpipe PREPARE) can have
+     * superseded and freed the generation we just committed. Re-validate the
+     * staged slot by generation number before the swap so we never activate a
+     * freed slot or the wrong generation; MA sends START for the newer
+     * generation next. */
+    if (!s->staged || s->staged->gen.number != generation ||
+        s->state == AP2_SESSION_ENDED) {
+        pthread_mutex_unlock(&s->lock);
+        LOG_WARN("[SESSION] generation %llu superseded before activation",
+                 (unsigned long long)generation);
+        return false;
+    }
     slot_t *old = s->active;
     s->active = s->staged;
     s->staged = NULL;

@@ -486,7 +486,15 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
     } else if (strcmp(key, "GENERATION") == 0) {
         g_pend_generation = strtoull(value, NULL, 10);
     } else if (strcmp(key, "AUDIO") == 0) {
-        snprintf(g_pend_audio, sizeof(g_pend_audio), "%s", value);
+        int written = snprintf(g_pend_audio, sizeof(g_pend_audio), "%s", value);
+        if (written < 0 || (size_t)written >= sizeof(g_pend_audio)) {
+            /* A truncated path would fail to open later at PREPARE with an
+             * opaque error; reject it here where the cause is clear. */
+            LOG_ERROR("AUDIO path too long (%zu bytes, max %zu)",
+                      strlen(value), sizeof(g_pend_audio) - 1);
+            g_pend_audio[0] = '\0';
+            status_error("AUDIO path too long");
+        }
     } else if (strcmp(key, "POSITION_MS") == 0) {
         g_pend_position_ms = strtoull(value, NULL, 10);
     } else if (strcmp(key, "START_UNIX_MS") == 0) {

@@ -1987,15 +1987,6 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
     return true;
 }
 
-/* Warm-flush a LIVE session for a generation switch: discard receiver-buffered
- * audio and re-base the timeline so the next written frame is audible at the
- * requested instant. Native realtime sends the classic RTSP FLUSH with
- * RTP-Info and freezes a fresh anchor line (measured accepted down to a
- * 150 ms lead on Sonos and Apple TV); the RAOP paths use libraop's documented
- * flush + start-at seek flow. Sequence numbers (and thus audio nonces) are
- * never reset, so crypto state stays valid across the boundary. A start in
- * the past (or 0) is clamped to now + the minimum warm lead so the first
- * samples of the new generation can never be clipped. */
 /* Silence the receiver but keep the session warm (persistent standby):
  * discard buffered audio with an RTSP FLUSH, publish the stopped playback
  * state, and drop back to CONNECTED so a later warm flush can restart. */
@@ -2023,6 +2014,15 @@ void ap2cl_standby(struct ap2cl_s *p)
     p->state = AP2_CONNECTED;
 }
 
+/* Warm-flush a LIVE session for a generation switch: discard receiver-buffered
+ * audio and re-base the timeline so the next written frame is audible at the
+ * requested instant. Native realtime sends the classic RTSP FLUSH with
+ * RTP-Info and freezes a fresh anchor line (measured accepted down to a
+ * 150 ms lead on Sonos and Apple TV); the RAOP paths use libraop's documented
+ * flush + start-at seek flow. Sequence numbers (and thus audio nonces) are
+ * never reset, so crypto state stays valid across the boundary. A start in
+ * the past (or 0) is clamped to now + the minimum warm lead so the first
+ * samples of the new generation can never be clipped. */
 bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms)
 {
     if (!p || p->state == AP2_DOWN) return false;
