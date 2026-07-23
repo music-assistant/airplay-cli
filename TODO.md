@@ -2,28 +2,19 @@
 
 Genuinely open work only. Completed work lives in git history.
 
-- [ ] **Apple TV artwork for non-public images.** Now-playing text and artwork
-      render on the Apple TV via MediaRemote, but cover art that is only
-      reachable through Music Assistant's imageproxy (e.g. filesystem-provider
-      images with no public URL) does not appear, while externally-hosted art
-      does. Artwork is embedded as JPEG bytes in the now-playing push, so the
-      failure needs an on-device capture to localise (MA render vs. embed vs.
-      the receiver rejecting the payload).
-- [ ] **MediaRemote follow-ups.** Metadata-only display mode (an Apple TV as a
-      now-playing screen for audio playing elsewhere) and Companion-protocol
-      wake/power tracking.
-- [ ] **Buffered (type 103) playback anchoring on Apple TV.** Framing and
-      anchoring are implemented and verified against a reference receiver, but
-      the Apple TV never measures our clock on a buffered stream so its rate
-      anchor never clears. Parked (realtime carries hi-res); revisiting needs a
-      capture of an iOS → Apple TV buffered session.
+- [ ] **Persistent session mode.** Keep one connection per player across
+      seek/next/resume: numbered media generations over per-generation input
+      pipes, committed with RTSP `FLUSH` + a re-based frozen anchor line
+      (measured working down to a 150 ms warm lead on Sonos and Apple TV).
+      Replaces today's teardown-and-reconnect per `play_media`.
 - [ ] **Parse `audioLatencies` from GET /info.** The SETUP echo of
       `latencyMin`/`latencyMax` is receiver-optional (Sonos omits it); the
       /info table would populate the pacing window and the reported
       `[STATUS] latency` line for every device instead of falling back to the
       1.75 s default.
-- [ ] **Format negotiation with try-fallback.** Default to the best format the
-      device advertises and gate hi-res behind an explicit opt-in (the
-      advertised table understates on Apple TV, and a SETUP 200 can lie — Sonos
-      silently renders nothing on 48/24). A try-then-fall-back negotiation
-      would let opt-in hi-res degrade gracefully.
+- [ ] **`--probe` mode for capability discovery.** A one-shot plaintext
+      GET /info (no pairing needed) printing the capabilities line, so the
+      caller can pick the best format per device before the first stream —
+      the CLI half of fully automatic 24-bit selection (no user toggle; the
+      format tables are evidence, the Apple-model check covers understating
+      receivers).

@@ -19,7 +19,7 @@ One binary, three streaming paths plus utility modes:
 
 Native AP2 with PTP-timed realtime streaming is the primary path: it carries
 16- and 24-bit ALAC, sample-aligned multi-room, and scheduled group starts.
-The buffered stream (type 103) is implemented but parked (§9).
+The buffered stream (type 103) was investigated and removed (§9).
 
 Utility modes: `--pair` (legacy RAOP secret), `--pair-setup` (HomeKit PIN
 pairing producing `--auth` credentials), `--ptp-daemon` (shared clock,
@@ -50,9 +50,9 @@ accepted as `ft=`) and the status flags (`flags=`/`sf=`) drive the decision:
 Decision order:
 
 1. **Protocol** — bit 38 or 48 set ⇒ AirPlay 2, else legacy RAOP.
-   `--ap2-native`/`--buffered` force AirPlay 2 regardless.
+   `--ap2-native` forces AirPlay 2 regardless.
 2. **Native vs RAOP-compat** — stored credentials (`--auth`) ⇒ native with
-   pair-verify. `--ap2-native`/`--buffered` ⇒ native with transient pairing.
+   pair-verify. `--ap2-native` ⇒ native with transient pairing.
    In `auto`, a device that advertises pairing (bit 46 or 48) with no PIN, no
    legacy flag, and no password ⇒ native with transient pairing. Otherwise
    the RAOP-compat flow. An explicit `--protocol airplay2` without
@@ -60,9 +60,8 @@ Decision order:
 3. **Timing** — `--ptp` forces PTP; otherwise the SupportsPTP feature bit
    selects PTP vs the NTP responder. If PTP is selected but UDP 319/320
    cannot be bound (no privilege, no daemon), the session falls back to NTP.
-4. **Stream type** — realtime (96) always, unless `--buffered` forces
-   type 103 (which requires PTP). Bit depth never steers the stream type:
-   24-bit rides realtime.
+4. **Stream type** — realtime (96) always; 16- and 24-bit both ride it
+   (buffered type 103 was investigated and removed, §9).
 
 ## 3. The two AirPlay 2 flows
 
@@ -97,9 +96,9 @@ Connect sequence (`ap2_native_connect()`):
    clock ID and advertised address. NTP sessions carry
    `timingProtocol=NTP` + `timingPort`. The response's `eventPort` is opened
    as a keep-open reverse TCP connection.
-6. **Stream SETUP** — a `streams` array entry: `type` 96 (or 103),
+6. **Stream SETUP** — a `streams` array entry: `type` 96,
    `audioFormat` (§7), `ct=2` (ALAC), `spf=352`, `shk` (the 32-byte audio
-   key), our `controlPort` (+ `dataPort` for realtime),
+   key), our `controlPort` and `dataPort`,
    `latencyMin`/`latencyMax`. The response is parsed **by key** with a real
    binary-plist reader (`ap2_bplist`) — receivers typically serialize
    `controlPort` before `dataPort`, so positional parsing would send audio to
@@ -108,9 +107,6 @@ Connect sequence (`ap2_native_connect()`):
    pacing window (§6).
 7. **RECORD**, then for PTP sessions **SETPEERS** (a bare plist array
    `[receiver, us]`) and the same peer list handed to the PTP engine.
-8. Buffered only: TCP connect to the receiver's returned `dataPort`
-   (`SO_SNDTIMEO`/`SO_RCVTIMEO` bounded so a stalled receiver can never hang
-   the process).
 
 The audio key (`shk`) is the first 32 bytes of the pairing shared secret —
 the raw X25519 secret for pair-verify, `SHA512(S)[:32]` for transient.
@@ -258,7 +254,7 @@ All AirPlay 2 audio is ALAC, 352 frames per chunk. `audioFormat` codes:
 
 24-bit input arrives as s32le and is truncated to packed s24 for the encoder
 (`alac_ext.cpp` replaces libcodecs' encoder, whose 24-bit path is broken).
-Hi-res rides the **realtime** stream; it is not gated to buffered.
+Hi-res rides the realtime stream.
 
 **Realtime (type 96) packet**:
 `[12B RTP header][ALAC ciphertext][16B Poly1305 tag][8B trailing nonce]` over
@@ -268,12 +264,6 @@ AAD = RTP header bytes 4..11 (timestamp + SSRC); the trailing 8 bytes are the
 low nonce bytes so the receiver reconstructs it. SSRC is 0 for PTP sessions
 (the stream is keyed by the PTP clock identity) and the `streamConnectionID`
 for NTP sessions.
-
-**Buffered (type 103) packet**: the same encryption over TCP, each packet
-prefixed with a 2-byte big-endian length; the nonce carries a full 8-byte
-counter at offset 4. Playback is scheduled purely by
-`SETRATEANCHORTIME` (rate 1 = play at anchor, rate 0 = freeze /pause) and
-`FLUSHBUFFERED` on stop.
 
 **RAOP**: compressed ALAC by default; uncompressed when the device's `cn`
 field lacks ALAC or `--raw` is given. Optional RSA-AES payload encryption
@@ -443,19 +433,36 @@ proto2 emitters, the `/command` builders, the bplist `params.data` wrapper, the
 DataStream key derivation and channel framing, and answers inbound `sync`
 frames with `rply`.
 
-## 9. Buffered audio (type 103) — parked
+## 9. Buffered audio (type 103) — investigated and removed
 
-Implemented end-to-end: SETUP type 103, TCP push with correct length-prefix
-framing (verified against a reference receiver), PTP-anchored start with
-anchor retry (a strict receiver 400s `SETRATEANCHORTIME` until it has
-measured our clock), rate-0 pause, `FLUSHBUFFERED`. **Parked as a known
-limitation**: the Apple TV will not send Delay_Req on a buffered stream, so
-it never measures our clock and its rate anchor never clears — cracking that
-needs a capture of an iOS → Apple TV buffered session. Realtime now carries
-24-bit, which removed buffered's only payoff among the tested devices (Sonos
-accepts the anchor but has no hi-res; its buffered ALAC SETUP is accepted but
-not rendered — iOS buffered streams carry AAC). Reachable only via
-`--buffered`; nothing auto-selects it.
+Buffered streaming was implemented end-to-end and validated where it could
+be: SETUP type 103, TCP push with correct length-prefix framing (verified
+against a reference receiver; sustained ALAC 44.1/16 playback worked on a
+Sonos Era 100), PTP-anchored start with anchor retry (a strict receiver 400s
+`SETRATEANCHORTIME` until it has measured our clock), rate-0 pause,
+`FLUSHBUFFERED`. It was then **removed** rather than parked, because every
+reason to want it fell away:
+
+- **The Apple TV cannot use it**: it will not send Delay_Req on a buffered
+  stream, so it never measures our clock and its rate anchor never clears.
+  Cracking that needs a capture of an iOS → Apple TV buffered session — and
+  real iOS buffered sessions carry AAC, not ALAC, so even a fix lands us on
+  a wire format no real sender exercises.
+- **Realtime carries everything**: 16- and 24-bit ALAC render on the
+  realtime stream on every tested receiver class, and a live realtime
+  session accepts a classic RTSP `FLUSH` + a re-based frozen anchor line
+  with warm leads measured down to 150 ms on both Sonos and Apple TV — so
+  fast seek/next does not need buffered's explicit anchoring either.
+- **No startup win**: buffered cold start measured slower than realtime
+  (both dominated by initial PTP acquisition).
+
+What was kept: the `/info` `bufferStream` format-table parsing — a device
+advertising 24-bit ALAC there is a capability signal (the Apple TV
+advertises hi-res only in that table) even though the stream type itself is
+gone. The working implementation remains recoverable from git history
+(≤ v0.2.0). Revisiting would only make sense for deterministic late-join in
+homogeneous buffered groups, and must start with that iOS → Apple TV
+capture.
 
 ## 10. Session robustness
 

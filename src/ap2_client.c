@@ -69,7 +69,6 @@ extern log_level *loglevel;
 #define AP2_FEEDBACK_INTERVAL_MS     2000
 #define AP2_EVENT_POLL_INTERVAL_MS   100
 #define AP2_UDP_SEND_TIMEOUT_MS      20
-#define AP2_BUFFERED_WRITE_TIMEOUT_MS 8000
 
 typedef enum {
     FLOW_RAOP_COMPAT = 0,
@@ -107,7 +106,7 @@ struct ap2cl_s {
     /* Native AP2 flow */
     int sock_fd;                  /* TCP connection */
     /* The RTSP socket carries whole request/response cycles from multiple
-     * threads (streaming thread: SETRATEANCHORTIME/FLUSHBUFFERED/TEARDOWN;
+     * threads (streaming thread: TEARDOWN;
      * cmdpipe thread: SET_PARAMETER volume/metadata; feedback worker: keepalive).
      * This lock serializes the cycles so a response cannot be attributed to
      * the wrong request and the HAP nonce sequence stays intact. */
@@ -185,13 +184,6 @@ struct ap2cl_s {
     bool ptp_forced;   /* ap2cl_set_ptp() was called (overrides auto-detect) */
     bool ptp_enabled;  /* value passed to ap2cl_set_ptp() */
     bool ptp_shared;   /* prefer a shared PTP daemon clock (multi-room) if present */
-
-    /* Buffered audio (type 103): RTP is pushed over a TCP connection to the
-     * receiver's dataPort instead of the realtime UDP data socket. */
-    bool buffered;         /* buffered stream requested */
-    bool use_buffered;     /* resolved: buffered active this session (needs PTP) */
-    int buffered_sock;     /* TCP connection to the receiver's dataPort */
-    bool anchored;         /* SETRATEANCHORTIME has been sent */
 };
 
 static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
@@ -655,7 +647,7 @@ static bool ap2_features_has_ptp(const char *txt)
 
 ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char *pw,
                               bool have_credentials, int bit_depth,
-                              bool force_native, bool force_buffered,
+                              bool force_native,
                               bool ptp_forced, bool ptp_enabled)
 {
     ap2_route_t r = {0};
@@ -663,8 +655,8 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     r.flags = ap2_txt_flags(txt);
     bool has_pw = (pw && !strcasecmp(pw, "true"));
 
-    /* 1. Protocol: AirPlay 2 vs legacy RAOP. The --ap2-native / --buffered
-     * overrides pull us onto AirPlay 2 regardless of the advertised features. */
+    /* 1. Protocol: AirPlay 2 vs legacy RAOP. The --ap2-native override pulls
+     * us onto AirPlay 2 regardless of the advertised features. */
     bool is_ap2;
     if (pref == AP2_PROTO_RAOP) {
         is_ap2 = false;
@@ -674,7 +666,7 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
         is_ap2 = AP2_FEAT(r.features, AP2_FEAT_UNIFIED_MEDIA) ||
                  AP2_FEAT(r.features, AP2_FEAT_COREUTILS);
     }
-    if (force_native || force_buffered) is_ap2 = true;
+    if (force_native) is_ap2 = true;
 
     if (!is_ap2) {
         r.use_raop = true;
@@ -689,7 +681,7 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     bool native, transient = false;
     if (have_credentials) {
         native = true;            /* pair-verify with stored keys (Apple TV/HomePod) */
-    } else if (force_native || force_buffered) {
+    } else if (force_native) {
         native = true;
         transient = true;         /* no creds -> transient pairing */
     } else if (pref == AP2_PROTO_AUTO &&
@@ -716,19 +708,13 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     /* 3. Timing: PTP grandmaster when forced, else the SupportsPTP feature bit. */
     r.ptp = ptp_forced ? ptp_enabled : (AP2_FEAT(r.features, AP2_FEAT_PTP) != 0);
 
-    /* 4. Buffered (type 103): only when forced by --buffered. Hi-res (24-bit)
-     * rides the REALTIME stream — verified audible on device — so it must
-     * never steer the route onto the buffered path (whose playback anchoring
-     * is unresolved on Apple TV). Buffered anchoring needs PTP. */
+    /* Stream type is always realtime (type 96); it carries 16- and 24-bit —
+     * verified audible on device. Buffered (type 103) was investigated and
+     * removed: see DESIGN.md for the findings and rationale. */
     (void)bit_depth;
-    r.buffered = force_buffered;
-    if (r.buffered) r.ptp = true;
 
-    r.reason = transient
-                   ? (r.buffered ? "native AP2, transient, buffered"
-                                 : "native AP2, transient, realtime")
-                   : (r.buffered ? "native AP2, pair-verify, buffered"
-                                 : "native AP2, pair-verify, realtime");
+    r.reason = transient ? "native AP2, transient, realtime"
+                         : "native AP2, pair-verify, realtime";
     return r;
 }
 
@@ -1071,14 +1057,6 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         timing_port = ap2_ptp_get_timing_port(p->ptp);
     }
 
-    /* Buffered audio (type 103) anchors playback against the PTP timeline via
-     * SETRATEANCHORTIME, so it is only viable with an active grandmaster. Fall
-     * back to the realtime stream when PTP could not be established. */
-    p->use_buffered = p->buffered && p->use_ptp;
-    if (p->buffered && !p->use_buffered)
-        LOG_WARN("[AP2] Buffered audio requested but PTP is unavailable; "
-                 "falling back to realtime (type 96)");
-
     /* 4. Session SETUP (encrypted). PTP and NTP use different session dicts. */
     uint8_t *plist_data = NULL; int plist_len = 0;
     if (p->use_ptp) {
@@ -1207,11 +1185,9 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     /* Determine audio format */
     uint64_t audio_format = ap2_audio_format_code(&p->format);
 
-    /* Realtime (type 96) streams the audio over UDP and carries our data port in
-     * the SETUP; buffered (type 103) pushes RTP over a TCP connection to the
-     * receiver's dataPort, so we advertise no dataPort and let the receiver
-     * assign the TCP listener it returns in the response. */
-    int stream_type = p->use_buffered ? 103 : 96;
+    /* Realtime (type 96) streams the audio over UDP and carries our data port
+     * in the SETUP. */
+    int stream_type = 96;
 
     struct ap2_plist *ssp = ap2_plist_create();
     ap2_plist_stream_begin(ssp);
@@ -1219,8 +1195,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     ap2_plist_stream_add_string(ssp, "audioMode", "default");
     ap2_plist_stream_add_int(ssp, "controlPort", local_ctrl_port);
     ap2_plist_stream_add_int(ssp, "ct", 2);  /* ALAC */
-    if (!p->use_buffered)
-        ap2_plist_stream_add_int(ssp, "dataPort", local_data_port);
+    ap2_plist_stream_add_int(ssp, "dataPort", local_data_port);
     ap2_plist_stream_add_bool(ssp, "isMedia", true);
     ap2_plist_stream_add_int(ssp, "latencyMax", 88200);
     ap2_plist_stream_add_int(ssp, "latencyMin", 11025);
@@ -1367,45 +1342,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_ptp_shared_kick(p->ptp);
     }
 
-    /* 6c. Buffered audio: open the TCP data connection to the receiver's
-     * dataPort (parsed above into p->data_addr). Audio is pushed here as
-     * length-prefixed RTP; the realtime UDP data socket stays unused. */
-    if (p->use_buffered) {
-        if (p->data_addr.sin_port == 0) {
-            LOG_ERROR("[AP2] Buffered stream SETUP returned no dataPort");
-            return false;
-        }
-        p->buffered_sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (p->buffered_sock >= 0 && p->bind_addr.s_addr != INADDR_ANY) {
-            struct sockaddr_in la = {.sin_family = AF_INET, .sin_addr = p->bind_addr};
-            if (bind(p->buffered_sock, (struct sockaddr *)&la, sizeof(la)) != 0)
-                LOG_WARN("[AP2] Cannot bind buffered TCP socket to %s",
-                         inet_ntoa(p->bind_addr));
-        }
-        if (p->buffered_sock >= 0) {
-            /* Bound both directions so a receiver that stops draining the
-             * stream can never hang the process: the blocking send loop in
-             * ap2_buffered_send_chunk relies on SO_SNDTIMEO expiring. */
-            struct timeval stv = {.tv_sec = 8};
-            setsockopt(p->buffered_sock, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
-            setsockopt(p->buffered_sock, SOL_SOCKET, SO_RCVTIMEO, &stv, sizeof(stv));
-        }
-        if (p->buffered_sock < 0 ||
-            connect(p->buffered_sock, (struct sockaddr *)&p->data_addr,
-                    sizeof(p->data_addr)) != 0) {
-            LOG_ERROR("[AP2] Buffered data TCP connect to %s:%d failed: %s",
-                      inet_ntoa(p->data_addr.sin_addr),
-                      ntohs(p->data_addr.sin_port), strerror(errno));
-            if (p->buffered_sock >= 0) { close(p->buffered_sock); p->buffered_sock = -1; }
-            return false;
-        }
-        int one = 1;
-        setsockopt(p->buffered_sock, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
-        LOG_INFO("[AP2] Buffered data TCP connected to %s:%d",
-                 inet_ntoa(p->data_addr.sin_addr), ntohs(p->data_addr.sin_port));
-    }
-
-    /* 6d. MRP now-playing. Ground-truth capture (DESIGN.md §8) shows a real
+    /* 6c. MRP now-playing. Ground-truth capture (DESIGN.md §8) shows a real
      * sender delivers now-playing over POST /command, NOT the type-130 channel
      * (its type-130 SETUPs never completed a data connection), and pushing state
      * over type-130 competes with /command. So the type-130 channel is OFF by
@@ -1607,7 +1544,7 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     return result;
 }
 
-/* ---- Native AP2 buffered audio (type 103) ---- */
+/* ---- Native AP2 audio encryption ---- */
 
 static bool ap2_encrypt_audio(const uint8_t key[32], const uint8_t nonce[12],
                               const uint8_t aad[8], const uint8_t *plain,
@@ -1637,181 +1574,10 @@ static bool ap2_encrypt_audio(const uint8_t key[32], const uint8_t nonce[12],
     return ok;
 }
 
-/* Send the SETRATEANCHORTIME anchor. It pins an RTP sample number to a point on
- * the PTP timeline at a playback rate, so the receiver can schedule every
- * buffered sample: "sample rtpTime renders at PTP time networkTime, at rate".
- * rate=1 plays, rate=0 pauses. */
-static bool ap2_send_setrateanchortime(struct ap2cl_s *p, uint32_t rtp_time,
-                                       uint64_t anchor_ns, uint64_t rate)
-{
-    uint64_t secs = anchor_ns / 1000000000ULL;
-    uint64_t rem_ns = anchor_ns % 1000000000ULL;
-    /* networkTimeFrac is a fraction of a second in units of 1/2^64. Build it in
-     * two 32-bit steps to avoid a 128-bit multiply: frac32 = rem_ns * 2^32 / 1e9
-     * (a fraction in 1/2^32 units, <= 32 bits) placed in the high half. */
-    uint64_t frac32 = ((uint64_t)rem_ns << 32) / 1000000000ULL;
-    uint64_t network_time_frac = frac32 << 32;
-
-    ap2_pl_node *root = ap2_pl_dict();
-    ap2_pl_dict_set(root, "networkTimeTimelineID",
-                    ap2_pl_int((int64_t)ap2_ptp_master_clock_id(p->ptp)));
-    ap2_pl_dict_set(root, "networkTimeSecs", ap2_pl_int((int64_t)secs));
-    ap2_pl_dict_set(root, "networkTimeFrac", ap2_pl_int((int64_t)network_time_frac));
-    ap2_pl_dict_set(root, "rtpTime", ap2_pl_int((int64_t)rtp_time));
-    ap2_pl_dict_set(root, "rate", ap2_pl_int((int64_t)rate));
-
-    uint8_t *body = NULL;
-    int body_len = ap2_pl_serialize(root, &body);
-    ap2_pl_free(root);
-
-    uint8_t *resp = NULL; int resp_len = 0;
-    int status = ap2_rtsp_send(p, "SETRATEANCHORTIME", p->session_url, body, body_len,
-                               "application/x-apple-binary-plist", &resp, &resp_len);
-    free(body);
-    LOG_INFO("[AP2] SETRATEANCHORTIME rtp=%u anchor=%" PRIu64 "ns rate=%" PRIu64 " -> %d",
-             rtp_time, anchor_ns, rate, status);
-    if (status != 200 && resp && resp_len > 0) {
-        int dump = resp_len < 64 ? resp_len : 64;
-        char hex[200];
-        for (int i = 0; i < dump; i++) sprintf(hex + i * 3, "%02x ", resp[i]);
-        hex[dump * 3] = '\0';
-        LOG_INFO("[AP2] SETRATEANCHORTIME response body (%d bytes): %s", resp_len, hex);
-    }
-    free(resp);
-    return status == 200;
-}
-
-/* Discard buffered audio on stop/flush. flushUntilSeq/TS mark the end of the
- * range to drop; the receiver stops rendering and clears its buffer. */
-static bool ap2_send_flushbuffered(struct ap2cl_s *p)
-{
-    ap2_pl_node *root = ap2_pl_dict();
-    ap2_pl_dict_set(root, "flushUntilSeq", ap2_pl_int((int64_t)p->seq_number));
-    ap2_pl_dict_set(root, "flushUntilTS", ap2_pl_int((int64_t)p->rtp_timestamp));
-
-    uint8_t *body = NULL;
-    int body_len = ap2_pl_serialize(root, &body);
-    ap2_pl_free(root);
-
-    uint8_t *resp = NULL; int resp_len = 0;
-    int status = ap2_rtsp_send(p, "FLUSHBUFFERED", p->session_url, body, body_len,
-                               "application/x-apple-binary-plist", &resp, &resp_len);
-    free(body);
-    free(resp);
-    LOG_INFO("[AP2] FLUSHBUFFERED untilSeq=%u untilTS=%u -> %d",
-             p->seq_number, p->rtp_timestamp, status);
-    return status == 200;
-}
-
-/* Push one encoded chunk over the buffered TCP data connection. The wire frame
- * is a 2-byte big-endian length prefix followed by the encrypted RTP packet
- * [12B hdr][ciphertext][16B tag][8B nonce]. TCP provides reliability and
- * bounded backpressure for flow control. */
-static ap2_send_result_t ap2_buffered_send_chunk(
-    struct ap2cl_s *p, uint8_t *sample, int frames)
-{
-    if (p->buffered_sock < 0 || !p->alac) {
-        LOG_ERROR("[AP2] Buffered audio channel is unavailable");
-        return AP2_SEND_FATAL;
-    }
-
-    uint8_t *encoded = NULL;
-    int enc_size = 0;
-    pcm_to_alac(p->alac, sample, frames, &encoded, &enc_size);
-    if (!encoded || enc_size <= 0) {
-        LOG_ERROR("[AP2] ALAC encoder failed for buffered audio");
-        free(encoded);
-        return AP2_SEND_FATAL;
-    }
-
-    const uint8_t *audio_key = ap2_hap_get_shared_secret(p->hap);
-    if (!audio_key) {
-        LOG_ERROR("[AP2] No shared secret for audio encryption");
-        free(encoded);
-        return AP2_SEND_FATAL;
-    }
-
-    /* RTP header (12 bytes). Payload type = stream type (103), marker bit set on
-     * the first packet, mirroring the realtime header shape. */
-    uint8_t rtp_hdr[12];
-    rtp_hdr[0] = 0x80;
-    rtp_hdr[1] = p->first_packet ? 0xE7 : 0x67;   /* 0x67 = PT 103 */
-    rtp_hdr[2] = (p->seq_number >> 8) & 0xFF;
-    rtp_hdr[3] = p->seq_number & 0xFF;
-    uint32_t ts_be = htonl(p->rtp_timestamp);
-    memcpy(rtp_hdr + 4, &ts_be, 4);
-    uint32_t ssrc_be = htonl(p->ssrc);
-    memcpy(rtp_hdr + 8, &ssrc_be, 4);
-    /* Nonce = 4 zero bytes + an 8-byte little-endian per-packet counter placed at
-     * offset 4 (matching the realtime nonce layout). The same 8 counter bytes are
-     * appended to the packet so the receiver reconstructs the nonce explicitly.
-     * AAD = RTP header bytes 4..11 (timestamp + ssrc), as in the realtime path. */
-    uint64_t counter = p->audio_nonce_counter;
-    uint8_t nonce[12];
-    memset(nonce, 0, 12);
-    for (int i = 0; i < 8; i++) nonce[4 + i] = (uint8_t)((counter >> (8 * i)) & 0xFF);
-
-    int cap = 2 + 12 + enc_size + AP2_CHACHA_TAG_SIZE + 8;
-    uint8_t *frame = malloc(cap);
-    if (!frame) {
-        LOG_ERROR("[AP2] Cannot allocate buffered RTP packet");
-        free(encoded);
-        return AP2_SEND_FATAL;
-    }
-    uint8_t *pkt = frame + 2;   /* payload starts after the 2-byte length prefix */
-    memcpy(pkt, rtp_hdr, 12);
-
-    int ct_len = 0;
-    uint8_t tag[AP2_CHACHA_TAG_SIZE];
-    bool encrypted_ok = ap2_encrypt_audio(
-        audio_key, nonce, rtp_hdr + 4, encoded, enc_size,
-        pkt + 12, &ct_len, tag);
-    free(encoded);
-    if (!encrypted_ok) {
-        LOG_ERROR("[AP2] Buffered audio encryption failed");
-        free(frame);
-        return AP2_SEND_FATAL;
-    }
-    memcpy(pkt + 12 + ct_len, tag, sizeof(tag));
-    /* Encryption consumed this nonce. A write failure below closes the socket,
-     * so the advanced counter can never be reused on this channel. */
-    p->audio_nonce_counter++;
-
-    int payload_len = 12 + ct_len + AP2_CHACHA_TAG_SIZE;
-    memcpy(pkt + payload_len, nonce + 4, 8);   /* trailing nonce (nonce[4..11]) */
-    payload_len += 8;
-
-    /* The 2-byte big-endian prefix is the TOTAL frame length INCLUDING itself:
-     * the receiver reads it, then reads (length - 2) more bytes for the RTP
-     * packet. */
-    int total = 2 + payload_len;
-    frame[0] = (uint8_t)((total >> 8) & 0xFF);
-    frame[1] = (uint8_t)(total & 0xFF);
-
-    bool ok = ap2_io_write_all_deadline(
-        p->buffered_sock, frame, (size_t)total,
-        ap2_io_monotonic_ms() + AP2_BUFFERED_WRITE_TIMEOUT_MS);
-    free(frame);
-
-    if (ok) {
-        p->first_packet = false;
-        p->seq_number++;
-        p->rtp_timestamp += frames;
-        p->head_ts += frames;
-    } else {
-        LOG_ERROR("[AP2] Buffered TCP write failed: %s", strerror(errno));
-        shutdown(p->buffered_sock, SHUT_RDWR);
-        close(p->buffered_sock);
-        p->buffered_sock = -1;
-        return AP2_SEND_FATAL;
-    }
-    return AP2_SEND_SENT;
-}
 
 static ap2_send_result_t ap2_native_send_chunk(
     struct ap2cl_s *p, uint8_t *sample, int frames)
 {
-    if (p->use_buffered) return ap2_buffered_send_chunk(p, sample, frames);
     if (p->data_sock < 0 || !p->alac || !p->hap) {
         LOG_ERROR("[AP2] Realtime audio session is incomplete");
         return AP2_SEND_FATAL;
@@ -1999,7 +1765,6 @@ struct ap2cl_s *ap2cl_create(
     p->data_sock = -1;
     p->ctrl_sock = -1;
     p->events_sock = -1;
-    p->buffered_sock = -1;
     pthread_mutex_init(&p->rtsp_lock, NULL);
     pthread_mutex_init(&p->mrp_lock, NULL);
     pthread_mutex_init(&p->mrp_publish_lock, NULL);
@@ -2059,7 +1824,6 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     if (p->data_sock >= 0) close(p->data_sock);
     if (p->ctrl_sock >= 0) close(p->ctrl_sock);
     if (p->events_sock >= 0) close(p->events_sock);
-    if (p->buffered_sock >= 0) close(p->buffered_sock);
     free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
     free(p->secret); free(p->password); free(p->et); free(p->md); free(p->am);
     free(p->auth_credentials);
@@ -2110,13 +1874,6 @@ void ap2cl_set_ptp_shared(struct ap2cl_s *p, bool enable)
     LOG_INFO("[AP2] Shared PTP daemon clock %s", enable ? "preferred" : "disabled");
 }
 
-void ap2cl_set_buffered(struct ap2cl_s *p, bool enable)
-{
-    if (!p) return;
-    p->buffered = enable;
-    LOG_INFO("[AP2] Buffered audio (type 103) %s", enable ? "requested" : "disabled");
-}
-
 void ap2cl_set_remote_command_callback(
     struct ap2cl_s *p, ap2_remote_command_cb_t callback, void *userdata)
 {
@@ -2162,10 +1919,6 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
         if (p->events_sock >= 0) {
             close(p->events_sock);
             p->events_sock = -1;
-        }
-        if (p->buffered_sock >= 0) {
-            close(p->buffered_sock);
-            p->buffered_sock = -1;
         }
         if (p->sock_fd >= 0) {
             uint8_t *resp = NULL; int resp_len = 0;
@@ -2216,42 +1969,10 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
          * announce shortly after RECORD can abandon the stream. The line is
          * fully determined by ntpstart, so this and the per-chunk announces
          * agree. */
-        if (p->use_ptp && !p->use_buffered && p->ctrl_sock >= 0 &&
+        if (p->use_ptp && p->ctrl_sock >= 0 &&
             ap2_send_sync_packet_ptp(p, true) == AP2_SEND_FATAL) {
             atomic_store(&p->media_healthy, false);
             return false;
-        }
-        /* Buffered playback is scheduled entirely by the anchor: map the
-         * current RTP sample to the PTP timeline at the requested start
-         * instant. A strict receiver 400s the anchor until it has acquired
-         * our clock (a second or two of Delay_Req), so retry.
-         * NOTE (parked): buffered is only needed for hi-res 24-bit, which
-         * among the tested devices only the Apple TV supports — and the Apple
-         * TV will not measure our PTP clock on a buffered stream at all, so its
-         * anchor never clears. Cracking that needs a capture of iOS -> Apple TV
-         * buffered. Sonos does accept the anchor but offers no 24-bit, so
-         * buffered has no payoff there. */
-        if (p->use_buffered && !p->anchored) {
-            uint64_t now_ntp = raopcl_get_ntp(NULL);
-            uint64_t lead_ns = 0;
-            if (ntp_start > now_ntp) {
-                uint64_t d = ntp_start - now_ntp;  /* NTP fixed-point: sec<<32 | frac */
-                lead_ns = (d >> 32) * 1000000000ULL +
-                          (((d & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            }
-            bool anchored_ok = false;
-            for (int try = 0; try < 12 && !anchored_ok; try++) {
-                if (try) usleep(500000);
-                uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + lead_ns;
-                anchored_ok = ap2_send_setrateanchortime(p, p->rtp_timestamp,
-                                                         anchor_ns, 1);
-            }
-            if (!anchored_ok) {
-                atomic_store(&p->media_healthy, false);
-                LOG_ERROR("[AP2] Unable to establish buffered playback anchor");
-                return false;
-            }
-            p->anchored = true;
         }
         return true;
     }
@@ -2293,10 +2014,6 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
     if (!p || p->state != AP2_STREAMING) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
         if (atomic_load(&p->rtsp_dead)) return false;
-        /* Buffered pushes over TCP: the blocking write and its send timeout
-         * provide flow control, so accept whenever we are streaming and let
-         * backpressure pace us (rather than the realtime latency window). */
-        if (p->use_buffered) return true;
         /* Pace against the ANCHOR DEADLINE, capped to the receiver's buffer.
          * Contract: frame f is AUDIBLE at its frame-clock position (the anchor
          * line starts one lead early), so f's deadline IS f. A frame delivered
@@ -2319,8 +2036,7 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
 
 bool ap2cl_recover_input_gap(struct ap2cl_s *p)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2 || p->use_buffered ||
-        p->state != AP2_STREAMING)
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->state != AP2_STREAMING)
         return false;
 
     uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
@@ -2376,13 +2092,6 @@ void ap2cl_log_diagnostics(struct ap2cl_s *p)
 void ap2cl_pause(struct ap2cl_s *p)
 {
     if (!p) return;
-    if (p->use_buffered && p->buffered_sock >= 0) {
-        /* Freeze the buffered timeline in place with a rate-0 anchor. */
-        ap2_send_setrateanchortime(p, p->rtp_timestamp, ap2_ptp_master_now_ns(p->ptp), 0);
-        p->state = AP2_PAUSED;
-        ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_PAUSED, true);
-        return;
-    }
     if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
     p->rt_anchor_valid = false;    /* resume re-anchors on a fresh line */
     p->state = AP2_PAUSED;
@@ -2392,14 +2101,6 @@ void ap2cl_pause(struct ap2cl_s *p)
 void ap2cl_play(struct ap2cl_s *p)
 {
     if (!p) return;
-    if (p->use_buffered && p->buffered_sock >= 0) {
-        /* Re-anchor at rate 1 a short lead ahead to resume the buffered stream. */
-        uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + (uint64_t)p->latency_ms * 1000000ULL;
-        ap2_send_setrateanchortime(p, p->rtp_timestamp, anchor_ns, 1);
-        p->state = AP2_STREAMING;
-        ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_PLAYING, true);
-        return;
-    }
     if (p->raopcl) {
         int lat = raopcl_latency(p->raopcl);
         uint64_t now = raopcl_get_ntp(NULL);
@@ -2412,8 +2113,6 @@ void ap2cl_play(struct ap2cl_s *p)
 void ap2cl_stop(struct ap2cl_s *p)
 {
     if (!p) return;
-    if (p->use_buffered && p->buffered_sock >= 0)
-        ap2_send_flushbuffered(p);
     if (p->raopcl) raopcl_stop(p->raopcl);
     ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
     p->rt_anchor_valid = false;
