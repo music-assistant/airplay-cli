@@ -10,6 +10,15 @@
  * a command pipe there is no way to receive further generations, so input EOF
  * drains and exits - the classic one-shot behavior, by construction.
  *
+ * Start times are COMMANDED, not configured: every generation (including
+ * generation 0) starts on an explicit START, which the caller sends after
+ * seeing `connected` and `primed`. The caller therefore never has to guess a
+ * safe setup lead in advance - it picks the start once the expensive work has
+ * already succeeded, and a group start is simply the same START_UNIX_MS sent
+ * to every primed member. An argv --start-unix-ms, when present, acts as an
+ * implicit START for generation 0 (manual one-shot use, and the transitional
+ * caller); starts of 0 or in the past clamp to now + the minimum warm lead.
+ *
  *   PREPARE(gen, audio pipe, position)  ->  ready  ->  primed
  *   START(gen, start time)              ->  flush old + swap + anchor -> playing
  *   STANDBY                             ->  stop playback, keep the connection warm
@@ -58,12 +67,14 @@ typedef enum {
     AP2_SESSION_ENDED,        /* DISCONNECT requested or idle timeout hit */
 } ap2_session_state_t;
 
-/* One staged/active generation. */
+/* One staged/active generation. Audio comes from `audio_fd` when >= 0 (an
+ * already-open descriptor - generation 0 adopts stdin/the argv file this
+ * way), else from opening `audio_path` (a FIFO created by the caller). */
 typedef struct {
     uint64_t number;          /* caller-assigned generation number */
-    char *audio_path;         /* FIFO delivering this generation's PCM */
+    const char *audio_path;   /* FIFO delivering this generation's PCM */
+    int audio_fd;             /* pre-opened input fd, or -1 to open the path */
     uint64_t position_ms;     /* media position of byte zero (progress base) */
-    uint64_t start_unix_ms;   /* audible start instant; 0 = ASAP */
 } ap2_generation_t;
 
 struct ap2_session_s;
@@ -78,6 +89,7 @@ struct ap2_session_s;
  */
 typedef struct {
     bool (*commit)(void *transport, uint64_t start_unix_ms);
+    void (*stop)(void *transport);      /* silence the receiver, keep session */
     void (*status)(const char *line);   /* emit one [STATUS] line */
     void *transport;
 } ap2_session_ops_t;
