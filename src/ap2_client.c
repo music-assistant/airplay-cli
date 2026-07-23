@@ -1996,6 +1996,33 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
  * never reset, so crypto state stays valid across the boundary. A start in
  * the past (or 0) is clamped to now + the minimum warm lead so the first
  * samples of the new generation can never be clipped. */
+/* Silence the receiver but keep the session warm (persistent standby):
+ * discard buffered audio with an RTSP FLUSH, publish the stopped playback
+ * state, and drop back to CONNECTED so a later warm flush can restart. */
+void ap2cl_standby(struct ap2cl_s *p)
+{
+    if (!p || p->state == AP2_DOWN) return;
+    if (p->flow != FLOW_NATIVE_AP2) {
+        if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
+        p->state = AP2_CONNECTED;
+        return;
+    }
+    if (!atomic_load(&p->rtsp_dead)) {
+        char hdr[64];
+        snprintf(hdr, sizeof(hdr), "RTP-Info: seq=%u;rtptime=%u\r\n",
+                 (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
+        uint8_t *resp = NULL;
+        int resp_len = 0;
+        int status = ap2_rtsp_send_ex(p, "FLUSH", p->session_url, NULL, 0,
+                                      NULL, hdr, &resp, &resp_len);
+        free(resp);
+        LOG_INFO("[AP2] standby FLUSH -> %d", status);
+    }
+    ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
+    p->rt_anchor_valid = false;
+    p->state = AP2_CONNECTED;
+}
+
 bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms)
 {
     if (!p || p->state == AP2_DOWN) return false;

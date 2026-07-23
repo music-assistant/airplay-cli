@@ -161,6 +161,10 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start);
  */
 bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms);
 
+/* Silence the receiver but keep the session warm: discard buffered audio,
+ * publish the stopped state, drop to CONNECTED awaiting the next warm flush. */
+void ap2cl_standby(struct ap2cl_s *p);
+
 /* Send a chunk of PCM audio data.
  * A transient realtime UDP drop advances the media timeline and returns
  * AP2_SEND_DROPPED; hard encode/control/session failures return AP2_SEND_FATAL.
