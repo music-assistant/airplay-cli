@@ -1483,13 +1483,14 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * Contract (all protocol paths): the first sample is AUDIBLE
              * exactly at the start time — anchoring one lead early makes the
              * line's audible point land on it, and mixed RAOP/AP2 groups
-             * align regardless of each member's lead. Valid because our
-             * timeline — in-process GM or the shared daemon — is host
-             * CLOCK_REALTIME, the same clock the start value comes from
-             * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
+             * align regardless of each member's lead. The start value is
+             * UNIX-epoch (libraop's NTP fixed-point: seconds<<32 | frac)
+             * while the PTP timeline is boot-relative, so map it onto the
+             * master timeline here. */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->latency_ms * 1000000ULL;
+            p->rt_anchor_wall0 = ap2_ptp_unix_to_master_ns(p->ptp, unix_ns)
+                             - (uint64_t)p->latency_ms * 1000000ULL;
             p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
                               + atomic_load(&p->rtp_offset);
         } else {

@@ -1103,8 +1103,24 @@ uint64_t ap2_ptp_now_ns(struct ap2_ptp_ctx *ctx)
 {
     (void)ctx;
     struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
+    /* The PTP timeline is boot-relative like Apple grandmasters', NOT the
+     * unix epoch: at least one receiver class (Samsung AirPlay 2) locks and
+     * ACKs normally on an epoch-magnitude master timeline yet renders
+     * silence. RAW keeps the timeline rate steady against NTP slew of the
+     * host clock; every process on the host reads the same monotonic clock,
+     * so the shared-daemon offset contract is unchanged. */
+    clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
     return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+uint64_t ap2_ptp_unix_to_master_ns(struct ap2_ptp_ctx *ctx, uint64_t unix_ns)
+{
+    /* Anchor values arrive as unix-epoch time (the MA contract) while the
+     * timeline runs boot-relative; convert via "same instant, both clocks". */
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    uint64_t unix_now = (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    return ap2_ptp_master_now_ns(ctx) + unix_ns - unix_now;
 }
 
 void ap2_ptp_set_peers(struct ap2_ptp_ctx *ctx, const char *const *ips, int count)

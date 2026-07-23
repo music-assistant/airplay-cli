@@ -123,6 +123,13 @@ uint64_t ap2_ptp_master_clock_id(struct ap2_ptp_ctx *ctx);
  */
 uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx);
 
+/*
+ * Map a unix-epoch nanosecond instant onto the master timeline. Anchor/start
+ * values cross the MA<->binary contract as unix time while the PTP timeline
+ * runs boot-relative; this converts "the same instant" between the two.
+ */
+uint64_t ap2_ptp_unix_to_master_ns(struct ap2_ptp_ctx *ctx, uint64_t unix_ns);
+
 /* ---- shared daemon clock (multi-room: one engine, many streams) ---- */
 
 /*
