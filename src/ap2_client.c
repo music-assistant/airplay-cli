@@ -69,6 +69,10 @@ extern log_level *loglevel;
 #define AP2_FEEDBACK_INTERVAL_MS     2000
 #define AP2_EVENT_POLL_INTERVAL_MS   100
 #define AP2_UDP_SEND_TIMEOUT_MS      20
+/* Minimum lead for a warm generation switch: receivers accepted re-anchors
+ * down to 150 ms in the flush-ladder measurements; 350 ms leaves margin for
+ * the commit round-trips and scheduling jitter. */
+#define AP2_MIN_WARM_LEAD_MS         350
 
 typedef enum {
     FLOW_RAOP_COMPAT = 0,
@@ -1980,6 +1984,71 @@ bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
     int latency = raopcl_latency(p->raopcl);
     raopcl_start_at(p->raopcl, ntp_start - TS2NTP(latency, p->format.sample_rate));
     p->state = AP2_STREAMING;
+    return true;
+}
+
+/* Warm-flush a LIVE session for a generation switch: discard receiver-buffered
+ * audio and re-base the timeline so the next written frame is audible at the
+ * requested instant. Native realtime sends the classic RTSP FLUSH with
+ * RTP-Info and freezes a fresh anchor line (measured accepted down to a
+ * 150 ms lead on Sonos and Apple TV); the RAOP paths use libraop's documented
+ * flush + start-at seek flow. Sequence numbers (and thus audio nonces) are
+ * never reset, so crypto state stays valid across the boundary. A start in
+ * the past (or 0) is clamped to now + the minimum warm lead so the first
+ * samples of the new generation can never be clipped. */
+bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms)
+{
+    if (!p || p->state == AP2_DOWN) return false;
+
+    uint64_t now_ntp = raopcl_get_ntp(NULL);
+    uint64_t start_ntp = start_unix_ms
+        ? ((start_unix_ms / 1000) << 32) |
+              (((start_unix_ms % 1000) << 32) / 1000)
+        : 0;
+    uint64_t min_start = now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+    if (start_ntp < min_start) start_ntp = min_start;
+
+    if (p->flow != FLOW_NATIVE_AP2) {
+        if (!p->raopcl) return false;
+        raopcl_pause(p->raopcl);
+        raopcl_flush(p->raopcl);
+        int latency = raopcl_latency(p->raopcl);
+        raopcl_start_at(p->raopcl,
+                        start_ntp - TS2NTP(latency, p->format.sample_rate));
+        p->state = AP2_STREAMING;
+        return true;
+    }
+
+    if (atomic_load(&p->rtsp_dead)) return false;
+    char hdr[64];
+    snprintf(hdr, sizeof(hdr), "RTP-Info: seq=%u;rtptime=%u\r\n",
+             (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
+    uint8_t *resp = NULL;
+    int resp_len = 0;
+    int status = ap2_rtsp_send_ex(p, "FLUSH", p->session_url, NULL, 0, NULL,
+                                  hdr, &resp, &resp_len);
+    free(resp);
+    LOG_INFO("[AP2] warm FLUSH (seq=%u rtptime=%u) -> %d",
+             (unsigned)p->seq_number, (unsigned)p->rtp_timestamp, status);
+    if (status != 200)
+        LOG_WARN("[AP2] receiver did not accept FLUSH (%d); re-anchoring anyway",
+                 status);
+
+    /* Re-base the frozen line: head_ts moves in the scheduling domain, the
+     * wire timestamp follows it plus the per-process offset, and the next
+     * sync packet freezes the new line from start_ntp. */
+    p->start_ntp = start_ntp;
+    p->head_ts = NTP2TS(start_ntp, p->format.sample_rate);
+    p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
+    p->rt_anchor_valid = false;
+    p->state = AP2_STREAMING;
+    atomic_store(&p->media_healthy, true);
+
+    if (p->use_ptp && p->ctrl_sock >= 0 &&
+        ap2_send_sync_packet_ptp(p, true) == AP2_SEND_FATAL) {
+        atomic_store(&p->media_healthy, false);
+        return false;
+    }
     return true;
 }
 
