@@ -23,10 +23,10 @@ bool raop_session_flush(struct raopcl_s *client);
 /* Silence playback while preserving the RAOP connection for a later START. */
 bool raop_session_standby(struct raopcl_s *client);
 
-/* Pause and retain the current generation's backlog for ACTION=PLAY. */
+/* Pause and retain the current stream's backlog for ACTION=PLAY. */
 bool raop_session_pause(struct raopcl_s *client);
 
-/* Resume a paused generation without discarding libraop's retained backlog. */
+/* Resume a paused stream without discarding libraop's retained backlog. */
 bool raop_session_resume(struct raopcl_s *client);
 
 #endif /* RAOP_SESSION_H */

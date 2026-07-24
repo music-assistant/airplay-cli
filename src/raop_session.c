@@ -21,8 +21,8 @@ bool raop_session_commit(struct raopcl_s *client, uint64_t start_unix_ms)
 
     raop_state_t state = raopcl_state(client);
     if (state != RAOP_STREAMING && state != RAOP_FLUSHED) return false;
-    /* Generation switches discard old backlog. pause() would preserve one
-     * latency window and replay it before the new generation. */
+    /* A commanded (re)start discards the old backlog. pause() would preserve
+     * one latency window and replay it before the new track. */
     raopcl_stop(client);
     if (state == RAOP_STREAMING) {
         if (!raopcl_flush(client)) return false;
