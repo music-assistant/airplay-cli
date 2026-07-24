@@ -4,11 +4,12 @@ Unified AirPlay streaming CLI for Music Assistant. One binary speaks RAOP
 (AirPlay 1) and AirPlay 2 — both the RAOP-compatible flow and the native HAP
 flow — replacing the previous `cliraop` and `cliap2` binaries.
 
-Music Assistant spawns one `cliairplay` process per player, then supplies each
-PCM generation through cmdpipe `PREPARE`/`START`. `AUDIO=-` reads a commanded
-generation from process stdin; named FIFOs allow later generations to be staged
-without reconnecting. For synchronized multi-room AirPlay 2 playback it also
-runs one `cliairplay --ptp-daemon` per host.
+Music Assistant spawns one `cliairplay` process per player and feeds it a
+single, persistent PCM stream on the process stdin for the whole process
+lifetime. Seek and next-track flush the live stream in place (cmdpipe
+`ACTION=FLUSH`) and re-anchor it with a new `ACTION=START` — the connection and
+the input are never re-opened. For synchronized multi-room AirPlay 2 playback it
+also runs one `cliairplay --ptp-daemon` per host.
 
 Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
 
@@ -31,9 +32,9 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   the device's mDNS TXT records.
 - **Hi-res audio**: 24-bit ALAC (44.1 kHz and 48 kHz) on the native realtime
   stream.
-- **Commanded group starts**: every generation on every protocol is staged with
-  cmdpipe `PREPARE`, then `START_UNIX_MS` schedules its first sample to be
-  audible at an exact wall-clock instant.
+- **Commanded group starts**: on every protocol, `START_UNIX_MS` schedules the
+  first sample to be audible at an exact wall-clock instant, so every member of
+  a sync group is handed the same instant and aligns by construction.
 
 ## Usage
 
@@ -48,10 +49,9 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   --cmdpipe /tmp/ap2-cap 192.168.1.50
 ```
 
-Every streaming protocol requires `--cmdpipe`; each generation's raw
-interleaved PCM arrives through the `AUDIO=<path>` supplied to `PREPARE`.
-`AUDIO=-` duplicates process stdin for one commanded active generation; use
-named FIFOs when staging replacements. The format is selected with
+Every streaming protocol requires `--cmdpipe`; the raw interleaved PCM arrives
+on the process stdin, which is the single persistent audio input for the whole
+process lifetime. The format is selected with
 `--samplerate`/`--bitdepth`/`--channels` (default s16le 44100 stereo). At
 `--bitdepth 24` the input must be **s32le**; the binary truncates it to the
 24-bit samples the ALAC encoder consumes.
@@ -60,10 +60,13 @@ named FIFOs when staging replacements. The format is selected with
 
 `START_UNIX_MS=<ms>` followed by `ACTION=START` means: **the first sample is
 audible exactly at that unix-epoch instant** for legacy RAOP, RAOP-compatible
-AirPlay 2, and native AirPlay 2. Every generation, including generation 0, must
-first be staged with cmdpipe `PREPARE`. A caller waits for
-`[STATUS] primed generation=<n>`, then sends the same start value to every
-primed member of a sync group.
+AirPlay 2, and native AirPlay 2. The first `ACTION=START` begins the session; a
+`START` after an `ACTION=FLUSH` re-anchors the same live stream to a new instant
+without reconnecting. A caller can wait for the one-shot
+`[STATUS] audio buffered_ms=<ms>` line — emitted once the (new) track's feed is
+flowing — before it commands the start, then send the same start value to every
+member of a sync group. A `START_UNIX_MS` of 0 or in the past clamps to now plus
+the minimum commanded-start lead (250 ms, 200 ms on RAOP).
 
 Delivery is not gated on the start time: frames are released up to the
 receiver's buffer window ahead of each frame's deadline (the device-reported
@@ -104,7 +107,7 @@ sudo setcap cap_net_bind_service=+ep /path/to/cliairplay
 cliairplay --protocol airplay2 --ptp-shared --cmdpipe /tmp/cap1 ... <ip1>
 cliairplay --protocol airplay2 --ptp-shared --cmdpipe /tmp/cap2 ... <ip2>
 
-# PREPARE each generation, wait until both are primed, then send the same:
+# Wait until both report [STATUS] audio, then send the same start to both:
 # START_UNIX_MS=<T>
 # ACTION=START
 ```
@@ -142,7 +145,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--if <ip>` | Local interface IP to bind all sockets to (multi-homed hosts). |
 | `--dacp <id>` | DACP ID advertised for remote-control callbacks; also the HAP pairing identity. |
 | `--activeremote <id>` | Active-Remote ID for DACP callbacks. |
-| `--cmdpipe <path>` | Required named pipe for runtime commands, metadata, and generation staging (see below). |
+| `--cmdpipe <path>` | Required named pipe for runtime commands and metadata (see below). Audio is not carried here — it is the process stdin. |
 | `--udn <name>` | UDN / instance name used for mDNS. |
 | `--debug <0-9>` | Log verbosity (default: 3). |
 
@@ -181,19 +184,29 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 ### Runtime commands (`--cmdpipe`)
 
 Newline-terminated `KEY=VALUE` lines written to the command pipe control a
-running stream:
+running stream. The raw PCM audio is **not** carried here — it is the process
+stdin, the single persistent audio input for the whole process lifetime.
 
-- Generations on every streaming protocol: `GENERATION=<n>`,
-  `AUDIO=<FIFO path>` (or `AUDIO=-` for process stdin),
-  `POSITION_MS=<ms>`, `ACTION=PREPARE`; after the matching `primed` status,
-  send `START_UNIX_MS=<unix epoch ms>` and `ACTION=START`. Generation 0 follows
-  this same path and never starts from argv.
-- Session lifecycle: `ACTION=FLUSH|STANDBY|DISCONNECT`
-- `VOLUME=<0-100>`
-- `ACTION=PLAY|PAUSE|STOP`
+- Start / re-anchor: `START_UNIX_MS=<unix epoch ms>` then `ACTION=START`. The
+  first `START` begins the session; a `START` after an `ACTION=FLUSH` re-anchors
+  the same live stream (no reconnect). `START_UNIX_MS=0` (or a past instant)
+  starts as soon as possible, at the minimum commanded-start lead.
+- `ACTION=FLUSH` — in-place warm flush for seek/next: flush the receiver (RTSP
+  FLUSH), discard the internal ring, and drain stdin to empty; acks with
+  `[STATUS] flushed` and then keeps buffering the next track while sending
+  nothing until the next `START` (idle-primed). The one-shot
+  `[STATUS] audio buffered_ms=<ms>` line fires again when the next track's feed
+  starts flowing.
+- Session lifecycle: `ACTION=STANDBY` (silence the receiver, keep the connection
+  warm), `ACTION=DISCONNECT` (end the session).
+- Transport: `ACTION=PLAY|PAUSE|STOP`.
+- `VOLUME=<0-100>`.
 - Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
   `ARTWORK=<local file path or http:// imageproxy URL>`, followed by
   `ACTION=SENDMETA` to push the set.
+
+`[STATUS] eof` means the stdin input ended — the whole feed is done, not just
+one track.
 
 Some receivers (notably Sonos) do not emit audio until they have received
 metadata; the binary pushes an initial metadata set at the first commanded
@@ -252,13 +265,14 @@ the server `dev` branch with both Dockerfile pins. That step requires the
 ## Architecture
 
 ```
-src/cliairplay.c      CLI entry, route dispatch, playback loops, input ring,
-                      cmdpipe, --pair-setup and --ptp-daemon modes
+src/cliairplay.c      CLI entry, route dispatch, playback loops, cmdpipe,
+                      --pair-setup and --ptp-daemon modes
 src/ap2_client.c      AP2 orchestrator: route resolution, RAOP-compat + native
                       flows, the realtime sender, anchor & pacing
-src/ap2_session.c     Protocol-neutral persistent generation engine used by
-                      legacy RAOP and both AirPlay 2 flows
-src/raop_session.c    Legacy RAOP generation commit/standby scheduling
+src/ap2_session.c     Protocol-neutral single-stdin flush-and-refill engine
+                      (persistent input reader + ring) used by legacy RAOP and
+                      both AirPlay 2 flows
+src/raop_session.c    Legacy RAOP commit / flush / standby scheduling
 src/ap2_hap.c         HAP pair-verify, transient and PIN pair-setup, encrypted
                       RTSP framing (ChaCha20-Poly1305)
 src/ap2_io.c          Absolute-deadline socket I/O shared by RTSP and MRP

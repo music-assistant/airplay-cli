@@ -182,8 +182,15 @@ grandmaster — but MA spawns one cliairplay per device. The split
 
 **Contract: cmdpipe `START_UNIX_MS=T` means the first sample is AUDIBLE at
 exactly T on every streaming protocol.** Legacy RAOP, RAOP-compatible AirPlay 2,
-and native AirPlay 2 members are handed the same T after each one reports its
-generation primed, then align by construction.
+and native AirPlay 2 members are handed the same T, then align by construction.
+The first `ACTION=START` begins the session; a `START` after an `ACTION=FLUSH`
+re-anchors the same live stream (§10) by re-basing the frozen anchor line below,
+with no reconnect and no crypto/sequence reset. The caller can gate the command
+on the one-shot `[STATUS] audio buffered_ms=` line — emitted once the current
+track's feed is flowing, and re-armed by each FLUSH — so it commits a start only
+after the feed is confirmed. A T of 0 or in the past clamps to now plus the
+minimum commanded-start lead (250 ms; 200 ms on RAOP), which covers only the
+commit round-trips since the connection and the feed are already up.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its
@@ -492,19 +499,26 @@ capture.
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
   to tear down a MediaRemote-active stream after roughly 30 seconds.
-- **Generation staging rings** — each cmdpipe `PREPARE` drains its FIFO (or
-  single active `AUDIO=-` stdin source) into an independent bounded ring before
-  `START`, decoupled from network pacing. The active and staged generations
-  never share PCM, and
-  the sender waits in bounded intervals so control failures remain visible
-  during producer starvation.
+- **Single-stream flush-and-refill** — one reader thread drains the persistent
+  stdin input into one bounded ring for the whole session, decoupled from
+  network pacing. A warm seek/next is `ACTION=FLUSH`: it quiesces the audio
+  sends, flushes the receiver (RTSP FLUSH), parks the reader to take exclusive
+  fd access, resets the ring, and drains stdin to `EAGAIN` — removing exactly
+  the pre-flush audio the caller stopped writing — then acks `[STATUS] flushed`
+  and releases the reader onto the empty ring. The stream is then idle-primed:
+  it keeps buffering the next track but sends nothing until the next `START`,
+  which re-anchors it. The one-shot `[STATUS] audio` signal (§6) is re-armed by
+  the flush, so the caller learns when the next track's feed is flowing. The
+  sender waits in bounded intervals so control failures remain visible during
+  producer starvation.
 - **Realtime send outcomes** — local UDP backpressure is a bounded transient
   drop that advances sequence, RTP, and scheduling timestamps. Encode,
   allocation, encryption, socket, and control failures are terminal and produce
   a nonzero process exit rather than a false EOF.
-- **EOF drain** — after generation EOF the receiver drains at most
-  `latency + 2 s`; the connection then remains idle for the next PREPARE until
-  the orphan timeout or DISCONNECT.
+- **EOF drain** — `[STATUS] eof` means the single stdin input ended (the whole
+  feed, not one track). The receiver then drains at most `latency + 2 s`, and
+  the connection idles awaiting the next `START` or the orphan idle timeout /
+  `DISCONNECT`.
 - **Initial metadata** — pushed at the first START with a placeholder title if the
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
