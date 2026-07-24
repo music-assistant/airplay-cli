@@ -4,10 +4,11 @@ Unified AirPlay streaming CLI for Music Assistant. One binary speaks RAOP
 (AirPlay 1) and AirPlay 2 — both the RAOP-compatible flow and the native HAP
 flow — replacing the previous `cliraop` and `cliap2` binaries.
 
-Music Assistant spawns one `cliairplay` process per player and feeds it raw PCM
-on stdin. For synchronized multi-room AirPlay 2 playback it additionally runs
-one `cliairplay --ptp-daemon` per host, which owns the PTP clock that every
-per-device stream on that host shares.
+Music Assistant spawns one `cliairplay` process per player, then supplies each
+PCM generation through cmdpipe `PREPARE`/`START`. `AUDIO=-` reads a commanded
+generation from process stdin; named FIFOs allow later generations to be staged
+without reconnecting. For synchronized multi-room AirPlay 2 playback it also
+runs one `cliairplay --ptp-daemon` per host.
 
 Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
 
@@ -30,37 +31,39 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   the device's mDNS TXT records.
 - **Hi-res audio**: 24-bit ALAC (44.1 kHz and 48 kHz) on the native realtime
   stream.
-- **Group starts**: `--start-unix-ms` schedules the first sample to be audible
-  at an exact wall-clock instant on every protocol path, so mixed
-  RAOP + AirPlay 2 groups start aligned.
+- **Commanded group starts**: every generation on every protocol is staged with
+  cmdpipe `PREPARE`, then `START_UNIX_MS` schedules its first sample to be
+  audible at an exact wall-clock instant.
 
 ## Usage
 
 ```bash
-# RAOP (or let --protocol auto decide from --txt):
-ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | \
-  ./bin/cliairplay-macos-arm64 --protocol raop --port 5000 \
-  --volume 50 --cmdpipe /tmp/cap 192.168.1.50 -
+# RAOP command-only session (or let --protocol auto decide from --txt):
+./bin/cliairplay-macos-arm64 --protocol raop --port 5000 \
+  --volume 50 --cmdpipe /tmp/raop-cap 192.168.1.50
 
-# AirPlay 2, native flow with stored credentials (Apple TV / HomePod):
-ffmpeg -i song.flac -f s16le -ar 44100 -ac 2 - | \
-  ./bin/cliairplay-macos-arm64 --protocol airplay2 --port 7000 \
-  --auth <192-hex-credentials> --volume 50 192.168.1.50 -
+# AirPlay 2 native command-only session:
+./bin/cliairplay-macos-arm64 --protocol airplay2 --port 7000 \
+  --auth <192-hex-credentials> --volume 50 \
+  --cmdpipe /tmp/ap2-cap 192.168.1.50
 ```
 
-Audio is read as raw interleaved PCM from `<filename>` or stdin (`-`) at the
-given `--samplerate`/`--bitdepth`/`--channels` (default s16le 44100 stereo).
-At `--bitdepth 24` the input must be **s32le**; the binary truncates it to the
-24-bit samples the ALAC encoder consumes. Input is drained eagerly into a 4 MB
-ring buffer, decoupled from network pacing, so the source pipeline fills ahead
-of a scheduled start.
+Every streaming protocol requires `--cmdpipe`; each generation's raw
+interleaved PCM arrives through the `AUDIO=<path>` supplied to `PREPARE`.
+`AUDIO=-` duplicates process stdin for one commanded active generation; use
+named FIFOs when staging replacements. The format is selected with
+`--samplerate`/`--bitdepth`/`--channels` (default s16le 44100 stereo). At
+`--bitdepth 24` the input must be **s32le**; the binary truncates it to the
+24-bit samples the ALAC encoder consumes.
 
 ### The start contract
 
-`--start-unix-ms <ms>` means: **the first sample is audible exactly at that
-unix-epoch instant**, on every protocol path (RAOP and both AirPlay 2 flows).
-Every member of a sync group is given the same value and aligns by
-construction — including mixed RAOP + AirPlay 2 groups.
+`START_UNIX_MS=<ms>` followed by `ACTION=START` means: **the first sample is
+audible exactly at that unix-epoch instant** for legacy RAOP, RAOP-compatible
+AirPlay 2, and native AirPlay 2. Every generation, including generation 0, must
+first be staged with cmdpipe `PREPARE`. A caller waits for
+`[STATUS] primed generation=<n>`, then sends the same start value to every
+primed member of a sync group.
 
 Delivery is not gated on the start time: frames are released up to the
 receiver's buffer window ahead of each frame's deadline (the device-reported
@@ -97,9 +100,13 @@ cliairplay --ptp-daemon [--if <ip>] &
 # Grant only the privileged-port capability instead of running as root:
 sudo setcap cap_net_bind_service=+ep /path/to/cliairplay
 
-# Per device, each with --ptp-shared and the SAME start time:
-cliairplay --protocol airplay2 --ptp-shared --start-unix-ms <T> ... <ip1> -
-cliairplay --protocol airplay2 --ptp-shared --start-unix-ms <T> ... <ip2> -
+# Per device, connect a command-only session:
+cliairplay --protocol airplay2 --ptp-shared --cmdpipe /tmp/cap1 ... <ip1>
+cliairplay --protocol airplay2 --ptp-shared --cmdpipe /tmp/cap2 ... <ip2>
+
+# PREPARE each generation, wait until both are primed, then send the same:
+# START_UNIX_MS=<T>
+# ACTION=START
 ```
 
 The daemon binds 319/320 once, runs the PTP engine, publishes the elected
@@ -113,7 +120,7 @@ first PTP stream begins and stops it (SIGTERM) when the last one ends.
 ## Command-line reference
 
 ```
-cliairplay [options] <host_ip> <filename ('-' for stdin)>
+cliairplay [options] --cmdpipe <path> <host_ip>
 ```
 
 ### Protocol selection
@@ -129,14 +136,13 @@ cliairplay [options] <host_ip> <filename ('-' for stdin)>
 | `--port <port>` | Device RTSP port (default: 5000; AirPlay 2 devices use 7000). |
 | `--volume <0-100>` | Initial volume. Mapped linear-in-dB onto -30..0 dB (the AirPlay ecosystem convention); 0 mutes. |
 | `--latency <ms>` | Playback lead / buffer (default: 2000, clamped into the device-reported window). |
-| `--start-unix-ms <ms>` | Absolute start time as unix-epoch milliseconds: the first sample is audible at exactly this instant. Pass the **same** value to every member of a sync group. |
 | `--samplerate <rate>` | Input sample rate (default: 44100). |
 | `--bitdepth <16\|24>` | Input bit depth (default: 16). 24 requires the native AirPlay 2 flow and s32le input. |
 | `--channels <n>` | Input channel count (default: 2). |
 | `--if <ip>` | Local interface IP to bind all sockets to (multi-homed hosts). |
 | `--dacp <id>` | DACP ID advertised for remote-control callbacks; also the HAP pairing identity. |
 | `--activeremote <id>` | Active-Remote ID for DACP callbacks. |
-| `--cmdpipe <path>` | Named pipe for runtime commands/metadata (see below). |
+| `--cmdpipe <path>` | Required named pipe for runtime commands, metadata, and generation staging (see below). |
 | `--udn <name>` | UDN / instance name used for mDNS. |
 | `--debug <0-9>` | Log verbosity (default: 3). |
 
@@ -177,6 +183,12 @@ cliairplay [options] <host_ip> <filename ('-' for stdin)>
 Newline-terminated `KEY=VALUE` lines written to the command pipe control a
 running stream:
 
+- Generations on every streaming protocol: `GENERATION=<n>`,
+  `AUDIO=<FIFO path>` (or `AUDIO=-` for process stdin),
+  `POSITION_MS=<ms>`, `ACTION=PREPARE`; after the matching `primed` status,
+  send `START_UNIX_MS=<unix epoch ms>` and `ACTION=START`. Generation 0 follows
+  this same path and never starts from argv.
+- Session lifecycle: `ACTION=FLUSH|STANDBY|DISCONNECT`
 - `VOLUME=<0-100>`
 - `ACTION=PLAY|PAUSE|STOP`
 - Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
@@ -184,8 +196,8 @@ running stream:
   `ACTION=SENDMETA` to push the set.
 
 Some receivers (notably Sonos) do not emit audio until they have received
-metadata; the binary pushes an initial metadata set at connect on its own, so
-audio starts regardless of whether the caller ever sends `SENDMETA`.
+metadata; the binary pushes an initial metadata set at the first commanded
+start, so audio starts regardless of whether the caller ever sends `SENDMETA`.
 Pair-verified native Apple sessions additionally mirror these updates over
 MediaRemote `POST /command`, including explicit play/pause/stop state. Set
 `CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
@@ -241,6 +253,9 @@ src/cliairplay.c      CLI entry, route dispatch, playback loops, input ring,
                       cmdpipe, --pair-setup and --ptp-daemon modes
 src/ap2_client.c      AP2 orchestrator: route resolution, RAOP-compat + native
                       flows, the realtime sender, anchor & pacing
+src/ap2_session.c     Protocol-neutral persistent generation engine used by
+                      legacy RAOP and both AirPlay 2 flows
+src/raop_session.c    Legacy RAOP generation commit/standby scheduling
 src/ap2_hap.c         HAP pair-verify, transient and PIN pair-setup, encrypted
                       RTSP framing (ChaCha20-Poly1305)
 src/ap2_io.c          Absolute-deadline socket I/O shared by RTSP and MRP

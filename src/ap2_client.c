@@ -49,6 +49,7 @@
 #include "ap2_plist.h"
 #include "ap2_bplist.h"
 #include "ap2_ptp.h"
+#include "raop_session.h"
 #include "ap2_timeline.h"
 
 extern log_level *loglevel;
@@ -1949,9 +1950,21 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     return true;
 }
 
-bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start)
+static uint64_t commanded_start_ntp(uint64_t start_unix_ms)
+{
+    uint64_t start_ntp = start_unix_ms
+        ? ((start_unix_ms / 1000) << 32) |
+              (((start_unix_ms % 1000) << 32) / 1000)
+        : 0;
+    uint64_t min_start =
+        raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+    return start_ntp < min_start ? min_start : start_ntp;
+}
+
+bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms)
 {
     if (!p) return false;
+    uint64_t ntp_start = commanded_start_ntp(start_unix_ms);
     if (p->flow == FLOW_NATIVE_AP2) {
         /* Offset the RTP timeline per process: streams in one group share
          * ntpstart, and with identical pos0 two sessions from one host are
@@ -2003,7 +2016,7 @@ void ap2cl_standby(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return;
     if (p->flow != FLOW_NATIVE_AP2) {
-        if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
+        if (p->raopcl) raop_session_standby(p->raopcl);
         p->state = AP2_CONNECTED;
         return;
     }
@@ -2036,21 +2049,10 @@ bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms)
 {
     if (!p || p->state == AP2_DOWN) return false;
 
-    uint64_t now_ntp = raopcl_get_ntp(NULL);
-    uint64_t start_ntp = start_unix_ms
-        ? ((start_unix_ms / 1000) << 32) |
-              (((start_unix_ms % 1000) << 32) / 1000)
-        : 0;
-    uint64_t min_start = now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
-    if (start_ntp < min_start) start_ntp = min_start;
+    uint64_t start_ntp = commanded_start_ntp(start_unix_ms);
 
     if (p->flow != FLOW_NATIVE_AP2) {
-        if (!p->raopcl) return false;
-        raopcl_pause(p->raopcl);
-        raopcl_flush(p->raopcl);
-        int latency = raopcl_latency(p->raopcl);
-        raopcl_start_at(p->raopcl,
-                        start_ntp - TS2NTP(latency, p->format.sample_rate));
+        if (!raop_session_commit(p->raopcl, start_unix_ms)) return false;
         p->state = AP2_STREAMING;
         return true;
     }
@@ -2800,5 +2802,20 @@ void ap2cl_test_lock_mrp(struct ap2cl_s *p)
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p)
 {
     pthread_mutex_unlock(&p->mrp_lock);
+}
+
+void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd)
+{
+    p->sock_fd = fd;
+    p->rtsp_established = true;
+    atomic_store(&p->rtsp_dead, false);
+    snprintf(p->session_url, sizeof(p->session_url), "rtsp://test/session");
+}
+
+void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p)
+{
+    p->sock_fd = -1;
+    p->rtsp_established = false;
+    p->state = AP2_DOWN;
 }
 #endif

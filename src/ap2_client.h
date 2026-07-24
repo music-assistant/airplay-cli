@@ -149,8 +149,9 @@ bool ap2cl_connect(struct ap2cl_s *p);
 /* Disconnect from the device. */
 bool ap2cl_disconnect(struct ap2cl_s *p);
 
-/* Start playback at the given NTP timestamp. */
-bool ap2cl_start_at(struct ap2cl_s *p, uint64_t ntp_start);
+/* Start playback at a commanded unix-epoch millisecond instant. A start of 0
+ * or one already in the past is clamped to now + the minimum warm lead. */
+bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms);
 
 /*
  * Warm-flush a live session for a generation switch (persistent session

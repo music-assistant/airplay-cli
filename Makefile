@@ -100,7 +100,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
-	cliairplay.c artwork.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c raop_session.c artwork.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -134,12 +134,22 @@ TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
 RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-raop-lifecycle
 RAOP_LIFECYCLE_TEST_OBJECTS = $(BUILDDIR)/test_ap2_raop_lifecycle.o \
 	$(BUILDDIR)/ap2_client_raop_lifecycle_test.o \
-	$(filter-out $(BUILDDIR)/ap2_client.o $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL))
+	$(BUILDDIR)/raop_session_raop_lifecycle_test.o \
+	$(filter-out $(BUILDDIR)/ap2_client.o $(BUILDDIR)/cliairplay.o \
+		$(BUILDDIR)/raop_session.o,$(OBJECTS_ALL))
 RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_create=ap2_test_raopcl_create \
 	-Draopcl_connect=ap2_test_raopcl_connect \
 	-Draopcl_disconnect=ap2_test_raopcl_disconnect \
-	-Draopcl_destroy=ap2_test_raopcl_destroy
+	-Draopcl_destroy=ap2_test_raopcl_destroy \
+	-Draopcl_state=ap2_test_raopcl_state \
+	-Draopcl_stop=ap2_test_raopcl_stop \
+	-Draopcl_flush=ap2_test_raopcl_flush \
+	-Draopcl_start_at=ap2_test_raopcl_start_at \
+	-Draopcl_get_ntp=ap2_test_raopcl_get_ntp \
+	-Draopcl_latency=ap2_test_raopcl_latency \
+	-Draopcl_sample_rate=ap2_test_raopcl_sample_rate
+RAOP_SESSION_TEST = build/tests/test_raop_session
 
 all: directory $(EXECUTABLE)
 
@@ -169,7 +179,10 @@ $(BUILDDIR)/test_mrp_artwork.o: tests/test_mrp_artwork.c
 $(BUILDDIR)/test_ap2_raop_lifecycle.o: tests/test_ap2_raop_lifecycle.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
-$(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c
+$(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
+
+$(BUILDDIR)/raop_session_raop_lifecycle_test.o: $(SRC)/raop_session.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
 
 $(BUILDDIR)/%.o: %.c
@@ -181,15 +194,29 @@ $(BUILDDIR)/%.o: %.cpp
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
-test: directory $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
-		$(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE)
+test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
+		$(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) $(RAOP_SESSION_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
 	$(CLIENT_TEST)
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
+	$(RAOP_SESSION_TEST)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
+	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
+		127.0.0.1 2>&1 || true)"; \
+		printf '%s\n' "$$missing_pipe" | grep -q "Streaming requires --cmdpipe"
+	@argv_audio="$$($(EXECUTABLE) --protocol raop --cmdpipe \
+		/tmp/cliairplay-test-unused 127.0.0.1 - 2>&1 || true)"; \
+		printf '%s\n' "$$argv_audio" | \
+		grep -q "Streaming audio must be provided by cmdpipe PREPARE, not argv"
+
+$(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
+		src/raop_session.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_raop_session.c \
+		src/raop_session.c $(EXTRA_LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

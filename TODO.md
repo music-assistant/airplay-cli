@@ -6,9 +6,9 @@ Genuinely open work only. Completed work lives in git history.
       across seek/next/resume: numbered media generations over per-generation
       input pipes, committed with RTSP `FLUSH` + a re-based frozen anchor line
       (measured working down to a 150 ms warm lead on Sonos and Apple TV).
-      The argv invocation is generation 0; an attached `--cmdpipe` means the
-      connection outlives it awaiting the next generation. Replaces today's
-      teardown-and-reconnect per `play_media`.
+      Every generation, including generation 0, arrives through `--cmdpipe`
+      PREPARE/START; the connection outlives it awaiting the next generation.
+      Replaces today's teardown-and-reconnect per `play_media`.
 - [ ] **Parse `audioLatencies` from GET /info.** The SETUP echo of
       `latencyMin`/`latencyMax` is receiver-optional (Sonos omits it); the
       /info table would populate the pacing window and the reported
