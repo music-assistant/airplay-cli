@@ -136,6 +136,7 @@ static void drain_input_fd(int fd)
      * drain terminates on EAGAIN long before this. */
     for (int guard = 0; guard < 100000; guard++) {
         ssize_t n = read(fd, scratch, sizeof(scratch));
+        if (n < 0 && errno == EINTR) continue;   /* retry: bytes may remain */
         if (n <= 0) return;   /* EAGAIN / EOF / error: nothing more to discard */
     }
 }
@@ -259,9 +260,17 @@ struct ap2_session_s *ap2_session_create(const ap2_session_ops_t *ops,
         ap2_session_destroy(s);
         return NULL;
     }
+    /* The reader's poll loop and the FLUSH drain (which runs on the cmdpipe
+     * thread under the session lock) both rely on reads never blocking, so a
+     * blocking input fd is not survivable — refuse to start rather than risk
+     * wedging the command thread later. */
     int fl = fcntl(s->input_fd, F_GETFL, 0);
-    if (fl != -1)
-        (void)fcntl(s->input_fd, F_SETFL, fl | O_NONBLOCK);
+    if (fl == -1 || fcntl(s->input_fd, F_SETFL, fl | O_NONBLOCK) == -1) {
+        LOG_ERROR("[SESSION] cannot make the input fd non-blocking: %s",
+                  strerror(errno));
+        ap2_session_destroy(s);
+        return NULL;
+    }
 
     if (pthread_create(&s->reader, NULL, reader_thread, s) != 0) {
         LOG_ERROR("[SESSION] cannot start input reader");

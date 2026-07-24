@@ -37,8 +37,11 @@ bool raop_session_commit(struct raopcl_s *client, uint64_t start_unix_ms)
 bool raop_session_start_at(struct raopcl_s *client, uint64_t start_unix_ms)
 {
     if (!client) return false;
+    /* Only valid after a flush (seek/standby): re-anchoring a live stream
+     * would replay the receiver's retained backlog against the new timeline.
+     * Rejecting STREAMING makes a START without a preceding FLUSH fail fast. */
     raop_state_t state = raopcl_state(client);
-    if (state != RAOP_STREAMING && state != RAOP_FLUSHED) return false;
+    if (state != RAOP_FLUSHED) return false;
 
     uint64_t audible_ntp = commanded_audible_ntp(start_unix_ms);
     uint64_t latency_ntp =

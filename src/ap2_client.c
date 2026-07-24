@@ -2041,7 +2041,8 @@ void ap2cl_standby(struct ap2cl_s *p)
 /* Discard the receiver's buffered audio in place for a warm seek, keeping the
  * session and its timeline continuity. Native realtime sends the classic RTSP
  * FLUSH with the current RTP-Info; the RAOP-compat path uses libraop's flush.
- * The stream sends nothing until the next ap2cl_resume re-anchors it. Sequence
+ * The send gate lives in the session engine: it is idle-primed after a FLUSH
+ * and calls no send until the next START commands ap2cl_resume. Sequence
  * numbers (and thus audio nonces) are never reset, so crypto state stays valid
  * across the boundary (measured accepted down to a ~150 ms lead on Sonos and
  * Apple TV once resumed). */

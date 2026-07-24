@@ -177,6 +177,13 @@ int main(void)
     assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
            unix_ms_to_ntp(resume_ms));
 
+    /* A START without a preceding FLUSH must fail fast: re-anchoring a live
+     * stream would replay the receiver backlog against the new timeline. */
+    reset_mocks();
+    client.state = RAOP_STREAMING;
+    assert(!raop_session_start_at(&client, resume_ms));
+    assert(start_calls == 0);
+
     client.state = RAOP_DOWN;
     assert(!raop_session_commit(&client, future_ms));
     assert(!raop_session_standby(&client));
