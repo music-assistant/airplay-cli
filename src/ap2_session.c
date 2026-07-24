@@ -149,6 +149,18 @@ static void *reader_thread(void *arg)
                   strerror(errno));
         return NULL;
     }
+    /* The read loop below assumes a non-blocking fd: it polls for readiness and
+     * re-checks the abort flag on every poll timeout, so read() must never
+     * block. Named-pipe generations are opened O_NONBLOCK above, but generation
+     * 0 dup()s the process stdin, which is blocking and whose write end the
+     * caller keeps open for the whole process. Without this, once such a
+     * generation is superseded its read() blocks forever on the idle-but-open
+     * pipe, so retire_slot()'s join wedges the command-pipe thread and no
+     * further generation can be staged. Force non-blocking so read() yields
+     * EAGAIN and the loop can honour abort. */
+    int fl = fcntl(fd, F_GETFL, 0);
+    if (fl != -1)
+        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
     struct stat input_stat;
     if (fstat(fd, &input_stat) < 0) {
         int open_errno = errno;
