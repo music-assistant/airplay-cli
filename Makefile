@@ -213,7 +213,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	@argv_audio="$$($(EXECUTABLE) --protocol raop --cmdpipe \
 		/tmp/cliairplay-test-unused 127.0.0.1 - 2>&1 || true)"; \
 		printf '%s\n' "$$argv_audio" | \
-		grep -q "Streaming audio must be provided by cmdpipe PREPARE, not argv"
+		grep -q "Streaming audio must be provided on stdin, not argv"
 
 $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 		src/raop_session.h Makefile

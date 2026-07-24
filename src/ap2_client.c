@@ -2036,26 +2036,19 @@ void ap2cl_standby(struct ap2cl_s *p)
     p->state = AP2_CONNECTED;
 }
 
-/* Warm-flush a LIVE session for a generation switch: discard receiver-buffered
- * audio and re-base the timeline so the next written frame is audible at the
- * requested instant. Native realtime sends the classic RTSP FLUSH with
- * RTP-Info and freezes a fresh anchor line (measured accepted down to a
- * 150 ms lead on Sonos and Apple TV); the RAOP paths use libraop's documented
- * flush + start-at seek flow. Sequence numbers (and thus audio nonces) are
- * never reset, so crypto state stays valid across the boundary. A start in
- * the past (or 0) is clamped to now + the minimum warm lead so the first
- * samples of the new generation can never be clipped. */
-bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms)
+/* Discard the receiver's buffered audio in place for a warm seek, keeping the
+ * session and its timeline continuity. Native realtime sends the classic RTSP
+ * FLUSH with the current RTP-Info; the RAOP-compat path uses libraop's flush.
+ * The stream sends nothing until the next ap2cl_resume re-anchors it. Sequence
+ * numbers (and thus audio nonces) are never reset, so crypto state stays valid
+ * across the boundary (measured accepted down to a ~150 ms lead on Sonos and
+ * Apple TV once resumed). */
+bool ap2cl_flush(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return false;
 
-    uint64_t start_ntp = commanded_start_ntp(start_unix_ms);
-
-    if (p->flow != FLOW_NATIVE_AP2) {
-        if (!raop_session_commit(p->raopcl, start_unix_ms)) return false;
-        p->state = AP2_STREAMING;
-        return true;
-    }
+    if (p->flow != FLOW_NATIVE_AP2)
+        return raop_session_flush(p->raopcl);
 
     if (atomic_load(&p->rtsp_dead)) return false;
     char hdr[64];
@@ -2071,7 +2064,28 @@ bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms)
     if (status != 200)
         LOG_WARN("[AP2] receiver did not accept FLUSH (%d); re-anchoring anyway",
                  status);
+    /* Drop the stale anchor; ap2cl_resume freezes a fresh line at START. */
+    p->rt_anchor_valid = false;
+    return true;
+}
 
+/* Re-base the frozen timeline so the next written frame is audible at
+ * start_unix_ms (unix epoch ms), resuming a stream that ap2cl_flush discarded
+ * (the START after a FLUSH). A start of 0 or one already in the past is clamped
+ * to now + the minimum warm lead so a new track's first samples can never be
+ * clipped. Sequence numbers and audio nonces are untouched. */
+bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
+{
+    if (!p || p->state == AP2_DOWN) return false;
+
+    if (p->flow != FLOW_NATIVE_AP2) {
+        if (!raop_session_start_at(p->raopcl, start_unix_ms)) return false;
+        p->state = AP2_STREAMING;
+        return true;
+    }
+
+    if (atomic_load(&p->rtsp_dead)) return false;
+    uint64_t start_ntp = commanded_start_ntp(start_unix_ms);
     /* Re-base the frozen line: head_ts moves in the scheduling domain, the
      * wire timestamp follows it plus the per-process offset, and the next
      * sync packet freezes the new line from start_ntp. */

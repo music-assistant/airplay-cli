@@ -161,16 +161,12 @@ static void status_connected(void)
     status_print("[STATUS] connected");
 }
 
-/* Persistent-session engine: every generation is commanded through the
- * command pipe, including generation 0. */
-#define SESSION_PREFILL_MS        500     /* staging fill that emits `primed` */
+/* Persistent-session engine: one stdin-backed PCM stream, flushed and refilled
+ * in place across seeks; playback (and each warm re-anchor) begins on START. */
 #define SESSION_IDLE_TIMEOUT_MS   120000  /* orphan safety net */
 static struct ap2_session_s *g_session = NULL;
 static pthread_mutex_t g_audio_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_first_start_done = false;
-static uint64_t g_pend_generation = 0;
-static char g_pend_audio[512];
-static uint64_t g_pend_position_ms = 0;
 static uint64_t g_pend_start_unix_ms = 0;
 
 static void session_quiesce(void *transport)
@@ -374,40 +370,14 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_set_volume(g_ap2cl, vol);
         }
-    } else if (strcmp(key, "GENERATION") == 0) {
-        g_pend_generation = strtoull(value, NULL, 10);
-    } else if (strcmp(key, "AUDIO") == 0) {
-        int written = snprintf(g_pend_audio, sizeof(g_pend_audio), "%s", value);
-        if (written < 0 || (size_t)written >= sizeof(g_pend_audio)) {
-            /* A truncated path would fail to open later at PREPARE with an
-             * opaque error; reject it here where the cause is clear. */
-            LOG_ERROR("AUDIO path too long (%zu bytes, max %zu)",
-                      strlen(value), sizeof(g_pend_audio) - 1);
-            g_pend_audio[0] = '\0';
-            status_error("AUDIO path too long");
-        }
-    } else if (strcmp(key, "POSITION_MS") == 0) {
-        g_pend_position_ms = strtoull(value, NULL, 10);
     } else if (strcmp(key, "START_UNIX_MS") == 0) {
         g_pend_start_unix_ms = strtoull(value, NULL, 10);
-    } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "PREPARE") == 0) {
-        ap2_generation_t gen = {
-            .number = g_pend_generation,
-            .audio_path = g_pend_audio[0] ? g_pend_audio : NULL,
-            .position_ms = g_pend_position_ms,
-        };
-        if (!g_session || !ap2_session_prepare(g_session, &gen))
-            status_error("PREPARE failed");
-        g_pend_audio[0] = '\0';
-        g_pend_position_ms = 0;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "START") == 0) {
-        if (!g_session ||
-            !ap2_session_start(g_session, g_pend_generation,
-                               g_pend_start_unix_ms))
+        if (!g_session || !ap2_session_start(g_session, g_pend_start_unix_ms))
             status_error("START failed");
         g_pend_start_unix_ms = 0;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "FLUSH") == 0) {
-        if (!g_session || !ap2_session_flush(g_session, g_pend_generation))
+        if (!g_session || !ap2_session_flush(g_session))
             status_error("FLUSH failed");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STANDBY") == 0) {
         if (g_session) ap2_session_standby(g_session);
@@ -495,15 +465,20 @@ static bool session_commit(void *transport, uint64_t start_unix_ms)
 {
     cli_config_t *cfg = transport;
     bool committed;
+    /* The first START begins the session; a START after a FLUSH re-anchors the
+     * flushed stream (no second receiver flush, no crypto/sequence reset). */
     if (cfg->protocol == PROTO_RAOP) {
         struct raopcl_s *client = g_raopcl;
-        committed = client && raop_session_commit(client, start_unix_ms);
+        if (!client) return false;
+        committed = !g_first_start_done
+            ? raop_session_commit(client, start_unix_ms)
+            : raop_session_start_at(client, start_unix_ms);
     } else {
         struct ap2cl_s *client = g_ap2cl;
         if (!client) return false;
         committed = !g_first_start_done
             ? ap2cl_start(client, start_unix_ms)
-            : ap2cl_warm_flush(client, start_unix_ms);
+            : ap2cl_resume(client, start_unix_ms);
     }
     if (!committed) return false;
 
@@ -512,6 +487,20 @@ static bool session_commit(void *transport, uint64_t start_unix_ms)
     g_first_start_done = true;
     g_status = STATUS_PLAYING;
     return true;
+}
+
+/* Discard the receiver's buffered audio in place for a warm seek and mark the
+ * stream not-playing; the next START re-anchors and resumes sending. */
+static void session_flush_op(void *transport)
+{
+    cli_config_t *cfg = transport;
+    if (cfg->protocol == PROTO_RAOP) {
+        if (g_raopcl && !raop_session_flush(g_raopcl))
+            status_error("RAOP flush failed");
+    } else if (g_ap2cl) {
+        ap2cl_flush(g_ap2cl);
+    }
+    if (g_status == STATUS_PLAYING) g_status = STATUS_PAUSED;
 }
 
 static void session_stop_op(void *transport)
@@ -638,6 +627,7 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf)
 {
     ap2_session_ops_t ops = {
         .quiesce = session_quiesce,
+        .flush = session_flush_op,
         .commit = session_commit,
         .resume = session_resume,
         .stop = session_stop_op,
@@ -646,7 +636,7 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf)
     };
     g_session = ap2_session_create(
         &ops, (unsigned)cfg->sample_rate * (unsigned)input_bpf,
-        SESSION_PREFILL_MS, SESSION_IDLE_TIMEOUT_MS);
+        SESSION_IDLE_TIMEOUT_MS, STDIN_FILENO);
     if (!g_session) {
         status_error("Cannot create session engine");
         return false;
@@ -771,9 +761,9 @@ static int run_raop(cli_config_t *cfg)
     }
 
     uint64_t last = 0, frames = 0;
-    uint64_t current_gen = ap2_session_active_generation(g_session);
+    uint64_t current_epoch = ap2_session_epoch(g_session);
     bool playback_failed = false;
-    bool gen_eof = false;
+    bool input_ended = false;
     bool eof_reported = false;
     uint64_t eof_time = 0;
     int pcm_carry = 0;
@@ -791,11 +781,13 @@ static int run_raop(cli_config_t *cfg)
             break;
         }
 
-        uint64_t active = ap2_session_active_generation(g_session);
-        if (active != current_gen) {
-            current_gen = active;
+        /* Each START bumps the epoch; reset the per-track bookkeeping so
+         * elapsed and frame alignment restart at the new anchor. */
+        uint64_t epoch = ap2_session_epoch(g_session);
+        if (epoch != current_epoch) {
+            current_epoch = epoch;
             frames = 0;
-            gen_eof = false;
+            input_ended = false;
             eof_reported = false;
             eof_time = 0;
             pcm_carry = 0;
@@ -803,7 +795,7 @@ static int run_raop(cli_config_t *cfg)
 
         /* Periodic status reporting (only while playing, so a pause does not keep
            emitting a "playing" status that would revive the sender's play state) */
-        if (g_status == STATUS_PLAYING && !gen_eof &&
+        if (g_status == STATUS_PLAYING && !input_ended &&
             now - last > MS2NTP(1000)) {
             last = now;
             if (frames > (uint64_t)raopcl_latency(g_raopcl)) {
@@ -812,15 +804,13 @@ static int run_raop(cli_config_t *cfg)
             }
         }
 
-        if (gen_eof) {
+        if (input_ended) {
             bool drained = !raopcl_is_playing(g_raopcl) ||
                            now - eof_time > MS2NTP(
                                TS2MS(raopcl_latency(g_raopcl),
                                      raopcl_sample_rate(g_raopcl)) + 2000);
             if (drained && !eof_reported) {
                 eof_reported = true;
-                status_print("[STATUS] eof generation=%llu",
-                             (unsigned long long)current_gen);
                 status_eof();
             }
             usleep(drained ? 50000 : 10000);
@@ -836,11 +826,11 @@ static int run_raop(cli_config_t *cfg)
                 usleep(1000);
                 continue;
             }
-            active = ap2_session_active_generation(g_session);
-            if (active != current_gen) {
-                current_gen = active;
+            epoch = ap2_session_epoch(g_session);
+            if (epoch != current_epoch) {
+                current_epoch = epoch;
                 frames = 0;
-                gen_eof = false;
+                input_ended = false;
                 eof_reported = false;
                 eof_time = 0;
                 pcm_carry = 0;
@@ -862,9 +852,8 @@ static int run_raop(cli_config_t *cfg)
                 break;
             }
             if (n == -1) {
-                LOG_INFO("End of RAOP generation %llu input, draining...",
-                         (unsigned long long)current_gen);
-                gen_eof = true;
+                LOG_INFO("End of RAOP input stream, draining...");
+                input_ended = true;
                 eof_time = raopcl_get_ntp(NULL);
                 pthread_mutex_unlock(&g_audio_send_lock);
                 continue;
@@ -1005,21 +994,21 @@ static int run_airplay2(cli_config_t *cfg)
         ap2cl_set_volume(g_ap2cl, cfg->volume);
     }
 
-    /* The session starts empty. Every generation, including generation 0, is
-     * prepared and started by the command-pipe thread after connection setup. */
+    /* The reader begins draining stdin into the ring immediately; the command
+     * pipe thread anchors playback on the first START after connection setup. */
     int ap2_input_bpf = (cfg->bit_depth <= 16 ? 2 : 4) * cfg->channels;
     int ap2_alac_bpf = (cfg->bit_depth <= 16 ? 2 : 3) * cfg->channels;
     if (!start_stream_session(cfg, ap2_input_bpf)) return 1;
     status_connected();
 
     uint64_t last = 0, frames = 0;
-    uint64_t current_gen = ap2_session_active_generation(g_session);
+    uint64_t current_epoch = ap2_session_epoch(g_session);
     uint8_t *buf = malloc(AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
     uint8_t *ap2_alac_buf = (cfg->bit_depth > 16) ? malloc(AP2_FRAMES_PER_CHUNK * ap2_alac_bpf) : NULL;
     bool playback_failed = false;
     bool starving = false;
     uint64_t starvation_started = 0;
-    bool gen_eof = false;         /* active generation's input fully consumed */
+    bool input_ended = false;     /* the input stream was fully consumed */
     bool eof_reported = false;
     uint64_t eof_time = 0;
     int pcm_carry = 0;            /* sub-frame remainder between ring reads */
@@ -1038,12 +1027,13 @@ static int run_airplay2(cli_config_t *cfg)
             break;
         }
 
-        /* A generation switch resets the per-generation bookkeeping. */
-        uint64_t active = ap2_session_active_generation(g_session);
-        if (active != current_gen) {
-            current_gen = active;
+        /* Each START bumps the epoch; reset the per-track bookkeeping so
+         * elapsed and frame alignment restart at the new anchor. */
+        uint64_t epoch = ap2_session_epoch(g_session);
+        if (epoch != current_epoch) {
+            current_epoch = epoch;
             frames = 0;
-            gen_eof = false;
+            input_ended = false;
             eof_reported = false;
             eof_time = 0;
             pcm_carry = 0;
@@ -1051,7 +1041,7 @@ static int run_airplay2(cli_config_t *cfg)
 
         /* Periodic status reporting (only while playing, so a pause does not keep
            emitting a "playing" status that would revive the sender's play state) */
-        if (g_status == STATUS_PLAYING && !gen_eof && now - last > MS2NTP(1000)) {
+        if (g_status == STATUS_PLAYING && !input_ended && now - last > MS2NTP(1000)) {
             last = now;
             uint32_t latency_frames = MS2TS(cfg->latency_ms, cfg->sample_rate);
             if (frames > latency_frames) {
@@ -1060,15 +1050,13 @@ static int run_airplay2(cli_config_t *cfg)
             }
         }
 
-        if (gen_eof) {
+        if (input_ended) {
             /* Input consumed: let the receiver drain, report once, then idle
-             * awaiting the next commanded generation or idle timeout. */
+             * awaiting the next START or the idle timeout. */
             bool drained = !ap2cl_is_playing(g_ap2cl) ||
                            now - eof_time > MS2NTP(cfg->latency_ms + 2000);
             if (drained && !eof_reported) {
                 eof_reported = true;
-                status_print("[STATUS] eof generation=%llu",
-                             (unsigned long long)current_gen);
                 status_eof();
             }
             usleep(drained ? 50000 : 10000);
@@ -1084,11 +1072,11 @@ static int run_airplay2(cli_config_t *cfg)
                 usleep(1000);
                 continue;
             }
-            active = ap2_session_active_generation(g_session);
-            if (active != current_gen) {
-                current_gen = active;
+            epoch = ap2_session_epoch(g_session);
+            if (epoch != current_epoch) {
+                current_epoch = epoch;
                 frames = 0;
-                gen_eof = false;
+                input_ended = false;
                 eof_reported = false;
                 eof_time = 0;
                 pcm_carry = 0;
@@ -1112,9 +1100,8 @@ static int run_airplay2(cli_config_t *cfg)
                 break;
             }
             if (n == -1) {
-                LOG_INFO("End of generation %llu input, draining buffer...",
-                         (unsigned long long)current_gen);
-                gen_eof = true;
+                LOG_INFO("End of AirPlay 2 input stream, draining buffer...");
+                input_ended = true;
                 eof_time = raopcl_get_ntp(NULL);
                 pthread_mutex_unlock(&g_audio_send_lock);
                 continue;
@@ -1533,7 +1520,7 @@ int main(int argc, char *argv[])
     }
     if (optind < argc) {
         status_error(
-            "Streaming audio must be provided by cmdpipe PREPARE, not argv");
+            "Streaming audio must be provided on stdin, not argv");
         return 1;
     }
 

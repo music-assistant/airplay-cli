@@ -1,17 +1,15 @@
 /*
- * Persistent session - generation state machine (see ap2_session.h)
+ * Persistent session - single-stream flush-and-refill engine (see ap2_session.h)
  *
- * Threading model: PREPARE spawns one reader thread per generation that
- * drains the generation's input into its own ring. The command-pipe thread
- * drives prepare/start/flush/standby; START performs the transport commit
- * (RTSP work is serialized inside the transport) and swaps the staged slot
- * in as active under the session lock. The audio loop only ever calls
- * ap2_session_read()/poll(), so a generation switch is invisible to it
- * beyond the data changing.
- *
- * Slots are heap objects with stable addresses for their reader threads;
- * generation switches swap pointers, never slot contents. A retired slot is
- * freed only after its reader has been joined.
+ * Threading model: one reader thread drains the persistent input fd into one
+ * ring for the whole session. The command-pipe thread drives start/flush/
+ * standby; the audio loop only ever calls ap2_session_read()/poll(). A FLUSH
+ * must drain the input fd without racing the reader on the same descriptor, so
+ * the cmdpipe thread parks the reader (drain_request -> reader_paused handshake)
+ * before it resets the ring and drains the fd, then releases it onto the empty
+ * ring to buffer the next track. The reader never blocks (the fd is
+ * non-blocking and poll uses a short timeout), so the handshake is bounded and
+ * the cmdpipe thread is never wedged.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * See LICENSE
@@ -25,7 +23,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -37,40 +34,37 @@ extern log_level *loglevel;
 
 #define SRING_MIN_BYTES   (1u << 20)   /* 1 MiB floor */
 #define SRING_SECONDS     4            /* ring depth in media time */
+#define READER_POLL_MS    30           /* input poll slice; bounds pause latency */
 
-/* One generation's input ring, filled by its reader thread. */
+/* The single input ring, filled by the reader thread. */
 typedef struct {
     uint8_t *data;
     size_t cap, rd, wr, fill;
-    bool eof;        /* writer closed (or read error) */
-    bool abort;      /* stop the reader and discard */
+    bool eof;        /* input closed (or read error): end of stream */
 } sring_t;
-
-typedef struct {
-    ap2_generation_t gen;
-    char *path_owned;         /* strdup'd audio_path (gen.audio_path aliases) */
-    sring_t ring;
-    pthread_t thread;
-    bool thread_started;
-    bool ready_sent;
-    bool primed_sent;
-} slot_t;
 
 struct ap2_session_s {
     ap2_session_ops_t ops;
     unsigned byte_rate;
-    size_t prefill_bytes;
     int idle_timeout_ms;
+    int input_fd;              /* owned dup of the caller's PCM descriptor */
 
     pthread_mutex_t lock;
-    pthread_cond_t can_read;   /* active ring gained data / state changed */
-    pthread_cond_t can_write;  /* a ring gained space / abort requested */
+    pthread_cond_t can_read;   /* ring gained data / state changed */
+    pthread_cond_t can_write;  /* ring gained space / abort / drain requested */
+    pthread_cond_t reader_paused_cond;  /* reader entered the paused state */
+    pthread_cond_t reader_resume_cond;  /* drain finished; reader may continue */
+
+    pthread_t reader;
+    bool reader_started;
+    bool reader_paused;        /* reader parked for a drain */
+    bool drain_request;        /* cmdpipe asked the reader to park */
+    bool abort;                /* tear the reader down */
 
     ap2_session_state_t state;
-    slot_t *active;
-    slot_t *staged;
-    uint64_t played_bytes;     /* consumed from the ACTIVE generation */
+    uint64_t epoch;            /* bumped on every START */
     uint64_t idle_since_ms;    /* monotonic ms when we last went idle */
+    sring_t ring;
 };
 
 /* ---- ring helpers (called with s->lock held) ---- */
@@ -84,6 +78,12 @@ static bool sring_init(sring_t *r, unsigned byte_rate)
     if (!r->data) return false;
     r->cap = cap;
     return true;
+}
+
+static void sring_reset(sring_t *r)
+{
+    r->rd = r->wr = r->fill = 0;
+    r->eof = false;
 }
 
 static size_t sring_pop(sring_t *r, uint8_t *buf, size_t want)
@@ -123,393 +123,254 @@ static void emit(struct ap2_session_s *s, const char *fmt, ...)
     s->ops.status(line);
 }
 
-/* ---- generation reader thread ---- */
+/* ---- input reader thread (single, persistent) ---- */
 
-typedef struct {
-    struct ap2_session_s *s;
-    slot_t *slot;
-} reader_arg_t;
+/* Read+discard from the fd until it would block. Called by the cmdpipe thread
+ * under s->lock with the reader parked, so it has exclusive fd access. */
+static void drain_input_fd(int fd)
+{
+    uint8_t scratch[16384];
+    /* Cap the loop so a misbehaving writer that never stops can never wedge the
+     * cmdpipe thread; MA stops writing old bytes before FLUSH, so a well-behaved
+     * drain terminates on EAGAIN long before this. */
+    for (int guard = 0; guard < 100000; guard++) {
+        ssize_t n = read(fd, scratch, sizeof(scratch));
+        if (n <= 0) return;   /* EAGAIN / EOF / error: nothing more to discard */
+    }
+}
 
 static void *reader_thread(void *arg)
 {
-    reader_arg_t a = *(reader_arg_t *)arg;
-    free(arg);
-    struct ap2_session_s *s = a.s;
-    slot_t *slot = a.slot;
-
-    int fd = strcmp(slot->path_owned, "-") == 0
-        ? dup(STDIN_FILENO)
-        : open(slot->path_owned, O_RDONLY | O_NONBLOCK);
-    if (fd < 0) {
-        pthread_mutex_lock(&s->lock);
-        slot->ring.eof = true;
-        pthread_cond_broadcast(&s->can_read);
-        pthread_mutex_unlock(&s->lock);
-        LOG_ERROR("[SESSION] cannot open %s: %s", slot->path_owned,
-                  strerror(errno));
-        return NULL;
-    }
-    /* The read loop below assumes a non-blocking fd: it polls for readiness and
-     * re-checks the abort flag on every poll timeout, so read() must never
-     * block. Named-pipe generations are opened O_NONBLOCK above, but generation
-     * 0 dup()s the process stdin, which is blocking and whose write end the
-     * caller keeps open for the whole process. Without this, once such a
-     * generation is superseded its read() blocks forever on the idle-but-open
-     * pipe, so retire_slot()'s join wedges the command-pipe thread and no
-     * further generation can be staged. Force non-blocking so read() yields
-     * EAGAIN and the loop can honour abort. */
-    int fl = fcntl(fd, F_GETFL, 0);
-    if (fl != -1)
-        (void)fcntl(fd, F_SETFL, fl | O_NONBLOCK);
-    struct stat input_stat;
-    if (fstat(fd, &input_stat) < 0) {
-        int open_errno = errno;
-        pthread_mutex_lock(&s->lock);
-        slot->ring.eof = true;
-        emit(s, "[STATUS] input_error generation=%llu errno=%d (%s)",
-             (unsigned long long)slot->gen.number, open_errno,
-             strerror(open_errno));
-        pthread_cond_broadcast(&s->can_read);
-        pthread_mutex_unlock(&s->lock);
-        close(fd);
-        return NULL;
-    }
-    bool writer_seen = !S_ISFIFO(input_stat.st_mode);
-
-    pthread_mutex_lock(&s->lock);
-    if (!slot->ring.abort && !slot->ready_sent) {
-        slot->ready_sent = true;
-        emit(s, "[STATUS] ready generation=%llu",
-             (unsigned long long)slot->gen.number);
-    }
-    pthread_mutex_unlock(&s->lock);
-
-    /* The read below unblocks when the writer closes its end (MA kills the
-     * generation's ffmpeg on replace), which is the normal retirement path;
-     * abort covers the never-started cases. */
+    struct ap2_session_s *s = arg;
     uint8_t buf[16384];
+
     for (;;) {
         pthread_mutex_lock(&s->lock);
-        bool abort = slot->ring.abort;
+        /* Park on a drain request: the cmdpipe thread needs exclusive fd access
+         * to drain it, so we release the lock and wait until the drain is done. */
+        while (s->drain_request && !s->abort) {
+            s->reader_paused = true;
+            pthread_cond_broadcast(&s->reader_paused_cond);
+            pthread_cond_wait(&s->reader_resume_cond, &s->lock);
+        }
+        s->reader_paused = false;
+        bool abort = s->abort;
+        bool at_eof = s->ring.eof;
         pthread_mutex_unlock(&s->lock);
         if (abort) break;
 
-        struct pollfd pfd = {.fd = fd, .events = POLLIN};
-        int polled = poll(&pfd, 1, 250);
-        if (polled < 0 && errno == EINTR) continue;
-        if (polled == 0) {
-            /* A timeout says nothing about FIFO writer presence: both a
-             * connected idle writer and a writerless FIFO can time out. */
-            if (!writer_seen) continue;
-            /* Once data proved that a writer existed, read to distinguish an
-             * idle writer (EAGAIN) from one that closed (EOF). */
-        }
-        if (!writer_seen && (pfd.revents & POLLHUP) &&
-            !(pfd.revents & POLLIN)) {
-            /* No writer has connected yet. Avoid treating that as input EOF. */
-            usleep(10000);
+        if (at_eof) {
+            /* Input closed (teardown): stay alive to honour pause/abort, but do
+             * not busy-poll a closed descriptor. */
+            usleep(20000);
             continue;
         }
-        if (pfd.revents & POLLIN) writer_seen = true;
 
-        ssize_t n = polled < 0 ? -1 : read(fd, buf, sizeof(buf));
-        if (n < 0 && errno == EINTR)
-            continue;  /* interrupted syscall, not an error — retry the read */
-        if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
-            continue;
-        int read_errno = errno;
+        struct pollfd pfd = {.fd = s->input_fd, .events = POLLIN};
+        int polled = poll(&pfd, 1, READER_POLL_MS);
+        if (polled < 0 && errno == EINTR) continue;
+
+        /* A drain may have been requested while we polled; park before touching
+         * the fd so the cmdpipe thread keeps exclusive access. */
         pthread_mutex_lock(&s->lock);
-        if (slot->ring.abort) {
-            pthread_mutex_unlock(&s->lock);
-            break;
-        }
+        bool pause_now = s->drain_request;
+        pthread_mutex_unlock(&s->lock);
+        if (pause_now) continue;
+        if (polled <= 0) continue;   /* timeout: no data yet */
+
+        ssize_t n = read(s->input_fd, buf, sizeof(buf));
+        if (n < 0 && (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK))
+            continue;
         if (n <= 0) {
-            slot->ring.eof = true;
-            if (n == 0 && slot->ring.fill > 0 && !slot->primed_sent) {
-                slot->primed_sent = true;
-                emit(s, "[STATUS] primed generation=%llu prefill_ms=%llu",
-                     (unsigned long long)slot->gen.number,
-                     (unsigned long long)(slot->ring.fill * 1000ULL /
-                                          s->byte_rate));
-            }
-            /* A clean EOF (0) is the normal retirement path; a negative return
-             * is a real read error (e.g. a broken pipe) and is surfaced
-             * distinctly instead of being hidden as end-of-input. */
-            if (n < 0)
-                emit(s, "[STATUS] input_error generation=%llu errno=%d (%s)",
-                     (unsigned long long)slot->gen.number, read_errno,
-                     strerror(read_errno));
-            else
-                emit(s, "[STATUS] input_eof generation=%llu",
-                     (unsigned long long)slot->gen.number);
+            /* A clean EOF (0) is the normal teardown path; a negative return is
+             * a read error. Both end the stream. */
+            int read_errno = errno;
+            pthread_mutex_lock(&s->lock);
+            s->ring.eof = true;
             pthread_cond_broadcast(&s->can_read);
             pthread_mutex_unlock(&s->lock);
-            break;
+            if (n < 0)
+                LOG_ERROR("[SESSION] input read error: %s", strerror(read_errno));
+            continue;
         }
+
         size_t off = 0;
-        while (off < (size_t)n && !slot->ring.abort) {
-            size_t pushed = sring_push(&slot->ring, buf + off, (size_t)n - off);
+        pthread_mutex_lock(&s->lock);
+        while (off < (size_t)n && !s->abort && !s->drain_request) {
+            size_t pushed = sring_push(&s->ring, buf + off, (size_t)n - off);
             off += pushed;
             if (pushed) pthread_cond_broadcast(&s->can_read);
-            if (!slot->primed_sent && slot->ring.fill >= s->prefill_bytes) {
-                slot->primed_sent = true;
-                emit(s, "[STATUS] primed generation=%llu prefill_ms=%llu",
-                     (unsigned long long)slot->gen.number,
-                     (unsigned long long)(slot->ring.fill * 1000ULL /
-                                          s->byte_rate));
-            }
             if (off < (size_t)n)
                 pthread_cond_wait(&s->can_write, &s->lock);
         }
         pthread_mutex_unlock(&s->lock);
+        /* If a drain interrupted the push, the unwritten tail is pre-flush audio
+         * and is dropped on purpose. */
     }
-    close(fd);
     return NULL;
-}
-
-/* Stop a detached slot's reader, join it and free the slot. The slot must
- * already be unlinked from the session. Lock must NOT be held. */
-static void retire_slot(struct ap2_session_s *s, slot_t *slot)
-{
-    if (!slot) return;
-    pthread_mutex_lock(&s->lock);
-    slot->ring.abort = true;
-    pthread_cond_broadcast(&s->can_write);
-    bool started = slot->thread_started;
-    pthread_mutex_unlock(&s->lock);
-
-    if (started) {
-        pthread_join(slot->thread, NULL);
-    }
-    free(slot->ring.data);
-    free(slot->path_owned);
-    free(slot);
-}
-
-/* Detach a slot pointer from the session under the lock. */
-static slot_t *detach(struct ap2_session_s *s, slot_t **ref)
-{
-    pthread_mutex_lock(&s->lock);
-    slot_t *slot = *ref;
-    *ref = NULL;
-    pthread_mutex_unlock(&s->lock);
-    return slot;
 }
 
 /* ---- public API ---- */
 
 struct ap2_session_s *ap2_session_create(const ap2_session_ops_t *ops,
-                                         unsigned byte_rate, int prefill_ms,
-                                         int idle_timeout_ms)
+                                         unsigned byte_rate, int idle_timeout_ms,
+                                         int input_fd)
 {
-    if (!ops || !ops->quiesce || !ops->commit || !ops->resume ||
-        !ops->stop || !ops->status || !byte_rate)
+    if (!ops || !ops->quiesce || !ops->flush || !ops->commit || !ops->resume ||
+        !ops->stop || !ops->status || !byte_rate || input_fd < 0)
         return NULL;
     struct ap2_session_s *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->ops = *ops;
     s->byte_rate = byte_rate;
-    s->prefill_bytes = (size_t)byte_rate * (prefill_ms > 0 ? prefill_ms : 1)
-                       / 1000;
     s->idle_timeout_ms = idle_timeout_ms;
+    s->input_fd = -1;
     pthread_mutex_init(&s->lock, NULL);
     pthread_cond_init(&s->can_read, NULL);
     pthread_cond_init(&s->can_write, NULL);
+    pthread_cond_init(&s->reader_paused_cond, NULL);
+    pthread_cond_init(&s->reader_resume_cond, NULL);
     s->state = AP2_SESSION_IDLE;
     s->idle_since_ms = ap2_io_monotonic_ms();
+    if (!sring_init(&s->ring, byte_rate)) {
+        ap2_session_destroy(s);
+        return NULL;
+    }
+
+    /* Own a private, non-blocking dup of the caller's descriptor: the reader
+     * polls for readiness and must never block, and the caller keeps its own
+     * reference (killing the per-seek transcoder must not close our input). */
+    s->input_fd = dup(input_fd);
+    if (s->input_fd < 0) {
+        LOG_ERROR("[SESSION] cannot dup input fd: %s", strerror(errno));
+        ap2_session_destroy(s);
+        return NULL;
+    }
+    int fl = fcntl(s->input_fd, F_GETFL, 0);
+    if (fl != -1)
+        (void)fcntl(s->input_fd, F_SETFL, fl | O_NONBLOCK);
+
+    if (pthread_create(&s->reader, NULL, reader_thread, s) != 0) {
+        LOG_ERROR("[SESSION] cannot start input reader");
+        ap2_session_destroy(s);
+        return NULL;
+    }
+    s->reader_started = true;
     return s;
 }
 
 void ap2_session_destroy(struct ap2_session_s *s)
 {
     if (!s) return;
-    ap2_session_end(s);
-    retire_slot(s, detach(s, &s->staged));
-    retire_slot(s, detach(s, &s->active));
+    pthread_mutex_lock(&s->lock);
+    s->state = AP2_SESSION_ENDED;
+    s->abort = true;
+    /* Wake the reader out of any wait (ring-full, paused, or state change). */
+    pthread_cond_broadcast(&s->can_read);
+    pthread_cond_broadcast(&s->can_write);
+    pthread_cond_broadcast(&s->reader_resume_cond);
+    pthread_mutex_unlock(&s->lock);
+    if (s->reader_started)
+        pthread_join(s->reader, NULL);
+    if (s->input_fd >= 0) close(s->input_fd);
     pthread_cond_destroy(&s->can_read);
     pthread_cond_destroy(&s->can_write);
+    pthread_cond_destroy(&s->reader_paused_cond);
+    pthread_cond_destroy(&s->reader_resume_cond);
     pthread_mutex_destroy(&s->lock);
+    free(s->ring.data);
     free(s);
 }
 
-bool ap2_session_prepare(struct ap2_session_s *s, const ap2_generation_t *gen)
-{
-    if (!s || !gen || !gen->audio_path) return false;
-    if (strcmp(gen->audio_path, "-") == 0) {
-        pthread_mutex_lock(&s->lock);
-        bool stdin_active =
-            s->active && strcmp(s->active->path_owned, "-") == 0;
-        pthread_mutex_unlock(&s->lock);
-        if (stdin_active) {
-            LOG_ERROR("[SESSION] cannot stage AUDIO=- while another stdin "
-                      "generation is active; use a named FIFO");
-            return false;
-        }
-    }
-    /* A superseded staged generation is discarded: the caller only ever wants
-     * the newest one (rapid seek/seek/seek collapses naturally). */
-    retire_slot(s, detach(s, &s->staged));
-
-    slot_t *slot = calloc(1, sizeof(*slot));
-    if (!slot) return false;
-    slot->gen = *gen;
-    slot->path_owned = gen->audio_path ? strdup(gen->audio_path) : NULL;
-    slot->gen.audio_path = slot->path_owned;
-    if (!sring_init(&slot->ring, s->byte_rate)) {
-        free(slot->path_owned);
-        free(slot);
-        return false;
-    }
-
-    pthread_mutex_lock(&s->lock);
-    if (s->state == AP2_SESSION_ENDED) {
-        pthread_mutex_unlock(&s->lock);
-        free(slot->ring.data);
-        free(slot->path_owned);
-        free(slot);
-        return false;
-    }
-    s->staged = slot;
-    if (s->state == AP2_SESSION_IDLE || s->state == AP2_SESSION_STANDBY)
-        s->state = AP2_SESSION_PREPARING;
-    pthread_mutex_unlock(&s->lock);
-
-    reader_arg_t *arg = malloc(sizeof(*arg));
-    if (!arg) {
-        retire_slot(s, detach(s, &s->staged));
-        return false;
-    }
-    arg->s = s;
-    arg->slot = slot;
-    if (pthread_create(&slot->thread, NULL, reader_thread, arg) != 0) {
-        free(arg);
-        retire_slot(s, detach(s, &s->staged));
-        return false;
-    }
-    pthread_mutex_lock(&s->lock);
-    slot->thread_started = true;
-    pthread_mutex_unlock(&s->lock);
-    return true;
-}
-
-bool ap2_session_start(struct ap2_session_s *s, uint64_t generation,
-                       uint64_t start_unix_ms)
+bool ap2_session_start(struct ap2_session_s *s, uint64_t start_unix_ms)
 {
     if (!s) return false;
     pthread_mutex_lock(&s->lock);
-    bool ok = s->staged && s->staged->gen.number == generation &&
-              s->state != AP2_SESSION_ENDED;
+    bool ended = s->state == AP2_SESSION_ENDED;
     pthread_mutex_unlock(&s->lock);
-    if (!ok) {
-        LOG_ERROR("[SESSION] START for generation %llu does not match the "
-                  "staged generation",
-                  (unsigned long long)generation);
-        return false;
-    }
+    if (ended) return false;
 
-    /* Stop the audio loop between its current chunk and the transport FLUSH;
-     * keep it stopped until the staged slot is active. */
+    /* Stop the audio loop between chunks, do the transport work, then swap to
+     * PLAYING. On the first start commit begins the session; after a FLUSH it
+     * re-bases the frozen anchor. */
     s->ops.quiesce(s->ops.transport);
-    pthread_mutex_lock(&s->lock);
-    ok = s->staged && s->staged->gen.number == generation &&
-         s->state != AP2_SESSION_ENDED;
-    pthread_mutex_unlock(&s->lock);
-    if (!ok) {
-        s->ops.resume(s->ops.transport);
-        return false;
-    }
-
-    /* Transport commit outside the lock: it does RTSP round-trips. The staged
-     * reader keeps filling meanwhile; audio sends remain quiesced. */
     if (!s->ops.commit(s->ops.transport, start_unix_ms)) {
         s->ops.resume(s->ops.transport);
-        LOG_ERROR("[SESSION] transport commit failed for generation %llu",
-                  (unsigned long long)generation);
+        LOG_ERROR("[SESSION] transport commit failed");
         return false;
     }
-
     pthread_mutex_lock(&s->lock);
-    /* Command actions are serialized by the cmdpipe thread. Re-validate after
-     * the unlocked transport round-trip as a defensive API invariant. */
-    if (!s->staged || s->staged->gen.number != generation ||
-        s->state == AP2_SESSION_ENDED) {
+    if (s->state == AP2_SESSION_ENDED) {
         pthread_mutex_unlock(&s->lock);
         s->ops.resume(s->ops.transport);
-        LOG_WARN("[SESSION] generation %llu superseded before activation",
-                 (unsigned long long)generation);
         return false;
     }
-    slot_t *old = s->active;
-    s->active = s->staged;
-    s->staged = NULL;
-    s->played_bytes = 0;
+    s->ring.eof = false;   /* a fresh START clears any stale end-of-stream */
+    s->epoch++;
     s->state = AP2_SESSION_PLAYING;
     pthread_cond_broadcast(&s->can_read);
     pthread_cond_broadcast(&s->can_write);
     pthread_mutex_unlock(&s->lock);
     s->ops.resume(s->ops.transport);
-
-    retire_slot(s, old);
     return true;
 }
 
-bool ap2_session_flush(struct ap2_session_s *s, uint64_t generation)
+bool ap2_session_flush(struct ap2_session_s *s)
 {
     if (!s) return false;
     pthread_mutex_lock(&s->lock);
-    bool is_staged = s->staged && s->staged->gen.number == generation;
-    bool is_active = s->active && s->active->gen.number == generation;
+    bool ended = s->state == AP2_SESSION_ENDED;
+    pthread_mutex_unlock(&s->lock);
+    if (ended) return false;
+
+    /* Stop sending, then discard the receiver's buffered audio in place. */
+    s->ops.quiesce(s->ops.transport);
+    s->ops.flush(s->ops.transport);
+
+    pthread_mutex_lock(&s->lock);
+    /* Park the reader so we can drain the input fd without racing it, then
+     * discard our own ring and drain the fd to EAGAIN. MA has already stopped
+     * writing old bytes, so this removes exactly the pre-flush audio. */
+    s->drain_request = true;
+    pthread_cond_broadcast(&s->can_write);
+    while (s->reader_started && !s->reader_paused && !s->abort)
+        pthread_cond_wait(&s->reader_paused_cond, &s->lock);
+    sring_reset(&s->ring);
+    drain_input_fd(s->input_fd);
+    /* Release the reader onto the now-empty ring: it buffers the next track
+     * while we send nothing until the next START (idle-primed). */
+    s->drain_request = false;
+    if (s->state != AP2_SESSION_ENDED) {
+        s->state = AP2_SESSION_IDLE;
+        s->idle_since_ms = ap2_io_monotonic_ms();
+    }
+    pthread_cond_broadcast(&s->reader_resume_cond);
+    pthread_cond_broadcast(&s->can_read);
     pthread_mutex_unlock(&s->lock);
 
-    if (is_staged) {
-        retire_slot(s, detach(s, &s->staged));
-        pthread_mutex_lock(&s->lock);
-        if (s->state != AP2_SESSION_ENDED) {
-            if (s->active &&
-                (!s->active->ring.eof || s->active->ring.fill > 0)) {
-                s->state = AP2_SESSION_PLAYING;
-            } else {
-                s->state = AP2_SESSION_IDLE;
-                s->idle_since_ms = ap2_io_monotonic_ms();
-            }
-        }
-        pthread_cond_broadcast(&s->can_read);
-        pthread_mutex_unlock(&s->lock);
-        return true;
-    }
-    if (is_active) {
-        s->ops.quiesce(s->ops.transport);
-        s->ops.stop(s->ops.transport);
-        slot_t *old = detach(s, &s->active);
-        pthread_mutex_lock(&s->lock);
-        if (s->state != AP2_SESSION_ENDED) {
-            s->state = s->staged ? AP2_SESSION_PREPARING : AP2_SESSION_IDLE;
-            s->idle_since_ms = ap2_io_monotonic_ms();
-        }
-        pthread_cond_broadcast(&s->can_read);
-        pthread_mutex_unlock(&s->lock);
-        s->ops.resume(s->ops.transport);
-        retire_slot(s, old);
-        return true;
-    }
-    return false;
+    s->ops.resume(s->ops.transport);
+    emit(s, "[STATUS] flushed");
+    return true;
 }
 
 bool ap2_session_standby(struct ap2_session_s *s)
 {
     if (!s) return false;
+    pthread_mutex_lock(&s->lock);
+    bool ended = s->state == AP2_SESSION_ENDED;
+    pthread_mutex_unlock(&s->lock);
+    if (ended) return false;
+
     s->ops.quiesce(s->ops.transport);
     s->ops.stop(s->ops.transport);
-    slot_t *old = detach(s, &s->active);
     pthread_mutex_lock(&s->lock);
     if (s->state != AP2_SESSION_ENDED) {
-        s->state = s->staged ? AP2_SESSION_PREPARING : AP2_SESSION_STANDBY;
+        s->state = AP2_SESSION_STANDBY;
         s->idle_since_ms = ap2_io_monotonic_ms();
     }
     pthread_cond_broadcast(&s->can_read);
     pthread_mutex_unlock(&s->lock);
     s->ops.resume(s->ops.transport);
-    retire_slot(s, old);
     return true;
 }
 
@@ -520,6 +381,7 @@ void ap2_session_end(struct ap2_session_s *s)
     s->state = AP2_SESSION_ENDED;
     pthread_cond_broadcast(&s->can_read);
     pthread_cond_broadcast(&s->can_write);
+    pthread_cond_broadcast(&s->reader_resume_cond);
     pthread_mutex_unlock(&s->lock);
 }
 
@@ -536,22 +398,17 @@ int ap2_session_read(struct ap2_session_s *s, uint8_t *buf, int len,
             pthread_mutex_unlock(&s->lock);
             return -2;
         }
-        if (s->active && s->active->ring.fill > 0) {
-            size_t n = sring_pop(&s->active->ring, buf, (size_t)len);
-            s->played_bytes += n;
-            pthread_cond_broadcast(&s->can_write);
-            pthread_mutex_unlock(&s->lock);
-            return (int)n;
-        }
-        if (s->active && s->active->ring.eof) {
-            if (s->state == AP2_SESSION_PLAYING) {
-                s->state = s->staged
-                    ? AP2_SESSION_PREPARING : AP2_SESSION_IDLE;
-                if (s->state == AP2_SESSION_IDLE)
-                    s->idle_since_ms = ap2_io_monotonic_ms();
+        if (s->state == AP2_SESSION_PLAYING) {
+            if (s->ring.fill > 0) {
+                size_t n = sring_pop(&s->ring, buf, (size_t)len);
+                pthread_cond_broadcast(&s->can_write);
+                pthread_mutex_unlock(&s->lock);
+                return (int)n;
             }
-            pthread_mutex_unlock(&s->lock);
-            return -1;   /* generation fully consumed */
+            if (s->ring.eof) {
+                pthread_mutex_unlock(&s->lock);
+                return -1;   /* input stream fully consumed */
+            }
         }
         uint64_t now = ap2_io_monotonic_ms();
         if (now >= deadline) {
@@ -582,6 +439,7 @@ void ap2_session_poll(struct ap2_session_s *s)
         emit(s, "[STATUS] idle_timeout");
         pthread_cond_broadcast(&s->can_read);
         pthread_cond_broadcast(&s->can_write);
+        pthread_cond_broadcast(&s->reader_resume_cond);
     }
     pthread_mutex_unlock(&s->lock);
 }
@@ -595,23 +453,11 @@ ap2_session_state_t ap2_session_state(struct ap2_session_s *s)
     return st;
 }
 
-uint64_t ap2_session_active_generation(struct ap2_session_s *s)
+uint64_t ap2_session_epoch(struct ap2_session_s *s)
 {
     if (!s) return 0;
     pthread_mutex_lock(&s->lock);
-    uint64_t g = s->active ? s->active->gen.number : 0;
+    uint64_t e = s->epoch;
     pthread_mutex_unlock(&s->lock);
-    return g;
-}
-
-uint64_t ap2_session_position_ms(struct ap2_session_s *s)
-{
-    if (!s) return 0;
-    pthread_mutex_lock(&s->lock);
-    uint64_t pos = 0;
-    if (s->active)
-        pos = s->active->gen.position_ms +
-              s->played_bytes * 1000ULL / s->byte_rate;
-    pthread_mutex_unlock(&s->lock);
-    return pos;
+    return e;
 }

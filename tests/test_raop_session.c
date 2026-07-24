@@ -153,9 +153,35 @@ int main(void)
     assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
            mock_now + MS2NTP(200));
 
+    /* raop_session_flush discards the receiver buffer in place: stop, and flush
+     * only when currently streaming (a warm seek's FLUSH half). */
+    reset_mocks();
+    client.state = RAOP_STREAMING;
+    assert(raop_session_flush(&client));
+    assert(stop_calls == 1);
+    assert(flush_calls == 1);
+    assert(client.state == RAOP_FLUSHED);
+    assert(raop_session_flush(&client));   /* already flushed: stop only */
+    assert(stop_calls == 2);
+    assert(flush_calls == 1);
+
+    /* raop_session_start_at re-anchors a flushed stream without stopping or
+     * flushing again (the START half after a FLUSH). */
+    reset_mocks();
+    client.state = RAOP_FLUSHED;
+    const uint64_t resume_ms = 1700000123000ULL;
+    assert(raop_session_start_at(&client, resume_ms));
+    assert(stop_calls == 0);
+    assert(flush_calls == 0);
+    assert(start_calls == 1);
+    assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
+           unix_ms_to_ntp(resume_ms));
+
     client.state = RAOP_DOWN;
     assert(!raop_session_commit(&client, future_ms));
     assert(!raop_session_standby(&client));
+    assert(!raop_session_flush(&client));
+    assert(!raop_session_start_at(&client, future_ms));
     assert(!raop_session_pause(&client));
     assert(!raop_session_resume(&client));
 

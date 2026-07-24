@@ -34,7 +34,19 @@ bool raop_session_commit(struct raopcl_s *client, uint64_t start_unix_ms)
     return raopcl_start_at(client, audible_ntp - latency_ntp);
 }
 
-bool raop_session_standby(struct raopcl_s *client)
+bool raop_session_start_at(struct raopcl_s *client, uint64_t start_unix_ms)
+{
+    if (!client) return false;
+    raop_state_t state = raopcl_state(client);
+    if (state != RAOP_STREAMING && state != RAOP_FLUSHED) return false;
+
+    uint64_t audible_ntp = commanded_audible_ntp(start_unix_ms);
+    uint64_t latency_ntp =
+        TS2NTP(raopcl_latency(client), raopcl_sample_rate(client));
+    return raopcl_start_at(client, audible_ntp - latency_ntp);
+}
+
+bool raop_session_flush(struct raopcl_s *client)
 {
     if (!client) return false;
     raop_state_t state = raopcl_state(client);
@@ -42,6 +54,11 @@ bool raop_session_standby(struct raopcl_s *client)
     raopcl_stop(client);
     if (state == RAOP_FLUSHED) return true;
     return raopcl_flush(client);
+}
+
+bool raop_session_standby(struct raopcl_s *client)
+{
+    return raop_session_flush(client);
 }
 
 bool raop_session_pause(struct raopcl_s *client)

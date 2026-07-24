@@ -9,7 +9,6 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/stat.h>
 #include <unistd.h>
 
 #include "ap2_io.h"
@@ -19,307 +18,289 @@
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
 
-#define MAX_GENERATIONS 64
-
-typedef struct {
-    atomic_int ready[MAX_GENERATIONS];
-    atomic_int primed[MAX_GENERATIONS];
-    atomic_int eof[MAX_GENERATIONS];
-    atomic_int commits;
-    atomic_int quiesces;
-    atomic_int resumes;
-} test_state_t;
-
-static test_state_t *status_state;
-static atomic_int injected_poll_step;
-static atomic_bool inject_no_writer_events;
-
+/* ap2_session.c is compiled with -Dpoll=ap2_session_test_poll; the single-stream
+ * model no longer needs poll injection, so just delegate to the real poll. */
 int ap2_session_test_poll(struct pollfd *fds, nfds_t nfds, int timeout)
 {
-    if (atomic_load(&inject_no_writer_events)) {
-        int step = atomic_fetch_add(&injected_poll_step, 1);
-        if (step == 0) {
-            usleep((useconds_t)timeout * 1000);
-            for (nfds_t i = 0; i < nfds; i++) fds[i].revents = 0;
-            return 0;
-        }
-        if (step == 1) {
-            for (nfds_t i = 0; i < nfds; i++) fds[i].revents = POLLHUP;
-            atomic_store(&inject_no_writer_events, false);
-            return 1;
-        }
-    }
     return poll(fds, nfds, timeout);
 }
 
+typedef struct {
+    atomic_int commits;
+    atomic_int flushes;
+    atomic_int quiesces;
+    atomic_int resumes;
+    atomic_int stops;
+    atomic_int flushed_status;
+    atomic_int idle_timeouts;
+    uint64_t last_start_unix_ms;
+} test_state_t;
+
+static test_state_t *status_state;
+
 static void quiesce(void *transport)
 {
-    test_state_t *state = transport;
-    atomic_fetch_add(&state->quiesces, 1);
+    atomic_fetch_add(&((test_state_t *)transport)->quiesces, 1);
+}
+
+static void flush(void *transport)
+{
+    atomic_fetch_add(&((test_state_t *)transport)->flushes, 1);
 }
 
 static bool commit(void *transport, uint64_t start_unix_ms)
 {
     test_state_t *state = transport;
-    (void)start_unix_ms;
+    state->last_start_unix_ms = start_unix_ms;
     atomic_fetch_add(&state->commits, 1);
     return true;
 }
 
 static void resume(void *transport)
 {
-    test_state_t *state = transport;
-    atomic_fetch_add(&state->resumes, 1);
+    atomic_fetch_add(&((test_state_t *)transport)->resumes, 1);
 }
 
 static void stop(void *transport)
 {
-    (void)transport;
+    atomic_fetch_add(&((test_state_t *)transport)->stops, 1);
 }
 
 static void status(const char *line)
 {
-    unsigned long long generation;
-    if (sscanf(line, "[STATUS] ready generation=%llu", &generation) == 1 &&
-        generation < MAX_GENERATIONS) {
-        atomic_fetch_add(&status_state->ready[generation], 1);
-    } else if (sscanf(line, "[STATUS] primed generation=%llu", &generation) ==
-                   1 &&
-               generation < MAX_GENERATIONS) {
-        atomic_fetch_add(&status_state->primed[generation], 1);
-    } else if (sscanf(line, "[STATUS] input_eof generation=%llu", &generation) ==
-                   1 &&
-               generation < MAX_GENERATIONS) {
-        atomic_fetch_add(&status_state->eof[generation], 1);
-    }
+    if (strcmp(line, "[STATUS] flushed") == 0)
+        atomic_fetch_add(&status_state->flushed_status, 1);
+    else if (strcmp(line, "[STATUS] idle_timeout") == 0)
+        atomic_fetch_add(&status_state->idle_timeouts, 1);
 }
 
-static struct ap2_session_s *create_session(test_state_t *state)
+static void state_init(test_state_t *state)
 {
-    for (size_t i = 0; i < MAX_GENERATIONS; i++) {
-        atomic_init(&state->ready[i], 0);
-        atomic_init(&state->primed[i], 0);
-        atomic_init(&state->eof[i], 0);
-    }
+    memset(state, 0, sizeof(*state));
     atomic_init(&state->commits, 0);
+    atomic_init(&state->flushes, 0);
     atomic_init(&state->quiesces, 0);
     atomic_init(&state->resumes, 0);
+    atomic_init(&state->stops, 0);
+    atomic_init(&state->flushed_status, 0);
+    atomic_init(&state->idle_timeouts, 0);
     status_state = state;
+}
+
+/* Create a pipe-backed session: the engine reads (a dup of) the pipe read end,
+ * the test writes the audio into the returned write end. */
+static struct ap2_session_s *create_session(test_state_t *state,
+                                            int idle_timeout_ms, int *write_fd)
+{
+    state_init(state);
     ap2_session_ops_t ops = {
         .quiesce = quiesce,
+        .flush = flush,
         .commit = commit,
         .resume = resume,
         .stop = stop,
         .status = status,
         .transport = state,
     };
-    return ap2_session_create(&ops, 1000, 1, 0);
-}
-
-static void make_fifo(char *path, size_t size, const char *name)
-{
-    int written = snprintf(path, size, "/tmp/%s.XXXXXX", name);
-    assert(written > 0 && (size_t)written < size);
-    int placeholder = mkstemp(path);
-    assert(placeholder >= 0);
-    assert(close(placeholder) == 0);
-    assert(unlink(path) == 0);
-    assert(mkfifo(path, 0600) == 0);
-}
-
-static bool wait_for_count(atomic_int *value, int expected, int timeout_ms)
-{
-    uint64_t deadline = ap2_io_monotonic_ms() + (uint64_t)timeout_ms;
-    while (atomic_load(value) < expected &&
-           ap2_io_monotonic_ms() < deadline) {
-        usleep(1000);
-    }
-    return atomic_load(value) >= expected;
-}
-
-typedef struct {
-    const char *path;
-    const uint8_t *data;
-    size_t size;
-    int delay_ms;
-    int open_errno;
-    bool ok;
-} writer_arg_t;
-
-static void *delayed_writer(void *opaque)
-{
-    writer_arg_t *arg = opaque;
-    usleep((useconds_t)arg->delay_ms * 1000);
-    int fd = open(arg->path, O_WRONLY | O_NONBLOCK);
-    if (fd < 0) {
-        arg->open_errno = errno;
-        return NULL;
-    }
-    arg->ok = write(fd, arg->data, arg->size) == (ssize_t)arg->size;
-    if (close(fd) != 0) arg->ok = false;
-    return NULL;
-}
-
-static void read_generation(struct ap2_session_s *session,
-                            const uint8_t *expected, size_t size)
-{
-    uint8_t received[256];
-    assert(size <= sizeof(received));
-    size_t offset = 0;
-    while (offset < size) {
-        int n = ap2_session_read(session, received + offset,
-                                 (int)(size - offset), 1000);
-        assert(n > 0);
-        offset += (size_t)n;
-    }
-    assert(memcmp(received, expected, size) == 0);
-    assert(ap2_session_read(session, received, sizeof(received), 1000) == -1);
-}
-
-static void test_timeout_then_hup_keeps_fifo_reader(void)
-{
-    static const uint8_t audio[] = {0x10, 0x20, 0x30, 0x40};
-    char path[128];
-    make_fifo(path, sizeof(path), "cliairplay-fifo-race");
-
-    test_state_t state;
-    struct ap2_session_s *session = create_session(&state);
+    int input[2];
+    assert(pipe(input) == 0);
+    struct ap2_session_s *session =
+        ap2_session_create(&ops, 1000, idle_timeout_ms, input[0]);
     assert(session);
-    atomic_store(&injected_poll_step, 0);
-    atomic_store(&inject_no_writer_events, true);
+    /* The engine owns its own dup of the read end. */
+    assert(close(input[0]) == 0);
+    *write_fd = input[1];
+    return session;
+}
 
-    ap2_generation_t generation = {
-        .number = 0,
-        .audio_path = path,
-    };
-    writer_arg_t writer = {
-        .path = path,
-        .data = audio,
-        .size = sizeof(audio),
-        .delay_ms = 1000,
-    };
-    pthread_t writer_thread;
-    assert(pthread_create(&writer_thread, NULL, delayed_writer, &writer) == 0);
+static void feed(int write_fd, const uint8_t *data, size_t size)
+{
+    assert(write(write_fd, data, size) == (ssize_t)size);
+}
 
-    uint64_t prepare_started = ap2_io_monotonic_ms();
-    assert(ap2_session_prepare(session, &generation));
-    assert(ap2_io_monotonic_ms() - prepare_started < 500);
-    assert(wait_for_count(&state.ready[0], 1, 500));
-    usleep(600000);
-    assert(atomic_load(&state.ready[0]) == 1);
-    assert(atomic_load(&state.eof[0]) == 0);
+static void read_exact(struct ap2_session_s *session, const uint8_t *expected,
+                       size_t size)
+{
+    uint8_t got[256];
+    assert(size <= sizeof(got));
+    size_t off = 0;
+    uint64_t deadline = ap2_io_monotonic_ms() + 2000;
+    while (off < size && ap2_io_monotonic_ms() < deadline) {
+        int n = ap2_session_read(session, got + off, (int)(size - off), 200);
+        assert(n >= 0);   /* -1 (input EOF) / -2 (ended) must not happen here */
+        off += (size_t)n;
+    }
+    assert(off == size);
+    assert(memcmp(got, expected, size) == 0);
+}
 
-    assert(pthread_join(writer_thread, NULL) == 0);
-    assert(writer.ok);
-    assert(wait_for_count(&state.primed[0], 1, 1000));
-    assert(wait_for_count(&state.eof[0], 1, 1000));
-    assert(atomic_load(&state.ready[0]) == 1);
-    assert(atomic_load(&state.primed[0]) == 1);
-    assert(atomic_load(&state.eof[0]) == 1);
+static void test_start_streams_the_input(void)
+{
+    static const uint8_t audio[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
 
-    assert(ap2_session_start(session, 0, 1700000000000ULL));
-    read_generation(session, audio, sizeof(audio));
-    assert(atomic_load(&state.quiesces) == 1);
+    /* Before START the engine is idle and sends nothing. */
+    assert(ap2_session_state(session) == AP2_SESSION_IDLE);
+    assert(ap2_session_epoch(session) == 0);
+    feed(write_fd, audio, sizeof(audio));
+
+    const uint64_t audible = 1770000000123ULL;
+    assert(ap2_session_start(session, audible));
+    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
+    assert(ap2_session_epoch(session) == 1);
     assert(atomic_load(&state.commits) == 1);
+    assert(atomic_load(&state.quiesces) == 1);
     assert(atomic_load(&state.resumes) == 1);
+    assert(state.last_start_unix_ms == audible);
+
+    read_exact(session, audio, sizeof(audio));
 
     ap2_session_destroy(session);
     status_state = NULL;
-    assert(unlink(path) == 0);
+    assert(close(write_fd) == 0);
 }
 
-static void test_repeated_delayed_fifo_generations(void)
+/* The headline test: FLUSH drains the ring AND any undelivered stdin bytes and
+ * acks with [STATUS] flushed; the next START re-anchors and resumes cleanly from
+ * only the post-flush audio. */
+static void test_flush_drains_and_reanchors(void)
 {
-    static const int delays_ms[] = {20, 300, 1000, 450, 30, 1100, 275, 800};
+    static const uint8_t old_audio[] = {0xA0, 0xA1, 0xA2, 0xA3};
+    static const uint8_t stale_audio[] = {0xB0, 0xB1, 0xB2, 0xB3, 0xB4, 0xB5};
+    static const uint8_t new_audio[] = {0xC0, 0xC1, 0xC2, 0xC3, 0xC4};
     test_state_t state;
-    struct ap2_session_s *session = create_session(&state);
-    assert(session);
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
 
-    for (size_t i = 0; i < sizeof(delays_ms) / sizeof(delays_ms[0]); i++) {
-        char path[128];
-        make_fifo(path, sizeof(path), "cliairplay-fifo-stress");
-        uint8_t audio[64];
-        size_t audio_size = i == 0 ? 1 : sizeof(audio);
-        memset(audio, (int)(i + 1), audio_size);
-        ap2_generation_t generation = {
-            .number = i,
-            .audio_path = path,
-            .position_ms = i * 1000,
-        };
-        writer_arg_t writer = {
-            .path = path,
-            .data = audio,
-            .size = audio_size,
-            .delay_ms = delays_ms[i],
-        };
-        pthread_t writer_thread;
-        assert(pthread_create(
-                   &writer_thread, NULL, delayed_writer, &writer) == 0);
-        assert(ap2_session_prepare(session, &generation));
-        assert(wait_for_count(&state.ready[i], 1, 200));
-        assert(pthread_join(writer_thread, NULL) == 0);
-        assert(writer.ok);
-        assert(wait_for_count(&state.primed[i], 1, 1000));
-        assert(wait_for_count(&state.eof[i], 1, 1000));
-        assert(ap2_session_start(
-            session, i, 1700000000000ULL + i * 5000));
-        read_generation(session, audio, audio_size);
-        assert(atomic_load(&state.ready[i]) == 1);
-        assert(atomic_load(&state.primed[i]) == 1);
-        assert(atomic_load(&state.eof[i]) == 1);
-        assert(unlink(path) == 0);
-    }
+    feed(write_fd, old_audio, sizeof(old_audio));
+    assert(ap2_session_start(session, 1700000000000ULL));
+    read_exact(session, old_audio, sizeof(old_audio));
 
-    assert(atomic_load(&state.commits) ==
-           (int)(sizeof(delays_ms) / sizeof(delays_ms[0])));
-    ap2_session_destroy(session);
-    status_state = NULL;
-}
+    /* Bytes fed but never delivered before FLUSH: they sit in the ring and/or
+     * the input pipe and must be discarded by the drain. */
+    feed(write_fd, stale_audio, sizeof(stale_audio));
 
-static void test_empty_regular_input_and_writerless_abort(void)
-{
-    char empty_path[] = "/tmp/cliairplay-empty.XXXXXX";
-    int empty_fd = mkstemp(empty_path);
-    assert(empty_fd >= 0);
-    assert(close(empty_fd) == 0);
-
-    test_state_t state;
-    struct ap2_session_s *session = create_session(&state);
-    assert(session);
-    ap2_generation_t empty = {
-        .number = 0,
-        .audio_path = empty_path,
-    };
-    assert(ap2_session_prepare(session, &empty));
-    assert(wait_for_count(&state.ready[0], 1, 200));
-    assert(wait_for_count(&state.eof[0], 1, 200));
-    assert(ap2_session_start(session, 0, 1700000000000ULL));
-    uint8_t byte;
-    assert(ap2_session_read(session, &byte, 1, 200) == -1);
-
-    char fifo_path[128];
-    make_fifo(fifo_path, sizeof(fifo_path), "cliairplay-fifo-abort");
-    ap2_generation_t waiting = {
-        .number = 1,
-        .audio_path = fifo_path,
-    };
-    assert(ap2_session_prepare(session, &waiting));
-    assert(wait_for_count(&state.ready[1], 1, 200));
     uint64_t flush_started = ap2_io_monotonic_ms();
-    assert(ap2_session_flush(session, 1));
-    assert(ap2_io_monotonic_ms() - flush_started < 500);
+    assert(ap2_session_flush(session));
+    assert(ap2_io_monotonic_ms() - flush_started < 1000);
+    assert(atomic_load(&state.flushes) == 1);
+    assert(atomic_load(&state.flushed_status) == 1);
+    assert(ap2_session_state(session) == AP2_SESSION_IDLE);
+    assert(ap2_session_epoch(session) == 1);   /* FLUSH does not bump the epoch */
+
+    /* The post-flush track: START must re-anchor and deliver ONLY this audio,
+     * proving the stale bytes were drained from both the ring and the input. */
+    feed(write_fd, new_audio, sizeof(new_audio));
+    assert(ap2_session_start(session, 1700000005000ULL));
+    assert(atomic_load(&state.commits) == 2);
+    assert(ap2_session_epoch(session) == 2);
+    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
+    read_exact(session, new_audio, sizeof(new_audio));
 
     ap2_session_destroy(session);
     status_state = NULL;
-    assert(unlink(fifo_path) == 0);
-    assert(unlink(empty_path) == 0);
+    assert(close(write_fd) == 0);
+}
+
+static void test_flush_while_idle_before_start(void)
+{
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
+
+    /* A FLUSH before the first START is valid: no commit yet, still idle. */
+    assert(ap2_session_flush(session));
+    assert(atomic_load(&state.flushes) == 1);
+    assert(atomic_load(&state.flushed_status) == 1);
+    assert(atomic_load(&state.commits) == 0);
+    assert(ap2_session_state(session) == AP2_SESSION_IDLE);
+
+    static const uint8_t audio[] = {0x01, 0x02, 0x03, 0x04};
+    feed(write_fd, audio, sizeof(audio));
+    assert(ap2_session_start(session, 0));
+    read_exact(session, audio, sizeof(audio));
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+    assert(close(write_fd) == 0);
+}
+
+static void test_standby_then_resume(void)
+{
+    static const uint8_t audio[] = {0x20, 0x21, 0x22, 0x23};
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
+
+    feed(write_fd, audio, sizeof(audio));
+    assert(ap2_session_start(session, 1700000000000ULL));
+    read_exact(session, audio, sizeof(audio));
+
+    assert(ap2_session_standby(session));
+    assert(atomic_load(&state.stops) == 1);
+    assert(ap2_session_state(session) == AP2_SESSION_STANDBY);
+
+    static const uint8_t more[] = {0x30, 0x31, 0x32};
+    feed(write_fd, more, sizeof(more));
+    assert(ap2_session_start(session, 1700000005000ULL));
+    assert(atomic_load(&state.commits) == 2);
+    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
+    read_exact(session, more, sizeof(more));
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+    assert(close(write_fd) == 0);
+}
+
+static void test_idle_timeout_ends_session(void)
+{
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 20, &write_fd);
+
+    usleep(60000);
+    ap2_session_poll(session);
+    assert(ap2_session_state(session) == AP2_SESSION_ENDED);
+    assert(atomic_load(&state.idle_timeouts) == 1);
+    /* A read on an ended session reports -2. */
+    uint8_t byte;
+    assert(ap2_session_read(session, &byte, 1, 50) == -2);
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+    assert(close(write_fd) == 0);
+}
+
+/* The input pipe's writer stays open (as MA holds the CLI stdin open), so the
+ * reader never sees EOF; destroy must still tear it down promptly. */
+static void test_destroy_is_prompt_with_open_writer(void)
+{
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
+
+    static const uint8_t audio[] = {0x40, 0x41};
+    feed(write_fd, audio, sizeof(audio));
+    assert(ap2_session_start(session, 1700000000000ULL));
+    read_exact(session, audio, sizeof(audio));
+
+    uint64_t started = ap2_io_monotonic_ms();
+    ap2_session_destroy(session);
+    assert(ap2_io_monotonic_ms() - started < 1000);
+    status_state = NULL;
+    assert(close(write_fd) == 0);
 }
 
 int main(void)
 {
-    test_timeout_then_hup_keeps_fifo_reader();
-    test_repeated_delayed_fifo_generations();
-    test_empty_regular_input_and_writerless_abort();
-    puts("AP2 session FIFO lifecycle tests passed");
+    test_start_streams_the_input();
+    test_flush_drains_and_reanchors();
+    test_flush_while_idle_before_start();
+    test_standby_then_resume();
+    test_idle_timeout_ends_session();
+    test_destroy_is_prompt_with_open_writer();
+    puts("AP2 session flush-and-refill tests passed");
     return 0;
 }
