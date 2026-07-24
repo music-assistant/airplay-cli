@@ -1,5 +1,5 @@
-#ifndef __RAOP_SESSION_H_
-#define __RAOP_SESSION_H_
+#ifndef RAOP_SESSION_H
+#define RAOP_SESSION_H
 
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,4 +20,4 @@ bool raop_session_pause(struct raopcl_s *client);
 /* Resume a paused generation without discarding libraop's retained backlog. */
 bool raop_session_resume(struct raopcl_s *client);
 
-#endif /* __RAOP_SESSION_H_ */
+#endif /* RAOP_SESSION_H */
