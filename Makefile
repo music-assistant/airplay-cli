@@ -45,6 +45,7 @@ IO_TEST       = build/tests/test_ap2_io
 TIMELINE_TEST = build/tests/test_ap2_timeline
 EVENT_TEST    = build/tests/test_ap2_event
 CLIENT_TEST   = build/tests/test_ap2_client
+SESSION_TEST  = build/tests/test_ap2_session
 TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
@@ -195,11 +196,13 @@ clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
-		$(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) $(RAOP_SESSION_TEST)
+		$(SESSION_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
+		$(RAOP_SESSION_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
 	$(CLIENT_TEST)
+	$(SESSION_TEST)
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
@@ -217,6 +220,15 @@ $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_raop_session.c \
 		src/raop_session.c $(EXTRA_LDFLAGS) -o $@
+
+$(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
+		src/ap2_io.c src/ap2_io.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) -Dpoll=ap2_session_test_poll \
+		-c src/ap2_session.c -o build/tests/ap2_session_fifo_test.o
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_session.c \
+		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(TOOLS)/cross_log.c \
+		$(EXTRA_LDFLAGS) -lpthread -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

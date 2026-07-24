@@ -186,9 +186,11 @@ static void *reader_thread(void *arg)
         int polled = poll(&pfd, 1, 250);
         if (polled < 0 && errno == EINTR) continue;
         if (polled == 0) {
-            /* A FIFO with a connected but idle writer has no poll events. */
-            writer_seen = true;
-            continue;
+            /* A timeout says nothing about FIFO writer presence: both a
+             * connected idle writer and a writerless FIFO can time out. */
+            if (!writer_seen) continue;
+            /* Once data proved that a writer existed, read to distinguish an
+             * idle writer (EAGAIN) from one that closed (EOF). */
         }
         if (!writer_seen && (pfd.revents & POLLHUP) &&
             !(pfd.revents & POLLIN)) {
