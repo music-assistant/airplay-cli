@@ -134,12 +134,21 @@ TEST_OBJECTS = $(BUILDDIR)/test_mrp_artwork.o \
 RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-raop-lifecycle
 RAOP_LIFECYCLE_TEST_OBJECTS = $(BUILDDIR)/test_ap2_raop_lifecycle.o \
 	$(BUILDDIR)/ap2_client_raop_lifecycle_test.o \
-	$(filter-out $(BUILDDIR)/ap2_client.o $(BUILDDIR)/cliairplay.o,$(OBJECTS_ALL))
+	$(BUILDDIR)/raop_session_raop_lifecycle_test.o \
+	$(filter-out $(BUILDDIR)/ap2_client.o $(BUILDDIR)/cliairplay.o \
+		$(BUILDDIR)/raop_session.o,$(OBJECTS_ALL))
 RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_create=ap2_test_raopcl_create \
 	-Draopcl_connect=ap2_test_raopcl_connect \
 	-Draopcl_disconnect=ap2_test_raopcl_disconnect \
-	-Draopcl_destroy=ap2_test_raopcl_destroy
+	-Draopcl_destroy=ap2_test_raopcl_destroy \
+	-Draopcl_state=ap2_test_raopcl_state \
+	-Draopcl_stop=ap2_test_raopcl_stop \
+	-Draopcl_flush=ap2_test_raopcl_flush \
+	-Draopcl_start_at=ap2_test_raopcl_start_at \
+	-Draopcl_get_ntp=ap2_test_raopcl_get_ntp \
+	-Draopcl_latency=ap2_test_raopcl_latency \
+	-Draopcl_sample_rate=ap2_test_raopcl_sample_rate
 RAOP_SESSION_TEST = build/tests/test_raop_session
 
 all: directory $(EXECUTABLE)
@@ -170,7 +179,10 @@ $(BUILDDIR)/test_mrp_artwork.o: tests/test_mrp_artwork.c
 $(BUILDDIR)/test_ap2_raop_lifecycle.o: tests/test_ap2_raop_lifecycle.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
-$(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c
+$(BUILDDIR)/ap2_client_raop_lifecycle_test.o: $(SRC)/ap2_client.c Makefile
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
+
+$(BUILDDIR)/raop_session_raop_lifecycle_test.o: $(SRC)/raop_session.c Makefile
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $(RAOP_LIFECYCLE_TEST_DEFINES) $< -c -o $@
 
 $(BUILDDIR)/%.o: %.c
