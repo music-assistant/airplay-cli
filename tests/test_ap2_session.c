@@ -32,6 +32,7 @@ typedef struct {
     atomic_int resumes;
     atomic_int stops;
     atomic_int flushed_status;
+    atomic_int audio_status;
     atomic_int idle_timeouts;
     uint64_t last_start_unix_ms;
 } test_state_t;
@@ -70,6 +71,8 @@ static void status(const char *line)
 {
     if (strcmp(line, "[STATUS] flushed") == 0)
         atomic_fetch_add(&status_state->flushed_status, 1);
+    else if (strncmp(line, "[STATUS] audio ", 15) == 0)
+        atomic_fetch_add(&status_state->audio_status, 1);
     else if (strcmp(line, "[STATUS] idle_timeout") == 0)
         atomic_fetch_add(&status_state->idle_timeouts, 1);
 }
@@ -83,6 +86,7 @@ static void state_init(test_state_t *state)
     atomic_init(&state->resumes, 0);
     atomic_init(&state->stops, 0);
     atomic_init(&state->flushed_status, 0);
+    atomic_init(&state->audio_status, 0);
     atomic_init(&state->idle_timeouts, 0);
     status_state = state;
 }
@@ -134,6 +138,17 @@ static void read_exact(struct ap2_session_s *session, const uint8_t *expected,
     assert(memcmp(got, expected, size) == 0);
 }
 
+/* The reader thread emits [STATUS] audio asynchronously; poll for the count. */
+static bool wait_for_count(atomic_int *counter, int want, int timeout_ms)
+{
+    uint64_t deadline = ap2_io_monotonic_ms() + (uint64_t)timeout_ms;
+    while (ap2_io_monotonic_ms() < deadline) {
+        if (atomic_load(counter) >= want) return true;
+        usleep(5000);
+    }
+    return atomic_load(counter) >= want;
+}
+
 static void test_start_streams_the_input(void)
 {
     static const uint8_t audio[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
@@ -175,8 +190,11 @@ static void test_flush_drains_and_reanchors(void)
     struct ap2_session_s *session = create_session(&state, 0, &write_fd);
 
     feed(write_fd, old_audio, sizeof(old_audio));
+    /* The one-shot audio signal announces the feed is flowing (pre-START). */
+    assert(wait_for_count(&state.audio_status, 1, 1000));
     assert(ap2_session_start(session, 1700000000000ULL));
     read_exact(session, old_audio, sizeof(old_audio));
+    assert(atomic_load(&state.audio_status) == 1);
 
     /* Bytes fed but never delivered before FLUSH: they sit in the ring and/or
      * the input pipe and must be discarded by the drain. */
@@ -191,8 +209,11 @@ static void test_flush_drains_and_reanchors(void)
     assert(ap2_session_epoch(session) == 1);   /* FLUSH does not bump the epoch */
 
     /* The post-flush track: START must re-anchor and deliver ONLY this audio,
-     * proving the stale bytes were drained from both the ring and the input. */
+     * proving the stale bytes were drained from both the ring and the input.
+     * FLUSH re-armed the one-shot audio signal, so the new track's first bytes
+     * announce themselves again. */
     feed(write_fd, new_audio, sizeof(new_audio));
+    assert(wait_for_count(&state.audio_status, 2, 1000));
     assert(ap2_session_start(session, 1700000005000ULL));
     assert(atomic_load(&state.commits) == 2);
     assert(ap2_session_epoch(session) == 2);

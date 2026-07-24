@@ -64,6 +64,7 @@ struct ap2_session_s {
     ap2_session_state_t state;
     uint64_t epoch;            /* bumped on every START */
     uint64_t idle_since_ms;    /* monotonic ms when we last went idle */
+    bool audio_seen;           /* first input bytes since create/FLUSH arrived */
     sring_t ring;
 };
 
@@ -199,7 +200,19 @@ static void *reader_thread(void *arg)
         while (off < (size_t)n && !s->abort && !s->drain_request) {
             size_t pushed = sring_push(&s->ring, buf + off, (size_t)n - off);
             off += pushed;
-            if (pushed) pthread_cond_broadcast(&s->can_read);
+            if (pushed) {
+                pthread_cond_broadcast(&s->can_read);
+                if (!s->audio_seen) {
+                    /* One-shot per start cycle: the caller uses this to know
+                     * the new track's audio is flowing before it commands a
+                     * START, so it can anchor with a short lead instead of
+                     * blind margin for source/transcoder spin-up. */
+                    s->audio_seen = true;
+                    emit(s, "[STATUS] audio buffered_ms=%llu",
+                         (unsigned long long)(s->ring.fill * 1000ULL /
+                                              s->byte_rate));
+                }
+            }
             if (off < (size_t)n)
                 pthread_cond_wait(&s->can_write, &s->lock);
         }
@@ -337,6 +350,9 @@ bool ap2_session_flush(struct ap2_session_s *s)
         pthread_cond_wait(&s->reader_paused_cond, &s->lock);
     sring_reset(&s->ring);
     drain_input_fd(s->input_fd);
+    /* Re-arm the one-shot audio signal: the next bytes to arrive belong to
+     * the new track and announce that its feed is flowing. */
+    s->audio_seen = false;
     /* Release the reader onto the now-empty ring: it buffers the next track
      * while we send nothing until the next START (idle-primed). */
     s->drain_request = false;
