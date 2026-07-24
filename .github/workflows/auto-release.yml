@@ -1,0 +1,99 @@
+name: Auto Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: auto-release
+  cancel-in-progress: false
+
+jobs:
+  prepare-release:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calculate next version
+        id: version
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+
+          latest_release="$(
+            gh release list \
+              --repo "$GITHUB_REPOSITORY" \
+              --exclude-drafts \
+              --exclude-pre-releases \
+              --limit 100 \
+              --json tagName,publishedAt \
+              --jq 'map(select(.tagName | test("^v[0-9]+\\.[0-9]+\\.[0-9]+$"))) | sort_by(.publishedAt) | last | .tagName // ""'
+          )"
+
+          if [[ -z "$latest_release" ]]; then
+            release_tag="v0.1.0"
+            commit_count="$(git rev-list --count HEAD)"
+          else
+            if ! git merge-base --is-ancestor "$latest_release" HEAD; then
+              echo "::error::Latest release $latest_release is not an ancestor of HEAD"
+              exit 1
+            fi
+
+            version="${latest_release#v}"
+            IFS=. read -r major minor patch <<< "$version"
+            release_tag="v${major}.${minor}.$((10#$patch + 1))"
+            commit_count="$(git rev-list --count "${latest_release}..HEAD")"
+          fi
+
+          echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
+          if (( commit_count == 0 )); then
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            echo "No commits found since ${latest_release:-the repository was created}; skipping release."
+            exit 0
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+          echo "Preparing $release_tag from $commit_count new commit(s)."
+
+      - name: Create release tag
+        if: steps.version.outputs.should_release == 'true'
+        env:
+          RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
+        run: |
+          set -euo pipefail
+
+          head_sha="$(git rev-parse HEAD)"
+          if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
+            tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
+            if [[ "$tag_sha" != "$head_sha" ]]; then
+              echo "::error::$RELEASE_TAG already points to $tag_sha instead of $head_sha"
+              exit 1
+            fi
+            echo "Reusing $RELEASE_TAG at $head_sha."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -a "$RELEASE_TAG" -m "Release $RELEASE_TAG"
+          git push origin "refs/tags/$RELEASE_TAG"
+
+  release:
+    name: Build and release
+    needs: prepare-release
+    if: needs.prepare-release.outputs.should_release == 'true'
+    uses: ./.github/workflows/build.yml
+    with:
+      release_tag: ${{ needs.prepare-release.outputs.release_tag }}
+    secrets:
+      PRIVILEGED_GITHUB_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
