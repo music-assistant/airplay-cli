@@ -57,6 +57,18 @@ CFLAGS  += -Wall -fPIC -ggdb -O2 $(DEFINES) -fdata-sections -ffunction-sections
 CXXFLAGS += -std=gnu++17
 LDFLAGS += -lpthread -ldl -lm -L.
 
+# Version string reported by --check/--help (src/cliairplay.c). CI overrides this
+# with the exact tag (e.g. VERSION=0.3.3) when building a tagged release; local/dev
+# builds fall back to `git describe`. Strip a leading "v" either way since
+# cliairplay.c already prints its own "v" prefix. If git or tags aren't available
+# (shallow clone, no .git) this resolves to empty and the compiled-in literal in
+# cliairplay.c is used instead.
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null)
+VERSION := $(patsubst v%,%,$(VERSION))
+ifneq ($(VERSION),)
+DEFINES += -DCLIAIRPLAY_VERSION='"$(VERSION)"'
+endif
+
 # POSIX shared memory (shm_open/shm_unlink) for the --ptp-daemon shared clock:
 # glibc exposes these via librt; macOS has them in libSystem, so link -lrt on
 # Linux only.
