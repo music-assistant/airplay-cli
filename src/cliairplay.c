@@ -41,7 +41,11 @@
 #include "raop_session.h"
 #include "artwork.h"
 
-#define VERSION "0.3.1"
+#define VERSION "0.3.3"
+/* Overridden at build time from the git tag for tagged releases (see Makefile). */
+#ifndef CLIAIRPLAY_VERSION
+#define CLIAIRPLAY_VERSION VERSION
+#endif
 #define AP2_FRAMES_PER_CHUNK 352
 
 /* Protocol selection (resolved, concrete protocol used for dispatch). */
@@ -1290,7 +1294,7 @@ static int run_ptp_daemon(cli_config_t *cfg)
 
 static void print_usage(const char *name)
 {
-    printf("cliairplay v%s - Unified AirPlay streaming CLI\n\n", VERSION);
+    printf("cliairplay v%s - Unified AirPlay streaming CLI\n\n", CLIAIRPLAY_VERSION);
     printf("Usage: %s [options] --cmdpipe <path> <host_ip>\n\n", name);
     printf("Protocol selection:\n");
     printf("  --protocol <auto|raop|airplay2>  Protocol to use (default: auto).\n");
@@ -1466,7 +1470,7 @@ int main(int argc, char *argv[])
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
         case 1002:
-            printf("cliairplay v%s check\n", VERSION);
+            printf("cliairplay v%s check\n", CLIAIRPLAY_VERSION);
             return 0;
         case 1003:
             pairing_mode = true;

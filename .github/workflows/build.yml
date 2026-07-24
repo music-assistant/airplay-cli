@@ -58,7 +58,17 @@ jobs:
         if: matrix.packages != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
       - name: Build
-        run: make STATIC=1 CC=${{ matrix.cc }} CXX=${{ matrix.cxx }}
+        run: |
+          # RELEASE_TAG (workflow-level env, see top of file) covers both a
+          # direct `v*` tag push and an Auto Release run: in the latter,
+          # github.ref is the caller's ref (not the tag), so RELEASE_TAG is the
+          # only reliable signal. Other builds (branch pushes, PRs) fall back
+          # to the Makefile's own `git describe`.
+          VERSION_ARGS=()
+          if [[ "$RELEASE_TAG" == v* ]]; then
+            VERSION_ARGS=(VERSION="${RELEASE_TAG#v}")
+          fi
+          make STATIC=1 CC=${{ matrix.cc }} CXX=${{ matrix.cxx }} "${VERSION_ARGS[@]}"
       - name: Validate
         run: |
           bin="bin/cliairplay-linux-${{ matrix.platform }}"
@@ -103,11 +113,20 @@ jobs:
           submodules: recursive
       - name: Build
         run: |
+          # RELEASE_TAG (workflow-level env, see top of file) covers both a
+          # direct `v*` tag push and an Auto Release run: in the latter,
+          # github.ref is the caller's ref (not the tag), so RELEASE_TAG is the
+          # only reliable signal. Other builds (branch pushes, PRs) fall back
+          # to the Makefile's own `git describe`.
+          VERSION_ARGS=()
+          if [[ "$RELEASE_TAG" == v* ]]; then
+            VERSION_ARGS=(VERSION="${RELEASE_TAG#v}")
+          fi
           if [ "${{ matrix.platform }}" = "x86_64" ]; then
             make STATIC=1 CC=clang CXX=clang++ HOST=macos PLATFORM=x86_64 \
-              EXTRA_CFLAGS="-arch x86_64" EXTRA_LDFLAGS="-arch x86_64"
+              EXTRA_CFLAGS="-arch x86_64" EXTRA_LDFLAGS="-arch x86_64" "${VERSION_ARGS[@]}"
           else
-            make STATIC=1 CC=clang CXX=clang++
+            make STATIC=1 CC=clang CXX=clang++ "${VERSION_ARGS[@]}"
           fi
       - name: Validate
         run: |
