@@ -2,11 +2,10 @@
  * Persistent session - generation state machine
  *
  * Separates connection lifetime from media lifetime: the binary connects once
- * (HAP, RTSP, timing, MRP) and plays a sequence of numbered media GENERATIONS
- * over that one connection, so seek/next/resume never pay the connect cost
- * again. Every generation is supplied through the command pipe, including
- * generation 0; the connection outlives each generation (bounded by the idle
- * timeout) awaiting the next PREPARE.
+ * and plays a sequence of numbered media GENERATIONS over that connection, so
+ * seek/next/resume never pay the protocol setup cost again. Every generation is
+ * supplied through the command pipe, including generation 0; the connection
+ * outlives each generation (bounded by the idle timeout) awaiting PREPARE.
  *
  * Start times are COMMANDED, not configured: every generation (including
  * generation 0) starts on an explicit START, which the caller sends after
@@ -65,7 +64,8 @@ typedef enum {
 } ap2_session_state_t;
 
 /* One staged/active generation. Audio comes from opening `audio_path`, normally
- * a FIFO created by the caller. */
+ * a FIFO created by the caller; "-" duplicates process stdin and is limited to
+ * one active generation because duplicated descriptors share the same stream. */
 typedef struct {
     uint64_t number;          /* caller-assigned generation number */
     const char *audio_path;   /* FIFO delivering this generation's PCM */

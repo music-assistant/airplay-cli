@@ -49,6 +49,7 @@
 #include "ap2_plist.h"
 #include "ap2_bplist.h"
 #include "ap2_ptp.h"
+#include "raop_session.h"
 #include "ap2_timeline.h"
 
 extern log_level *loglevel;
@@ -2006,7 +2007,7 @@ void ap2cl_standby(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return;
     if (p->flow != FLOW_NATIVE_AP2) {
-        if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
+        if (p->raopcl) raop_session_standby(p->raopcl);
         p->state = AP2_CONNECTED;
         return;
     }
@@ -2042,12 +2043,7 @@ bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms)
     uint64_t start_ntp = commanded_start_ntp(start_unix_ms);
 
     if (p->flow != FLOW_NATIVE_AP2) {
-        if (!p->raopcl) return false;
-        raopcl_pause(p->raopcl);
-        raopcl_flush(p->raopcl);
-        int latency = raopcl_latency(p->raopcl);
-        raopcl_start_at(p->raopcl,
-                        start_ntp - TS2NTP(latency, p->format.sample_rate));
+        if (!raop_session_commit(p->raopcl, start_unix_ms)) return false;
         p->state = AP2_STREAMING;
         return true;
     }

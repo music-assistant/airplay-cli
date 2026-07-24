@@ -100,7 +100,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
-	cliairplay.c artwork.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c raop_session.c artwork.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -140,6 +140,7 @@ RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_connect=ap2_test_raopcl_connect \
 	-Draopcl_disconnect=ap2_test_raopcl_disconnect \
 	-Draopcl_destroy=ap2_test_raopcl_destroy
+RAOP_SESSION_TEST = build/tests/test_raop_session
 
 all: directory $(EXECUTABLE)
 
@@ -182,21 +183,28 @@ clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
-		$(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE)
+		$(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) $(RAOP_SESSION_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
 	$(CLIENT_TEST)
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
+	$(RAOP_SESSION_TEST)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
-	@! $(EXECUTABLE) --help | grep -q -- '--start-unix-ms'
-	@removed="$$($(EXECUTABLE) --start-unix-ms 1 2>&1 || true)"; \
-		printf '%s\n' "$$removed" | grep -q "unrecognized option.*start-unix-ms"
-	@argv_audio="$$($(EXECUTABLE) --protocol airplay2 --cmdpipe \
+	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
+		127.0.0.1 2>&1 || true)"; \
+		printf '%s\n' "$$missing_pipe" | grep -q "Streaming requires --cmdpipe"
+	@argv_audio="$$($(EXECUTABLE) --protocol raop --cmdpipe \
 		/tmp/cliairplay-test-unused 127.0.0.1 - 2>&1 || true)"; \
 		printf '%s\n' "$$argv_audio" | \
-		grep -q "AirPlay 2 audio must be provided by cmdpipe PREPARE"
+		grep -q "Streaming audio must be provided by cmdpipe PREPARE, not argv"
+
+$(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
+		src/raop_session.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_raop_session.c \
+		src/raop_session.c $(EXTRA_LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

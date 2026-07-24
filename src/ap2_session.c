@@ -137,7 +137,9 @@ static void *reader_thread(void *arg)
     struct ap2_session_s *s = a.s;
     slot_t *slot = a.slot;
 
-    int fd = open(slot->path_owned, O_RDONLY | O_NONBLOCK);
+    int fd = strcmp(slot->path_owned, "-") == 0
+        ? dup(STDIN_FILENO)
+        : open(slot->path_owned, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         pthread_mutex_lock(&s->lock);
         slot->ring.eof = true;
@@ -319,6 +321,17 @@ void ap2_session_destroy(struct ap2_session_s *s)
 bool ap2_session_prepare(struct ap2_session_s *s, const ap2_generation_t *gen)
 {
     if (!s || !gen || !gen->audio_path) return false;
+    if (strcmp(gen->audio_path, "-") == 0) {
+        pthread_mutex_lock(&s->lock);
+        bool stdin_active =
+            s->active && strcmp(s->active->path_owned, "-") == 0;
+        pthread_mutex_unlock(&s->lock);
+        if (stdin_active) {
+            LOG_ERROR("[SESSION] cannot stage AUDIO=- while another stdin "
+                      "generation is active; use a named FIFO");
+            return false;
+        }
+    }
     /* A superseded staged generation is discarded: the caller only ever wants
      * the newest one (rapid seek/seek/seek collapses naturally). */
     retire_slot(s, detach(s, &s->staged));

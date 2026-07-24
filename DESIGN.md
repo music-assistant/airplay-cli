@@ -178,8 +178,9 @@ grandmaster — but MA spawns one cliairplay per device. The split
 ## 6. Timing and the start contract
 
 **Contract: cmdpipe `START_UNIX_MS=T` means the first sample is AUDIBLE at
-exactly T.** AirPlay 2 group members are handed the same T after each one has
-reported its generation primed, then align by construction.
+exactly T on every streaming protocol.** Legacy RAOP, RAOP-compatible AirPlay 2,
+and native AirPlay 2 members are handed the same T after each one reports its
+generation primed, then align by construction.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its
@@ -488,19 +489,20 @@ capture.
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
   to tear down a MediaRemote-active stream after roughly 30 seconds.
-- **Eager input ring** — a dedicated reader drains stdin into a 4 MB ring as
-  fast as the source delivers, decoupled from network pacing: the pipeline
-  fills before a scheduled start, while a full ring backpressures the pipe.
-  Native playback waits in 250 ms intervals so control failures remain visible
-  during producer starvation. If realtime lead is exhausted, it advances the
-  scheduling/PTP anchor while preserving contiguous RTP content.
+- **Generation staging rings** — each cmdpipe `PREPARE` drains its FIFO (or
+  single active `AUDIO=-` stdin source) into an independent bounded ring before
+  `START`, decoupled from network pacing. The active and staged generations
+  never share PCM, and
+  the sender waits in bounded intervals so control failures remain visible
+  during producer starvation.
 - **Realtime send outcomes** — local UDP backpressure is a bounded transient
   drop that advances sequence, RTP, and scheduling timestamps. Encode,
   allocation, encryption, socket, and control failures are terminal and produce
   a nonzero process exit rather than a false EOF.
-- **EOF drain** — after input EOF the session drains at most
-  `latency + 2 s`, then tears down.
-- **Initial metadata** — pushed at connect with a placeholder title if the
+- **EOF drain** — after generation EOF the receiver drains at most
+  `latency + 2 s`; the connection then remains idle for the next PREPARE until
+  the orphan timeout or DISCONNECT.
+- **Initial metadata** — pushed at the first START with a placeholder title if the
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
   without it).

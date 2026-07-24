@@ -200,6 +200,67 @@ static void test_idle_fifo_does_not_block_shutdown(void)
     assert(unlink(path) == 0);
 }
 
+static void test_stdin_generation_uses_command_path(void)
+{
+    static const uint8_t audio[] = {
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+    };
+    int input[2];
+    assert(pipe(input) == 0);
+    int saved_stdin = dup(STDIN_FILENO);
+    assert(saved_stdin >= 0);
+    assert(dup2(input[0], STDIN_FILENO) == STDIN_FILENO);
+    assert(close(input[0]) == 0);
+
+    session_test_state_t state = {0};
+    atomic_init(&state.ready, false);
+    atomic_init(&state.primed, false);
+    session_status_state = &state;
+    ap2_session_ops_t ops = {
+        .quiesce = session_test_quiesce,
+        .commit = session_test_commit,
+        .resume = session_test_resume,
+        .stop = session_test_stop,
+        .status = session_test_status,
+        .transport = &state,
+    };
+    struct ap2_session_s *session =
+        ap2_session_create(&ops, 1000, 500, 0);
+    assert(session);
+    ap2_generation_t generation = {
+        .number = 0,
+        .audio_path = "-",
+    };
+    assert(ap2_session_prepare(session, &generation));
+    assert(write(input[1], audio, sizeof(audio)) == (ssize_t)sizeof(audio));
+    assert(close(input[1]) == 0);
+    for (int i = 0;
+         i < 200 && (!atomic_load(&state.ready) ||
+                     !atomic_load(&state.primed));
+         i++)
+        usleep(5000);
+    assert(atomic_load(&state.ready));
+    assert(atomic_load(&state.primed));
+    assert(state.commit_count == 0);
+    assert(ap2_session_start(session, 0, 1700000000000ULL));
+    ap2_generation_t overlapping_stdin = {
+        .number = 1,
+        .audio_path = "-",
+    };
+    assert(!ap2_session_prepare(session, &overlapping_stdin));
+
+    uint8_t received[sizeof(audio)] = {0};
+    assert(ap2_session_read(
+               session, received, sizeof(received), 100) ==
+           (int)sizeof(received));
+    assert(memcmp(received, audio, sizeof(audio)) == 0);
+    ap2_session_destroy(session);
+    session_status_state = NULL;
+
+    assert(dup2(saved_stdin, STDIN_FILENO) == STDIN_FILENO);
+    assert(close(saved_stdin) == 0);
+}
+
 typedef struct {
     struct ap2cl_s *client;
     atomic_bool done;
@@ -287,6 +348,7 @@ int main(void)
     test_info_format_tables();
     test_generation_zero_requires_prepare_then_start();
     test_idle_fifo_does_not_block_shutdown();
+    test_stdin_generation_uses_command_path();
 
     ap2_device_info_t device = {
         .name = "test",

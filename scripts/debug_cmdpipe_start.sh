@@ -5,11 +5,12 @@ set -eu
 usage()
 {
     cat <<'EOF'
-Usage: scripts/debug_cmdpipe_start.sh <speaker-ip> <raw-pcm-file> [stream options...]
+Usage: scripts/debug_cmdpipe_start.sh <raop|airplay2> <speaker-ip> <raw-pcm-file> [stream options...]
 
-Launches a shared PTP daemon and one command-only AirPlay 2 session, stages
-generation 0 through PREPARE, and sends START with a computed audible unix-ms
-instant. The PCM file must match the stream format (default: s16le 44100 stereo).
+Launches one command-only AirPlay session, stages generation 0 through PREPARE,
+and sends START with a computed audible unix-ms instant. AirPlay 2 also launches
+the shared PTP daemon. The PCM file must match the stream format (default:
+s16le 44100 stereo).
 
 Environment:
   CLIAIRPLAY_BIN        Binary to run (default: native bin/cliairplay-* path)
@@ -18,14 +19,18 @@ Environment:
   CONNECT_TIMEOUT_SEC   Connection/prime timeout (default: 30)
   SESSION_TIMEOUT_SEC   EOF timeout after START (default: 300)
 
-Example:
+Examples:
   CLIAIRPLAY_BIN=./bin/cliairplay-macos-arm64 \
-    scripts/debug_cmdpipe_start.sh 192.168.1.50 song.s16le \
+    scripts/debug_cmdpipe_start.sh raop 192.168.1.40 song.s16le \
+    --port 5000
+
+  CLIAIRPLAY_BIN=./bin/cliairplay-macos-arm64 \
+    scripts/debug_cmdpipe_start.sh airplay2 192.168.1.50 song.s16le \
     --port 7000 --auth <credentials> --name HomePod
 
-The PTP daemon needs permission to bind UDP 319/320 (root or the documented
-Linux capability). Logs and FIFOs live in a private temporary directory that
-is removed on exit.
+For AirPlay 2, the PTP daemon needs permission to bind UDP 319/320 (root or the
+documented Linux capability). Logs and FIFOs live in a private temporary
+directory that is removed on exit.
 EOF
 }
 
@@ -36,14 +41,23 @@ case "${1:-}" in
         ;;
 esac
 
-if [ "$#" -lt 2 ]; then
+if [ "$#" -lt 3 ]; then
     usage >&2
     exit 2
 fi
 
-speaker_ip=$1
-pcm_file=$2
-shift 2
+protocol=$1
+speaker_ip=$2
+pcm_file=$3
+shift 3
+
+case "$protocol" in
+    raop|airplay2) ;;
+    *)
+        echo "Protocol must be 'raop' or 'airplay2'." >&2
+        exit 2
+        ;;
+esac
 
 if [ ! -r "$pcm_file" ]; then
     echo "Raw PCM file is not readable: $pcm_file" >&2
@@ -127,21 +141,28 @@ wait_for_log()
     done
 }
 
-if [ -n "${PTP_INTERFACE:-}" ]; then
-    "$CLIAIRPLAY_BIN" --ptp-daemon --if "$PTP_INTERFACE" >"$ptp_log" 2>&1 &
-else
-    "$CLIAIRPLAY_BIN" --ptp-daemon >"$ptp_log" 2>&1 &
-fi
-ptp_pid=$!
-sleep 1
-if ! kill -0 "$ptp_pid" 2>/dev/null; then
-    echo "PTP daemon failed to start:" >&2
-    cat "$ptp_log" >&2
-    exit 1
+if [ "$protocol" = airplay2 ]; then
+    if [ -n "${PTP_INTERFACE:-}" ]; then
+        "$CLIAIRPLAY_BIN" --ptp-daemon --if "$PTP_INTERFACE" >"$ptp_log" 2>&1 &
+    else
+        "$CLIAIRPLAY_BIN" --ptp-daemon >"$ptp_log" 2>&1 &
+    fi
+    ptp_pid=$!
+    sleep 1
+    if ! kill -0 "$ptp_pid" 2>/dev/null; then
+        echo "PTP daemon failed to start:" >&2
+        cat "$ptp_log" >&2
+        exit 1
+    fi
 fi
 
-"$CLIAIRPLAY_BIN" --protocol airplay2 --ptp-shared \
-    --cmdpipe "$cmdpipe" "$@" "$speaker_ip" >"$session_log" 2>&1 &
+if [ "$protocol" = airplay2 ]; then
+    "$CLIAIRPLAY_BIN" --protocol airplay2 --ptp-shared \
+        --cmdpipe "$cmdpipe" "$@" "$speaker_ip" >"$session_log" 2>&1 &
+else
+    "$CLIAIRPLAY_BIN" --protocol raop \
+        --cmdpipe "$cmdpipe" "$@" "$speaker_ip" >"$session_log" 2>&1 &
+fi
 session_pid=$!
 wait_for_log "[STATUS] connected" "$connect_timeout"
 
