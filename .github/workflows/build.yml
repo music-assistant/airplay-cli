@@ -6,9 +6,21 @@ on:
     tags: ["v*"]
   pull_request:
   workflow_dispatch:
+  workflow_call:
+    inputs:
+      release_tag:
+        description: "Existing v-prefixed tag to build and release"
+        required: true
+        type: string
+    secrets:
+      PRIVILEGED_GITHUB_TOKEN:
+        required: true
 
 permissions:
   contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
   test-updater:
@@ -17,6 +29,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           persist-credentials: false
       - name: Run updater unit tests
         run: python3 -m unittest discover -s tests -v
@@ -39,6 +52,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           submodules: recursive
       - name: Install cross toolchain
         if: matrix.packages != ''
@@ -85,6 +99,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           submodules: recursive
       - name: Build
         run: |
@@ -112,8 +127,8 @@ jobs:
           if-no-files-found: error
 
   release:
-    # Publish binaries as release assets when a version tag is pushed.
-    if: startsWith(github.ref, 'refs/tags/v')
+    # Publish binaries for tag-based and reusable release runs.
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
     needs: [test-updater, build-linux, build-macos]
     runs-on: ubuntu-latest
     permissions:
@@ -137,28 +152,41 @@ jobs:
           chmod +x release/cliairplay-*
           (cd release && sha256sum "${binaries[@]}" > SHA256SUMS)
           ls -la release
+      # gh uploads assets to a temporary draft and publishes only after every
+      # upload succeeds, making the resulting release safe to lock.
       - name: Create release
         env:
           GH_TOKEN: ${{ github.token }}
         run: >
-          gh release create "${{ github.ref_name }}" release/*
+          gh release create "$RELEASE_TAG" release/*
           --repo "${{ github.repository }}"
-          --title "${{ github.ref_name }}"
+          --title "$RELEASE_TAG"
           --generate-notes
+          --verify-tag
 
   verify-release:
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
     needs: release
     runs-on: ubuntu-22.04
     outputs:
       checksums_sha256: ${{ steps.checksums_digest.outputs.sha256 }}
     steps:
+      - name: Verify release is immutable
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          test "$(
+            gh release view "$RELEASE_TAG" \
+              --repo "${{ github.repository }}" \
+              --json isImmutable \
+              --jq .isImmutable
+          )" = "true"
       - name: Download published assets
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           mkdir release
-          gh release download "${{ github.ref_name }}" \
+          gh release download "$RELEASE_TAG" \
             --repo "${{ github.repository }}" \
             --dir release
       - name: Verify asset contract and checksums
@@ -223,7 +251,7 @@ jobs:
 
   server-repo-pr:
     name: Update server release pins
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
     needs: verify-release
     runs-on: ubuntu-latest
     permissions:
@@ -245,6 +273,7 @@ jobs:
       - name: Checkout airplay-cli
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.release_tag || github.ref }}
           path: airplay-cli
           persist-credentials: false
       - name: Checkout server
@@ -257,7 +286,6 @@ jobs:
           persist-credentials: false
       - name: Update server Dockerfile pins
         env:
-          RELEASE_TAG: ${{ github.ref_name }}
           CHECKSUMS_SHA256: ${{ needs.verify-release.outputs.checksums_sha256 }}
         run: |
           set -euo pipefail
@@ -270,19 +298,19 @@ jobs:
         with:
           token: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
           path: server
-          commit-message: Update airplay-cli to ${{ github.ref_name }}
+          commit-message: Update airplay-cli to ${{ env.RELEASE_TAG }}
           # This branch deliberately avoids the server's auto-merge prefixes.
-          branch: bump-airplay-cli-${{ github.ref_name }}
+          branch: bump-airplay-cli-${{ env.RELEASE_TAG }}
           base: dev
           delete-branch: true
-          title: Update airplay-cli to ${{ github.ref_name }}
+          title: Update airplay-cli to ${{ env.RELEASE_TAG }}
           body: |
             # What does this implement/fix?
 
             Updates the server Dockerfile to use the verified
-            [airplay-cli ${{ github.ref_name }} release](https://github.com/music-assistant/airplay-cli/releases/tag/${{ github.ref_name }}).
+            [airplay-cli ${{ env.RELEASE_TAG }} release](https://github.com/music-assistant/airplay-cli/releases/tag/${{ env.RELEASE_TAG }}).
 
-            - Pins `CLIAIRPLAY_VERSION` to `${{ github.ref_name }}`.
+            - Pins `CLIAIRPLAY_VERSION` to `${{ env.RELEASE_TAG }}`.
             - Pins `CLIAIRPLAY_CHECKSUMS_SHA256` to `${{ needs.verify-release.outputs.checksums_sha256 }}`.
             - The release workflow verified the four published binaries and `SHA256SUMS` before opening this PR.
 
