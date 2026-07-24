@@ -300,7 +300,11 @@ static bool test_standby_reuses_raop_compatible_connection(void)
     CHECK(mock.disconnects == 0);
     CHECK(mock.destroys == 0);
 
-    CHECK(ap2cl_warm_flush(client, 1700000008000ULL));
+    /* A warm seek is now FLUSH (discard receiver buffer) + START (re-anchor):
+     * flush stops the flushed stream again, resume re-arms start-at. No extra
+     * receiver flush, so mock.flushes stays 1. */
+    CHECK(ap2cl_flush(client));
+    CHECK(ap2cl_resume(client, 1700000008000ULL));
     CHECK(ap2cl_state(client) == AP2_STREAMING);
     CHECK(mock.last_transport_client == transport_client);
     CHECK(mock.stops == 2);

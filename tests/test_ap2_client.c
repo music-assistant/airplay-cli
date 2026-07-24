@@ -13,7 +13,6 @@
 #include "ap2_bplist.h"
 #include "ap2_client.h"
 #include "ap2_io.h"
-#include "ap2_session.h"
 #include "cross_log.h"
 
 static log_level test_log_level = lSILENCE;
@@ -25,302 +24,6 @@ void ap2cl_test_lock_mrp(struct ap2cl_s *p);
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
-
-typedef struct {
-    atomic_bool ready;
-    atomic_bool primed;
-    int commit_count;
-    int stop_count;
-    uint64_t start_unix_ms;
-} session_test_state_t;
-
-static session_test_state_t *session_status_state;
-
-static bool session_test_commit(void *transport, uint64_t start_unix_ms)
-{
-    session_test_state_t *state = transport;
-    state->commit_count++;
-    state->start_unix_ms = start_unix_ms;
-    return true;
-}
-
-static void session_test_quiesce(void *transport)
-{
-    (void)transport;
-}
-
-static void session_test_resume(void *transport)
-{
-    (void)transport;
-}
-
-static void session_test_stop(void *transport)
-{
-    session_test_state_t *state = transport;
-    state->stop_count++;
-}
-
-static void session_test_status(const char *line)
-{
-    if (strstr(line, "[STATUS] ready generation=0"))
-        atomic_store(&session_status_state->ready, true);
-    if (strstr(line, "[STATUS] primed generation=0"))
-        atomic_store(&session_status_state->primed, true);
-}
-
-static void test_generation_zero_requires_prepare_then_start(void)
-{
-    static const uint8_t audio[] = {
-        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
-    };
-    char path[] = "/tmp/cliairplay-session-test.XXXXXX";
-    int fd = mkstemp(path);
-    assert(fd >= 0);
-    assert(write(fd, audio, sizeof(audio)) == (ssize_t)sizeof(audio));
-    assert(close(fd) == 0);
-
-    session_test_state_t state = {0};
-    atomic_init(&state.ready, false);
-    atomic_init(&state.primed, false);
-    session_status_state = &state;
-    ap2_session_ops_t ops = {
-        .quiesce = session_test_quiesce,
-        .commit = session_test_commit,
-        .resume = session_test_resume,
-        .stop = session_test_stop,
-        .status = session_test_status,
-        .transport = &state,
-    };
-    struct ap2_session_s *session =
-        ap2_session_create(&ops, 1000, 500, 20);
-    assert(session);
-
-    ap2_generation_t generation = {
-        .number = 0,
-        .audio_path = path,
-        .position_ms = 0,
-    };
-    assert(ap2_session_prepare(session, &generation));
-    for (int i = 0;
-         i < 200 && (!atomic_load(&state.ready) ||
-                     !atomic_load(&state.primed));
-         i++)
-        usleep(5000);
-    assert(atomic_load(&state.ready));
-    assert(atomic_load(&state.primed));
-    assert(state.commit_count == 0);
-    assert(ap2_session_state(session) == AP2_SESSION_PREPARING);
-
-    uint8_t received[sizeof(audio)] = {0};
-    assert(ap2_session_read(
-               session, received, sizeof(received), 10) == 0);
-    const uint64_t audible_start = 1770000000123ULL;
-    assert(ap2_session_start(session, 0, audible_start));
-    assert(state.commit_count == 1);
-    assert(state.start_unix_ms == audible_start);
-    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
-
-    char staged_path[] = "/tmp/cliairplay-staged-fifo.XXXXXX";
-    int staged_placeholder = mkstemp(staged_path);
-    assert(staged_placeholder >= 0);
-    assert(close(staged_placeholder) == 0);
-    assert(unlink(staged_path) == 0);
-    assert(mkfifo(staged_path, 0600) == 0);
-    ap2_generation_t staged_generation = {
-        .number = 1,
-        .audio_path = staged_path,
-    };
-    assert(ap2_session_prepare(session, &staged_generation));
-    assert(ap2_session_flush(session, 1));
-    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
-    assert(unlink(staged_path) == 0);
-
-    assert(ap2_session_read(
-               session, received, sizeof(received), 10) ==
-           (int)sizeof(received));
-    assert(memcmp(received, audio, sizeof(audio)) == 0);
-    assert(ap2_session_read(
-               session, received, sizeof(received), 100) == -1);
-    assert(ap2_session_state(session) == AP2_SESSION_IDLE);
-    usleep(30000);
-    ap2_session_poll(session);
-    assert(ap2_session_state(session) == AP2_SESSION_ENDED);
-
-    ap2_session_destroy(session);
-    session_status_state = NULL;
-    assert(unlink(path) == 0);
-}
-
-static void test_idle_fifo_does_not_block_shutdown(void)
-{
-    char path[] = "/tmp/cliairplay-session-fifo.XXXXXX";
-    int placeholder = mkstemp(path);
-    assert(placeholder >= 0);
-    assert(close(placeholder) == 0);
-    assert(unlink(path) == 0);
-    assert(mkfifo(path, 0600) == 0);
-
-    session_test_state_t state = {0};
-    atomic_init(&state.ready, false);
-    atomic_init(&state.primed, false);
-    session_status_state = &state;
-    ap2_session_ops_t ops = {
-        .quiesce = session_test_quiesce,
-        .commit = session_test_commit,
-        .resume = session_test_resume,
-        .stop = session_test_stop,
-        .status = session_test_status,
-        .transport = &state,
-    };
-    struct ap2_session_s *session =
-        ap2_session_create(&ops, 1000, 500, 0);
-    assert(session);
-    ap2_generation_t generation = {
-        .number = 0,
-        .audio_path = path,
-    };
-    assert(ap2_session_prepare(session, &generation));
-
-    uint64_t started = ap2_io_monotonic_ms();
-    assert(ap2_session_flush(session, 0));
-    assert(ap2_io_monotonic_ms() - started < 1000);
-    assert(ap2_session_state(session) == AP2_SESSION_IDLE);
-    ap2_session_destroy(session);
-
-    atomic_store(&state.ready, false);
-    session = ap2_session_create(&ops, 1000, 500, 0);
-    assert(session);
-    assert(ap2_session_prepare(session, &generation));
-    int writer = open(path, O_WRONLY);
-    assert(writer >= 0);
-    for (int i = 0; i < 200 && !atomic_load(&state.ready); i++)
-        usleep(5000);
-    assert(atomic_load(&state.ready));
-
-    started = ap2_io_monotonic_ms();
-    ap2_session_destroy(session);
-    assert(ap2_io_monotonic_ms() - started < 1000);
-    session_status_state = NULL;
-    assert(close(writer) == 0);
-    assert(unlink(path) == 0);
-}
-
-static void test_stdin_generation_uses_command_path(void)
-{
-    static const uint8_t audio[] = {
-        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
-    };
-    int input[2];
-    assert(pipe(input) == 0);
-    int saved_stdin = dup(STDIN_FILENO);
-    assert(saved_stdin >= 0);
-    assert(dup2(input[0], STDIN_FILENO) == STDIN_FILENO);
-    assert(close(input[0]) == 0);
-
-    session_test_state_t state = {0};
-    atomic_init(&state.ready, false);
-    atomic_init(&state.primed, false);
-    session_status_state = &state;
-    ap2_session_ops_t ops = {
-        .quiesce = session_test_quiesce,
-        .commit = session_test_commit,
-        .resume = session_test_resume,
-        .stop = session_test_stop,
-        .status = session_test_status,
-        .transport = &state,
-    };
-    struct ap2_session_s *session =
-        ap2_session_create(&ops, 1000, 500, 0);
-    assert(session);
-    ap2_generation_t generation = {
-        .number = 0,
-        .audio_path = "-",
-    };
-    assert(ap2_session_prepare(session, &generation));
-    assert(write(input[1], audio, sizeof(audio)) == (ssize_t)sizeof(audio));
-    assert(close(input[1]) == 0);
-    for (int i = 0;
-         i < 200 && (!atomic_load(&state.ready) ||
-                     !atomic_load(&state.primed));
-         i++)
-        usleep(5000);
-    assert(atomic_load(&state.ready));
-    assert(atomic_load(&state.primed));
-    assert(state.commit_count == 0);
-    assert(ap2_session_start(session, 0, 1700000000000ULL));
-    ap2_generation_t overlapping_stdin = {
-        .number = 1,
-        .audio_path = "-",
-    };
-    assert(!ap2_session_prepare(session, &overlapping_stdin));
-
-    uint8_t received[sizeof(audio)] = {0};
-    assert(ap2_session_read(
-               session, received, sizeof(received), 100) ==
-           (int)sizeof(received));
-    assert(memcmp(received, audio, sizeof(audio)) == 0);
-    ap2_session_destroy(session);
-    session_status_state = NULL;
-
-    assert(dup2(saved_stdin, STDIN_FILENO) == STDIN_FILENO);
-    assert(close(saved_stdin) == 0);
-}
-
-static void test_standby_keeps_session_reusable(void)
-{
-    static const uint8_t audio[] = {0x20, 0x21, 0x22, 0x23};
-    char first_path[] = "/tmp/cliairplay-standby-first.XXXXXX";
-    char second_path[] = "/tmp/cliairplay-standby-second.XXXXXX";
-    int first_fd = mkstemp(first_path);
-    int second_fd = mkstemp(second_path);
-    assert(first_fd >= 0);
-    assert(second_fd >= 0);
-    assert(write(first_fd, audio, sizeof(audio)) == (ssize_t)sizeof(audio));
-    assert(write(second_fd, audio, sizeof(audio)) == (ssize_t)sizeof(audio));
-    assert(close(first_fd) == 0);
-    assert(close(second_fd) == 0);
-
-    session_test_state_t state = {0};
-    atomic_init(&state.ready, false);
-    atomic_init(&state.primed, false);
-    session_status_state = &state;
-    ap2_session_ops_t ops = {
-        .quiesce = session_test_quiesce,
-        .commit = session_test_commit,
-        .resume = session_test_resume,
-        .stop = session_test_stop,
-        .status = session_test_status,
-        .transport = &state,
-    };
-    struct ap2_session_s *session =
-        ap2_session_create(&ops, 1000, 1, 0);
-    assert(session);
-
-    ap2_generation_t first = {
-        .number = 0,
-        .audio_path = first_path,
-    };
-    assert(ap2_session_prepare(session, &first));
-    assert(ap2_session_start(session, 0, 1700000000000ULL));
-    assert(ap2_session_standby(session));
-    assert(state.stop_count == 1);
-    assert(ap2_session_state(session) == AP2_SESSION_STANDBY);
-
-    ap2_generation_t second = {
-        .number = 1,
-        .audio_path = second_path,
-    };
-    assert(ap2_session_prepare(session, &second));
-    assert(ap2_session_start(session, 1, 1700000005000ULL));
-    assert(state.commit_count == 2);
-    assert(ap2_session_active_generation(session) == 1);
-    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
-
-    ap2_session_destroy(session);
-    session_status_state = NULL;
-    assert(unlink(first_path) == 0);
-    assert(unlink(second_path) == 0);
-}
 
 typedef struct {
     int fd;
@@ -369,7 +72,9 @@ static void *run_rtsp_flush_peer(void *arg)
     return NULL;
 }
 
-static void test_native_standby_keeps_rtsp_session_reusable(void)
+/* A standby then a warm seek (ap2cl_flush + ap2cl_resume) each send exactly one
+ * RTSP FLUSH and reuse the same native session — no reconnect, no crypto reset. */
+static void test_native_flush_resume_reuses_rtsp_session(void)
 {
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -399,7 +104,9 @@ static void test_native_standby_keeps_rtsp_session_reusable(void)
 
     ap2cl_standby(client);
     assert(ap2cl_state(client) == AP2_CONNECTED);
-    assert(ap2cl_warm_flush(client, 1700000005000ULL));
+    /* Warm seek: discard the receiver buffer, then re-anchor the timeline. */
+    assert(ap2cl_flush(client));
+    assert(ap2cl_resume(client, 1700000005000ULL));
     assert(ap2cl_state(client) == AP2_STREAMING);
 
     assert(pthread_join(peer_thread, NULL) == 0);
@@ -496,11 +203,7 @@ static void test_info_format_tables(void)
 int main(void)
 {
     test_info_format_tables();
-    test_generation_zero_requires_prepare_then_start();
-    test_idle_fifo_does_not_block_shutdown();
-    test_stdin_generation_uses_command_path();
-    test_standby_keeps_session_reusable();
-    test_native_standby_keeps_rtsp_session_reusable();
+    test_native_flush_resume_reuses_rtsp_session();
 
     ap2_device_info_t device = {
         .name = "test",

@@ -154,13 +154,19 @@ bool ap2cl_disconnect(struct ap2cl_s *p);
 bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms);
 
 /*
- * Warm-flush a live session for a generation switch (persistent session
- * mode): discard receiver-buffered audio and re-base the timeline so the next
- * written frame is audible at start_unix_ms (unix epoch milliseconds). A
- * start of 0 or one already in the past is clamped to now + the minimum warm
- * lead, so a new generation's first samples can never be clipped.
+ * Warm-seek a live session in place. FLUSH then START (below) are the two
+ * halves of the old combined warm flush:
+ *
+ * ap2cl_flush discards the receiver's buffered audio (RTSP FLUSH / libraop
+ * flush) and stops sending, keeping the session and its sequence/nonce state.
+ *
+ * ap2cl_resume re-bases the frozen timeline so the next written frame is
+ * audible at start_unix_ms (unix epoch milliseconds); a start of 0 or one in
+ * the past clamps to now + the minimum warm lead, so a new track's first
+ * samples can never be clipped.
  */
-bool ap2cl_warm_flush(struct ap2cl_s *p, uint64_t start_unix_ms);
+bool ap2cl_flush(struct ap2cl_s *p);
+bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms);
 
 /* Silence the receiver but keep the session warm: discard buffered audio,
  * publish the stopped state, drop to CONNECTED awaiting the next warm flush. */
