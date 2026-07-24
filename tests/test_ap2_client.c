@@ -6,6 +6,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -22,11 +23,14 @@ log_level raop_loglevel = lSILENCE;
 
 void ap2cl_test_lock_mrp(struct ap2cl_s *p);
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
+void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
+void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
 
 typedef struct {
     atomic_bool ready;
     atomic_bool primed;
     int commit_count;
+    int stop_count;
     uint64_t start_unix_ms;
 } session_test_state_t;
 
@@ -52,7 +56,8 @@ static void session_test_resume(void *transport)
 
 static void session_test_stop(void *transport)
 {
-    (void)transport;
+    session_test_state_t *state = transport;
+    state->stop_count++;
 }
 
 static void session_test_status(const char *line)
@@ -261,6 +266,151 @@ static void test_stdin_generation_uses_command_path(void)
     assert(close(saved_stdin) == 0);
 }
 
+static void test_standby_keeps_session_reusable(void)
+{
+    static const uint8_t audio[] = {0x20, 0x21, 0x22, 0x23};
+    char first_path[] = "/tmp/cliairplay-standby-first.XXXXXX";
+    char second_path[] = "/tmp/cliairplay-standby-second.XXXXXX";
+    int first_fd = mkstemp(first_path);
+    int second_fd = mkstemp(second_path);
+    assert(first_fd >= 0);
+    assert(second_fd >= 0);
+    assert(write(first_fd, audio, sizeof(audio)) == (ssize_t)sizeof(audio));
+    assert(write(second_fd, audio, sizeof(audio)) == (ssize_t)sizeof(audio));
+    assert(close(first_fd) == 0);
+    assert(close(second_fd) == 0);
+
+    session_test_state_t state = {0};
+    atomic_init(&state.ready, false);
+    atomic_init(&state.primed, false);
+    session_status_state = &state;
+    ap2_session_ops_t ops = {
+        .quiesce = session_test_quiesce,
+        .commit = session_test_commit,
+        .resume = session_test_resume,
+        .stop = session_test_stop,
+        .status = session_test_status,
+        .transport = &state,
+    };
+    struct ap2_session_s *session =
+        ap2_session_create(&ops, 1000, 1, 0);
+    assert(session);
+
+    ap2_generation_t first = {
+        .number = 0,
+        .audio_path = first_path,
+    };
+    assert(ap2_session_prepare(session, &first));
+    assert(ap2_session_start(session, 0, 1700000000000ULL));
+    assert(ap2_session_standby(session));
+    assert(state.stop_count == 1);
+    assert(ap2_session_state(session) == AP2_SESSION_STANDBY);
+
+    ap2_generation_t second = {
+        .number = 1,
+        .audio_path = second_path,
+    };
+    assert(ap2_session_prepare(session, &second));
+    assert(ap2_session_start(session, 1, 1700000005000ULL));
+    assert(state.commit_count == 2);
+    assert(ap2_session_active_generation(session) == 1);
+    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
+
+    ap2_session_destroy(session);
+    session_status_state = NULL;
+    assert(unlink(first_path) == 0);
+    assert(unlink(second_path) == 0);
+}
+
+typedef struct {
+    int fd;
+    int request_count;
+    bool ok;
+} rtsp_peer_t;
+
+static void *run_rtsp_flush_peer(void *arg)
+{
+    rtsp_peer_t *peer = arg;
+    peer->ok = true;
+    for (int request = 0; request < 2; request++) {
+        char buffer[2048] = {0};
+        size_t fill = 0;
+        while (!strstr(buffer, "\r\n\r\n")) {
+            ssize_t n = read(peer->fd, buffer + fill,
+                             sizeof(buffer) - fill - 1);
+            if (n <= 0) {
+                peer->ok = false;
+                return NULL;
+            }
+            fill += (size_t)n;
+            if (fill >= sizeof(buffer) - 1) {
+                peer->ok = false;
+                return NULL;
+            }
+        }
+        int cseq = 0;
+        char *cseq_header = strstr(buffer, "\r\nCSeq: ");
+        if (strncmp(buffer, "FLUSH ", 6) != 0 || !cseq_header ||
+            sscanf(cseq_header, "\r\nCSeq: %d", &cseq) != 1) {
+            peer->ok = false;
+            return NULL;
+        }
+        peer->request_count++;
+        char response[96];
+        int response_len = snprintf(
+            response, sizeof(response),
+            "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
+            cseq);
+        if (write(peer->fd, response, (size_t)response_len) != response_len) {
+            peer->ok = false;
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static void test_native_standby_keeps_rtsp_session_reusable(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    rtsp_peer_t peer = {
+        .fd = sockets[1],
+    };
+    pthread_t peer_thread;
+    assert(pthread_create(
+               &peer_thread, NULL, run_rtsp_flush_peer, &peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "standby test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    assert(ap2cl_start(client, 1700000000000ULL));
+
+    ap2cl_standby(client);
+    assert(ap2cl_state(client) == AP2_CONNECTED);
+    assert(ap2cl_warm_flush(client, 1700000005000ULL));
+    assert(ap2cl_state(client) == AP2_STREAMING);
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+    assert(peer.request_count == 2);
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+}
+
 typedef struct {
     struct ap2cl_s *client;
     atomic_bool done;
@@ -349,6 +499,8 @@ int main(void)
     test_generation_zero_requires_prepare_then_start();
     test_idle_fifo_does_not_block_shutdown();
     test_stdin_generation_uses_command_path();
+    test_standby_keeps_session_reusable();
+    test_native_standby_keeps_rtsp_session_reusable();
 
     ap2_device_info_t device = {
         .name = "test",

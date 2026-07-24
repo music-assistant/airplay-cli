@@ -133,6 +133,15 @@ int main(void)
     assert(stop_calls == stops_after_standby + 1);
     assert(flush_calls == flushes_after_standby);
 
+    /* Standby keeps the same connected libraop client reusable. A later
+     * commanded START only re-anchors it; no reconnect API is involved. */
+    const uint64_t post_standby_ms = replacement_ms + 5000;
+    assert(raop_session_commit(&client, post_standby_ms));
+    assert(last_client == &client);
+    assert(start_calls == 4);
+    assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
+           unix_ms_to_ntp(post_standby_ms));
+
     client.state = RAOP_STREAMING;
     assert(raop_session_pause(&client));
     assert(pause_calls == 1);
@@ -140,7 +149,7 @@ int main(void)
     int stops_before_resume = stop_calls;
     assert(raop_session_resume(&client));
     assert(stop_calls == stops_before_resume);
-    assert(start_calls == 4);
+    assert(start_calls == 5);
     assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
            mock_now + MS2NTP(200));
 

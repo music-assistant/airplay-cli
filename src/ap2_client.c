@@ -2794,4 +2794,19 @@ void ap2cl_test_unlock_mrp(struct ap2cl_s *p)
 {
     pthread_mutex_unlock(&p->mrp_lock);
 }
+
+void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd)
+{
+    p->sock_fd = fd;
+    p->rtsp_established = true;
+    atomic_store(&p->rtsp_dead, false);
+    snprintf(p->session_url, sizeof(p->session_url), "rtsp://test/session");
+}
+
+void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p)
+{
+    p->sock_fd = -1;
+    p->rtsp_established = false;
+    p->state = AP2_DOWN;
+}
 #endif
