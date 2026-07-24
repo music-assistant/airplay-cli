@@ -70,10 +70,12 @@ extern log_level *loglevel;
 #define AP2_FEEDBACK_INTERVAL_MS     2000
 #define AP2_EVENT_POLL_INTERVAL_MS   100
 #define AP2_UDP_SEND_TIMEOUT_MS      20
-/* Minimum lead for a warm generation switch: receivers accepted re-anchors
- * down to 150 ms in the flush-ladder measurements; 350 ms leaves margin for
- * the commit round-trips and scheduling jitter. */
-#define AP2_MIN_WARM_LEAD_MS         350
+/* Minimum lead for a commanded start: receivers accepted re-anchors down to
+ * 150 ms in the flush-ladder measurements; 250 ms leaves margin for the
+ * commit round-trips and scheduling jitter. The caller only commands a start
+ * after the connection and the audio feed are both confirmed, so no setup
+ * slack is needed on top. */
+#define AP2_MIN_WARM_LEAD_MS         250
 
 typedef enum {
     FLOW_RAOP_COMPAT = 0,
