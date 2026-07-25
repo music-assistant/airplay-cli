@@ -14,25 +14,28 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  prepare-release:
-    name: Prepare release
+  immutable-settings:
+    name: Verify immutable release settings
     runs-on: ubuntu-latest
-    outputs:
-      release_tag: ${{ steps.version.outputs.release_tag }}
-      should_release: ${{ steps.version.outputs.should_release }}
+    permissions: {}
     steps:
-      - name: Validate release settings token
+      - name: Create immutable-settings token
+        id: immutable-settings-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MUSIC_ASSISTANT_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}
+          permission-administration: read
+
+      - name: Validate immutable release settings
         env:
-          GH_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+          APP_SLUG: ${{ steps.immutable-settings-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.immutable-settings-token.outputs.token }}
         run: |
           set -euo pipefail
 
-          if ! actor="$(gh api user --jq '.login')"; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN must contain a valid GitHub credential."
-            exit 1
-          fi
-          if [[ "$actor" != "music-assistant-machine" ]]; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN authenticates as $actor, expected music-assistant-machine."
+          if [[ "$APP_SLUG" != "musicassistant-bot" ]]; then
+            echo "::error::Immutable-settings token belongs to $APP_SLUG, expected musicassistant-bot."
             exit 1
           fi
 
@@ -43,7 +46,7 @@ jobs:
               "repos/$GITHUB_REPOSITORY/immutable-releases" \
               --jq '.enabled'
           )"; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN needs repository administration read access to verify immutable releases."
+            echo "::error::The GitHub App needs repository administration read access to verify immutable releases."
             exit 1
           fi
           if [[ "$immutable_enabled" != "true" ]]; then
@@ -51,6 +54,14 @@ jobs:
             exit 1
           fi
 
+  prepare-release:
+    name: Prepare release
+    needs: immutable-settings
+    runs-on: ubuntu-latest
+    outputs:
+      release_tag: ${{ steps.version.outputs.release_tag }}
+      should_release: ${{ steps.version.outputs.should_release }}
+    steps:
       - name: Checkout repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -146,4 +157,4 @@ jobs:
     with:
       release_tag: ${{ needs.prepare-release.outputs.release_tag }}
     secrets:
-      PRIVILEGED_GITHUB_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+      MUSIC_ASSISTANT_BOT_PRIVATE_KEY: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}

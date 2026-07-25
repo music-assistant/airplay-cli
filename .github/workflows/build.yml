@@ -13,7 +13,7 @@ on:
         required: true
         type: string
     secrets:
-      PRIVILEGED_GITHUB_TOKEN:
+      MUSIC_ASSISTANT_BOT_PRIVATE_KEY:
         required: true
 
 permissions:
@@ -24,6 +24,47 @@ env:
   RELEASE_TAG: ${{ inputs.release_tag || github.ref_name }}
 
 jobs:
+  immutable-settings:
+    name: Verify immutable release settings
+    if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Create immutable-settings token
+        id: immutable-settings-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MUSIC_ASSISTANT_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}
+          permission-administration: read
+
+      - name: Validate immutable release settings
+        env:
+          APP_SLUG: ${{ steps.immutable-settings-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.immutable-settings-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$APP_SLUG" != "musicassistant-bot" ]]; then
+            echo "::error::Immutable-settings token belongs to $APP_SLUG, expected musicassistant-bot."
+            exit 1
+          fi
+
+          if ! immutable_enabled="$(
+            gh api \
+              --method GET \
+              --header "X-GitHub-Api-Version: $GITHUB_API_VERSION" \
+              "repos/$GITHUB_REPOSITORY/immutable-releases" \
+              --jq '.enabled'
+          )"; then
+            echo "::error::The GitHub App needs repository administration read access to verify immutable releases."
+            exit 1
+          fi
+          if [[ "$immutable_enabled" != "true" ]]; then
+            echo "::error::Enable release immutability under Settings > General > Releases before publishing."
+            exit 1
+          fi
+
   test-updater:
     name: Test release updater
     runs-on: ubuntu-latest
@@ -151,41 +192,11 @@ jobs:
   release:
     # Publish binaries for tag-based and reusable release runs.
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
-    needs: [test-updater, build-linux, build-macos]
+    needs: [immutable-settings, test-updater, build-linux, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
     steps:
-      - name: Validate release settings token
-        env:
-          GH_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          if ! actor="$(gh api user --jq '.login')"; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN must contain a valid GitHub credential."
-            exit 1
-          fi
-          if [[ "$actor" != "music-assistant-machine" ]]; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN authenticates as $actor, expected music-assistant-machine."
-            exit 1
-          fi
-
-          if ! immutable_enabled="$(
-            gh api \
-              --method GET \
-              --header "X-GitHub-Api-Version: $GITHUB_API_VERSION" \
-              "repos/$GITHUB_REPOSITORY/immutable-releases" \
-              --jq '.enabled'
-          )"; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN needs repository administration read access to verify immutable releases."
-            exit 1
-          fi
-          if [[ "$immutable_enabled" != "true" ]]; then
-            echo "::error::Enable release immutability under Settings > General > Releases before publishing."
-            exit 1
-          fi
-
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
@@ -309,27 +320,28 @@ jobs:
     permissions:
       contents: read
     steps:
-      - name: Validate server automation token
+      - name: Create server repository token
+        id: server-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MUSIC_ASSISTANT_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: server
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Validate server automation identity
         env:
-          GH_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+          APP_SLUG: ${{ steps.server-token.outputs.app-slug }}
         run: |
           set -euo pipefail
-          if [[ -z "${GH_TOKEN:-}" ]]; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN is required to update music-assistant/server"
+          if [[ "$APP_SLUG" != "musicassistant-bot" ]]; then
+            echo "::error::Server token belongs to $APP_SLUG, expected musicassistant-bot."
             exit 1
           fi
-          if ! actor="$(gh api user --jq '.login')"; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN must contain a valid GitHub credential."
-            exit 1
-          fi
-          if [[ "$actor" != "music-assistant-machine" ]]; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN authenticates as $actor, expected music-assistant-machine."
-            exit 1
-          fi
-          if [[ "$(gh api repos/music-assistant/server --jq '.permissions.push // false')" != "true" ]]; then
-            echo "::error::PRIVILEGED_GITHUB_TOKEN needs write access to music-assistant/server"
-            exit 1
-          fi
+
       - name: Checkout airplay-cli
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -341,7 +353,7 @@ jobs:
         with:
           repository: music-assistant/server
           ref: dev
-          token: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+          token: ${{ steps.server-token.outputs.token }}
           path: server
           persist-credentials: false
       - name: Update server Dockerfile pins
@@ -356,7 +368,7 @@ jobs:
       - name: Create or update server pull request
         uses: peter-evans/create-pull-request@5f6978faf089d4d20b00c7766989d076bb2fc7f1 # v8.1.1
         with:
-          token: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+          token: ${{ steps.server-token.outputs.token }}
           path: server
           commit-message: Update airplay-cli to ${{ env.RELEASE_TAG }}
           # This branch deliberately avoids the server's auto-merge prefixes.
