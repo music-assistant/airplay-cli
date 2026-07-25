@@ -6,20 +6,66 @@ on:
 permissions:
   contents: write
 
+env:
+  GITHUB_API_VERSION: "2026-03-10"
+
 concurrency:
   group: auto-release
   cancel-in-progress: false
 
 jobs:
+  immutable-settings:
+    name: Verify immutable release settings
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - name: Create immutable-settings token
+        id: immutable-settings-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.MUSIC_ASSISTANT_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}
+          owner: ${{ github.repository_owner }}
+          repositories: ${{ github.event.repository.name }}
+          permission-administration: read
+
+      - name: Validate immutable release settings
+        env:
+          APP_SLUG: ${{ steps.immutable-settings-token.outputs.app-slug }}
+          GH_TOKEN: ${{ steps.immutable-settings-token.outputs.token }}
+        run: |
+          set -euo pipefail
+
+          if [[ "$APP_SLUG" != "musicassistant-bot" ]]; then
+            echo "::error::Immutable-settings token belongs to $APP_SLUG, expected musicassistant-bot."
+            exit 1
+          fi
+
+          if ! immutable_enabled="$(
+            gh api \
+              --method GET \
+              --header "X-GitHub-Api-Version: $GITHUB_API_VERSION" \
+              "repos/$GITHUB_REPOSITORY/immutable-releases" \
+              --jq '.enabled'
+          )"; then
+            echo "::error::The GitHub App needs repository administration read access to verify immutable releases."
+            exit 1
+          fi
+          if [[ "$immutable_enabled" != "true" ]]; then
+            echo "::error::Enable release immutability under Settings > General > Releases before publishing."
+            exit 1
+          fi
+
   prepare-release:
     name: Prepare release
+    needs: immutable-settings
     runs-on: ubuntu-latest
     outputs:
       release_tag: ${{ steps.version.outputs.release_tag }}
       should_release: ${{ steps.version.outputs.should_release }}
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
 
@@ -55,6 +101,7 @@ jobs:
             commit_count="$(git rev-list --count "${latest_release}..HEAD")"
           fi
 
+          echo "latest_release=$latest_release" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           if (( commit_count == 0 )); then
             echo "should_release=false" >> "$GITHUB_OUTPUT"
@@ -68,6 +115,7 @@ jobs:
       - name: Create release tag
         if: steps.version.outputs.should_release == 'true'
         env:
+          LATEST_RELEASE: ${{ steps.version.outputs.latest_release }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
         run: |
           set -euo pipefail
@@ -75,17 +123,32 @@ jobs:
           head_sha="$(git rev-parse HEAD)"
           if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
             tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
-            if [[ "$tag_sha" != "$head_sha" ]]; then
-              echo "::error::$RELEASE_TAG already points to $tag_sha instead of $head_sha"
+            if ! git merge-base --is-ancestor "$tag_sha" "$head_sha"; then
+              echo "::error::$RELEASE_TAG points to $tag_sha, which is not on the current HEAD history"
               exit 1
             fi
-            echo "Reusing $RELEASE_TAG at $head_sha."
+            if [[ -n "$LATEST_RELEASE" ]]; then
+              if ! git merge-base --is-ancestor "$LATEST_RELEASE" "$tag_sha"; then
+                echo "::error::$RELEASE_TAG points before or outside latest release $LATEST_RELEASE"
+                exit 1
+              fi
+              if [[ "$(git rev-list --count "${LATEST_RELEASE}..${tag_sha}")" -eq 0 ]]; then
+                echo "::error::$RELEASE_TAG contains no commits after $LATEST_RELEASE"
+                exit 1
+              fi
+            fi
+            if [[ "$tag_sha" == "$head_sha" ]]; then
+              echo "Reusing $RELEASE_TAG at HEAD."
+            else
+              echo "Reusing orphaned $RELEASE_TAG at $tag_sha; later commits remain for the next release."
+            fi
             exit 0
           fi
 
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$RELEASE_TAG" -m "Release $RELEASE_TAG"
+          # GITHUB_TOKEN tag pushes do not start a competing v* workflow run.
           git push origin "refs/tags/$RELEASE_TAG"
 
   release:
@@ -96,4 +159,4 @@ jobs:
     with:
       release_tag: ${{ needs.prepare-release.outputs.release_tag }}
     secrets:
-      PRIVILEGED_GITHUB_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+      MUSIC_ASSISTANT_BOT_PRIVATE_KEY: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}

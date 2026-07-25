@@ -259,8 +259,14 @@ point GitHub locks its tag and assets. The manually dispatched **Auto Release**
 workflow calculates the next patch version, creates its tag, and runs the same
 release pipeline with generated release notes. After verifying the published
 assets, CI hashes `SHA256SUMS` and opens or updates a non-auto-merge PR against
-the server `dev` branch with both Dockerfile pins. That step requires the
-`PRIVILEGED_GITHUB_TOKEN` Actions secret to have server write access.
+the server `dev` branch with both Dockerfile pins. Same-repository tags and
+releases use the built-in `GITHUB_TOKEN`. The private `music-assistant-bot`
+GitHub App (slug `musicassistant-bot`) uses the
+`MUSIC_ASSISTANT_BOT_CLIENT_ID` organization variable and
+`MUSIC_ASSISTANT_BOT_PRIVATE_KEY` organization secret to mint separate,
+short-lived tokens: administration read access for this repository's immutable
+release preflight, and contents/issues/pull requests write access scoped only
+to the server repository for its pin-update PR.
 
 ## Architecture
 
