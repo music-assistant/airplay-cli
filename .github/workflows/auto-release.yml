@@ -4,7 +4,10 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  GITHUB_API_VERSION: "2026-03-10"
 
 concurrency:
   group: auto-release
@@ -18,10 +21,41 @@ jobs:
       release_tag: ${{ steps.version.outputs.release_tag }}
       should_release: ${{ steps.version.outputs.should_release }}
     steps:
+      - name: Validate privileged release token
+        env:
+          GH_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if ! actor="$(gh api user --jq '.login')"; then
+            echo "::error::PRIVILEGED_GITHUB_TOKEN must contain a valid GitHub credential."
+            exit 1
+          fi
+          if [[ "$actor" != "music-assistant-machine" ]]; then
+            echo "::error::PRIVILEGED_GITHUB_TOKEN authenticates as $actor, expected music-assistant-machine."
+            exit 1
+          fi
+
+          if ! immutable_enabled="$(
+            gh api \
+              --method GET \
+              --header "X-GitHub-Api-Version: $GITHUB_API_VERSION" \
+              "repos/$GITHUB_REPOSITORY/immutable-releases" \
+              --jq '.enabled'
+          )"; then
+            echo "::error::PRIVILEGED_GITHUB_TOKEN needs repository administration read access to verify immutable releases."
+            exit 1
+          fi
+          if [[ "$immutable_enabled" != "true" ]]; then
+            echo "::error::Enable release immutability under Settings > General > Releases before publishing."
+            exit 1
+          fi
+
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
+          persist-credentials: false
 
       - name: Calculate next version
         id: version
@@ -68,6 +102,7 @@ jobs:
       - name: Create release tag
         if: steps.version.outputs.should_release == 'true'
         env:
+          GH_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
         run: |
           set -euo pipefail
@@ -83,9 +118,10 @@ jobs:
             exit 0
           fi
 
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git config user.name "music-assistant-machine"
+          git config user.email "141749843+music-assistant-machine@users.noreply.github.com"
           git tag -a "$RELEASE_TAG" -m "Release $RELEASE_TAG"
+          gh auth setup-git
           git push origin "refs/tags/$RELEASE_TAG"
 
   release:

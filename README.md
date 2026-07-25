@@ -260,7 +260,9 @@ workflow calculates the next patch version, creates its tag, and runs the same
 release pipeline with generated release notes. After verifying the published
 assets, CI hashes `SHA256SUMS` and opens or updates a non-auto-merge PR against
 the server `dev` branch with both Dockerfile pins. That step requires the
-`PRIVILEGED_GITHUB_TOKEN` Actions secret to have server write access.
+`PRIVILEGED_GITHUB_TOKEN` Actions secret to authenticate as
+`music-assistant-machine`, with contents write and administration read access
+to this repository plus server write access.
 
 ## Architecture
 
