@@ -23,8 +23,8 @@ jobs:
         id: immutable-settings-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          app-id: ${{ secrets.TRIAGE_APP_ID }}
-          private-key: ${{ secrets.TRIAGE_APP_PRIVATE_KEY }}
+          client-id: ${{ vars.MUSIC_ASSISTANT_BOT_CLIENT_ID }}
+          private-key: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}
           permission-administration: read
 
       - name: Validate immutable release settings
@@ -157,5 +157,4 @@ jobs:
     with:
       release_tag: ${{ needs.prepare-release.outputs.release_tag }}
     secrets:
-      TRIAGE_APP_ID: ${{ secrets.TRIAGE_APP_ID }}
-      TRIAGE_APP_PRIVATE_KEY: ${{ secrets.TRIAGE_APP_PRIVATE_KEY }}
+      MUSIC_ASSISTANT_BOT_PRIVATE_KEY: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}
