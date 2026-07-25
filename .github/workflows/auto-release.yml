@@ -4,7 +4,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
 
 env:
   GITHUB_API_VERSION: "2026-03-10"
@@ -21,7 +21,7 @@ jobs:
       release_tag: ${{ steps.version.outputs.release_tag }}
       should_release: ${{ steps.version.outputs.should_release }}
     steps:
-      - name: Validate privileged release token
+      - name: Validate release settings token
         env:
           GH_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
         run: |
@@ -55,7 +55,6 @@ jobs:
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
         with:
           fetch-depth: 0
-          persist-credentials: false
 
       - name: Calculate next version
         id: version
@@ -89,6 +88,7 @@ jobs:
             commit_count="$(git rev-list --count "${latest_release}..HEAD")"
           fi
 
+          echo "latest_release=$latest_release" >> "$GITHUB_OUTPUT"
           echo "release_tag=$release_tag" >> "$GITHUB_OUTPUT"
           if (( commit_count == 0 )); then
             echo "should_release=false" >> "$GITHUB_OUTPUT"
@@ -102,7 +102,7 @@ jobs:
       - name: Create release tag
         if: steps.version.outputs.should_release == 'true'
         env:
-          GH_TOKEN: ${{ secrets.PRIVILEGED_GITHUB_TOKEN }}
+          LATEST_RELEASE: ${{ steps.version.outputs.latest_release }}
           RELEASE_TAG: ${{ steps.version.outputs.release_tag }}
         run: |
           set -euo pipefail
@@ -110,18 +110,32 @@ jobs:
           head_sha="$(git rev-parse HEAD)"
           if git show-ref --verify --quiet "refs/tags/$RELEASE_TAG"; then
             tag_sha="$(git rev-list -n 1 "$RELEASE_TAG")"
-            if [[ "$tag_sha" != "$head_sha" ]]; then
-              echo "::error::$RELEASE_TAG already points to $tag_sha instead of $head_sha"
+            if ! git merge-base --is-ancestor "$tag_sha" "$head_sha"; then
+              echo "::error::$RELEASE_TAG points to $tag_sha, which is not on the current HEAD history"
               exit 1
             fi
-            echo "Reusing $RELEASE_TAG at $head_sha."
+            if [[ -n "$LATEST_RELEASE" ]]; then
+              if ! git merge-base --is-ancestor "$LATEST_RELEASE" "$tag_sha"; then
+                echo "::error::$RELEASE_TAG points before or outside latest release $LATEST_RELEASE"
+                exit 1
+              fi
+              if [[ "$(git rev-list --count "${LATEST_RELEASE}..${tag_sha}")" -eq 0 ]]; then
+                echo "::error::$RELEASE_TAG contains no commits after $LATEST_RELEASE"
+                exit 1
+              fi
+            fi
+            if [[ "$tag_sha" == "$head_sha" ]]; then
+              echo "Reusing $RELEASE_TAG at HEAD."
+            else
+              echo "Reusing orphaned $RELEASE_TAG at $tag_sha; later commits remain for the next release."
+            fi
             exit 0
           fi
 
-          git config user.name "music-assistant-machine"
-          git config user.email "141749843+music-assistant-machine@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git tag -a "$RELEASE_TAG" -m "Release $RELEASE_TAG"
-          gh auth setup-git
+          # GITHUB_TOKEN tag pushes do not start a competing v* workflow run.
           git push origin "refs/tags/$RELEASE_TAG"
 
   release:
