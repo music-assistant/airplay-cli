@@ -261,11 +261,12 @@ release pipeline with generated release notes. After verifying the published
 assets, CI hashes `SHA256SUMS` and opens or updates a non-auto-merge PR against
 the server `dev` branch with both Dockerfile pins. Same-repository tags and
 releases use the built-in `GITHUB_TOKEN`. The private `music-assistant-bot`
-GitHub App uses the `MUSIC_ASSISTANT_BOT_CLIENT_ID` organization variable and
+GitHub App (slug `musicassistant-bot`) uses the
+`MUSIC_ASSISTANT_BOT_CLIENT_ID` organization variable and
 `MUSIC_ASSISTANT_BOT_PRIVATE_KEY` organization secret to mint separate,
 short-lived tokens: administration read access for this repository's immutable
-release preflight, and contents/issues/pull requests write access scoped only to
-the server repository for its pin-update PR.
+release preflight, and contents/issues/pull requests write access scoped only
+to the server repository for its pin-update PR.
 
 ## Architecture
 
