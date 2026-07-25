@@ -59,6 +59,7 @@ jobs:
         with:
           ref: ${{ inputs.release_tag || github.ref }}
           submodules: recursive
+          persist-credentials: false
       - name: Install cross toolchain
         if: matrix.packages != ''
         run: sudo apt-get update && sudo apt-get install -y ${{ matrix.packages }}
@@ -117,6 +118,7 @@ jobs:
         with:
           ref: ${{ inputs.release_tag || github.ref }}
           submodules: recursive
+          persist-credentials: false
       - name: Build
         run: |
           # RELEASE_TAG (workflow-level env, see top of file) covers both a
