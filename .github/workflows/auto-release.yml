@@ -26,7 +26,7 @@ jobs:
           client-id: ${{ vars.MUSIC_ASSISTANT_BOT_CLIENT_ID }}
           private-key: ${{ secrets.MUSIC_ASSISTANT_BOT_PRIVATE_KEY }}
           owner: ${{ github.repository_owner }}
-          repositories: ${{ github.repository }}
+          repositories: ${{ github.event.repository.name }}
           permission-administration: read
 
       - name: Validate immutable release settings
