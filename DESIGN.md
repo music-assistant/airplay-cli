@@ -185,12 +185,13 @@ exactly T on every streaming protocol.** Legacy RAOP, RAOP-compatible AirPlay 2,
 and native AirPlay 2 members are handed the same T, then align by construction.
 The first `ACTION=START` begins the session; a `START` after an `ACTION=FLUSH`
 re-anchors the same live stream (§10) by re-basing the frozen anchor line below,
-with no reconnect and no crypto/sequence reset. The caller can gate the command
-on the one-shot `[STATUS] audio buffered_ms=` line — emitted once the current
-track's feed is flowing, and re-armed by each FLUSH — so it commits a start only
-after the feed is confirmed. A T of 0 or in the past clamps to now plus the
-minimum commanded-start lead (250 ms; 200 ms on RAOP), which covers only the
-commit round-trips since the connection and the feed are already up.
+with no reconnect and no crypto/sequence reset. The first packet carries a fresh
+restart marker and sync announcement for the new timeline. The caller can gate
+the command on the one-shot `[STATUS] audio buffered_ms=` line — emitted once a
+complete transport packet is buffered, and re-armed by each FLUSH — so it
+commits a start only after the feed is ready. A T of 0 or in the past clamps to
+now plus the minimum commanded-start lead (250 ms; 200 ms on RAOP), which covers
+only the commit round-trips since the connection and the feed are already up.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its
@@ -504,13 +505,15 @@ capture.
   network pacing. A warm seek/next is `ACTION=FLUSH`: it quiesces the audio
   sends, flushes the receiver (RTSP FLUSH), parks the reader to take exclusive
   fd access, resets the ring, and drains stdin to `EAGAIN` — removing exactly
-  the pre-flush audio the caller stopped writing — then acks `[STATUS] flushed`
-  and releases the reader onto the empty ring. The stream is then idle-primed:
-  it keeps buffering the next track but sends nothing until the next `START`,
-  which re-anchors it. The one-shot `[STATUS] audio` signal (§6) is re-armed by
-  the flush, so the caller learns when the next track's feed is flowing. The
-  sender waits in bounded intervals so control failures remain visible during
-  producer starvation.
+  the pre-flush audio the caller stopped writing — then, after the receiver
+  accepts the flush, acks `[STATUS] flushed` and releases the reader onto the
+  empty ring. The stream is then idle-primed: it keeps buffering the next track
+  but sends nothing until the next `START`, which re-anchors it. The one-shot
+  `[STATUS] audio` signal (§6) is re-armed by the flush and fires after one
+  complete transport packet is buffered. Partial PCM remains in the ring until
+  a full packet is available; only the final EOF packet is padded with silence.
+  The sender waits in bounded intervals so control failures remain visible
+  during producer starvation.
 - **Realtime send outcomes** — local UDP backpressure is a bounded transient
   drop that advances sequence, RTP, and scheduling timestamps. Encode,
   allocation, encryption, socket, and control failures are terminal and produce

@@ -1703,8 +1703,10 @@ static ap2_send_result_t ap2_native_send_chunk(
         return AP2_SEND_FATAL;
     }
     /* A transient local UDP drop exposes a sequence gap rather than retrying
-     * an old timestamp late, so the media timeline always advances. */
-    p->first_packet = false;
+     * an old timestamp late, so the media timeline always advances. Keep the
+     * restart marker armed until its sync and audio packet reach the receiver. */
+    if (result == AP2_SEND_SENT && sync_result == AP2_SEND_SENT)
+        p->first_packet = false;
     p->seq_number++;
     p->rtp_timestamp += frames;
     p->head_ts += frames;
@@ -2064,9 +2066,10 @@ bool ap2cl_flush(struct ap2cl_s *p)
     free(resp);
     LOG_INFO("[AP2] warm FLUSH (seq=%u rtptime=%u) -> %d",
              (unsigned)p->seq_number, (unsigned)p->rtp_timestamp, status);
-    if (status != 200)
-        LOG_WARN("[AP2] receiver did not accept FLUSH (%d); re-anchoring anyway",
-                 status);
+    if (status != 200) {
+        LOG_WARN("[AP2] receiver did not accept FLUSH (%d)", status);
+        return false;
+    }
     /* Drop the stale anchor; ap2cl_resume freezes a fresh line at START. */
     p->rt_anchor_valid = false;
     return true;
@@ -2096,6 +2099,9 @@ bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
     p->head_ts = NTP2TS(start_ntp, p->format.sample_rate);
     p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
     p->rt_anchor_valid = false;
+    /* The first packet after a timeline discontinuity carries the RTP marker
+     * and sends a fresh sync packet before its audio payload. */
+    p->first_packet = true;
     p->state = AP2_STREAMING;
     atomic_store(&p->media_healthy, true);
 
@@ -2834,5 +2840,15 @@ void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p)
     p->sock_fd = -1;
     p->rtsp_established = false;
     p->state = AP2_DOWN;
+}
+
+bool ap2cl_test_first_packet(struct ap2cl_s *p)
+{
+    return p->first_packet;
+}
+
+void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet)
+{
+    p->first_packet = first_packet;
 }
 #endif
