@@ -24,10 +24,14 @@ void ap2cl_test_lock_mrp(struct ap2cl_s *p);
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
+bool ap2cl_test_first_packet(struct ap2cl_s *p);
+void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet);
 
 typedef struct {
     int fd;
     int request_count;
+    int expected_requests;
+    int response_status;
     bool ok;
 } rtsp_peer_t;
 
@@ -35,7 +39,7 @@ static void *run_rtsp_flush_peer(void *arg)
 {
     rtsp_peer_t *peer = arg;
     peer->ok = true;
-    for (int request = 0; request < 2; request++) {
+    for (int request = 0; request < peer->expected_requests; request++) {
         char buffer[2048] = {0};
         size_t fill = 0;
         while (!strstr(buffer, "\r\n\r\n")) {
@@ -60,10 +64,11 @@ static void *run_rtsp_flush_peer(void *arg)
         }
         peer->request_count++;
         char response[96];
+        const char *reason = peer->response_status == 200 ? "OK" : "Error";
         int response_len = snprintf(
             response, sizeof(response),
-            "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
-            cseq);
+            "RTSP/1.0 %d %s\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
+            peer->response_status, reason, cseq);
         if (write(peer->fd, response, (size_t)response_len) != response_len) {
             peer->ok = false;
             return NULL;
@@ -80,6 +85,8 @@ static void test_native_flush_resume_reuses_rtsp_session(void)
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     rtsp_peer_t peer = {
         .fd = sockets[1],
+        .expected_requests = 2,
+        .response_status = 200,
     };
     pthread_t peer_thread;
     assert(pthread_create(
@@ -101,6 +108,9 @@ static void test_native_flush_resume_reuses_rtsp_session(void)
     ap2cl_force_native(client);
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
     assert(ap2cl_start(client, 1700000000000ULL));
+    /* The test bypasses native connect, so model a completed first send before
+     * exercising the warm restart. */
+    ap2cl_test_set_first_packet(client, false);
 
     ap2cl_standby(client);
     assert(ap2cl_state(client) == AP2_CONNECTED);
@@ -108,10 +118,51 @@ static void test_native_flush_resume_reuses_rtsp_session(void)
     assert(ap2cl_flush(client));
     assert(ap2cl_resume(client, 1700000005000ULL));
     assert(ap2cl_state(client) == AP2_STREAMING);
+    assert(ap2cl_test_first_packet(client));
 
     assert(pthread_join(peer_thread, NULL) == 0);
     assert(peer.ok);
     assert(peer.request_count == 2);
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+}
+
+static void test_native_flush_rejects_receiver_error(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    rtsp_peer_t peer = {
+        .fd = sockets[1],
+        .expected_requests = 1,
+        .response_status = 500,
+    };
+    pthread_t peer_thread;
+    assert(pthread_create(
+               &peer_thread, NULL, run_rtsp_flush_peer, &peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "flush failure test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    assert(ap2cl_start(client, 1700000000000ULL));
+    assert(!ap2cl_flush(client));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+    assert(peer.request_count == 1);
     ap2cl_test_detach_rtsp_socket(client);
     assert(close(sockets[0]) == 0);
     assert(close(sockets[1]) == 0);
@@ -204,6 +255,7 @@ int main(void)
 {
     test_info_format_tables();
     test_native_flush_resume_reuses_rtsp_session();
+    test_native_flush_rejects_receiver_error();
 
     ap2_device_info_t device = {
         .name = "test",

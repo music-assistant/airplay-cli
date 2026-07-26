@@ -46,6 +46,7 @@ typedef struct {
 struct ap2_session_s {
     ap2_session_ops_t ops;
     unsigned byte_rate;
+    unsigned ready_bytes;
     int idle_timeout_ms;
     int input_fd;              /* owned dup of the caller's PCM descriptor */
 
@@ -189,6 +190,13 @@ static void *reader_thread(void *arg)
             int read_errno = errno;
             pthread_mutex_lock(&s->lock);
             s->ring.eof = true;
+            if (n == 0 && !s->audio_seen && s->ring.fill > 0) {
+                /* A final short input can still form one silence-padded packet. */
+                s->audio_seen = true;
+                emit(s, "[STATUS] audio buffered_ms=%llu",
+                     (unsigned long long)(s->ring.fill * 1000ULL /
+                                          s->byte_rate));
+            }
             pthread_cond_broadcast(&s->can_read);
             pthread_mutex_unlock(&s->lock);
             if (n < 0)
@@ -203,11 +211,10 @@ static void *reader_thread(void *arg)
             off += pushed;
             if (pushed) {
                 pthread_cond_broadcast(&s->can_read);
-                if (!s->audio_seen) {
+                if (!s->audio_seen && s->ring.fill >= s->ready_bytes) {
                     /* One-shot per start cycle: the caller uses this to know
-                     * the new track's audio is flowing before it commands a
-                     * START, so it can anchor with a short lead instead of
-                     * blind margin for source/transcoder spin-up. */
+                     * one complete transport packet is buffered before it
+                     * commands a START. */
                     s->audio_seen = true;
                     emit(s, "[STATUS] audio buffered_ms=%llu",
                          (unsigned long long)(s->ring.fill * 1000ULL /
@@ -227,16 +234,18 @@ static void *reader_thread(void *arg)
 /* ---- public API ---- */
 
 struct ap2_session_s *ap2_session_create(const ap2_session_ops_t *ops,
-                                         unsigned byte_rate, int idle_timeout_ms,
-                                         int input_fd)
+                                         unsigned byte_rate,
+                                         unsigned ready_bytes,
+                                         int idle_timeout_ms, int input_fd)
 {
     if (!ops || !ops->quiesce || !ops->flush || !ops->commit || !ops->resume ||
-        !ops->stop || !ops->status || !byte_rate || input_fd < 0)
+        !ops->stop || !ops->status || !byte_rate || !ready_bytes || input_fd < 0)
         return NULL;
     struct ap2_session_s *s = calloc(1, sizeof(*s));
     if (!s) return NULL;
     s->ops = *ops;
     s->byte_rate = byte_rate;
+    s->ready_bytes = ready_bytes;
     s->idle_timeout_ms = idle_timeout_ms;
     s->input_fd = -1;
     pthread_mutex_init(&s->lock, NULL);
@@ -247,6 +256,11 @@ struct ap2_session_s *ap2_session_create(const ap2_session_ops_t *ops,
     s->state = AP2_SESSION_IDLE;
     s->idle_since_ms = ap2_io_monotonic_ms();
     if (!sring_init(&s->ring, byte_rate)) {
+        ap2_session_destroy(s);
+        return NULL;
+    }
+    if (ready_bytes > s->ring.cap) {
+        LOG_ERROR("[SESSION] ready buffer exceeds ring capacity");
         ap2_session_destroy(s);
         return NULL;
     }
@@ -327,7 +341,6 @@ bool ap2_session_start(struct ap2_session_s *s, uint64_t start_unix_ms)
         s->ops.resume(s->ops.transport);
         return false;
     }
-    s->ring.eof = false;   /* a fresh START clears any stale end-of-stream */
     s->epoch++;
     s->state = AP2_SESSION_PLAYING;
     pthread_cond_broadcast(&s->can_read);
@@ -347,7 +360,11 @@ bool ap2_session_flush(struct ap2_session_s *s)
 
     /* Stop sending, then discard the receiver's buffered audio in place. */
     s->ops.quiesce(s->ops.transport);
-    s->ops.flush(s->ops.transport);
+    if (!s->ops.flush(s->ops.transport)) {
+        s->ops.resume(s->ops.transport);
+        LOG_ERROR("[SESSION] transport flush failed");
+        return false;
+    }
 
     pthread_mutex_lock(&s->lock);
     /* Park the reader so we can drain the input fd without racing it, then
@@ -359,8 +376,7 @@ bool ap2_session_flush(struct ap2_session_s *s)
         pthread_cond_wait(&s->reader_paused_cond, &s->lock);
     sring_reset(&s->ring);
     drain_input_fd(s->input_fd);
-    /* Re-arm the one-shot audio signal: the next bytes to arrive belong to
-     * the new track and announce that its feed is flowing. */
+    /* Re-arm the one-shot audio signal for the next complete packet. */
     s->audio_seen = false;
     /* Release the reader onto the now-empty ring: it buffers the next track
      * while we send nothing until the next START (idle-primed). */
@@ -424,7 +440,8 @@ int ap2_session_read(struct ap2_session_s *s, uint8_t *buf, int len,
             return -2;
         }
         if (s->state == AP2_SESSION_PLAYING) {
-            if (s->ring.fill > 0) {
+            if (s->ring.fill >= (size_t)len ||
+                (s->ring.eof && s->ring.fill > 0)) {
                 size_t n = sring_pop(&s->ring, buf, (size_t)len);
                 pthread_cond_broadcast(&s->can_write);
                 pthread_mutex_unlock(&s->lock);

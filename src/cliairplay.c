@@ -292,6 +292,19 @@ static int truncate_32to24(const uint8_t *in, int in_bytes, uint8_t *out)
     return samples * 3;
 }
 
+/* The session only returns a short read when stdin reaches EOF. Complete the
+ * final transport packet with silence, dropping any incomplete PCM frame. */
+static int pad_final_pcm_chunk(uint8_t *buf, int bytes, int chunk_bytes,
+                               int bytes_per_frame)
+{
+    if (bytes >= chunk_bytes) return bytes;
+    int aligned = bytes - bytes % bytes_per_frame;
+    if (aligned != bytes)
+        LOG_WARN("Discarding %d trailing incomplete PCM bytes", bytes - aligned);
+    memset(buf + aligned, 0, (size_t)(chunk_bytes - aligned));
+    return chunk_bytes;
+}
+
 /* ---- Command pipe handler ---- */
 
 static struct {
@@ -495,16 +508,19 @@ static bool session_commit(void *transport, uint64_t start_unix_ms)
 
 /* Discard the receiver's buffered audio in place for a warm seek and mark the
  * stream not-playing; the next START re-anchors and resumes sending. */
-static void session_flush_op(void *transport)
+static bool session_flush_op(void *transport)
 {
     cli_config_t *cfg = transport;
+    bool flushed = false;
     if (cfg->protocol == PROTO_RAOP) {
-        if (g_raopcl && !raop_session_flush(g_raopcl))
-            status_error("RAOP flush failed");
+        flushed = g_raopcl && raop_session_flush(g_raopcl);
     } else if (g_ap2cl) {
-        ap2cl_flush(g_ap2cl);
+        flushed = ap2cl_flush(g_ap2cl);
     }
+    /* A failed RTSP round-trip can leave the receiver partially flushed.
+     * Keep sends paused while the caller falls back to a cold restart. */
     if (g_status == STATUS_PLAYING) g_status = STATUS_PAUSED;
+    return flushed;
 }
 
 static void session_stop_op(void *transport)
@@ -627,7 +643,8 @@ static bool start_command_thread(cli_config_t *cfg)
     return true;
 }
 
-static bool start_stream_session(cli_config_t *cfg, int input_bpf)
+static bool start_stream_session(cli_config_t *cfg, int input_bpf,
+                                 int frames_per_chunk)
 {
     ap2_session_ops_t ops = {
         .quiesce = session_quiesce,
@@ -640,6 +657,7 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf)
     };
     g_session = ap2_session_create(
         &ops, (unsigned)cfg->sample_rate * (unsigned)input_bpf,
+        (unsigned)frames_per_chunk * (unsigned)input_bpf,
         SESSION_IDLE_TIMEOUT_MS, STDIN_FILENO);
     if (!g_session) {
         status_error("Cannot create session engine");
@@ -742,7 +760,9 @@ static int run_raop(cli_config_t *cfg)
     latency = raopcl_latency(g_raopcl);
     int input_bpf = (cfg->bit_depth <= 16 ? 2 : 4) * cfg->channels;
     int alac_bpf = (cfg->bit_depth <= 16 ? 2 : 3) * cfg->channels;
-    if (!start_stream_session(cfg, input_bpf)) return 1;
+    if (!start_stream_session(
+            cfg, input_bpf, DEFAULT_FRAMES_PER_CHUNK))
+        return 1;
     status_connected_legacy(inet_ntoa(player_addr), cfg->port,
                             (int)TS2MS(latency, raopcl_sample_rate(g_raopcl)));
 
@@ -770,7 +790,6 @@ static int run_raop(cli_config_t *cfg)
     bool input_ended = false;
     bool eof_reported = false;
     uint64_t eof_time = 0;
-    int pcm_carry = 0;
 
     /* Main audio loop */
     while (g_status != STATUS_STOPPED) {
@@ -785,8 +804,7 @@ static int run_raop(cli_config_t *cfg)
             break;
         }
 
-        /* Each START bumps the epoch; reset the per-track bookkeeping so
-         * elapsed and frame alignment restart at the new anchor. */
+        /* Each START bumps the epoch; elapsed restarts at the new anchor. */
         uint64_t epoch = ap2_session_epoch(g_session);
         if (epoch != current_epoch) {
             current_epoch = epoch;
@@ -794,7 +812,6 @@ static int run_raop(cli_config_t *cfg)
             input_ended = false;
             eof_reported = false;
             eof_time = 0;
-            pcm_carry = 0;
         }
 
         /* Periodic status reporting (only while playing, so a pause does not keep
@@ -837,20 +854,9 @@ static int run_raop(cli_config_t *cfg)
                 input_ended = false;
                 eof_reported = false;
                 eof_time = 0;
-                pcm_carry = 0;
             }
             int n = ap2_session_read(
-                g_session, buf + pcm_carry,
-                DEFAULT_FRAMES_PER_CHUNK * input_bpf - pcm_carry, 250);
-            if (n > 0) {
-                n += pcm_carry;
-                pcm_carry = n % input_bpf;
-                n -= pcm_carry;
-                if (n == 0) {
-                    pthread_mutex_unlock(&g_audio_send_lock);
-                    continue;
-                }
-            }
+                g_session, buf, DEFAULT_FRAMES_PER_CHUNK * input_bpf, 250);
             if (n == -2) {
                 pthread_mutex_unlock(&g_audio_send_lock);
                 break;
@@ -866,6 +872,8 @@ static int run_raop(cli_config_t *cfg)
                 pthread_mutex_unlock(&g_audio_send_lock);
                 continue;
             }
+            n = pad_final_pcm_chunk(
+                buf, n, DEFAULT_FRAMES_PER_CHUNK * input_bpf, input_bpf);
 
             int audio_frames = n / input_bpf;
             uint8_t *send_buf = buf;
@@ -883,7 +891,6 @@ static int run_raop(cli_config_t *cfg)
                 break;
             }
             frames += audio_frames;
-            if (pcm_carry) memmove(buf, buf + n, (size_t)pcm_carry);
             pthread_mutex_unlock(&g_audio_send_lock);
         } else {
             usleep(1000);
@@ -1002,7 +1009,9 @@ static int run_airplay2(cli_config_t *cfg)
      * pipe thread anchors playback on the first START after connection setup. */
     int ap2_input_bpf = (cfg->bit_depth <= 16 ? 2 : 4) * cfg->channels;
     int ap2_alac_bpf = (cfg->bit_depth <= 16 ? 2 : 3) * cfg->channels;
-    if (!start_stream_session(cfg, ap2_input_bpf)) return 1;
+    if (!start_stream_session(
+            cfg, ap2_input_bpf, AP2_FRAMES_PER_CHUNK))
+        return 1;
     status_connected();
 
     uint64_t last = 0, frames = 0;
@@ -1015,7 +1024,6 @@ static int run_airplay2(cli_config_t *cfg)
     bool input_ended = false;     /* the input stream was fully consumed */
     bool eof_reported = false;
     uint64_t eof_time = 0;
-    int pcm_carry = 0;            /* sub-frame remainder between ring reads */
 
     /* Main audio loop */
     while (g_status != STATUS_STOPPED) {
@@ -1031,8 +1039,7 @@ static int run_airplay2(cli_config_t *cfg)
             break;
         }
 
-        /* Each START bumps the epoch; reset the per-track bookkeeping so
-         * elapsed and frame alignment restart at the new anchor. */
+        /* Each START bumps the epoch; elapsed restarts at the new anchor. */
         uint64_t epoch = ap2_session_epoch(g_session);
         if (epoch != current_epoch) {
             current_epoch = epoch;
@@ -1040,7 +1047,6 @@ static int run_airplay2(cli_config_t *cfg)
             input_ended = false;
             eof_reported = false;
             eof_time = 0;
-            pcm_carry = 0;
         }
 
         /* Periodic status reporting (only while playing, so a pause does not keep
@@ -1083,22 +1089,9 @@ static int run_airplay2(cli_config_t *cfg)
                 input_ended = false;
                 eof_reported = false;
                 eof_time = 0;
-                pcm_carry = 0;
             }
             int n = ap2_session_read(
-                g_session, buf + pcm_carry,
-                AP2_FRAMES_PER_CHUNK * ap2_input_bpf - pcm_carry, 250);
-            if (n > 0) {
-                /* Ring pops are byte-granular: carry any sub-frame remainder
-                 * into the next read so frame alignment never drifts. */
-                n += pcm_carry;
-                pcm_carry = n % ap2_input_bpf;
-                n -= pcm_carry;
-                if (n == 0) {
-                    pthread_mutex_unlock(&g_audio_send_lock);
-                    continue;   /* only a partial frame arrived so far */
-                }
-            }
+                g_session, buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf, 250);
             if (n == -2) {
                 pthread_mutex_unlock(&g_audio_send_lock);
                 break;
@@ -1121,6 +1114,8 @@ static int run_airplay2(cli_config_t *cfg)
                 pthread_mutex_unlock(&g_audio_send_lock);
                 continue;
             }
+            n = pad_final_pcm_chunk(
+                buf, n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf, ap2_input_bpf);
             if (starving) {
                 uint32_t stalled_ms =
                     (uint32_t)NTP2MS(raopcl_get_ntp(NULL) -
@@ -1145,7 +1140,6 @@ static int run_airplay2(cli_config_t *cfg)
                 break;
             }
             frames += af;
-            if (pcm_carry) memmove(buf, buf + n, (size_t)pcm_carry);
             pthread_mutex_unlock(&g_audio_send_lock);
         } else {
             /* Paused, or connected and awaiting the commanded first START. */

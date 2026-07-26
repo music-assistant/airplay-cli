@@ -68,11 +68,12 @@ struct ap2_session_s;
  * lead when 0). Returns false when the transport failed terminally (the caller
  * then ends the session so MA can fall back cold). `flush` discards the
  * receiver's buffered audio in place (RTSP FLUSH / libraop flush), keeping the
- * session and timeline continuity; the re-anchor happens on the next `commit`.
+ * session and timeline continuity; it returns false when the receiver did not
+ * accept the flush. The re-anchor happens on the next `commit`.
  */
 typedef struct {
     void (*quiesce)(void *transport);    /* pause audio sends across a command */
-    void (*flush)(void *transport);      /* RTSP-flush receiver, keep session */
+    bool (*flush)(void *transport);      /* RTSP-flush receiver, keep session */
     bool (*commit)(void *transport, uint64_t start_unix_ms);
     void (*resume)(void *transport);     /* resume sends after the command */
     void (*stop)(void *transport);       /* silence the receiver, keep session */
@@ -85,6 +86,7 @@ typedef struct {
  *
  * :param ops: transport quiesce/flush/commit/resume/stop + status callbacks.
  * :param byte_rate: PCM byte rate of the input format (ring sizing/timing).
+ * :param ready_bytes: buffered PCM required before the one-shot audio status.
  * :param idle_timeout_ms: end the session after this long idle (no playing
  *                         stream), an orphan safety net; 0 disables it.
  * :param input_fd: PCM input descriptor (normally the process stdin). The
@@ -93,8 +95,9 @@ typedef struct {
  *                  descriptor.
  */
 struct ap2_session_s *ap2_session_create(const ap2_session_ops_t *ops,
-                                         unsigned byte_rate, int idle_timeout_ms,
-                                         int input_fd);
+                                         unsigned byte_rate,
+                                         unsigned ready_bytes,
+                                         int idle_timeout_ms, int input_fd);
 void ap2_session_destroy(struct ap2_session_s *s);
 
 /* Command-pipe entry points, serialized by the single cmdpipe thread. Invalid
@@ -104,17 +107,18 @@ bool ap2_session_flush(struct ap2_session_s *s);
 bool ap2_session_standby(struct ap2_session_s *s);
 void ap2_session_end(struct ap2_session_s *s);
 
-/* Audio-loop entry points. `read` returns PCM from the ring while PLAYING
- * (blocking up to timeout_ms; 0 on underrun/not-yet-playing, -1 on end of the
- * input stream, -2 when the session ended). The loop calls `poll` once per
- * iteration so the engine can run the idle timeout. */
+/* Audio-loop entry points. While the input remains open, `read` retains partial
+ * data in the ring until exactly len bytes are available. It blocks up to
+ * timeout_ms; returns 0 when that deadline passes, a final short read at EOF,
+ * -1 once the input is fully consumed, and -2 when the session ended. The loop
+ * calls `poll` once per iteration so the engine can run the idle timeout. */
 int ap2_session_read(struct ap2_session_s *s, uint8_t *buf, int len,
                      int timeout_ms);
 void ap2_session_poll(struct ap2_session_s *s);
 
 ap2_session_state_t ap2_session_state(struct ap2_session_s *s);
 /* Monotonic counter bumped on every START; the audio loop resets its
- * per-track bookkeeping (elapsed, alignment) when it changes. */
+ * per-track elapsed/EOF bookkeeping when it changes. */
 uint64_t ap2_session_epoch(struct ap2_session_s *s);
 
 #endif /* __AP2_SESSION_H_ */

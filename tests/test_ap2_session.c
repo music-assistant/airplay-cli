@@ -35,6 +35,7 @@ typedef struct {
     atomic_int audio_status;
     atomic_int idle_timeouts;
     uint64_t last_start_unix_ms;
+    bool flush_succeeds;
 } test_state_t;
 
 static test_state_t *status_state;
@@ -44,9 +45,11 @@ static void quiesce(void *transport)
     atomic_fetch_add(&((test_state_t *)transport)->quiesces, 1);
 }
 
-static void flush(void *transport)
+static bool flush(void *transport)
 {
-    atomic_fetch_add(&((test_state_t *)transport)->flushes, 1);
+    test_state_t *state = transport;
+    atomic_fetch_add(&state->flushes, 1);
+    return state->flush_succeeds;
 }
 
 static bool commit(void *transport, uint64_t start_unix_ms)
@@ -88,13 +91,15 @@ static void state_init(test_state_t *state)
     atomic_init(&state->flushed_status, 0);
     atomic_init(&state->audio_status, 0);
     atomic_init(&state->idle_timeouts, 0);
+    state->flush_succeeds = true;
     status_state = state;
 }
 
 /* Create a pipe-backed session: the engine reads (a dup of) the pipe read end,
  * the test writes the audio into the returned write end. */
-static struct ap2_session_s *create_session(test_state_t *state,
-                                            int idle_timeout_ms, int *write_fd)
+static struct ap2_session_s *create_session_with_ready(
+    test_state_t *state, unsigned ready_bytes, int idle_timeout_ms,
+    int *write_fd)
 {
     state_init(state);
     ap2_session_ops_t ops = {
@@ -109,12 +114,19 @@ static struct ap2_session_s *create_session(test_state_t *state,
     int input[2];
     assert(pipe(input) == 0);
     struct ap2_session_s *session =
-        ap2_session_create(&ops, 1000, idle_timeout_ms, input[0]);
+        ap2_session_create(
+            &ops, 1000, ready_bytes, idle_timeout_ms, input[0]);
     assert(session);
     /* The engine owns its own dup of the read end. */
     assert(close(input[0]) == 0);
     *write_fd = input[1];
     return session;
+}
+
+static struct ap2_session_s *create_session(test_state_t *state,
+                                             int idle_timeout_ms, int *write_fd)
+{
+    return create_session_with_ready(state, 1, idle_timeout_ms, write_fd);
 }
 
 static void feed(int write_fd, const uint8_t *data, size_t size)
@@ -175,6 +187,58 @@ static void test_start_streams_the_input(void)
     ap2_session_destroy(session);
     status_state = NULL;
     assert(close(write_fd) == 0);
+}
+
+static void test_ready_and_reads_wait_for_a_complete_packet(void)
+{
+    static const uint8_t first[] = {0x10, 0x20, 0x30, 0x40};
+    static const uint8_t second[] = {0x50, 0x60, 0x70, 0x80};
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session =
+        create_session_with_ready(&state, sizeof(first), 0, &write_fd);
+
+    feed(write_fd, first, sizeof(first) - 1);
+    usleep(50000);
+    assert(atomic_load(&state.audio_status) == 0);
+    feed(write_fd, first + sizeof(first) - 1, 1);
+    assert(wait_for_count(&state.audio_status, 1, 1000));
+
+    assert(ap2_session_start(session, 1700000000000ULL));
+    read_exact(session, first, sizeof(first));
+
+    feed(write_fd, second, sizeof(second) - 1);
+    uint8_t got[sizeof(second)];
+    assert(ap2_session_read(session, got, sizeof(got), 50) == 0);
+    feed(write_fd, second + sizeof(second) - 1, 1);
+    read_exact(session, second, sizeof(second));
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+    assert(close(write_fd) == 0);
+}
+
+static void test_short_read_is_released_at_eof(void)
+{
+    static const uint8_t audio[] = {0x10, 0x20, 0x30};
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session =
+        create_session_with_ready(&state, sizeof(audio) + 1, 0, &write_fd);
+
+    feed(write_fd, audio, sizeof(audio));
+    assert(close(write_fd) == 0);
+    assert(wait_for_count(&state.audio_status, 1, 1000));
+    assert(ap2_session_start(session, 1700000000000ULL));
+
+    uint8_t got[sizeof(audio) + 1];
+    assert(ap2_session_read(session, got, sizeof(got), 1000) ==
+           (int)sizeof(audio));
+    assert(memcmp(got, audio, sizeof(audio)) == 0);
+    assert(ap2_session_read(session, got, sizeof(got), 50) == -1);
+
+    ap2_session_destroy(session);
+    status_state = NULL;
 }
 
 /* The headline test: FLUSH drains the ring AND any undelivered stdin bytes and
@@ -241,6 +305,31 @@ static void test_flush_while_idle_before_start(void)
     static const uint8_t audio[] = {0x01, 0x02, 0x03, 0x04};
     feed(write_fd, audio, sizeof(audio));
     assert(ap2_session_start(session, 0));
+    read_exact(session, audio, sizeof(audio));
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+    assert(close(write_fd) == 0);
+}
+
+static void test_failed_flush_preserves_pending_audio(void)
+{
+    static const uint8_t audio[] = {0x10, 0x20, 0x30, 0x40};
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
+
+    feed(write_fd, audio, sizeof(audio));
+    assert(wait_for_count(&state.audio_status, 1, 1000));
+    assert(ap2_session_start(session, 1700000000000ULL));
+    state.flush_succeeds = false;
+
+    assert(!ap2_session_flush(session));
+    assert(atomic_load(&state.flushes) == 1);
+    assert(atomic_load(&state.flushed_status) == 0);
+    assert(atomic_load(&state.quiesces) == 2);
+    assert(atomic_load(&state.resumes) == 2);
+    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
     read_exact(session, audio, sizeof(audio));
 
     ap2_session_destroy(session);
@@ -317,8 +406,11 @@ static void test_destroy_is_prompt_with_open_writer(void)
 int main(void)
 {
     test_start_streams_the_input();
+    test_ready_and_reads_wait_for_a_complete_packet();
+    test_short_read_is_released_at_eof();
     test_flush_drains_and_reanchors();
     test_flush_while_idle_before_start();
+    test_failed_flush_preserves_pending_audio();
     test_standby_then_resume();
     test_idle_timeout_ends_session();
     test_destroy_is_prompt_with_open_writer();
