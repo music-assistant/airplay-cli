@@ -517,6 +517,8 @@ static bool session_flush_op(void *transport)
     } else if (g_ap2cl) {
         flushed = ap2cl_flush(g_ap2cl);
     }
+    /* A failed RTSP round-trip can leave the receiver partially flushed.
+     * Keep sends paused while the caller falls back to a cold restart. */
     if (g_status == STATUS_PLAYING) g_status = STATUS_PAUSED;
     return flushed;
 }

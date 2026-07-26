@@ -223,13 +223,15 @@ static void test_short_read_is_released_at_eof(void)
     static const uint8_t audio[] = {0x10, 0x20, 0x30};
     test_state_t state;
     int write_fd;
-    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
+    struct ap2_session_s *session =
+        create_session_with_ready(&state, sizeof(audio) + 1, 0, &write_fd);
 
-    assert(ap2_session_start(session, 1700000000000ULL));
     feed(write_fd, audio, sizeof(audio));
-    uint8_t got[sizeof(audio) + 1];
-    assert(ap2_session_read(session, got, sizeof(got), 50) == 0);
     assert(close(write_fd) == 0);
+    assert(wait_for_count(&state.audio_status, 1, 1000));
+    assert(ap2_session_start(session, 1700000000000ULL));
+
+    uint8_t got[sizeof(audio) + 1];
     assert(ap2_session_read(session, got, sizeof(got), 1000) ==
            (int)sizeof(audio));
     assert(memcmp(got, audio, sizeof(audio)) == 0);

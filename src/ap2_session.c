@@ -190,6 +190,13 @@ static void *reader_thread(void *arg)
             int read_errno = errno;
             pthread_mutex_lock(&s->lock);
             s->ring.eof = true;
+            if (n == 0 && !s->audio_seen && s->ring.fill > 0) {
+                /* A final short input can still form one silence-padded packet. */
+                s->audio_seen = true;
+                emit(s, "[STATUS] audio buffered_ms=%llu",
+                     (unsigned long long)(s->ring.fill * 1000ULL /
+                                          s->byte_rate));
+            }
             pthread_cond_broadcast(&s->can_read);
             pthread_mutex_unlock(&s->lock);
             if (n < 0)
@@ -334,7 +341,6 @@ bool ap2_session_start(struct ap2_session_s *s, uint64_t start_unix_ms)
         s->ops.resume(s->ops.transport);
         return false;
     }
-    s->ring.eof = false;   /* a fresh START clears any stale end-of-stream */
     s->epoch++;
     s->state = AP2_SESSION_PLAYING;
     pthread_cond_broadcast(&s->can_read);

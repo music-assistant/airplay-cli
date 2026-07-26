@@ -64,10 +64,10 @@ AirPlay 2, and native AirPlay 2. The first `ACTION=START` begins the session; a
 `START` after an `ACTION=FLUSH` re-anchors the same live stream to a new instant
 without reconnecting. A caller can wait for the one-shot
 `[STATUS] audio buffered_ms=<ms>` line — emitted once the (new) track has a
-complete audio packet buffered — before it commands the start, then send the
-same start value to every member of a sync group. A `START_UNIX_MS` of 0 or in
-the past clamps to now plus the minimum commanded-start lead (250 ms, 200 ms on
-RAOP).
+complete audio packet buffered, or its final short packet reaches EOF — before
+it commands the start, then send the same start value to every member of a sync
+group. A `START_UNIX_MS` of 0 or in the past clamps to now plus the minimum
+commanded-start lead (250 ms, 200 ms on RAOP).
 
 Delivery is not gated on the start time: frames are released up to the
 receiver's buffer window ahead of each frame's deadline (the device-reported
@@ -197,7 +197,7 @@ stdin, the single persistent audio input for the whole process lifetime.
   accepts the flush, acks with `[STATUS] flushed` and keeps buffering the next
   track while sending nothing until the next `START` (idle-primed). The one-shot
   `[STATUS] audio buffered_ms=<ms>` line fires again when the next track's feed
-  has a complete packet buffered.
+  has a complete packet buffered, or its final short packet reaches EOF.
 - Session lifecycle: `ACTION=STANDBY` (silence the receiver, keep the connection
   warm), `ACTION=DISCONNECT` (end the session).
 - Transport: `ACTION=PLAY|PAUSE|STOP`.
