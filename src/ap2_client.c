@@ -157,6 +157,8 @@ struct ap2cl_s {
     uint64_t sync_packets_dropped;
     atomic_uint feedback_failures;
     uint64_t timeline_reanchors;
+    uint64_t reanchor_shifted_frames; /* cumulative shift since the last start/
+                                        * resume, for [STATUS] REANCHOR */
 
     /* Frozen realtime anchor line (PTP): the rtp<->wall mapping is fixed once
      * at stream start and every periodic time-announce extrapolates along it.
@@ -1986,6 +1988,7 @@ bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms)
                            atomic_load(&p->rtp_offset);
         p->seq_number = (uint16_t)(getpid() * 40503u);
         p->start_ntp = ntp_start;
+        p->reanchor_shifted_frames = 0;
         p->state = AP2_STREAMING;
         atomic_store(&p->media_healthy, true);
         pthread_mutex_lock(&p->mrp_publish_lock);
@@ -2098,6 +2101,7 @@ bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
     p->start_ntp = start_ntp;
     p->head_ts = NTP2TS(start_ntp, p->format.sample_rate);
     p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
+    p->reanchor_shifted_frames = 0;
     p->rt_anchor_valid = false;
     /* The first packet after a timeline discontinuity carries the RTP marker
      * and sends a fresh sync packet before its audio payload. */
@@ -2192,6 +2196,7 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
             recovery.shifted_frames, (uint32_t)p->format.sample_rate);
     }
     p->timeline_reanchors++;
+    p->reanchor_shifted_frames += recovery.shifted_frames;
     ap2_send_result_t sync_result =
         p->use_ptp ? ap2_send_sync_packet_ptp(p, true)
                    : ap2_send_sync_packet(p, true);
@@ -2199,6 +2204,14 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
     LOG_WARN("[AP2] Re-anchored after PCM starvation: shifted_frames=%" PRIu64
              " lead_frames=%" PRIu64 " count=%" PRIu64,
              recovery.shifted_frames, recovery_lead, p->timeline_reanchors);
+    /* Machine-readable counterpart of the LOG_WARN above, on the same stderr
+     * channel as the binary's other [STATUS] lines, so Music Assistant can
+     * track re-anchor drift without scraping the human-readable log. */
+    fprintf(stderr, "[STATUS] REANCHOR shifted_frames=%" PRIu64
+            " total_shifted_frames=%" PRIu64 " sample_rate=%d\n",
+            recovery.shifted_frames, p->reanchor_shifted_frames,
+            p->format.sample_rate);
+    fflush(stderr);
     return true;
 }
 
