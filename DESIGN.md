@@ -488,8 +488,8 @@ capture.
   keepalive thread and the streaming path can never interleave frames on the
   encrypted channel.
 - **Socket deadlines** — established RTSP request/response cycles use cumulative
-  absolute deadlines appropriate to the request: 1.5 seconds for feedback,
-  2 seconds for control, 5 seconds for metadata, and 15 seconds for artwork.
+  absolute deadlines appropriate to the request: 2 seconds for feedback and
+  control, 5 seconds for metadata, and 15 seconds for artwork.
   The deadline also bounds waiting for the RTSP serialization lock, so a long
   artwork transaction cannot silently extend a feedback request's budget. A
   feedback tick that exhausts its budget before acquiring that lock is skipped:
@@ -497,6 +497,15 @@ capture.
   Event/DataStream writes have a one-second deadline, while realtime RTP/control
   UDP sends are nonblocking with a short bounded retry. A dead encrypted channel
   is fail-closed and terminal so an advanced nonce is never reused.
+- **Keepalive miss tolerance** — a timeout-shaped `/feedback` failure (the
+  device riding out a short local network blackout with its buffered audio
+  intact) does not kill the channel: up to three consecutive missed beats are
+  tolerated (the third kills), while hard peer errors (reset/EOF/protocol)
+  stay immediately fatal. Responses to abandoned beats arrive late once the
+  device recovers, so the response reader skips complete stale responses by
+  CSeq, and bytes of a response that was mid-flight at an abandoned deadline
+  carry over into the next exchange to keep the byte stream and the HAP
+  read-nonce sequence intact. A succeeded beat resets the miss count.
 - **Reverse event channel** — pair-verified sessions derive independent
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS

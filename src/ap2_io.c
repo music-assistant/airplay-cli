@@ -177,6 +177,15 @@ ap2_feedback_result_t ap2_io_feedback_result(int rtsp_status,
     return AP2_FEEDBACK_FAILED;
 }
 
+bool ap2_io_feedback_miss_tolerated(const char *uri, int err,
+                                    unsigned prior_misses,
+                                    unsigned max_misses)
+{
+    if (!uri || strcmp(uri, "/feedback") != 0) return false;
+    if (err != ETIMEDOUT) return false;
+    return prior_misses + 1 < max_misses;
+}
+
 static size_t ap2_find_header_end(const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i + 3 < len; i++) {
@@ -273,4 +282,27 @@ int ap2_io_parse_rtsp_response(const uint8_t *data, size_t len,
     response->body_len = body_len;
     response->message_len = message_len;
     return 1;
+}
+
+int ap2_io_match_rtsp_response(const uint8_t *data, size_t len,
+                               int expect_cseq,
+                               ap2_rtsp_response_t *response,
+                               size_t *match_offset, unsigned *discarded)
+{
+    if (discarded) *discarded = 0;
+    size_t offset = 0;
+    while (offset < len) {
+        int parse_status =
+            ap2_io_parse_rtsp_response(data + offset, len - offset, response);
+        if (parse_status <= 0) return parse_status;
+        if (response->cseq == expect_cseq) {
+            if (offset + response->message_len != len) return -1;
+            if (match_offset) *match_offset = offset;
+            return 1;
+        }
+        if (response->cseq > expect_cseq) return -1;
+        if (discarded) (*discarded)++;
+        offset += response->message_len;
+    }
+    return 0;
 }

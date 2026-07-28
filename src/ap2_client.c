@@ -64,11 +64,18 @@ extern log_level *loglevel;
 #define AP2_FMT_ALAC_48000_24_2 (1ULL << 21)
 #define AP2_RTSP_SETUP_TIMEOUT_MS    8000
 #define AP2_RTSP_CONTROL_TIMEOUT_MS  2000
-#define AP2_RTSP_FEEDBACK_TIMEOUT_MS 1500
+#define AP2_RTSP_FEEDBACK_TIMEOUT_MS 2000
 #define AP2_RTSP_METADATA_TIMEOUT_MS 5000
 #define AP2_RTSP_ARTWORK_TIMEOUT_MS  15000
 #define AP2_FEEDBACK_INTERVAL_MS     2000
+/* A single missed keepalive beat must not kill an otherwise healthy session:
+ * receivers ride out multi-second local network blackouts (wifi roams, DFS
+ * scans) with their buffered audio intact. Consecutive timeout-shaped misses
+ * are tolerated up to this count (the final one kills), so a genuinely dead
+ * channel is still detected within roughly misses x (interval + timeout). */
+#define AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES 3
 #define AP2_EVENT_POLL_INTERVAL_MS   100
+#define AP2_RTSP_RX_BUF_SIZE         16384
 #define AP2_UDP_SEND_TIMEOUT_MS      20
 /* Minimum lead for a commanded start: receivers accepted re-anchors down to
  * 150 ms in the flush-ladder measurements; 250 ms leaves margin for the
@@ -121,6 +128,13 @@ struct ap2cl_s {
     atomic_bool rtsp_dead;
     atomic_bool media_healthy;
     bool rtsp_established;
+    /* Raw bytes received for a response whose exchange was abandoned by a
+     * tolerated /feedback miss. Re-seeded into the next exchange's read so
+     * the TCP byte stream (and the HAP read-nonce sequence) stays intact
+     * when that response was mid-flight at the deadline. Only touched under
+     * rtsp_lock (the exchange serializer). */
+    uint8_t rtsp_carry[AP2_RTSP_RX_BUF_SIZE];
+    int rtsp_carry_len;
     pthread_t feedback_thread;
     atomic_bool feedback_stop;
     bool feedback_thread_started;
@@ -219,6 +233,20 @@ static void ap2_mark_rtsp_dead(struct ap2cl_s *p, const char *method,
                                uint64_t elapsed_ms)
 {
     int saved_errno = errno;
+    unsigned prior_misses = atomic_load(&p->feedback_failures);
+    if (ap2_io_feedback_miss_tolerated(uri, saved_errno, prior_misses,
+                                       AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES)) {
+        /* The device may just be riding out a short local network blackout
+         * with its buffered audio intact. Leave the channel open — the next
+         * exchange skips this beat's late response by CSeq — and only give
+         * up after the consecutive-miss budget is spent. */
+        LOG_WARN("[AP2] POST /feedback keepalive miss %u/%d (%s after %" PRIu64
+                 "ms: %s); tolerating transient failure",
+                 prior_misses + 1, AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES, phase,
+                 elapsed_ms, strerror(saved_errno));
+        errno = saved_errno;
+        return;
+    }
     if ((p->rtsp_established || p->hap) &&
         !atomic_exchange(&p->rtsp_dead, true)) {
         LOG_ERROR("[AP2] RTSP channel failed during %s %s %s after %" PRIu64
@@ -316,18 +344,29 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
               cseq, method, uri, body_len, msg_len,
               (int)(deadline_ms - started_ms));
     if (!ap2_io_write_all_deadline(p->sock_fd, msg, msg_len, deadline_ms)) {
-        free(msg);
+        /* mark first: it keys off errno from the failed write, which a
+         * free() in between is not guaranteed to preserve */
         ap2_mark_rtsp_dead(p, method, uri, "write",
                            ap2_io_monotonic_ms() - started_ms);
+        free(msg);
         return 0;
     }
     free(msg);
 
     /* Read encrypted response.
      * HAP framing: [2-byte LE length][encrypted chunk + 16-byte tag]
-     * We accumulate raw bytes, then decrypt complete frames. */
-    uint8_t buf[16384] = {0};
+     * We accumulate raw bytes, then decrypt complete frames.
+     * The accumulation is seeded with bytes carried over from an exchange
+     * abandoned by a tolerated /feedback miss, so a response that was
+     * mid-flight at that deadline keeps the byte stream intact; responses
+     * to such abandoned requests are then skipped by CSeq below. */
+    uint8_t buf[AP2_RTSP_RX_BUF_SIZE] = {0};
     int total = 0;
+    if (p->rtsp_carry_len > 0) {
+        memcpy(buf, p->rtsp_carry, (size_t)p->rtsp_carry_len);
+        total = p->rtsp_carry_len;
+        p->rtsp_carry_len = 0;
+    }
     if (!p->hap) {
         while (total < (int)sizeof(buf)) {
             int n = (int)ap2_io_read_deadline(
@@ -336,18 +375,19 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
             if (n <= 0) break;
             total += n;
             ap2_rtsp_response_t parsed;
-            int parse_status = ap2_io_parse_rtsp_response(
-                buf, (size_t)total, &parsed);
-            if (parse_status < 0) {
+            size_t match_offset = 0;
+            unsigned discarded = 0;
+            int match_status = ap2_io_match_rtsp_response(
+                buf, (size_t)total, cseq, &parsed, &match_offset, &discarded);
+            if (match_status < 0) {
                 errno = EPROTO;
                 break;
             }
-            if (parse_status > 0) {
-                if (parsed.message_len != (size_t)total ||
-                    parsed.cseq != cseq) {
-                    errno = EPROTO;
-                    break;
-                }
+            if (match_status > 0) {
+                if (discarded)
+                    LOG_INFO("[AP2] %s %s: discarded %u stale response(s) "
+                             "from tolerated keepalive misses",
+                             method, uri, discarded);
                 *resp_len = (int)parsed.body_len;
                 *resp_body = parsed.body_len ? malloc(parsed.body_len) : NULL;
                 if (parsed.body_len && !*resp_body) {
@@ -355,12 +395,18 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
                     break;
                 }
                 if (*resp_body)
-                    memcpy(*resp_body, buf + parsed.header_len, parsed.body_len);
+                    memcpy(*resp_body, buf + match_offset + parsed.header_len,
+                           parsed.body_len);
                 return parsed.status;
             }
         }
+        if (total >= (int)sizeof(buf)) errno = EMSGSIZE;
         ap2_mark_rtsp_dead(p, method, uri, "read",
                            ap2_io_monotonic_ms() - started_ms);
+        if (!atomic_load(&p->rtsp_dead) && total > 0) {
+            memcpy(p->rtsp_carry, buf, (size_t)total);
+            p->rtsp_carry_len = total;
+        }
         *resp_body = NULL;
         *resp_len = 0;
         return 0;
@@ -382,20 +428,21 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
         int dec_len = ap2_hap_decrypt(p->hap, buf, total, &dec);
         if (dec_len > 0 && dec) {
             ap2_rtsp_response_t parsed;
-            int parse_status = ap2_io_parse_rtsp_response(
-                dec, (size_t)dec_len, &parsed);
-            if (parse_status < 0) {
+            size_t match_offset = 0;
+            unsigned discarded = 0;
+            int match_status = ap2_io_match_rtsp_response(
+                dec, (size_t)dec_len, cseq, &parsed, &match_offset,
+                &discarded);
+            if (match_status < 0) {
                 free(dec);
                 errno = EPROTO;
                 break;
             }
-            if (parse_status > 0) {
-                if (parsed.message_len != (size_t)dec_len ||
-                    parsed.cseq != cseq) {
-                    free(dec);
-                    errno = EPROTO;
-                    break;
-                }
+            if (match_status > 0) {
+                if (discarded)
+                    LOG_INFO("[AP2] %s %s: discarded %u stale response(s) "
+                             "from tolerated keepalive misses",
+                             method, uri, discarded);
                 *resp_len = (int)parsed.body_len;
                 *resp_body = parsed.body_len ? malloc(parsed.body_len) : NULL;
                 if (parsed.body_len && !*resp_body) {
@@ -404,7 +451,7 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
                     break;
                 }
                 if (*resp_body)
-                    memcpy(*resp_body, dec + parsed.header_len,
+                    memcpy(*resp_body, dec + match_offset + parsed.header_len,
                            parsed.body_len);
                 int status = parsed.status;
                 free(dec);
@@ -418,8 +465,13 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
         }
     }
 
+    if (total >= (int)sizeof(buf)) errno = EMSGSIZE;
     ap2_mark_rtsp_dead(p, method, uri, "read",
                        ap2_io_monotonic_ms() - started_ms);
+    if (!atomic_load(&p->rtsp_dead) && total > 0) {
+        memcpy(p->rtsp_carry, buf, (size_t)total);
+        p->rtsp_carry_len = total;
+    }
     *resp_body = NULL;
     *resp_len = 0;
     return 0;
@@ -889,6 +941,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     }
 
     if (getaddrinfo(p->device.address, port_str, &hints, &res) != 0) return false;
+    p->rtsp_carry_len = 0;
     p->sock_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (p->sock_fd >= 0 && p->bind_addr.s_addr != INADDR_ANY) {
         struct sockaddr_in la = {.sin_family = AF_INET, .sin_addr = p->bind_addr};
@@ -2326,7 +2379,10 @@ bool ap2cl_feedback(struct ap2cl_s *p)
         }
     }
     if (result == AP2_FEEDBACK_SUCCEEDED) {
-        atomic_store(&p->feedback_failures, 0);
+        unsigned prior_misses = atomic_exchange(&p->feedback_failures, 0);
+        if (prior_misses)
+            LOG_INFO("[AP2] /feedback keepalive recovered after %u missed "
+                     "beat(s)", prior_misses);
     } else if (result == AP2_FEEDBACK_FAILED) {
         atomic_fetch_add(&p->feedback_failures, 1);
     }
@@ -2338,7 +2394,7 @@ bool ap2cl_control_healthy(struct ap2cl_s *p)
     if (!p || p->flow != FLOW_NATIVE_AP2) return true;
     if (atomic_load(&p->rtsp_dead) ||
         !atomic_load(&p->media_healthy) ||
-        atomic_load(&p->feedback_failures) >= 3)
+        atomic_load(&p->feedback_failures) >= AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES)
         return false;
     return atomic_load(&p->mrp_event_health) != 0;
 }
@@ -2844,6 +2900,7 @@ void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd)
 {
     p->sock_fd = fd;
     p->rtsp_established = true;
+    p->rtsp_carry_len = 0;
     atomic_store(&p->rtsp_dead, false);
     snprintf(p->session_url, sizeof(p->session_url), "rtsp://test/session");
 }

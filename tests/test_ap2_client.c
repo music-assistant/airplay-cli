@@ -169,6 +169,104 @@ static void test_native_flush_rejects_receiver_error(void)
     assert(ap2cl_destroy(client));
 }
 
+static bool read_rtsp_request_cseq(int fd, const char *method, int *cseq)
+{
+    char buffer[2048] = {0};
+    size_t fill = 0;
+    while (!strstr(buffer, "\r\n\r\n")) {
+        ssize_t n = read(fd, buffer + fill, sizeof(buffer) - fill - 1);
+        if (n <= 0) return false;
+        fill += (size_t)n;
+        if (fill >= sizeof(buffer) - 1) return false;
+    }
+    char *cseq_header = strstr(buffer, "\r\nCSeq: ");
+    if (strncmp(buffer, method, strlen(method)) != 0 || !cseq_header ||
+        sscanf(cseq_header, "\r\nCSeq: %d", cseq) != 1)
+        return false;
+    return true;
+}
+
+typedef struct {
+    int fd;
+    bool ok;
+} feedback_peer_t;
+
+static void *run_feedback_miss_peer(void *arg)
+{
+    feedback_peer_t *peer = arg;
+    peer->ok = false;
+    /* Beat 1: swallow the request so the sender's read budget expires. */
+    int missed_cseq = 0;
+    if (!read_rtsp_request_cseq(peer->fd, "POST /feedback ", &missed_cseq))
+        return NULL;
+    /* Beat 2: answer the missed beat late, then the current one — the
+     * sender must skip the stale response and accept the fresh one. */
+    int current_cseq = 0;
+    if (!read_rtsp_request_cseq(peer->fd, "POST /feedback ", &current_cseq) ||
+        current_cseq != missed_cseq + 1)
+        return NULL;
+    char responses[192];
+    int responses_len = snprintf(
+        responses, sizeof(responses),
+        "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n"
+        "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
+        missed_cseq, current_cseq);
+    if (write(peer->fd, responses, (size_t)responses_len) != responses_len)
+        return NULL;
+    peer->ok = true;
+    return NULL;
+}
+
+/* One missed keepalive beat is tolerated (the channel stays alive) and the
+ * next successful beat — whose read must first skip the missed beat's late
+ * response — resets the consecutive-miss counter. */
+static void test_feedback_miss_tolerated_then_recovered(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    feedback_peer_t peer = {
+        .fd = sockets[1],
+    };
+    pthread_t peer_thread;
+    assert(pthread_create(
+               &peer_thread, NULL, run_feedback_miss_peer, &peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "feedback test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+
+    /* The unanswered beat fails after its read budget but must not kill the
+     * channel (single-strike behaviour would report unhealthy here). */
+    assert(!ap2cl_feedback(client));
+    assert(ap2cl_control_healthy(client));
+
+    /* The next beat rides over the stale response and resets the counter:
+     * were the miss still counted, two more misses would flip health, so a
+     * succeeded beat proving health is the observable reset. */
+    assert(ap2cl_feedback(client));
+    assert(ap2cl_control_healthy(client));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client feedback miss tolerance test passed");
+}
+
 typedef struct {
     struct ap2cl_s *client;
     atomic_bool done;
@@ -256,6 +354,7 @@ int main(void)
     test_info_format_tables();
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
+    test_feedback_miss_tolerated_then_recovered();
 
     ap2_device_info_t device = {
         .name = "test",

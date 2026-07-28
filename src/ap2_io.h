@@ -43,9 +43,30 @@ ap2_send_result_t ap2_io_send_datagram_deadline(
 ap2_feedback_result_t ap2_io_feedback_result(int rtsp_status,
                                              bool request_started);
 
+/* Returns true when a failed RTSP exchange may be survived as a keepalive
+ * miss instead of killing the channel: only POST /feedback, only a
+ * timeout-shaped error (a hard peer error means the connection is gone), and
+ * only while fewer than max_misses consecutive beats have been missed
+ * (prior_misses counts the misses before this one). */
+bool ap2_io_feedback_miss_tolerated(const char *uri, int err,
+                                    unsigned prior_misses,
+                                    unsigned max_misses);
+
 /* Returns 1 for a complete response, 0 for incomplete input, and -1 for
  * malformed input. */
 int ap2_io_parse_rtsp_response(const uint8_t *data, size_t len,
                                ap2_rtsp_response_t *response);
+
+/* Locate the response with expect_cseq in a buffer that may start with
+ * complete responses left over from abandoned (timed-out) requests; those
+ * stale responses (lower CSeq) are skipped and counted in *discarded.
+ * Returns 1 with *response and *match_offset set when the expected response is
+ * found (it must end the buffer: with one outstanding request nothing may
+ * trail it), 0 when more data is needed, and -1 for malformed input, a
+ * response from the future or trailing bytes after the match. */
+int ap2_io_match_rtsp_response(const uint8_t *data, size_t len,
+                               int expect_cseq,
+                               ap2_rtsp_response_t *response,
+                               size_t *match_offset, unsigned *discarded);
 
 #endif
