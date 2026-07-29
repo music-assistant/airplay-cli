@@ -59,6 +59,83 @@ static bool test_rtsp_parser(void)
     return true;
 }
 
+static bool test_feedback_miss_policy(void)
+{
+    /* Only /feedback, only timeout-shaped errors, only under the budget. */
+    CHECK(ap2_io_feedback_miss_tolerated("/feedback", ETIMEDOUT, 0, 3));
+    CHECK(ap2_io_feedback_miss_tolerated("/feedback", ETIMEDOUT, 1, 3));
+    /* The final miss of the budget kills the channel. */
+    CHECK(!ap2_io_feedback_miss_tolerated("/feedback", ETIMEDOUT, 2, 3));
+    CHECK(!ap2_io_feedback_miss_tolerated("/feedback", ETIMEDOUT, 7, 3));
+    /* Hard peer errors are never survivable. */
+    CHECK(!ap2_io_feedback_miss_tolerated("/feedback", ECONNRESET, 0, 3));
+    CHECK(!ap2_io_feedback_miss_tolerated("/feedback", EPIPE, 0, 3));
+    CHECK(!ap2_io_feedback_miss_tolerated("/feedback", EPROTO, 0, 3));
+    /* Other requests keep their single-strike behaviour. */
+    CHECK(!ap2_io_feedback_miss_tolerated("/command", ETIMEDOUT, 0, 3));
+    CHECK(!ap2_io_feedback_miss_tolerated("rtsp://x/session", ETIMEDOUT, 0, 3));
+    CHECK(!ap2_io_feedback_miss_tolerated(NULL, ETIMEDOUT, 0, 3));
+    /* A budget of one means no tolerance at all. */
+    CHECK(!ap2_io_feedback_miss_tolerated("/feedback", ETIMEDOUT, 0, 1));
+    return true;
+}
+
+static bool test_match_rtsp_response_skips_stale(void)
+{
+    static const uint8_t stream[] =
+        "RTSP/1.0 200 OK\r\nCSeq: 5\r\nContent-Length: 0\r\n\r\n"
+        "RTSP/1.0 500 Internal Server Error\r\nCSeq: 6\r\n"
+        "Content-Length: 2\r\n\r\nxy"
+        "RTSP/1.0 200 OK\r\nCSeq: 7\r\nContent-Length: 4\r\n\r\nbody";
+    const size_t len = sizeof(stream) - 1;
+    ap2_rtsp_response_t parsed;
+    size_t match_offset = 0;
+    unsigned discarded = 0;
+
+    /* An exact single response still matches with nothing discarded. */
+    static const uint8_t single[] =
+        "RTSP/1.0 200 OK\r\nCSeq: 7\r\nContent-Length: 4\r\n\r\nbody";
+    CHECK(ap2_io_match_rtsp_response(single, sizeof(single) - 1, 7, &parsed,
+                                     &match_offset, &discarded) == 1);
+    CHECK(discarded == 0);
+    CHECK(match_offset == 0);
+    CHECK(parsed.status == 200 && parsed.body_len == 4);
+
+    /* Two stale responses ahead of the expected one are skipped. */
+    CHECK(ap2_io_match_rtsp_response(stream, len, 7, &parsed,
+                                     &match_offset, &discarded) == 1);
+    CHECK(discarded == 2);
+    CHECK(parsed.status == 200);
+    CHECK(parsed.cseq == 7);
+    CHECK(parsed.body_len == 4);
+    CHECK(memcmp(stream + match_offset + parsed.header_len, "body", 4) == 0);
+
+    /* Only stale data so far: consumed entirely, more data needed. */
+    CHECK(ap2_io_match_rtsp_response(stream, len, 9, &parsed,
+                                     &match_offset, &discarded) == 0);
+    CHECK(discarded == 3);
+
+    /* Truncated tail after a stale prefix: more data needed. */
+    CHECK(ap2_io_match_rtsp_response(stream, len - 2, 7, &parsed,
+                                     &match_offset, &discarded) == 0);
+    CHECK(discarded == 2);
+
+    /* A response from the future means protocol desync. */
+    CHECK(ap2_io_match_rtsp_response(stream, len, 4, &parsed,
+                                     &match_offset, &discarded) == -1);
+
+    /* Trailing bytes after the matched response are not allowed. */
+    CHECK(ap2_io_match_rtsp_response(stream, len, 5, &parsed,
+                                     &match_offset, &discarded) == -1);
+
+    /* Malformed input propagates as -1. */
+    static const uint8_t malformed[] =
+        "RTSP/1.0 200 OK\r\nCSeq: nope\r\nContent-Length: 0\r\n\r\n";
+    CHECK(ap2_io_match_rtsp_response(malformed, sizeof(malformed) - 1, 5,
+                                     &parsed, &match_offset, &discarded) == -1);
+    return true;
+}
+
 static bool test_read_timeout_is_bounded(void)
 {
     int pair[2];
@@ -250,6 +327,10 @@ int main(void)
     fprintf(stderr, "fake peer response passed\n");
     if (!test_rtsp_parser()) return 1;
     fprintf(stderr, "RTSP parser passed\n");
+    if (!test_feedback_miss_policy()) return 1;
+    fprintf(stderr, "feedback miss policy passed\n");
+    if (!test_match_rtsp_response_skips_stale()) return 1;
+    fprintf(stderr, "stale response matcher passed\n");
     if (!test_read_timeout_is_bounded()) return 1;
     fprintf(stderr, "read timeout passed\n");
     if (!test_stalled_write_is_bounded()) return 1;
