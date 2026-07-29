@@ -15,7 +15,8 @@
  * Protocol flow (HAP transient pair-setup, X-Apple-HKP: 4, no credentials):
  *   1. Client sends state=0x01 + method=0 + flags=0x10 to /pair-setup
  *   2. Server responds with state=0x02 + SRP salt + SRP public key B
- *   3. Client runs SRP-6a (SHA-512, 3072-bit group, fixed PIN "3939") and
+ *   3. Client runs SRP-6a (SHA-512, 3072-bit group) with the fixed PIN "3939",
+ *      or with the device password on receivers that gate playback on one, and
  *      sends state=0x03 + public key A + client proof M1
  *   4. Server responds with state=0x04 + server proof; exchange stops here
  *      (no M5/M6, nothing is stored) and the SRP session key becomes the
@@ -47,6 +48,7 @@
 #include "../libraop/crosstools/src/platform.h"
 #include "cross_log.h"
 #include "ap2_hap.h"
+#include "ap2_io.h"
 
 extern log_level *loglevel;
 
@@ -71,8 +73,9 @@ extern log_level *loglevel;
 #define SRP_N_BYTES          384    /* 3072-bit modulus */
 #define SRP_HASH_LEN         SHA512_DIGEST_LENGTH
 #define SRP_USERNAME         "Pair-Setup"
-#define SRP_TRANSIENT_PIN    "3939" /* fixed PIN mandated for transient pairing */
+#define SRP_TRANSIENT_PIN    "3939" /* default secret for transient pairing */
 #define HAP_TRANSIENT_FLAG   0x10   /* kTLVFlag transient in the M1 Flags TLV */
+#define HAP_DIAG_BODY_MAX    512    /* body bytes dumped from a failed exchange */
 
 /* RFC 5054 3072-bit group used by HAP pair-setup; generator g = 5 */
 static const char srp_n_hex_3072[] =
@@ -471,16 +474,63 @@ done:
     return ok;
 }
 
+/* Record a failure cause for the caller, keeping the most informative HTTP
+ * status seen in this exchange when the failing step has none of its own. */
+static void hap_set_error(ap2_hap_error_t *err, ap2_hap_result_t result,
+                          int http_status, int tlv_error)
+{
+    if (!err) return;
+    err->result = result;
+    if (http_status) err->http_status = http_status;
+    err->tlv_error = tlv_error;
+}
+
+/*
+ * Log what the receiver actually answered on a failed exchange: the status
+ * line, every header (is there a WWW-Authenticate challenge?) and the body
+ * (what does its TLV/plist say?). This is the only evidence available for
+ * receivers whose password handling is undocumented.
+ */
+static void hap_log_response(const char *label, const uint8_t *data, int len)
+{
+    char dump[1600];
+    ap2_io_format_response_dump(data, len > 0 ? (size_t)len : 0,
+                                HAP_DIAG_BODY_MAX, dump, sizeof(dump));
+    LOG_ERROR("[HAP] %s response: %s", label, dump);
+}
+
+/* Check the status line of a raw pair-verify reply, dumping and recording a
+ * rejection. Returns true when the receiver answered 200. */
+static bool hap_verify_status_ok(const char *label, const uint8_t *data, int len,
+                                 ap2_hap_error_t *err)
+{
+    char line[64];
+    size_t n = (size_t)len < sizeof(line) - 1 ? (size_t)len : sizeof(line) - 1;
+    if (len > 0) memcpy(line, data, n);
+    else n = 0;
+    line[n] = '\0';
+
+    int status = 0;
+    sscanf(line, "%*s %d", &status);
+    if (status == 200) return true;
+    LOG_ERROR("[HAP] %s rejected (status %d)", label, status);
+    hap_log_response(label, data, len);
+    hap_set_error(err, AP2_HAP_ERR_AUTH, status, 0);
+    return false;
+}
+
 /*
  * POST a TLV body to /pair-setup (X-Apple-HKP: 4 = transient, 3 = full
  * HomeKit pairing with a PIN) and read the complete RTSP response. Returns
  * the HTTP status code (0 on transport error) and points *resp_body (with
- * *resp_body_len) at the body inside resp_buf.
+ * *resp_body_len) at the body inside resp_buf. A non-200 reply is dumped
+ * under label before returning.
  */
 static int hap_post_pair_setup_path(int sock_fd, const char *path, int cseq, int hkp,
                                const uint8_t *body, int body_len,
                                uint8_t *resp_buf, int resp_buf_size,
-                               uint8_t **resp_body, int *resp_body_len)
+                               uint8_t **resp_body, int *resp_body_len,
+                               const char *label)
 {
     char http_req[256];
     int hdr_len = snprintf(http_req, sizeof(http_req),
@@ -524,6 +574,7 @@ static int hap_post_pair_setup_path(int sock_fd, const char *path, int cseq, int
 
     if (header_len == 0 || total < header_len + content_len) {
         LOG_ERROR("[HAP] Incomplete pair-setup response (%d bytes)", total);
+        if (total > 0) hap_log_response(label, resp_buf, total);
         return 0;
     }
 
@@ -531,6 +582,7 @@ static int hap_post_pair_setup_path(int sock_fd, const char *path, int cseq, int
     sscanf((char *)resp_buf, "%*s %d", &status);
     *resp_body = resp_buf + header_len;
     *resp_body_len = content_len;
+    if (status != 200) hap_log_response(label, resp_buf, header_len + content_len);
     return status;
 }
 
@@ -602,9 +654,17 @@ void ap2_hap_destroy(struct ap2_hap_ctx *ctx)
     }
 }
 
-bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
+bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd,
+                         ap2_hap_error_t *err_out)
 {
     if (!ctx) return false;
+    if (err_out) {
+        ap2_hap_error_t empty = {0};
+        *err_out = empty;
+    }
+    /* Set once a pair-verify reply carries a non-200 status: a later content
+     * failure is then reported as a rejection rather than a protocol mismatch. */
+    bool rejected = false;
 
     LOG_INFO("[HAP] Starting pair-verify...");
 
@@ -643,6 +703,7 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
     if (write(sock_fd, http_req, hdr_len) != hdr_len ||
         write(sock_fd, msg1.data, msg1.len) != msg1.len) {
         LOG_ERROR("[HAP] Failed to send pair-verify M1");
+        hap_set_error(err_out, AP2_HAP_ERR_TRANSPORT, 0, 0);
         tlv_free(&msg1);
         EVP_PKEY_free(eph_key);
         return false;
@@ -654,9 +715,13 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
     int resp_len = read(sock_fd, resp_buf, sizeof(resp_buf));
     if (resp_len <= 0) {
         LOG_ERROR("[HAP] No response to pair-verify M1");
+        hap_set_error(err_out, AP2_HAP_ERR_TRANSPORT, 0, 0);
         EVP_PKEY_free(eph_key);
         return false;
     }
+    /* The status is recorded (and a rejection dumped) without changing the
+     * flow below: the M2 content checks stay the ones that decide. */
+    rejected = !hap_verify_status_ok("pair-verify M2", resp_buf, resp_len, err_out);
 
     /* Find HTTP body (after \r\n\r\n) */
     uint8_t *body = NULL;
@@ -671,6 +736,8 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
     }
     if (!body || body_len < 4) {
         LOG_ERROR("[HAP] Invalid pair-verify M2 response (resp_len=%d, body_len=%d)", resp_len, body_len);
+        hap_set_error(err_out,
+                      rejected ? AP2_HAP_ERR_AUTH : AP2_HAP_ERR_PROTOCOL, 0, 0);
         /* Dump first 200 bytes for debugging */
         char hex[600];
         int dump_len = resp_len < 200 ? resp_len : 200;
@@ -690,6 +757,8 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
     if (!state_val || *state_val != 0x02 || spk_len != 32 || enc_len < HAP_TAG_SIZE) {
         LOG_ERROR("[HAP] Invalid pair-verify M2 content (state=%d, spk=%d, enc=%d)",
                   state_val ? *state_val : -1, spk_len, enc_len);
+        hap_set_error(err_out,
+                      rejected ? AP2_HAP_ERR_AUTH : AP2_HAP_ERR_PROTOCOL, 0, 0);
         free(encrypted_data);
         EVP_PKEY_free(eph_key);
         return false;
@@ -744,6 +813,7 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
 
     if (dec_len < 0) {
         LOG_ERROR("[HAP] Failed to decrypt M2 (auth tag verification failed)");
+        hap_set_error(err_out, AP2_HAP_ERR_AUTH, 0, 0);
         free(decrypted);
         EVP_PKEY_free(eph_key);
         return false;
@@ -754,6 +824,7 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
     const uint8_t *server_sig = tlv_find(decrypted, dec_len, TLV_SIGNATURE, &sig_len);
     if (!server_sig || sig_len != 64) {
         LOG_ERROR("[HAP] Missing or invalid server signature in M2");
+        hap_set_error(err_out, AP2_HAP_ERR_PROTOCOL, 0, 0);
         free(decrypted);
         EVP_PKEY_free(eph_key);
         return false;
@@ -876,6 +947,7 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
     if (write(sock_fd, http_req, hdr_len) != hdr_len ||
         write(sock_fd, msg3.data, msg3.len) != msg3.len) {
         LOG_ERROR("[HAP] Failed to send pair-verify M3");
+        hap_set_error(err_out, AP2_HAP_ERR_TRANSPORT, 0, 0);
         tlv_free(&msg3);
         EVP_PKEY_free(eph_key);
         return false;
@@ -884,6 +956,13 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
 
     /* Read M4 response */
     resp_len = read(sock_fd, resp_buf, sizeof(resp_buf));
+    if (resp_len > 0) {
+        if (!hap_verify_status_ok("pair-verify M4", resp_buf, resp_len, err_out))
+            rejected = true;
+    } else {
+        LOG_WARN("[HAP] No response to pair-verify M3");
+        hap_set_error(err_out, AP2_HAP_ERR_TRANSPORT, 0, 0);
+    }
     body = NULL;
     for (int i = 0; i < resp_len - 3; i++) {
         if (resp_buf[i] == '\r' && resp_buf[i+1] == '\n' &&
@@ -903,11 +982,15 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
         }
         if (state_val && *state_val != 0x04) {
             LOG_ERROR("[HAP] Pair-verify M4 unexpected state: %d", *state_val);
+            hap_set_error(err_out,
+                          rejected ? AP2_HAP_ERR_AUTH : AP2_HAP_ERR_PROTOCOL,
+                          0, 0);
             EVP_PKEY_free(eph_key);
             return false;
         }
     }
-    /* M4 HTTP status was already checked - if we got 200, pair-verify succeeded */
+    /* A non-200 reply was recorded and dumped above; reaching here with a
+     * well-formed M4 means the receiver accepted our credentials. */
 
     EVP_PKEY_free(eph_key);
 
@@ -919,6 +1002,7 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
                      "Control-Salt", "Control-Read-Encryption-Key",
                      ctx->read_key, 32)) {
         LOG_ERROR("[HAP] Failed to derive session keys");
+        hap_set_error(err_out, AP2_HAP_ERR_PROTOCOL, 0, 0);
         return false;
     }
 
@@ -936,11 +1020,21 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd)
     return true;
 }
 
-bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
+bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd,
+                                  const char *srp_secret, ap2_hap_error_t *err_out)
 {
     if (!ctx) return false;
+    if (err_out) {
+        ap2_hap_error_t empty = {0};
+        *err_out = empty;
+    }
 
-    LOG_INFO("[HAP] Starting transient pair-setup...");
+    /* An empty secret keeps the fixed transient PIN every credential-less
+     * receiver expects; a device password replaces it as the SRP secret. */
+    bool password_secret = srp_secret && *srp_secret;
+    const char *secret = password_secret ? srp_secret : SRP_TRANSIENT_PIN;
+    LOG_INFO("[HAP] Starting transient pair-setup (%s)...",
+             password_secret ? "device password" : "fixed PIN");
 
     uint8_t resp_buf[8192];
     uint8_t *body = NULL;
@@ -954,11 +1048,15 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     tlv_add_uint8(&msg1, TLV_FLAGS, HAP_TRANSIENT_FLAG);
 
     int status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 1, 4, msg1.data, msg1.len,
-                                     resp_buf, sizeof(resp_buf), &body, &body_len);
+                                     resp_buf, sizeof(resp_buf), &body, &body_len,
+                                     "pair-setup M1");
     tlv_free(&msg1);
     if (status != 200) {
         LOG_ERROR("[HAP] Pair-setup M1 rejected (status %d)%s", status,
                   status == 470 ? " - device requires full HomeKit pairing" : "");
+        hap_set_error(err_out,
+                      status ? AP2_HAP_ERR_AUTH : AP2_HAP_ERR_TRANSPORT,
+                      status, 0);
         return false;
     }
 
@@ -968,6 +1066,7 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     const uint8_t *err = tlv_find(body, body_len, TLV_ERROR, &err_len);
     if (err && err_len > 0) {
         LOG_ERROR("[HAP] Pair-setup M2 error tag: %d", *err);
+        hap_set_error(err_out, AP2_HAP_ERR_AUTH, 0, *err);
         return false;
     }
     const uint8_t *salt = tlv_find(body, body_len, TLV_SALT, &salt_len);
@@ -977,6 +1076,7 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
         !b_pub || b_len <= 0 || b_len > SRP_N_BYTES) {
         LOG_ERROR("[HAP] Invalid pair-setup M2 content (state=%d, salt=%d, B=%d)",
                   state_val ? *state_val : -1, salt ? salt_len : -1, b_len);
+        hap_set_error(err_out, AP2_HAP_ERR_PROTOCOL, 0, 0);
         free(b_pub);
         return false;
     }
@@ -991,12 +1091,13 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     uint8_t proof_m1[SRP_HASH_LEN], proof_hamk[SRP_HASH_LEN], session_key[SRP_HASH_LEN];
 
     bool srp_ok = srp_client_compute(salt_buf, sizeof(salt_buf), b_pub, b_len,
-                                     SRP_TRANSIENT_PIN,
+                                     secret,
                                      a_pub, &a_pub_len,
                                      proof_m1, proof_hamk, session_key);
     free(b_pub);
     if (!srp_ok) {
         LOG_ERROR("[HAP] SRP-6a computation failed");
+        hap_set_error(err_out, AP2_HAP_ERR_PROTOCOL, 0, 0);
         return false;
     }
 
@@ -1010,10 +1111,14 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     tlv_add(&msg3, TLV_PROOF, proof_m1, SRP_HASH_LEN);
 
     status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 2, 4, msg3.data, msg3.len,
-                                 resp_buf, sizeof(resp_buf), &body, &body_len);
+                                 resp_buf, sizeof(resp_buf), &body, &body_len,
+                                 "pair-setup M3");
     tlv_free(&msg3);
     if (status != 200) {
         LOG_ERROR("[HAP] Pair-setup M3 rejected (status %d)", status);
+        hap_set_error(err_out,
+                      status ? AP2_HAP_ERR_AUTH : AP2_HAP_ERR_TRANSPORT,
+                      status, 0);
         goto fail;
     }
 
@@ -1024,6 +1129,7 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     if (err && err_len > 0) {
         LOG_ERROR("[HAP] Pair-setup M4 error tag: %d%s", *err,
                   *err == 0x02 ? " (authentication failed)" : "");
+        hap_set_error(err_out, AP2_HAP_ERR_AUTH, 0, *err);
         goto fail;
     }
     int srv_proof_len;
@@ -1031,10 +1137,15 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
     if (!state_val || *state_val != 0x04 || !srv_proof || srv_proof_len != SRP_HASH_LEN) {
         LOG_ERROR("[HAP] Invalid pair-setup M4 content (state=%d, proof=%d)",
                   state_val ? *state_val : -1, srv_proof ? srv_proof_len : -1);
+        hap_set_error(err_out, AP2_HAP_ERR_PROTOCOL, 0, 0);
         goto fail;
     }
+    /* A mismatching server proof means the two sides ran SRP with different
+     * secrets: the supplied password (or the fixed PIN) is not what this
+     * receiver expects. */
     if (memcmp(srv_proof, proof_hamk, SRP_HASH_LEN) != 0) {
         LOG_ERROR("[HAP] Server SRP proof mismatch in M4");
+        hap_set_error(err_out, AP2_HAP_ERR_AUTH, 0, 0);
         goto fail;
     }
 
@@ -1047,6 +1158,7 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd)
                      "Control-Salt", "Control-Read-Encryption-Key",
                      ctx->read_key, 32)) {
         LOG_ERROR("[HAP] Failed to derive session keys");
+        hap_set_error(err_out, AP2_HAP_ERR_PROTOCOL, 0, 0);
         goto fail;
     }
 
@@ -1098,7 +1210,8 @@ bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
      * accessories with a printed code do not need it, so treat any response as
      * success and continue. */
     int status = hap_post_pair_setup_path(sock_fd, "/pair-pin-start", 0, 3, NULL, 0,
-                                          resp_buf, sizeof(resp_buf), &body, &body_len);
+                                          resp_buf, sizeof(resp_buf), &body, &body_len,
+                                          "pair-pin-start");
     LOG_INFO("[HAP] /pair-pin-start -> %d (device should now show its PIN)", status);
 
     /* M1: state=1, method=0 (pair-setup with PIN) */
@@ -1107,7 +1220,8 @@ bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
     tlv_add_uint8(&msg1, TLV_STATE, 0x01);
     tlv_add_uint8(&msg1, TLV_METHOD, 0x00);
     status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 1, 3, msg1.data, msg1.len,
-                                         resp_buf, sizeof(resp_buf), &body, &body_len);
+                                         resp_buf, sizeof(resp_buf), &body, &body_len,
+                                         "pair-setup PIN M1");
     tlv_free(&msg1);
     if (status != 200) {
         LOG_ERROR("[HAP] Pair-setup M1 rejected (status %d)", status);
@@ -1160,7 +1274,8 @@ bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
     tlv_add(&msg3, TLV_PUBLIC_KEY, a_pub, a_pub_len);
     tlv_add(&msg3, TLV_PROOF, proof_m1, SRP_HASH_LEN);
     status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 2, 3, msg3.data, msg3.len,
-                                     resp_buf, sizeof(resp_buf), &body, &body_len);
+                                     resp_buf, sizeof(resp_buf), &body, &body_len,
+                                     "pair-setup PIN M3");
     tlv_free(&msg3);
     if (status != 200) {
         LOG_ERROR("[HAP] Pair-setup M3 rejected (status %d)", status);
@@ -1255,7 +1370,8 @@ bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
         tlv_add_uint8(&msg5, TLV_STATE, 0x05);
         tlv_add(&msg5, TLV_ENCRYPTED, enc_in, sub_len + HAP_TAG_SIZE);
         status = hap_post_pair_setup_path(sock_fd, "/pair-setup", 3, 3, msg5.data, msg5.len,
-                                         resp_buf, sizeof(resp_buf), &body, &body_len);
+                                         resp_buf, sizeof(resp_buf), &body, &body_len,
+                                         "pair-setup PIN M5");
         tlv_free(&msg5);
         free(enc_in); enc_in = NULL;
         if (status != 200) {

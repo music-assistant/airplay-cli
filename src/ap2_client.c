@@ -30,6 +30,7 @@
 #include <errno.h>
 #include <pthread.h>
 #include <poll.h>
+#include <stdarg.h>
 #include <stdatomic.h>
 #include <inttypes.h>
 
@@ -83,6 +84,10 @@ extern log_level *loglevel;
  * after the connection and the audio feed are both confirmed, so no setup
  * slack is needed on top. */
 #define AP2_MIN_WARM_LEAD_MS         250
+/* Raw bytes kept from a failed exchange for the auth diagnostics dump: enough
+ * for a full header block plus the start of a TLV/plist body. */
+#define AP2_DIAG_RESPONSE_MAX        1536
+#define AP2_DIAG_BODY_MAX            512
 
 typedef enum {
     FLOW_RAOP_COMPAT = 0,
@@ -202,6 +207,17 @@ struct ap2cl_s {
     uint32_t session_id;
     int cseq;
 
+    /* Outcome of the last connect attempt, surfaced through
+     * ap2cl_connect_error() so the caller can report why it failed. */
+    ap2_connect_error_t connect_error;
+    int connect_http_status;
+    char connect_detail[192];
+    /* Raw bytes of the most recent non-200 RTSP response, kept for the auth
+     * diagnostics dump. Written only from inside an RTSP exchange, which the
+     * rtsp_lock serializes. */
+    uint8_t last_error_response[AP2_DIAG_RESPONSE_MAX];
+    int last_error_response_len;
+
     /* PTP timing selection */
     bool use_ptp;      /* resolved: PTP grandmaster timing active this session */
     bool ptp_forced;   /* ap2cl_set_ptp() was called (overrides auto-detect) */
@@ -224,6 +240,93 @@ static void ap2_remote_command_received(
     struct ap2cl_s *p = userdata;
     if (p && p->remote_command_cb)
         p->remote_command_cb(command, p->remote_command_userdata);
+}
+
+/* ---- Native AP2 failure reporting ---- */
+
+/* True for the statuses a receiver uses to refuse an unauthenticated or
+ * wrongly-authenticated request. */
+static bool ap2_status_is_auth(int status)
+{
+    return status == 401 || status == 403;
+}
+
+/* An auth-shaped rejection means "supply a password" when we presented none,
+ * and "this password is wrong" when we did. */
+static ap2_connect_error_t ap2_auth_error_kind(struct ap2cl_s *p)
+{
+    return (p->password && *p->password) ? AP2_CONNECT_ERROR_AUTH_FAILED
+                                         : AP2_CONNECT_ERROR_AUTH_REQUIRED;
+}
+
+static void ap2_set_connect_error(struct ap2cl_s *p, ap2_connect_error_t kind,
+                                  int http_status, const char *fmt, ...)
+    __attribute__((format(printf, 4, 5)));
+
+static void ap2_set_connect_error(struct ap2cl_s *p, ap2_connect_error_t kind,
+                                  int http_status, const char *fmt, ...)
+{
+    p->connect_error = kind;
+    p->connect_http_status = http_status;
+    va_list args;
+    va_start(args, fmt);
+    vsnprintf(p->connect_detail, sizeof(p->connect_detail), fmt, args);
+    va_end(args);
+}
+
+/* Keep the raw bytes of a non-200 response for the diagnostics dump; a 200
+ * clears them so a later failure can never dump a stale exchange. */
+static void ap2_capture_response(struct ap2cl_s *p, const uint8_t *msg,
+                                 size_t len, int status)
+{
+    if (status == 200) {
+        p->last_error_response_len = 0;
+        return;
+    }
+    size_t keep = len < sizeof(p->last_error_response)
+                      ? len : sizeof(p->last_error_response);
+    memcpy(p->last_error_response, msg, keep);
+    p->last_error_response_len = (int)keep;
+}
+
+/*
+ * Log what the receiver answered on a failed native exchange: the status line,
+ * every header and a bounded body dump. For a 401 the questions that matter
+ * are whether a WWW-Authenticate challenge came with it and what the body
+ * carries, so the challenge is also returned for the caller's error detail.
+ */
+static void ap2_log_failed_response(struct ap2cl_s *p, const char *label,
+                                    int status, char *challenge,
+                                    size_t challenge_size)
+{
+    if (challenge && challenge_size) snprintf(challenge, challenge_size, "%s", "(absent)");
+    if (p->last_error_response_len <= 0) {
+        LOG_ERROR("[AP2] %s -> %d (no response body captured)", label, status);
+        return;
+    }
+    size_t len = (size_t)p->last_error_response_len;
+    char dump[1600];
+    ap2_io_format_response_dump(p->last_error_response, len,
+                                AP2_DIAG_BODY_MAX, dump, sizeof(dump));
+    LOG_ERROR("[AP2] %s -> %d response: %s", label, status, dump);
+    if (challenge && challenge_size)
+        ap2_io_header_value(p->last_error_response, len, "WWW-Authenticate",
+                            challenge, challenge_size);
+}
+
+/* Report a non-200 on the native connect path: dump the exchange and classify
+ * it, so the caller can tell a rejected password from a broken device. */
+static void ap2_report_failed_exchange(struct ap2cl_s *p, const char *label,
+                                       int status)
+{
+    char challenge[96];
+    ap2_log_failed_response(p, label, status, challenge, sizeof(challenge));
+    ap2_set_connect_error(p,
+                          ap2_status_is_auth(status)
+                              ? ap2_auth_error_kind(p)
+                              : AP2_CONNECT_ERROR_GENERIC,
+                          status, "%s -> %d; WWW-Authenticate: %s", label,
+                          status, challenge);
 }
 
 /* ---- Native AP2 RTSP I/O ---- */
@@ -388,6 +491,8 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
                     LOG_INFO("[AP2] %s %s: discarded %u stale response(s) "
                              "from tolerated keepalive misses",
                              method, uri, discarded);
+                ap2_capture_response(p, buf + match_offset, parsed.message_len,
+                                     parsed.status);
                 *resp_len = (int)parsed.body_len;
                 *resp_body = parsed.body_len ? malloc(parsed.body_len) : NULL;
                 if (parsed.body_len && !*resp_body) {
@@ -443,6 +548,8 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
                     LOG_INFO("[AP2] %s %s: discarded %u stale response(s) "
                              "from tolerated keepalive misses",
                              method, uri, discarded);
+                ap2_capture_response(p, dec + match_offset, parsed.message_len,
+                                     parsed.status);
                 *resp_len = (int)parsed.body_len;
                 *resp_body = parsed.body_len ? malloc(parsed.body_len) : NULL;
                 if (parsed.body_len && !*resp_body) {
@@ -707,8 +814,8 @@ static bool ap2_features_has_ptp(const char *txt)
 }
 
 ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char *pw,
-                              bool have_credentials, int bit_depth,
-                              bool force_native,
+                              bool have_credentials, bool have_password,
+                              int bit_depth, bool force_native,
                               bool ptp_forced, bool ptp_enabled)
 {
     ap2_route_t r = {0};
@@ -737,8 +844,11 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
 
     /* 2. Native AP2 vs RAOP-compatible flow. Stored credentials or an explicit
      * override select native; in AUTO, transient-pairable devices (pairing bits,
-     * no PIN/legacy flag, no password) go native too. Explicit --protocol
-     * airplay2 keeps the proven RAOP-compat default unless native is forced. */
+     * no PIN/legacy flag, and either no password required or one supplied) go
+     * native too — the device password doubles as the transient SRP secret, so a
+     * password-protected receiver no longer has to drop to RAOP-compat. Explicit
+     * --protocol airplay2 keeps the proven RAOP-compat default unless native is
+     * forced. */
     bool native, transient = false;
     if (have_credentials) {
         native = true;            /* pair-verify with stored keys (Apple TV/HomePod) */
@@ -748,7 +858,8 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     } else if (pref == AP2_PROTO_AUTO &&
                (AP2_FEAT(r.features, AP2_FEAT_HK_PAIRING) ||
                 AP2_FEAT(r.features, AP2_FEAT_COREUTILS)) &&
-               !(r.flags & (AP2_SF_PIN_REQUIRED | AP2_SF_LEGACY_PAIRING)) && !has_pw) {
+               !(r.flags & (AP2_SF_PIN_REQUIRED | AP2_SF_LEGACY_PAIRING)) &&
+               (!has_pw || have_password)) {
         native = true;
         transient = true;
     } else {
@@ -774,8 +885,11 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
      * removed: see DESIGN.md for the findings and rationale. */
     (void)bit_depth;
 
-    r.reason = transient ? "native AP2, transient, realtime"
-                         : "native AP2, pair-verify, realtime";
+    if (transient)
+        r.reason = have_password ? "native AP2, password, realtime"
+                                 : "native AP2, transient, realtime";
+    else
+        r.reason = "native AP2, pair-verify, realtime";
     return r;
 }
 
@@ -922,23 +1036,15 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
 
 /* ---- Native AP2 connect sequence ---- */
 
-static bool ap2_native_connect(struct ap2cl_s *p)
+/* Open the RTSP control connection to the device (bound to the configured
+ * interface on multi-homed hosts). */
+static bool ap2_native_open_socket(struct ap2cl_s *p)
 {
     struct addrinfo hints = {0}, *res;
     hints.ai_family = AF_INET;
     hints.ai_socktype = SOCK_STREAM;
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", p->device.port);
-
-    /* Resolve the local bind address once (multi-homed hosts): used for the
-     * RTSP TCP socket and the RTP data/control UDP sockets below. */
-    p->bind_addr.s_addr = INADDR_ANY;
-    if (p->iface) {
-        char *ifname = NULL;
-        uint32_t netmask;
-        p->bind_addr = get_interface(p->iface, &ifname, &netmask);
-        NFREE(ifname);
-    }
 
     if (getaddrinfo(p->device.address, port_str, &hints, &res) != 0) return false;
     p->rtsp_carry_len = 0;
@@ -954,6 +1060,227 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         return false;
     }
     freeaddrinfo(res);
+    return true;
+}
+
+/* GET /info on the (still unencrypted) control connection and read the
+ * advertised per-stream format tables from the reply. */
+static bool ap2_native_get_info(struct ap2cl_s *p)
+{
+    uint8_t *resp = NULL; int resp_len = 0;
+    int status = ap2_rtsp_send(p, "GET", "/info", NULL, 0, NULL, &resp, &resp_len);
+    if (status != 200) {
+        LOG_ERROR("[AP2] /info failed: %d", status);
+        ap2_report_failed_exchange(p, "GET /info", status);
+        free(resp);
+        return false;
+    }
+    p->audio_format = ap2_audio_format_code(&p->format);
+    if (resp && resp_len > 0) {
+        ap2_parse_format_capability(resp, (size_t)resp_len, "audioStream",
+                                    &p->realtime_formats,
+                                    &p->realtime_formats_known,
+                                    &p->realtime_formats_extended);
+        ap2_parse_format_capability(resp, (size_t)resp_len, "bufferStream",
+                                    &p->buffered_formats,
+                                    &p->buffered_formats_known,
+                                    &p->buffered_formats_extended);
+    }
+    LOG_INFO("[AP2] Formats requested=0x%" PRIx64
+             " realtime=%s0x%" PRIx64 " buffered=%s0x%" PRIx64,
+             p->audio_format,
+             p->realtime_formats_known
+                 ? (p->realtime_formats_extended ? "extended:" : "mask:")
+                 : "unknown:",
+             p->realtime_formats,
+             p->buffered_formats_known
+                 ? (p->buffered_formats_extended ? "extended:" : "mask:")
+                 : "unknown:",
+             p->buffered_formats);
+    free(resp);
+    return true;
+}
+
+/* Start the next pairing attempt from a clean connection: a receiver that
+ * rejected one pairing leg leaves its state machine wedged on that socket. */
+static bool ap2_native_reset_connection(struct ap2cl_s *p)
+{
+    if (p->sock_fd >= 0) { close(p->sock_fd); p->sock_fd = -1; }
+    if (!ap2_native_open_socket(p)) {
+        LOG_ERROR("[AP2] Cannot reopen the control connection for the next "
+                  "pairing attempt");
+        return false;
+    }
+    return ap2_native_get_info(p);
+}
+
+/* One transient pair-setup leg; secret NULL selects the fixed transient PIN. */
+static bool ap2_native_transient(struct ap2cl_s *p, const char *secret,
+                                 ap2_hap_error_t *err)
+{
+    p->hap = ap2_hap_create(NULL);
+    if (!p->hap) {
+        LOG_ERROR("[AP2] Cannot create HAP context");
+        return false;
+    }
+    LOG_INFO("[AP2] Performing HAP transient pair-setup...");
+    if (ap2_hap_pair_setup_transient(p->hap, p->sock_fd, secret, err))
+        return true;
+    LOG_ERROR("[AP2] HAP transient pair-setup failed");
+    ap2_hap_destroy(p->hap);
+    p->hap = NULL;
+    return false;
+}
+
+/* One pair-verify leg with the stored HAP credentials. */
+static bool ap2_native_pair_verify(struct ap2cl_s *p, ap2_hap_error_t *err)
+{
+    p->hap = ap2_hap_create(p->auth_credentials);
+    if (!p->hap) {
+        LOG_ERROR("[AP2] Invalid credentials");
+        return false;
+    }
+
+    /* Set client_id from DACP ID as UPPERCASE ASCII string.
+     * Must match what was sent during pair-setup. MA's pair-setup uses the
+     * DACP ID as a 16-char uppercase hex string encoded as bytes. */
+    if (p->dacp_id) {
+        /* Uppercase the string */
+        char upper_dacp[32];
+        int len = strlen(p->dacp_id);
+        if (len > 30) len = 30;
+        for (int i = 0; i < len; i++) {
+            char c = p->dacp_id[i];
+            upper_dacp[i] = (c >= 'a' && c <= 'f') ? (c - 'a' + 'A') : c;
+        }
+        upper_dacp[len] = '\0';
+        ap2_hap_set_client_id(p->hap, (const uint8_t *)upper_dacp, len);
+    }
+
+    LOG_INFO("[AP2] Performing HAP pair-verify...");
+    if (ap2_hap_pair_verify(p->hap, p->sock_fd, err)) return true;
+    LOG_ERROR("[AP2] HAP pair-verify failed");
+    ap2_hap_destroy(p->hap);
+    p->hap = NULL;
+    return false;
+}
+
+/*
+ * HAP handshake for the native flow, leaving p->hap holding the session keys.
+ *
+ * Without a device password this is exactly one leg: pair-verify with stored
+ * credentials (Apple TV/HomePod), transient pair-setup with the fixed PIN
+ * otherwise (Sonos and most third-party receivers).
+ *
+ * A device password makes it a ladder, because receivers disagree on what a
+ * password means for AirPlay 2: some substitute it for the fixed PIN as the
+ * transient SRP secret, others disable transient pairing entirely once a
+ * password is set and expect the stored HomeKit credentials instead. The
+ * password leg goes first and each rejected leg is retried on a fresh
+ * connection; the reported status is the password leg's, which is the one
+ * that describes the device's password handling.
+ */
+static bool ap2_native_pair(struct ap2cl_s *p)
+{
+    ap2_hap_error_t err = {0};
+    const bool have_password = p->password && *p->password;
+
+    if (!have_password) {
+        if (p->auth_credentials) {
+            if (ap2_native_pair_verify(p, &err)) return true;
+            ap2_set_connect_error(p,
+                                  ap2_status_is_auth(err.http_status)
+                                      ? ap2_auth_error_kind(p)
+                                      : AP2_CONNECT_ERROR_GENERIC,
+                                  err.http_status, "HAP pair-verify failed");
+            return false;
+        }
+        if (ap2_native_transient(p, NULL, &err)) return true;
+        ap2_set_connect_error(p,
+                              ap2_status_is_auth(err.http_status)
+                                  ? ap2_auth_error_kind(p)
+                                  : AP2_CONNECT_ERROR_GENERIC,
+                              err.http_status, "HAP transient pair-setup failed");
+        return false;
+    }
+
+    LOG_INFO("[AP2] Pairing leg 1/2: transient pair-setup with the device password");
+    if (ap2_native_transient(p, p->password, &err)) {
+        LOG_INFO("[AP2] Device accepted the password as the transient secret");
+        return true;
+    }
+    int password_status = err.http_status;
+    LOG_WARN("[AP2] Password pair-setup rejected (cause=%d http=%d tlv=%d)",
+             (int)err.result, err.http_status, err.tlv_error);
+    if (err.result == AP2_HAP_ERR_TRANSPORT) {
+        /* Nothing was rejected — the connection died mid-handshake. */
+        ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, password_status,
+                              "pair-setup with the device password failed on the wire");
+        return false;
+    }
+
+    if (p->auth_credentials) {
+        LOG_INFO("[AP2] Pairing leg 2/2: stored credentials (pair-verify)");
+        if (!ap2_native_reset_connection(p)) {
+            ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, password_status,
+                                  "cannot reconnect for the pair-verify fallback");
+            return false;
+        }
+        ap2_hap_error_t verify_err = {0};
+        if (ap2_native_pair_verify(p, &verify_err)) {
+            LOG_INFO("[AP2] Stored credentials accepted after the password leg "
+                     "was rejected");
+            return true;
+        }
+        ap2_set_connect_error(p, AP2_CONNECT_ERROR_AUTH_FAILED,
+                              password_status ? password_status
+                                              : verify_err.http_status,
+                              "device rejected both the password and the stored "
+                              "credentials");
+        return false;
+    }
+
+    /* No credentials to fall back on. The password may simply not be this
+     * receiver's SRP secret (configured, but not actually required), so give
+     * the fixed transient PIN its normal chance before giving up. */
+    LOG_INFO("[AP2] Pairing leg 2/2: transient pair-setup with the fixed PIN");
+    if (!ap2_native_reset_connection(p)) {
+        ap2_set_connect_error(p, AP2_CONNECT_ERROR_AUTH_FAILED, password_status,
+                              "device rejected the password and the connection "
+                              "could not be retried");
+        return false;
+    }
+    ap2_hap_error_t pin_err = {0};
+    if (ap2_native_transient(p, NULL, &pin_err)) {
+        LOG_WARN("[AP2] Device paired with the fixed transient PIN; the "
+                 "configured password was not used");
+        return true;
+    }
+    ap2_set_connect_error(p, AP2_CONNECT_ERROR_AUTH_FAILED,
+                          password_status ? password_status : pin_err.http_status,
+                          "device rejected the supplied password");
+    return false;
+}
+
+static bool ap2_native_connect(struct ap2cl_s *p)
+{
+    /* Default outcome for every failure path below; the auth-aware sites
+     * refine it. Cleared once the session is up. */
+    ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,
+                          "native AirPlay 2 connect failed");
+    p->last_error_response_len = 0;
+
+    /* Resolve the local bind address once (multi-homed hosts): used for the
+     * RTSP TCP socket and the RTP data/control UDP sockets below. */
+    p->bind_addr.s_addr = INADDR_ANY;
+    if (p->iface) {
+        char *ifname = NULL;
+        uint32_t netmask;
+        p->bind_addr = get_interface(p->iface, &ifname, &netmask);
+        NFREE(ifname);
+    }
+
+    if (!ap2_native_open_socket(p)) return false;
 
     /* Get local address for session URL */
     struct sockaddr_in local;
@@ -987,78 +1314,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     ap2_gen_uuid(p->group_uuid);
 
     /* 1. GET /info */
-    uint8_t *resp = NULL; int resp_len = 0;
-    int status = ap2_rtsp_send(p, "GET", "/info", NULL, 0, NULL, &resp, &resp_len);
-    if (status != 200) {
-        LOG_ERROR("[AP2] /info failed: %d", status);
-        free(resp);
-        return false;
-    }
-    p->audio_format = ap2_audio_format_code(&p->format);
-    if (resp && resp_len > 0) {
-        ap2_parse_format_capability(resp, (size_t)resp_len, "audioStream",
-                                    &p->realtime_formats,
-                                    &p->realtime_formats_known,
-                                    &p->realtime_formats_extended);
-        ap2_parse_format_capability(resp, (size_t)resp_len, "bufferStream",
-                                    &p->buffered_formats,
-                                    &p->buffered_formats_known,
-                                    &p->buffered_formats_extended);
-    }
-    LOG_INFO("[AP2] Formats requested=0x%" PRIx64
-             " realtime=%s0x%" PRIx64 " buffered=%s0x%" PRIx64,
-             p->audio_format,
-             p->realtime_formats_known
-                 ? (p->realtime_formats_extended ? "extended:" : "mask:")
-                 : "unknown:",
-             p->realtime_formats,
-             p->buffered_formats_known
-                 ? (p->buffered_formats_extended ? "extended:" : "mask:")
-                 : "unknown:",
-             p->buffered_formats);
-    free(resp);
+    if (!ap2_native_get_info(p)) return false;
 
-    /* 2. HAP pairing: pair-verify with stored credentials (Apple TV/HomePod),
-     * transient pair-setup otherwise (Sonos and most third-party receivers) */
-    if (p->auth_credentials) {
-        p->hap = ap2_hap_create(p->auth_credentials);
-        if (!p->hap) { LOG_ERROR("[AP2] Invalid credentials"); return false; }
-
-        /* Set client_id from DACP ID as UPPERCASE ASCII string.
-         * Must match what was sent during pair-setup. MA's pair-setup uses the
-         * DACP ID as a 16-char uppercase hex string encoded as bytes. */
-        if (p->dacp_id) {
-            /* Uppercase the string */
-            char upper_dacp[32];
-            int len = strlen(p->dacp_id);
-            if (len > 30) len = 30;
-            for (int i = 0; i < len; i++) {
-                char c = p->dacp_id[i];
-                upper_dacp[i] = (c >= 'a' && c <= 'f') ? (c - 'a' + 'A') : c;
-            }
-            upper_dacp[len] = '\0';
-            ap2_hap_set_client_id(p->hap, (const uint8_t *)upper_dacp, len);
-        }
-
-        LOG_INFO("[AP2] Performing HAP pair-verify...");
-        if (!ap2_hap_pair_verify(p->hap, p->sock_fd)) {
-            LOG_ERROR("[AP2] HAP pair-verify failed");
-            ap2_hap_destroy(p->hap);
-            p->hap = NULL;
-            return false;
-        }
-    } else {
-        p->hap = ap2_hap_create(NULL);
-        if (!p->hap) { LOG_ERROR("[AP2] Cannot create HAP context"); return false; }
-
-        LOG_INFO("[AP2] Performing HAP transient pair-setup...");
-        if (!ap2_hap_pair_setup_transient(p->hap, p->sock_fd)) {
-            LOG_ERROR("[AP2] HAP transient pair-setup failed");
-            ap2_hap_destroy(p->hap);
-            p->hap = NULL;
-            return false;
-        }
-    }
+    /* 2. HAP pairing (see ap2_native_pair for the leg order). */
+    if (!ap2_native_pair(p)) return false;
     LOG_INFO("[AP2] Channel encrypted");
 
     /* Diagnostic: post-pairing /info — the encrypted-channel reply is the
@@ -1161,12 +1420,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_plist_free(sp);
     }
 
-    resp = NULL; resp_len = 0;
-    status = ap2_rtsp_send(p, "SETUP", p->session_url, plist_data, plist_len,
+    uint8_t *resp = NULL; int resp_len = 0;
+    int status = ap2_rtsp_send(p, "SETUP", p->session_url, plist_data, plist_len,
                             "application/x-apple-binary-plist", &resp, &resp_len);
     free(plist_data);
     if (status != 200) {
         LOG_ERROR("[AP2] Session SETUP failed: %d", status);
+        ap2_report_failed_exchange(p, "session SETUP", status);
         free(resp);
         return false;
     }
@@ -1300,6 +1560,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
 
     if (status != 200) {
         LOG_ERROR("[AP2] Stream SETUP failed: %d", status);
+        ap2_report_failed_exchange(p, "stream SETUP", status);
         free(resp);
         return false;
     }
@@ -1437,6 +1698,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         atomic_store(&p->rtsp_dead, true);
         return false;
     }
+    ap2_set_connect_error(p, AP2_CONNECT_ERROR_NONE, 0, "%s", "");
     LOG_INFO("[AP2] Native AP2 session ready");
     return true;
 }
@@ -1807,13 +2069,22 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
         p->format.sample_rate, p->format.bit_depth, p->format.channels,
         p->volume > 0 ? raopcl_float_volume(p->volume) : -144.0f);
 
-    if (!p->raopcl) return false;
+    if (!p->raopcl) {
+        ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,
+                              "cannot create the RAOP-compatible client");
+        return false;
+    }
 
     if (!raopcl_connect(p->raopcl, player_addr, p->device.port, p->volume > 0)) {
+        /* libraop does not expose the RTSP status of the failure, so a rejected
+         * password is not distinguishable from an unreachable device here. */
+        ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,
+                              "RAOP-compatible connect failed");
         ap2_raop_session_cleanup(p);
         return false;
     }
 
+    ap2_set_connect_error(p, AP2_CONNECT_ERROR_NONE, 0, "%s", "");
     p->state = AP2_CONNECTED;
     return true;
 }
@@ -1955,9 +2226,23 @@ void ap2cl_set_remote_command_callback(
     p->remote_command_userdata = userdata;
 }
 
+ap2_connect_error_t ap2cl_connect_error(struct ap2cl_s *p, int *http_status,
+                                        const char **detail)
+{
+    if (!p) {
+        if (http_status) *http_status = 0;
+        if (detail) *detail = "";
+        return AP2_CONNECT_ERROR_GENERIC;
+    }
+    if (http_status) *http_status = p->connect_http_status;
+    if (detail) *detail = p->connect_detail;
+    return p->connect_error;
+}
+
 bool ap2cl_connect(struct ap2cl_s *p)
 {
     if (!p) return false;
+    ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0, "connect failed");
     if (p->flow == FLOW_NATIVE_AP2) {
         LOG_INFO("[AP2] Connecting via native AP2 flow to %s:%d",
                  p->device.address, p->device.port);

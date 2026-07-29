@@ -22,6 +22,25 @@
 struct ap2_hap_ctx;
 
 /*
+ * Why a pairing exchange failed. The caller needs to tell a rejected secret
+ * (another pairing mode may still work) from a dead connection (nothing left
+ * to try) and from a receiver speaking an unexpected dialect.
+ */
+typedef enum {
+    AP2_HAP_OK = 0,
+    AP2_HAP_ERR_TRANSPORT,  /* request not sent, or no complete response read */
+    AP2_HAP_ERR_AUTH,       /* non-200 on a pairing POST, or a TLV error tag */
+    AP2_HAP_ERR_PROTOCOL,   /* malformed or unexpected message content */
+} ap2_hap_result_t;
+
+/* Failure detail; only meaningful when the pairing call returned false. */
+typedef struct {
+    ap2_hap_result_t result;
+    int http_status;   /* status of the last pairing POST (0 = none read) */
+    int tlv_error;     /* TLV error tag from M2/M4 (0 = none) */
+} ap2_hap_error_t;
+
+/*
  * Create HAP context from hex credentials string (192 chars).
  * Pass NULL to create a bare context without long-term keys, usable only
  * with ap2_hap_pair_setup_transient().
@@ -39,26 +58,34 @@ void ap2_hap_destroy(struct ap2_hap_ctx *ctx);
  *
  * :param ctx: HAP context with credentials.
  * :param sock_fd: Connected TCP socket to the device.
+ * :param err: receives the failure cause, or NULL.
  * :returns: true on success, false on failure.
  *
  * On success, the context holds encryption keys for the session.
  */
-bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd);
+bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd,
+                         ap2_hap_error_t *err);
 
 /*
  * Perform HomeKit transient pair-setup (X-Apple-HKP: 4) over an established
  * TCP connection. Used for devices without stored credentials (Sonos, WiiM
- * and most third-party AirPlay 2 receivers): SRP-6a with the fixed PIN,
- * messages M1-M4 only, no long-term keys are created or stored.
+ * and most third-party AirPlay 2 receivers): SRP-6a, messages M1-M4 only, no
+ * long-term keys are created or stored.
  *
  * :param ctx: HAP context (no credentials required).
  * :param sock_fd: Connected TCP socket to the device.
+ * :param srp_secret: SRP secret to authenticate with; NULL or empty selects
+ *                    the fixed transient PIN. Receivers that gate playback on
+ *                    a device password expect that password here instead.
+ * :param err: receives the failure cause, or NULL.
  * :returns: true on success, false on failure.
  *
  * On success, the context holds encryption keys for the session and
  * ap2_hap_get_shared_secret() returns the audio key.
  */
-bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd);
+bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd,
+                                  const char *srp_secret,
+                                  ap2_hap_error_t *err);
 
 /* Callback that supplies the PIN the device is currently displaying. */
 typedef const char *(*ap2_hap_pin_cb)(void *arg);

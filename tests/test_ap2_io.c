@@ -321,6 +321,54 @@ static bool test_feedback_lock_timeouts_are_skipped(void)
     return true;
 }
 
+/* A 401 challenge is the evidence an auth failure turns on: its header must be
+ * readable out of the raw response, and the whole exchange must render as one
+ * printable log line. */
+static bool test_auth_response_diagnostics(void)
+{
+    static const uint8_t unauthorized[] =
+        "RTSP/1.0 401 Unauthorized\r\n"
+        "CSeq: 3\r\n"
+        "WWW-Authenticate: Digest realm=\"raop\", nonce=\"abc\"\r\n"
+        "Content-Length: 3\r\n\r\n"
+        "\x01\x02\xff";
+    const size_t len = sizeof(unauthorized) - 1;
+
+    char value[128];
+    CHECK(ap2_io_header_value(unauthorized, len, "www-authenticate",
+                              value, sizeof(value)));
+    CHECK(strcmp(value, "Digest realm=\"raop\", nonce=\"abc\"") == 0);
+    CHECK(ap2_io_header_value(unauthorized, len, "CSeq", value, sizeof(value)));
+    CHECK(strcmp(value, "3") == 0);
+    /* Absent headers report as such, and the status line is not a header. */
+    CHECK(!ap2_io_header_value(unauthorized, len, "Session", value, sizeof(value)));
+    CHECK(value[0] == '\0');
+    CHECK(!ap2_io_header_value(unauthorized, len, "RTSP/1.0", value, sizeof(value)));
+
+    char dump[256];
+    size_t written = ap2_io_format_response_dump(unauthorized, len, 512,
+                                                 dump, sizeof(dump));
+    CHECK(written == strlen(dump));
+    CHECK(strstr(dump, "RTSP/1.0 401 Unauthorized | CSeq: 3 | ") == dump);
+    CHECK(strstr(dump, "WWW-Authenticate: Digest") != NULL);
+    CHECK(strstr(dump, "body[3]=0102ff") != NULL);
+    CHECK(strchr(dump, '\n') == NULL && strchr(dump, '\r') == NULL);
+
+    /* The body cap elides the rest instead of flooding the log. */
+    CHECK(ap2_io_format_response_dump(unauthorized, len, 2, dump, sizeof(dump)));
+    CHECK(strstr(dump, "body[3]=0102...") != NULL);
+
+    /* A truncated reply (no header terminator) still renders, and a tiny
+     * destination truncates instead of overflowing. */
+    CHECK(ap2_io_format_response_dump(unauthorized, 12, 512, dump, sizeof(dump)));
+    CHECK(strcmp(dump, "RTSP/1.0 401") == 0);
+    char small[8];
+    CHECK(ap2_io_format_response_dump(unauthorized, len, 512, small,
+                                      sizeof(small)) == sizeof(small) - 1);
+    CHECK(strcmp(small, "RTSP/1.") == 0);
+    return true;
+}
+
 int main(void)
 {
     if (!test_fake_peer_response()) return 1;
@@ -343,6 +391,8 @@ int main(void)
     fprintf(stderr, "datagram outcomes passed\n");
     if (!test_feedback_lock_timeouts_are_skipped()) return 1;
     fprintf(stderr, "feedback contention accounting passed\n");
+    if (!test_auth_response_diagnostics()) return 1;
+    fprintf(stderr, "auth response diagnostics passed\n");
     puts("ap2_io tests passed");
     return 0;
 }
