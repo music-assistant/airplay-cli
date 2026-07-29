@@ -156,7 +156,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 |--------|-------------|
 | `--raw` | Force uncompressed ALAC frames. Default is compressed ALAC; the binary also falls back to uncompressed when the device's `cn` field lacks ALAC. |
 | `--encrypt` | Enable RAOP audio-payload encryption (default: clear). |
-| `--password <pw>` | Device password, if the receiver requires one. |
+| `--password <pw>` | Device password, if the receiver requires one. Used for RAOP digest authentication and as the AirPlay 2 transient pairing secret (DESIGN.md §3a). |
 | `--secret <secret>` | Legacy Apple TV pairing secret (from `--pair`). |
 | `--et <v>` `--md <v>` `--am <v>` `--pk <v>` `--pw <v>` `--cn <v>` | mDNS TXT fields from the receiver's `_raop._tcp` record (encryption types, metadata types, model, public key, password flag, codec types). |
 

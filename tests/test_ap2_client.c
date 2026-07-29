@@ -349,8 +349,52 @@ static void test_info_format_tables(void)
     puts("ap2_bplist /info format-table tests passed");
 }
 
+/* A password-protected receiver keeps its native AirPlay 2 route: the password
+ * doubles as the transient pairing secret. Without one it still falls back to
+ * the RAOP-compatible flow, and every password-less decision is unchanged. */
+static void test_route_with_password(void)
+{
+    /* features bit 48 (AirPlay 2 + pairing) => "0x0,0x10000" */
+    const char *txt = "features=0x0,0x10000 flags=0x4";
+
+    ap2_route_t pw_supplied = ap2_resolve_route(
+        AP2_PROTO_AUTO, txt, "true", false, true, 16, false, false, false);
+    assert(!pw_supplied.use_raop && pw_supplied.native && pw_supplied.transient);
+    assert(strcmp(pw_supplied.reason, "native AP2, password, realtime") == 0);
+
+    ap2_route_t pw_missing = ap2_resolve_route(
+        AP2_PROTO_AUTO, txt, "true", false, false, 16, false, false, false);
+    assert(!pw_missing.use_raop && !pw_missing.native);
+
+    /* No password advertised: the plain transient route, password or not. */
+    ap2_route_t no_flag = ap2_resolve_route(
+        AP2_PROTO_AUTO, txt, NULL, false, false, 16, false, false, false);
+    assert(no_flag.native && no_flag.transient);
+    assert(strcmp(no_flag.reason, "native AP2, transient, realtime") == 0);
+
+    /* A PIN or legacy-pairing flag still wins over a supplied password. */
+    ap2_route_t pin_required = ap2_resolve_route(
+        AP2_PROTO_AUTO, "features=0x0,0x10000 flags=0x8", "true", false, true,
+        16, false, false, false);
+    assert(!pin_required.native);
+
+    /* Stored credentials keep pair-verify, whatever the password says. */
+    ap2_route_t with_creds = ap2_resolve_route(
+        AP2_PROTO_AUTO, txt, "true", true, true, 16, false, false, false);
+    assert(with_creds.native && !with_creds.transient);
+    assert(strcmp(with_creds.reason, "native AP2, pair-verify, realtime") == 0);
+
+    /* A device that is not AirPlay 2 at all stays on legacy RAOP. */
+    ap2_route_t legacy = ap2_resolve_route(
+        AP2_PROTO_AUTO, "features=0x0,0x0", "true", false, true, 16, false,
+        false, false);
+    assert(legacy.use_raop);
+    puts("ap2_client route password selection tests passed");
+}
+
 int main(void)
 {
+    test_route_with_password();
     test_info_format_tables();
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
@@ -370,6 +414,14 @@ int main(void)
         &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
     assert(client);
     ap2cl_force_native(client);
+
+    /* A client that has not connected reports no failure, and the accessor
+     * stays usable on a NULL client so the caller's error path cannot crash. */
+    int http = 1234;
+    const char *detail = NULL;
+    assert(ap2cl_connect_error(client, &http, &detail) == AP2_CONNECT_ERROR_NONE);
+    assert(http == 0 && detail && *detail == '\0');
+    assert(ap2cl_connect_error(NULL, NULL, NULL) == AP2_CONNECT_ERROR_GENERIC);
 
     health_check_t check = {
         .client = client,

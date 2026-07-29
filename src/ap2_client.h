@@ -106,6 +106,7 @@ uint64_t ap2_txt_flags(const char *txt);
  * :param txt: full _airplay._tcp TXT ("key=value key=value ...") or NULL.
  * :param pw: mDNS pw field ("true" when a device password is required), or NULL.
  * :param have_credentials: stored HAP credentials are available (--auth).
+ * :param have_password: a non-empty device password was supplied (--password).
  * :param bit_depth: requested output bit depth (informational; hi-res rides
  *                   the realtime stream).
  * :param force_native: --ap2-native was given (forces the native AP2 flow).
@@ -113,9 +114,29 @@ uint64_t ap2_txt_flags(const char *txt);
  * :param ptp_enabled: the value passed to --ptp.
  */
 ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char *pw,
-                              bool have_credentials, int bit_depth,
-                              bool force_native,
+                              bool have_credentials, bool have_password,
+                              int bit_depth, bool force_native,
                               bool ptp_forced, bool ptp_enabled);
+
+/* Why the last connect attempt failed, for the caller's structured report. */
+typedef enum {
+    AP2_CONNECT_ERROR_NONE = 0,
+    AP2_CONNECT_ERROR_GENERIC,        /* anything not auth-related */
+    AP2_CONNECT_ERROR_AUTH_REQUIRED,  /* the device wants a password we lack */
+    AP2_CONNECT_ERROR_AUTH_FAILED,    /* the device rejected what we presented */
+} ap2_connect_error_t;
+
+/*
+ * Outcome of the last ap2cl_connect().
+ *
+ * :param p: client context.
+ * :param http_status: receives the most informative HTTP status seen (0 when
+ *                     none applies), or NULL.
+ * :param detail: receives a short single-line description owned by the client,
+ *                or NULL.
+ */
+ap2_connect_error_t ap2cl_connect_error(struct ap2cl_s *p, int *http_status,
+                                        const char **detail);
 
 /*
  * Create a new AirPlay 2 client context.

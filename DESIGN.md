@@ -53,8 +53,9 @@ Decision order:
    `--ap2-native` forces AirPlay 2 regardless.
 2. **Native vs RAOP-compat** — stored credentials (`--auth`) ⇒ native with
    pair-verify. `--ap2-native` ⇒ native with transient pairing.
-   In `auto`, a device that advertises pairing (bit 46 or 48) with no PIN, no
-   legacy flag, and no password ⇒ native with transient pairing. Otherwise
+   In `auto`, a device that advertises pairing (bit 46 or 48) with no PIN and
+   no legacy flag ⇒ native with transient pairing, provided it either does not
+   require a password or one was supplied with `--password` (§3a). Otherwise
    the RAOP-compat flow. An explicit `--protocol airplay2` without
    credentials keeps RAOP-compat unless `--ap2-native` is given.
 3. **Timing** — `--ptp` forces PTP; otherwise the SupportsPTP feature bit
@@ -81,8 +82,9 @@ Connect sequence (`ap2_native_connect()`):
 3. **HAP pairing** — with `--auth`: pair-verify (`X-Apple-HKP: 3`) using the
    stored Ed25519/X25519 credentials, client identity = uppercased DACP ID
    (must match the one used at `--pair-setup` time). Without: transient
-   pair-setup (`X-Apple-HKP: 4`) — SRP-6a (SHA-512, 3072-bit group, fixed PIN
-   `3939`), M1–M4 only, nothing stored, shared secret = SRP session key.
+   pair-setup (`X-Apple-HKP: 4`) — SRP-6a (SHA-512, 3072-bit group, secret =
+   the fixed PIN `3939` or the device password, §3a), M1–M4 only, nothing
+   stored, shared secret = SRP session key.
    From here the RTSP channel is encrypted with HAP framing:
    `[2-byte LE length][ChaCha20-Poly1305 ciphertext + 16-byte tag]`, max 1024
    plaintext bytes per frame, nonce = 4 zero bytes + 8-byte LE per-direction
@@ -124,6 +126,62 @@ advertised ClockID.
 advertise in `timingPeerInfo`/SETPEERS when the reachable address differs
 from the bound one (Docker bridge, NAT). Default advertised address: the
 bind address, else the RTSP socket's local address.
+
+## 3a. Device passwords and the error contract
+
+A receiver with "Require Password" enabled advertises `pw=true` in its mDNS
+TXT. What that password means depends on the protocol:
+
+- **RAOP** — classic RTSP Digest (RFC 2069 shape, realm `raop`, username
+  `iTunes`; `AirPlay` for any other realm). libraop discovers the challenge on
+  a probe ANNOUNCE and then signs every request. The password is handed to
+  `raopcl_create()` whenever `--password` is non-empty: the `pw` flag only says
+  the device advertises one, and the digest is only used if the device actually
+  challenges.
+- **AirPlay 2** — there is no agreed mechanism. Reference receivers substitute
+  the password for the fixed `3939` transient SRP secret, and others disable
+  transient pairing entirely once a password is set, expecting full HomeKit
+  pairing (`--auth` credentials) instead. Real HomePods additionally answer
+  `401` on the session SETUP after a handshake that itself succeeded.
+
+Because the receiver decides, the native flow is self-selecting
+(`ap2_native_pair()`). Without `--password` it is exactly one leg and unchanged:
+credentials ⇒ pair-verify, otherwise transient pairing with the fixed PIN. With
+`--password`:
+
+1. transient pair-setup using the password as the SRP secret;
+2. if that is *rejected* (non-200 on a pair POST, or a TLV error), retry on a
+   fresh connection — with `--auth` credentials that is pair-verify, without
+   them it is transient pairing with the fixed PIN, which recovers the case of
+   a password configured on a device that does not require one.
+
+Each leg needs its own connection: a receiver that rejected a pairing attempt
+keeps its state machine wedged on that socket. A leg that dies on the wire
+(rather than being rejected) ends the attempt — there is nothing to retry.
+
+**Diagnostics.** Every non-200 on the native path (`/info`, pair-setup,
+pair-verify, session SETUP, stream SETUP) is logged at error level as the
+status line, all headers and a bounded hex dump of the body
+(`ap2_io_format_response_dump()`), which is what tells whether a receiver's
+`401` carries a `WWW-Authenticate` challenge and what its TLV/plist body says.
+
+**Error contract.** Before the human-readable `[ERROR]` line, a fatal
+connect/auth failure emits exactly one machine-readable line on stderr that
+Music Assistant parses:
+
+```
+[STATUS] error code=<slug> http=<int> detail="<single line>"
+```
+
+| slug | meaning |
+|---|---|
+| `auth_required` | a password is needed and none was supplied: reported before connecting when the TXT says so (and no credentials are stored), and on a `401`/`403` from a device we presented no password to |
+| `auth_failed` | the password we did present was rejected, on any exchange |
+| `connect_failed` | every other connect-path failure |
+
+`http` is the most informative HTTP status seen, `0` when none applies (a
+TLV-level rejection is an HTTP 200). The detail is squeezed onto one line and
+its double quotes replaced, so the shape holds for device-supplied text.
 
 ## 4. PTP engine
 

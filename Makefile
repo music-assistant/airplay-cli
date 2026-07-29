@@ -226,6 +226,12 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 		/tmp/cliairplay-test-unused 127.0.0.1 - 2>&1 || true)"; \
 		printf '%s\n' "$$argv_audio" | \
 		grep -q "Streaming audio must be provided on stdin, not argv"
+	@auth_required="$$($(EXECUTABLE) --protocol raop --pw true \
+		127.0.0.1 2>&1 || true)"; \
+		printf '%s\n' "$$auth_required" | \
+		grep -q '^\[STATUS\] error code=auth_required http=0 detail="[^"]*"$$'; \
+		printf '%s\n' "$$auth_required" | \
+		grep -q "Password required but not supplied"
 
 $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 		src/raop_session.h Makefile

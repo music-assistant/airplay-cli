@@ -284,6 +284,104 @@ int ap2_io_parse_rtsp_response(const uint8_t *data, size_t len,
     return 1;
 }
 
+bool ap2_io_header_value(const uint8_t *data, size_t len, const char *name,
+                         char *out, size_t out_size)
+{
+    if (!out || !out_size) return false;
+    out[0] = '\0';
+    if (!data || !name) return false;
+
+    size_t header_end = ap2_find_header_end(data, len);
+    if (header_end >= 4) header_end -= 4;
+    else header_end = len;
+
+    size_t name_len = strlen(name);
+    size_t offset = 0;
+    bool status_line = true;
+    while (offset < header_end) {
+        size_t end = offset;
+        while (end + 1 < header_end &&
+               !(data[end] == '\r' && data[end + 1] == '\n'))
+            end++;
+        if (end + 1 >= header_end) end = header_end;
+        if (status_line) {
+            status_line = false;
+            offset = end + 2;
+            continue;
+        }
+
+        size_t colon = offset;
+        while (colon < end && data[colon] != ':') colon++;
+        if (colon < end && colon - offset == name_len &&
+            strncasecmp((const char *)data + offset, name, name_len) == 0) {
+            size_t value = colon + 1;
+            while (value < end && (data[value] == ' ' || data[value] == '\t'))
+                value++;
+            size_t value_end = end;
+            while (value_end > value &&
+                   (data[value_end - 1] == ' ' || data[value_end - 1] == '\t'))
+                value_end--;
+            size_t copy = value_end - value;
+            if (copy > out_size - 1) copy = out_size - 1;
+            memcpy(out, data + value, copy);
+            out[copy] = '\0';
+            return true;
+        }
+        offset = end + 2;
+    }
+    return false;
+}
+
+static size_t ap2_dump_append(char *out, size_t out_size, size_t pos,
+                              const char *text, size_t text_len)
+{
+    for (size_t i = 0; i < text_len && pos + 1 < out_size; i++)
+        out[pos++] = text[i];
+    out[pos] = '\0';
+    return pos;
+}
+
+size_t ap2_io_format_response_dump(const uint8_t *data, size_t len,
+                                   size_t body_cap, char *out, size_t out_size)
+{
+    if (!out || !out_size) return 0;
+    out[0] = '\0';
+    if (!data) return 0;
+
+    size_t header_len = ap2_find_header_end(data, len);
+    size_t header_end = header_len ? header_len - 4 : len;
+    size_t pos = 0;
+
+    /* Header block on one line: CRLF becomes " | " and any control byte folds
+     * to '.', so a malformed or binary reply still logs as a single line. */
+    for (size_t i = 0; i < header_end; i++) {
+        if (data[i] == '\r' && i + 1 < header_end && data[i + 1] == '\n') {
+            pos = ap2_dump_append(out, out_size, pos, " | ", 3);
+            i++;
+            continue;
+        }
+        char c = (char)data[i];
+        if (c < 0x20 || c == 0x7f) c = '.';
+        pos = ap2_dump_append(out, out_size, pos, &c, 1);
+    }
+    if (!header_len) return pos;
+
+    size_t body_len = len > header_len ? len - header_len : 0;
+    char head[48];
+    int head_len = snprintf(head, sizeof(head), " | body[%zu]=", body_len);
+    if (head_len > 0)
+        pos = ap2_dump_append(out, out_size, pos, head, (size_t)head_len);
+
+    size_t shown = body_len < body_cap ? body_len : body_cap;
+    for (size_t i = 0; i < shown; i++) {
+        char hex[3];
+        snprintf(hex, sizeof(hex), "%02x", data[header_len + i]);
+        pos = ap2_dump_append(out, out_size, pos, hex, 2);
+    }
+    if (shown < body_len) pos = ap2_dump_append(out, out_size, pos, "...", 3);
+    return pos;
+}
+
 int ap2_io_match_rtsp_response(const uint8_t *data, size_t len,
                                int expect_cseq,
                                ap2_rtsp_response_t *response,

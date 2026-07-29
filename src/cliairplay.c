@@ -205,6 +205,36 @@ static void status_error(const char *msg)
     status_print("[ERROR] %s", msg);
 }
 
+/* Machine-readable failure codes Music Assistant matches on. */
+#define ERROR_CODE_AUTH_REQUIRED  "auth_required"
+#define ERROR_CODE_AUTH_FAILED    "auth_failed"
+#define ERROR_CODE_CONNECT_FAILED "connect_failed"
+
+/*
+ * Report a fatal failure as one machine-readable line followed by the
+ * human-readable one:
+ *   [STATUS] error code=<slug> http=<int> detail="<text>"
+ *   [ERROR] <msg>
+ * The detail is squeezed onto a single line and stripped of the double quotes
+ * that delimit it, so the contract holds for any device-supplied text.
+ */
+static void status_error_ex(const char *code, int http, const char *detail,
+                            const char *msg)
+{
+    char clean[256];
+    size_t out = 0;
+    for (const char *c = detail ? detail : ""; *c && out + 1 < sizeof(clean); c++) {
+        char ch = *c;
+        if (ch == '"') ch = '\'';
+        else if (ch == '\r' || ch == '\n' || ch == '\t') ch = ' ';
+        clean[out++] = ch;
+    }
+    clean[out] = '\0';
+    status_print("[STATUS] error code=%s http=%d detail=\"%s\"",
+                 code, http, clean);
+    status_error(msg);
+}
+
 static void remote_command_event(
     ap2_remote_command_t command, void *userdata)
 {
@@ -690,14 +720,18 @@ static int run_raop(cli_config_t *cfg)
     /* Resolve player */
     hostent = gethostbyname(cfg->host);
     if (!hostent) {
-        status_error("Cannot resolve hostname");
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        "cannot resolve the device hostname",
+                        "Cannot resolve hostname");
         return 1;
     }
     memcpy(&player_addr.s_addr, hostent->h_addr_list[0], hostent->h_length);
 
     /* Check AppleTV auth requirement */
     if (cfg->am && strcasestr(cfg->am, "appletv") && cfg->pk && *cfg->pk && (!cfg->secret || !*cfg->secret)) {
-        status_error("AppleTV requires authentication (need secret)");
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        "AppleTV pairing secret (--secret) is missing",
+                        "AppleTV requires authentication (need secret)");
         return 1;
     }
 
@@ -705,16 +739,11 @@ static int run_raop(cli_config_t *cfg)
     if ((cfg->encrypt) && cfg->et && strchr(cfg->et, '1'))
         crypto = RAOP_RSA;
 
-    /* Handle device password */
-    char *password = NULL;
-    if (cfg->pw && !strcasecmp(cfg->pw, "true")) {
-        if (cfg->password && *cfg->password)
-            password = cfg->password;
-        else {
-            status_error("Password required but not supplied");
-            return 1;
-        }
-    }
+    /* Arm RTSP digest authentication whenever a password was supplied: the
+     * mDNS pw flag only says the device advertises one, and libraop uses the
+     * password solely when the device actually challenges. A required password
+     * that was not supplied is rejected before any connect attempt (main). */
+    char *password = (cfg->password && *cfg->password) ? cfg->password : NULL;
 
     int latency = MS2TS(cfg->latency_ms, cfg->sample_rate);
 
@@ -741,14 +770,19 @@ static int run_raop(cli_config_t *cfg)
         cfg->volume > 0 ? raopcl_float_volume(cfg->volume) : -144.0f
     );
     if (!client) {
-        status_error("Cannot init RAOP client");
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        "cannot initialise the RAOP client",
+                        "Cannot init RAOP client");
         return 1;
     }
 
     /* Connect */
     LOG_INFO("Connecting to %s:%d via RAOP", inet_ntoa(player_addr), cfg->port);
     if (!raopcl_connect(client, player_addr, cfg->port, cfg->volume > 0)) {
-        status_error("Cannot connect to AirPlay device");
+        /* libraop does not expose the RTSP status of the failure, so a rejected
+         * password is not distinguishable from an unreachable device here. */
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0, "RAOP connect failed",
+                        "Cannot connect to AirPlay device");
         request_command_stop();
         atomic_store(&g_raopcl, NULL);
         if (!join_command_thread()) return 1;
@@ -927,7 +961,9 @@ static int run_airplay2(cli_config_t *cfg)
         &device, &format, cfg->auth, cfg->password,
         cfg->dacp_id, cfg->active_remote, cfg->latency_ms, cfg->volume);
     if (!client) {
-        status_error("Cannot create AirPlay 2 client");
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        "cannot create the AirPlay 2 client",
+                        "Cannot create AirPlay 2 client");
         return 1;
     }
 
@@ -948,7 +984,14 @@ static int run_airplay2(cli_config_t *cfg)
     /* Connect: auth-setup + RAOP ANNOUNCE/SETUP/RECORD */
     LOG_INFO("Connecting to %s:%d via AirPlay 2", cfg->host, cfg->port);
     if (!ap2cl_connect(client)) {
-        status_error("Cannot connect to AirPlay 2 device");
+        int http = 0;
+        const char *detail = NULL;
+        ap2_connect_error_t kind = ap2cl_connect_error(client, &http, &detail);
+        const char *code = ERROR_CODE_CONNECT_FAILED;
+        if (kind == AP2_CONNECT_ERROR_AUTH_REQUIRED) code = ERROR_CODE_AUTH_REQUIRED;
+        else if (kind == AP2_CONNECT_ERROR_AUTH_FAILED) code = ERROR_CODE_AUTH_FAILED;
+        status_error_ex(code, http, detail,
+                        "Cannot connect to AirPlay 2 device");
         request_command_stop();
         atomic_store(&g_ap2cl, NULL);
         if (!join_command_thread()) return 1;
@@ -1305,7 +1348,8 @@ static void print_usage(const char *name)
     printf("  --raw                      Force uncompressed audio (ALAC-raw)\n");
     printf("  --encrypt                  Enable audio payload encryption\n");
     printf("  --secret <secret>          AppleTV pairing secret\n");
-    printf("  --password <password>      Device password\n");
+    printf("  --password <password>      Device password: RAOP digest auth, and the\n");
+    printf("                             AirPlay 2 transient pairing secret\n");
     printf("  --et <value>               mDNS et field (encryption types)\n");
     printf("  --md <value>               mDNS md field (metadata types)\n");
     printf("  --am <value>               mDNS am field (model name)\n");
@@ -1529,8 +1573,9 @@ int main(int argc, char *argv[])
      * cfg.protocol becomes the concrete protocol used for dispatch and
      * cfg.route carries the AirPlay 2 sub-decisions applied in run_airplay2(). */
     bool have_creds = cfg.auth && strlen(cfg.auth) == 192;
+    bool have_password = cfg.password && *cfg.password;
     cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
-                                  cfg.bit_depth, cfg.force_native,
+                                  have_password, cfg.bit_depth, cfg.force_native,
                                   cfg.ptp, cfg.ptp);
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
@@ -1548,6 +1593,16 @@ int main(int argc, char *argv[])
            cfg.route.use_raop ? "legacy" : (cfg.route.native ? "native" : "raop-compat"),
            (!cfg.route.use_raop && cfg.route.ptp) ? "ptp" : "ntp");
     fflush(stdout);
+
+    /* The device advertises that it needs a password and we hold neither one
+     * nor stored credentials: every route would fail its handshake, so report
+     * what is missing instead of spending a connect attempt on it. */
+    if (cfg.pw && !strcasecmp(cfg.pw, "true") && !have_password && !have_creds) {
+        status_error_ex(ERROR_CODE_AUTH_REQUIRED, 0,
+                        "device requires a password; none was supplied",
+                        "Password required but not supplied");
+        return 1;
+    }
 
     if (!cfg.cmdpipe) {
         status_error("Streaming requires --cmdpipe");
