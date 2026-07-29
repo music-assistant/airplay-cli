@@ -36,7 +36,8 @@ typedef enum {
 /* Failure detail; only meaningful when the pairing call returned false. */
 typedef struct {
     ap2_hap_result_t result;
-    int http_status;   /* status of the last pairing POST (0 = none read) */
+    int http_status;   /* HTTP failure status; 0 when none was read or the
+                        * reply was 200 and the rejection is TLV-level */
     int tlv_error;     /* TLV error tag from M2/M4 (0 = none) */
 } ap2_hap_error_t;
 

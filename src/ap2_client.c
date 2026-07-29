@@ -309,9 +309,11 @@ static void ap2_log_failed_response(struct ap2cl_s *p, const char *label,
     ap2_io_format_response_dump(p->last_error_response, len,
                                 AP2_DIAG_BODY_MAX, dump, sizeof(dump));
     LOG_ERROR("[AP2] %s -> %d response: %s", label, status, dump);
-    if (challenge && challenge_size)
-        ap2_io_header_value(p->last_error_response, len, "WWW-Authenticate",
-                            challenge, challenge_size);
+    /* the lookup clears the buffer on a miss, so restore the sentinel then */
+    if (challenge && challenge_size &&
+        !ap2_io_header_value(p->last_error_response, len, "WWW-Authenticate",
+                             challenge, challenge_size))
+        snprintf(challenge, challenge_size, "%s", "(absent)");
 }
 
 /* Report a non-200 on the native connect path: dump the exchange and classify
@@ -1186,10 +1188,13 @@ static bool ap2_native_pair(struct ap2cl_s *p)
     const bool have_password = p->password && *p->password;
 
     if (!have_password) {
+        /* A TLV-level rejection arrives with HTTP 200, so the auth-shaped test
+         * must consider the HAP result kind as well as the HTTP status. */
         if (p->auth_credentials) {
             if (ap2_native_pair_verify(p, &err)) return true;
             ap2_set_connect_error(p,
-                                  ap2_status_is_auth(err.http_status)
+                                  (err.result == AP2_HAP_ERR_AUTH ||
+                                   ap2_status_is_auth(err.http_status))
                                       ? ap2_auth_error_kind(p)
                                       : AP2_CONNECT_ERROR_GENERIC,
                                   err.http_status, "HAP pair-verify failed");
@@ -1197,7 +1202,8 @@ static bool ap2_native_pair(struct ap2cl_s *p)
         }
         if (ap2_native_transient(p, NULL, &err)) return true;
         ap2_set_connect_error(p,
-                              ap2_status_is_auth(err.http_status)
+                              (err.result == AP2_HAP_ERR_AUTH ||
+                               ap2_status_is_auth(err.http_status))
                                   ? ap2_auth_error_kind(p)
                                   : AP2_CONNECT_ERROR_GENERIC,
                               err.http_status, "HAP transient pair-setup failed");
