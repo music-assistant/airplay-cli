@@ -337,6 +337,11 @@ uint32_t ap2cl_audible_lag_frames(struct ap2cl_s *p);
  * constraint. Surfaced on the [STATUS] latency line for the caller. */
 int ap2cl_warm_lead_ms(struct ap2cl_s *p);
 
+/* Audible instant (unix ms) of the current delivery head on the splice
+ * timeline, carried on the flush ack so the caller anchors warm starts beyond
+ * every member's queued audio. 0 = no constraint (not on the splice path). */
+uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p);
+
 /* Get current state. */
 ap2_state_t ap2cl_state(struct ap2cl_s *p);
 

@@ -565,6 +565,15 @@ static void session_stop_op(void *transport)
     if (g_status == STATUS_PLAYING) g_status = STATUS_PAUSED;
 }
 
+/* Audible instant of the delivery head frozen by a FLUSH (splice timeline
+ * only): rides the flushed ack so MA anchors the warm START beyond it. */
+static uint64_t session_warm_head_unix_ms(void *transport)
+{
+    cli_config_t *cfg = transport;
+    if (cfg->protocol == PROTO_RAOP) return 0;
+    return g_ap2cl ? ap2cl_splice_head_unix_ms(g_ap2cl) : 0;
+}
+
 static void session_status_line(const char *line)
 {
     status_print("%s", line);
@@ -683,6 +692,7 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf,
         .resume = session_resume,
         .stop = session_stop_op,
         .status = session_status_line,
+        .warm_head_unix_ms = session_warm_head_unix_ms,
         .transport = cfg,
     };
     g_session = ap2_session_create(

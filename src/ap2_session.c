@@ -390,7 +390,15 @@ bool ap2_session_flush(struct ap2_session_s *s)
     pthread_mutex_unlock(&s->lock);
 
     s->ops.resume(s->ops.transport);
-    emit(s, "[STATUS] flushed");
+    /* The head froze at quiesce and no sends happen while idle-primed, so the
+     * transport's warm-head instant is stable to read after the resume. */
+    uint64_t head_unix_ms = s->ops.warm_head_unix_ms
+        ? s->ops.warm_head_unix_ms(s->ops.transport) : 0;
+    if (head_unix_ms)
+        emit(s, "[STATUS] flushed head_unix_ms=%llu",
+             (unsigned long long)head_unix_ms);
+    else
+        emit(s, "[STATUS] flushed");
     return true;
 }
 

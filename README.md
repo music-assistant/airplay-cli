@@ -203,6 +203,9 @@ stdin, the single persistent audio input for the whole process lifetime.
   short noise burst): the queued audio — kept shallow, reported as
   `warm_lead_ms` on the `[STATUS] latency` line — plays out and the next `START`
   splices the new track at the commanded instant by skipping stamps forward.
+  The ack then reads `[STATUS] flushed head_unix_ms=<ms>` (the audible instant
+  of the frozen delivery head); the commanded start must land beyond every
+  member's head or that member splices at its own head instead.
 - Session lifecycle: `ACTION=STANDBY` (silence the receiver, keep the connection
   warm), `ACTION=DISCONNECT` (end the session).
 - Transport: `ACTION=PLAY|PAUSE|STOP`.

@@ -599,10 +599,13 @@ capture.
   the splice instant on the line (the same instant for every member of a sync
   group, so a group splices sample-aligned); the pacing depth is kept shallow
   (600 ms) because the receiver's queued audio plays out before a splice is
-  audible, and that depth is surfaced as `warm_lead_ms` on the
-  `[STATUS] latency` line so the caller anchors warm starts beyond it.
-  Third-party receivers keep the flush + re-anchor path below, which they
-  handle cleanly.
+  audible. A commanded instant at or behind a member's head splices at that
+  member's own head instead — silently breaking the shared instant — so the
+  flush ack carries the frozen head's audible instant
+  (`[STATUS] flushed head_unix_ms=<ms>`), the depth rides `warm_lead_ms` on
+  the `[STATUS] latency` line, and the caller anchors every warm START beyond
+  all members' heads (plus their sync adjustments). Third-party receivers
+  keep the flush + re-anchor path below, which they handle cleanly.
 - **Realtime send outcomes** — local UDP backpressure is a bounded transient
   drop that advances sequence, RTP, and scheduling timestamps. Encode,
   allocation, encryption, socket, and control failures are terminal and produce

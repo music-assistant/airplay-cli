@@ -3333,6 +3333,23 @@ int ap2cl_warm_lead_ms(struct ap2cl_s *p)
     return p && p->splice_timeline ? AP2_SPLICE_PACING_MS : 0;
 }
 
+/* Wall-clock instant (unix ms) at which the current delivery head becomes
+ * audible on the splice timeline. The flush ack carries it so the caller can
+ * anchor the warm START beyond EVERY member's queued audio: a commanded
+ * instant at or behind a member's head splices at that member's own head
+ * instead, silently breaking the shared instant (and the session's recorded
+ * start time, which late joiners anchor against). 0 when the stream is not on
+ * the splice timeline (no constraint). */
+uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p)
+{
+    if (!p || p->flow != FLOW_NATIVE_AP2 || !p->splice_timeline || !p->head_ts)
+        return 0;
+    /* head_ts lives in the frame-clock domain of the unix-epoch NTP wall
+     * clock, so its audible instant is the direct inverse mapping. */
+    uint64_t ntp = TS2NTP(p->head_ts, p->format.sample_rate);
+    return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
+}
+
 int ap2cl_render_latency_ms(struct ap2cl_s *p) { return p ? p->dev_render_ms : 0; }
 
 ap2_state_t ap2cl_state(struct ap2cl_s *p) { return p ? p->state : AP2_DOWN; }

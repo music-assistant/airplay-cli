@@ -61,15 +61,19 @@ typedef enum {
 struct ap2_session_s;
 
 /*
- * Callbacks the session engine invokes from its own threads. All are required.
- * `commit` performs the START transport work on a LIVE connection: on the first
- * start it begins the session; after a FLUSH it re-bases the timeline so the
- * next written frame is audible at `start_unix_ms` (or now + the minimum warm
- * lead when 0). Returns false when the transport failed terminally (the caller
- * then ends the session so MA can fall back cold). `flush` discards the
- * receiver's buffered audio in place (RTSP FLUSH / libraop flush), keeping the
- * session and timeline continuity; it returns false when the receiver did not
- * accept the flush. The re-anchor happens on the next `commit`.
+ * Callbacks the session engine invokes from its own threads. All are required
+ * except `warm_head_unix_ms`. `commit` performs the START transport work on a
+ * LIVE connection: on the first start it begins the session; after a FLUSH it
+ * re-bases the timeline so the next written frame is audible at
+ * `start_unix_ms` (or now + the minimum warm lead when 0). Returns false when
+ * the transport failed terminally (the caller then ends the session so MA can
+ * fall back cold). `flush` discards the receiver's buffered audio in place
+ * (RTSP FLUSH / libraop flush), keeping the session and timeline continuity;
+ * it returns false when the receiver did not accept the flush. The re-anchor
+ * happens on the next `commit`. `warm_head_unix_ms` (optional) reports the
+ * audible instant of the delivery head frozen by the flush (unix ms; 0 = no
+ * constraint); when nonzero it rides the `[STATUS] flushed` ack so the caller
+ * can anchor the warm START beyond every member's queued audio.
  */
 typedef struct {
     void (*quiesce)(void *transport);    /* pause audio sends across a command */
@@ -78,6 +82,7 @@ typedef struct {
     void (*resume)(void *transport);     /* resume sends after the command */
     void (*stop)(void *transport);       /* silence the receiver, keep session */
     void (*status)(const char *line);    /* emit one [STATUS] line */
+    uint64_t (*warm_head_unix_ms)(void *transport);  /* optional (may be NULL) */
     void *transport;
 } ap2_session_ops_t;
 
