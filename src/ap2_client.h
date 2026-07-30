@@ -348,6 +348,10 @@ uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p);
 uint32_t ap2cl_splice_pad_frames(struct ap2cl_s *p);
 void ap2cl_splice_pad_consume(struct ap2cl_s *p, uint32_t frames);
 
+/* True while the splice timeline is live on the wire (audio sends legal);
+ * gates the idle-window silence keepalive in the audio loop. */
+bool ap2cl_splice_hot(struct ap2cl_s *p);
+
 /* Get current state. */
 ap2_state_t ap2cl_state(struct ap2cl_s *p);
 

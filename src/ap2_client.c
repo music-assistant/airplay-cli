@@ -3381,6 +3381,15 @@ uint32_t ap2cl_splice_pad_frames(struct ap2cl_s *p)
     return p ? p->splice_pad_frames : 0;
 }
 
+/* True while the splice timeline is live on the wire (audio sends legal): the
+ * audio loop keeps the idle-primed window between a FLUSH and the next START
+ * fed with silence so the line can never lapse mid-session. */
+bool ap2cl_splice_hot(struct ap2cl_s *p)
+{
+    return p && p->flow == FLOW_NATIVE_AP2 && p->splice_timeline &&
+           p->state == AP2_STREAMING && !atomic_load(&p->rtsp_dead);
+}
+
 void ap2cl_splice_pad_consume(struct ap2cl_s *p, uint32_t frames)
 {
     if (!p) return;

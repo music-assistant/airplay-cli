@@ -1230,7 +1230,42 @@ static int run_airplay2(cli_config_t *cfg)
             frames += af - (int)pad_frames_now;
             pthread_mutex_unlock(&g_audio_send_lock);
         } else {
-            /* Paused, or connected and awaiting the commanded first START. */
+            /* Paused, or connected and awaiting the commanded first START.
+             * On the splice timeline the idle-primed window between a FLUSH
+             * and the next START keeps sending silence: if the wire went
+             * quiet here, a slow next-track spin-up would lapse the line and
+             * force a fresh re-anchor — an audible noise trigger on Apple
+             * receivers (the track-transition blip). Contiguous silence keeps
+             * every boundary a hot splice; the resume pad still lands the new
+             * content on the commanded instant. Pause and standby park the
+             * client out of AP2_STREAMING, so they drain as before. */
+            if (g_first_start_done && cfg->protocol == PROTO_AIRPLAY2 &&
+                ap2_session_state(g_session) == AP2_SESSION_IDLE &&
+                ap2cl_splice_hot(g_ap2cl)) {
+                pthread_mutex_lock(&g_audio_send_lock);
+                if (ap2_session_state(g_session) == AP2_SESSION_IDLE &&
+                    ap2cl_splice_hot(g_ap2cl) &&
+                    ap2cl_accept_frames(g_ap2cl)) {
+                    memset(buf, 0,
+                           (size_t)AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
+                    uint8_t *send = buf;
+                    if (ap2_alac_buf && cfg->bit_depth > 16) {
+                        truncate_32to24(
+                            buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf,
+                            ap2_alac_buf);
+                        send = ap2_alac_buf;
+                    }
+                    if (ap2cl_send_chunk(g_ap2cl, send,
+                                         AP2_FRAMES_PER_CHUNK) ==
+                        AP2_SEND_FATAL) {
+                        status_error("AirPlay 2 realtime send failed");
+                        playback_failed = true;
+                        pthread_mutex_unlock(&g_audio_send_lock);
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_audio_send_lock);
+            }
             usleep(1000);
         }
     }
