@@ -53,11 +53,12 @@ Decision order:
    `--ap2-native` forces AirPlay 2 regardless.
 2. **Native vs RAOP-compat** — stored credentials (`--auth`) ⇒ native with
    pair-verify. `--ap2-native` ⇒ native with transient pairing.
-   In `auto`, a device that advertises pairing (bit 46 or 48) with no PIN and
+   Otherwise a device that advertises pairing (bit 46 or 48) with no PIN and
    no legacy flag ⇒ native with transient pairing, provided it either does not
-   require a password or one was supplied with `--password` (§3a). Otherwise
-   the RAOP-compat flow. An explicit `--protocol airplay2` without
-   credentials keeps RAOP-compat unless `--ap2-native` is given.
+   require a password or one was supplied with `--password` (§3a).
+   `--protocol airplay2` takes that route on the same terms, and also when the
+   TXT advertises no features at all — an AirPlay-2-only receiver, with no
+   `_raop` service behind it. Everything else ⇒ the RAOP-compat flow.
 3. **Timing** — `--ptp` forces PTP; otherwise the SupportsPTP feature bit
    selects PTP vs the NTP responder. If PTP is selected but UDP 319/320
    cannot be bound (no privilege, no daemon), the session falls back to NTP.
