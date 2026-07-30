@@ -327,6 +327,16 @@ void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint
  * aligns with the group. */
 int ap2cl_render_latency_ms(struct ap2cl_s *p);
 
+/* Frames between the delivery head and the audible position (elapsed
+ * reporting): the shallow pacing depth on the Apple splice timeline, the
+ * latency lead otherwise. */
+uint32_t ap2cl_audible_lag_frames(struct ap2cl_s *p);
+
+/* Minimum lead (ms) a warm commanded START needs for exact placement — the
+ * splice timeline's queue depth, 0 when the stock warm path has no
+ * constraint. Surfaced on the [STATUS] latency line for the caller. */
+int ap2cl_warm_lead_ms(struct ap2cl_s *p);
+
 /* Get current state. */
 ap2_state_t ap2cl_state(struct ap2cl_s *p);
 

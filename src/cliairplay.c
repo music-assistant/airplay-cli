@@ -1022,9 +1022,13 @@ static int run_airplay2(cli_config_t *cfg)
         int lead_ms = 0;
         uint32_t dev_min = 0, dev_max = 0;
         ap2cl_latency_info(g_ap2cl, &lead_ms, &dev_min, &dev_max);
+        /* warm_lead_ms: minimum lead a warm commanded START needs for exact
+         * placement on the splice timeline (0 = no constraint). MA anchors
+         * group seeks beyond the largest member value. */
         printf("[STATUS] latency lead_ms=%d device_min_frames=%u device_max_frames=%u "
-               "device_render_ms=%d\n",
-               lead_ms, dev_min, dev_max, ap2cl_render_latency_ms(g_ap2cl));
+               "device_render_ms=%d warm_lead_ms=%d\n",
+               lead_ms, dev_min, dev_max, ap2cl_render_latency_ms(g_ap2cl),
+               ap2cl_warm_lead_ms(g_ap2cl));
         fflush(stdout);
     }
 
@@ -1096,7 +1100,9 @@ static int run_airplay2(cli_config_t *cfg)
            emitting a "playing" status that would revive the sender's play state) */
         if (g_status == STATUS_PLAYING && !input_ended && now - last > MS2NTP(1000)) {
             last = now;
-            uint32_t latency_frames = MS2TS(cfg->latency_ms, cfg->sample_rate);
+            /* Delivery runs ahead of audibility by the pacing depth (shallow
+             * on the splice timeline, the latency lead otherwise). */
+            uint32_t latency_frames = ap2cl_audible_lag_frames(g_ap2cl);
             if (frames > latency_frames) {
                 uint32_t elapsed = TS2MS(frames - latency_frames, cfg->sample_rate);
                 status_playing(elapsed);
@@ -1147,6 +1153,15 @@ static int run_airplay2(cli_config_t *cfg)
                 continue;
             }
             if (n == 0) {
+                /* A zero read while idle-primed (post-FLUSH awaiting START) or
+                 * in standby is by design, not starvation: the timeline is
+                 * frozen and a recovery re-anchor here would announce anchor
+                 * jumps to a receiver still rendering its buffered audio. Only
+                 * a stall of a genuinely playing stream is an input gap. */
+                if (ap2_session_state(g_session) != AP2_SESSION_PLAYING) {
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    continue;
+                }
                 if (!starving) {
                     starving = true;
                     starvation_started = raopcl_get_ntp(NULL);

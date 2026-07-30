@@ -198,6 +198,11 @@ stdin, the single persistent audio input for the whole process lifetime.
   track while sending nothing until the next `START` (idle-primed). The one-shot
   `[STATUS] audio buffered_ms=<ms>` line fires again when the next track's feed
   has a complete packet buffered, or its final short packet reaches EOF.
+  On Apple receivers the native flow instead runs a splice timeline (no receiver
+  flush, one immutable anchor line; any discard or re-anchor makes them emit a
+  short noise burst): the queued audio — kept shallow, reported as
+  `warm_lead_ms` on the `[STATUS] latency` line — plays out and the next `START`
+  splices the new track at the commanded instant by skipping stamps forward.
 - Session lifecycle: `ACTION=STANDBY` (silence the receiver, keep the connection
   warm), `ACTION=DISCONNECT` (end the session).
 - Transport: `ACTION=PLAY|PAUSE|STOP`.

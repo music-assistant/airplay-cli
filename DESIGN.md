@@ -582,6 +582,27 @@ capture.
   EOF. Partial PCM remains in the ring until a full packet is available; only
   the final EOF packet is padded with silence. The sender waits in bounded
   intervals so control failures remain visible during producer starvation.
+- **Apple splice timeline** — Apple's own receivers (tvOS/audioOS/macOS;
+  `model=`/`am=` prefix match) emit a ~100 ms noise burst on their native
+  realtime lane at any buffer discard (classic FLUSH with any RTP-Info, and
+  FLUSHBUFFERED alike), any anchor re-announce, and any late-frame delivery
+  (measured A/B on an Apple TV 4K, tvOS 27, 2026-07-30: the only clean warm
+  transitions were a natural drain and a bitstream-continuous splice; Apple
+  senders never exercise this corner — realtime streams are live and music
+  seeks ride the buffered lane). Native sessions to Apple models therefore run
+  a splice timeline: the anchor line frozen at the first START is immutable for
+  the whole session, no flush verb is ever sent, and every warm boundary
+  (seek/next FLUSH+START, standby park/resume, pause/un-pause, starvation
+  recovery) is expressed as a forward-only stamp skip on that line — the
+  sequence stays contiguous, so the receiver sees a content edit rather than
+  loss, and the skipped span renders as silence. The commanded START selects
+  the splice instant on the line (the same instant for every member of a sync
+  group, so a group splices sample-aligned); the pacing depth is kept shallow
+  (600 ms) because the receiver's queued audio plays out before a splice is
+  audible, and that depth is surfaced as `warm_lead_ms` on the
+  `[STATUS] latency` line so the caller anchors warm starts beyond it.
+  Third-party receivers keep the flush + re-anchor path below, which they
+  handle cleanly.
 - **Realtime send outcomes** — local UDP backpressure is a bounded transient
   drop that advances sequence, RTP, and scheduling timestamps. Encode,
   allocation, encryption, socket, and control failures are terminal and produce
