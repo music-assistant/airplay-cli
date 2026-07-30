@@ -420,8 +420,21 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
     } else if (strcmp(key, "START_UNIX_MS") == 0) {
         g_pend_start_unix_ms = strtoull(value, NULL, 10);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "START") == 0) {
-        if (!g_session || !ap2_session_start(g_session, g_pend_start_unix_ms))
+        /* The verified start contract: the ack always reports the true
+         * scheduled instant, so the caller compares it with the request,
+         * logs any correction loudly, and re-aligns a group by re-STARTing
+         * every member at the largest reported instant. */
+        uint64_t at_ms = 0;
+        ap2_commit_result_t started = g_session
+            ? ap2_session_start(g_session, g_pend_start_unix_ms, &at_ms)
+            : AP2_COMMIT_FAILED;
+        if (started == AP2_COMMIT_OK) {
+            status_print("[STATUS] started requested_unix_ms=%" PRIu64
+                         " at_unix_ms=%" PRIu64,
+                         g_pend_start_unix_ms, at_ms);
+        } else {
             status_error("START failed");
+        }
         g_pend_start_unix_ms = 0;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "FLUSH") == 0) {
         if (!g_session || !ap2_session_flush(g_session))
@@ -508,32 +521,36 @@ static void send_initial_metadata(const cli_config_t *cfg)
 
 /* ---- Session engine transport callbacks ---- */
 
-static bool session_commit(void *transport, uint64_t start_unix_ms)
+static ap2_commit_result_t session_commit(void *transport,
+                                          uint64_t start_unix_ms,
+                                          uint64_t *at_unix_ms)
 {
     cli_config_t *cfg = transport;
-    bool committed;
+    ap2_commit_result_t committed;
     /* The first START begins the session; a START after a FLUSH re-anchors the
-     * flushed stream (no second receiver flush, no crypto/sequence reset). */
+     * flushed stream (no second receiver flush, no crypto/sequence reset). An
+     * infeasible instant is corrected forward by the transport, which reports
+     * the true scheduled instant so the ack can carry it to the caller. */
     if (cfg->protocol == PROTO_RAOP) {
         struct raopcl_s *client = g_raopcl;
-        if (!client) return false;
+        if (!client) return AP2_COMMIT_FAILED;
         committed = !g_first_start_done
-            ? raop_session_commit(client, start_unix_ms)
-            : raop_session_start_at(client, start_unix_ms);
+            ? raop_session_commit(client, start_unix_ms, at_unix_ms)
+            : raop_session_start_at(client, start_unix_ms, at_unix_ms);
     } else {
         struct ap2cl_s *client = g_ap2cl;
-        if (!client) return false;
+        if (!client) return AP2_COMMIT_FAILED;
         committed = !g_first_start_done
-            ? ap2cl_start(client, start_unix_ms)
-            : ap2cl_resume(client, start_unix_ms);
+            ? ap2cl_start(client, start_unix_ms, at_unix_ms)
+            : ap2cl_resume(client, start_unix_ms, at_unix_ms);
     }
-    if (!committed) return false;
+    if (committed != AP2_COMMIT_OK) return committed;
 
     /* Metadata-gated receivers must receive a placeholder before audio. */
     if (!g_first_start_done) send_initial_metadata(cfg);
     g_first_start_done = true;
     g_status = STATUS_PLAYING;
-    return true;
+    return AP2_COMMIT_OK;
 }
 
 /* Discard the receiver's buffered audio in place for a warm seek and mark the

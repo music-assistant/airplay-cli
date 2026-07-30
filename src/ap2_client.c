@@ -2338,21 +2338,50 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     return true;
 }
 
-static uint64_t commanded_start_ntp(uint64_t start_unix_ms)
+static uint64_t ap2_unix_ms_to_ntp(uint64_t ms)
 {
-    uint64_t start_ntp = start_unix_ms
-        ? ((start_unix_ms / 1000) << 32) |
-              (((start_unix_ms % 1000) << 32) / 1000)
-        : 0;
-    uint64_t min_start =
-        raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS);
-    return start_ntp < min_start ? min_start : start_ntp;
+    return ((ms / 1000) << 32) | (((ms % 1000) << 32) / 1000);
 }
 
-bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms)
+static uint64_t ap2_ntp_to_unix_ms(uint64_t ntp)
 {
-    if (!p) return false;
-    uint64_t ntp_start = commanded_start_ntp(start_unix_ms);
+    return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
+}
+
+/* Resolve a commanded start: a request at or beyond `floor_ntp` is honored
+ * exactly; one behind it (or 0) is corrected FORWARD to the floor — audio
+ * always flows, never silently misplaced or refused. *ntp_start receives the
+ * audible instant and *at_unix_ms the same value in unix ms, so the caller's
+ * ack always carries the truth. A correction of a nonzero request is logged
+ * here; the caller re-aligns groups from the acks. */
+static void ap2_resolve_start(uint64_t start_unix_ms, uint64_t floor_ntp,
+                              uint64_t *ntp_start, uint64_t *at_unix_ms)
+{
+    uint64_t requested =
+        start_unix_ms ? ap2_unix_ms_to_ntp(start_unix_ms) : 0;
+    if (requested >= floor_ntp) {
+        *ntp_start = requested;
+        if (at_unix_ms) *at_unix_ms = start_unix_ms;
+        return;
+    }
+    *ntp_start = floor_ntp;
+    if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(floor_ntp);
+    if (start_unix_ms)
+        LOG_WARN("[AP2] start %llu ms is %llu ms behind the feasibility "
+                 "floor; corrected forward",
+                 (unsigned long long)start_unix_ms,
+                 (unsigned long long)(ap2_ntp_to_unix_ms(floor_ntp) -
+                                      start_unix_ms));
+}
+
+ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
+                                uint64_t *at_unix_ms)
+{
+    if (!p) return AP2_COMMIT_FAILED;
+    uint64_t ntp_start = 0;
+    ap2_resolve_start(start_unix_ms,
+                      raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS),
+                      &ntp_start, at_unix_ms);
     if (p->flow == FLOW_NATIVE_AP2) {
         /* Offset the RTP timeline per process: streams in one group share
          * ntpstart, and with identical pos0 two sessions from one host are
@@ -2387,15 +2416,15 @@ bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms)
         if (p->use_ptp && p->ctrl_sock >= 0 &&
             ap2_send_sync_packet_ptp(p, true) == AP2_SEND_FATAL) {
             atomic_store(&p->media_healthy, false);
-            return false;
+            return AP2_COMMIT_FAILED;
         }
-        return true;
+        return AP2_COMMIT_OK;
     }
-    if (!p->raopcl) return false;
+    if (!p->raopcl) return AP2_COMMIT_FAILED;
     int latency = raopcl_latency(p->raopcl);
     raopcl_start_at(p->raopcl, ntp_start - TS2NTP(latency, p->format.sample_rate));
     p->state = AP2_STREAMING;
-    return true;
+    return AP2_COMMIT_OK;
 }
 
 /* Silence the receiver but keep the session warm (persistent standby):
@@ -2485,24 +2514,29 @@ bool ap2cl_flush(struct ap2cl_s *p)
     return true;
 }
 
-/* Re-base the frozen timeline so the next written frame is audible at
- * start_unix_ms (unix epoch ms), resuming a stream that ap2cl_flush discarded
- * (the START after a FLUSH). A start of 0 or one already in the past is clamped
- * to now + the minimum warm lead so a new track's first samples can never be
- * clipped. Sequence numbers and audio nonces are untouched. */
-bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
+/* Schedule the next pending sample audible at start_unix_ms (unix epoch ms),
+ * resuming a stream after ap2cl_flush (the START after a FLUSH), under the
+ * strict start contract: a nonzero instant is honored exactly or rejected
+ * with the minimum feasible instant — never silently degraded. The splice
+ * timeline pads silence up to the instant on its immutable anchor line; the
+ * stock path re-bases the frozen anchor onto it. Sequence numbers and audio
+ * nonces are untouched. */
+ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
+                                 uint64_t *at_unix_ms)
 {
-    if (!p || p->state == AP2_DOWN) return false;
+    if (!p || p->state == AP2_DOWN) return AP2_COMMIT_FAILED;
 
     if (p->flow != FLOW_NATIVE_AP2) {
-        if (!raop_session_start_at(p->raopcl, start_unix_ms)) return false;
-        p->state = AP2_STREAMING;
-        return true;
+        ap2_commit_result_t r =
+            raop_session_start_at(p->raopcl, start_unix_ms, at_unix_ms);
+        if (r == AP2_COMMIT_OK) p->state = AP2_STREAMING;
+        return r;
     }
 
-    if (atomic_load(&p->rtsp_dead)) return false;
+    if (atomic_load(&p->rtsp_dead)) return AP2_COMMIT_FAILED;
+    uint64_t now_ntp = raopcl_get_ntp(NULL);
     if (p->splice_timeline && p->rt_anchor_valid &&
-        p->head_ts > NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate)) {
+        p->head_ts > NTP2TS(now_ntp, p->format.sample_rate)) {
         /* Splice resume (hot line: the receiver still holds queued audio).
          * The anchor line frozen at the first START is immutable for the
          * whole session, and the wire must stay bitstream-continuous —
@@ -2512,29 +2546,40 @@ bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
          * between the frozen head and that instant is FILLED with encoded
          * silence: sequence numbers and timestamps advance normally and the
          * first real sample lands exactly on the commanded instant. Every
-         * member of a sync group is handed the same instant, so a group
-         * splices sample-aligned by construction. A start at or behind the
-         * current head splices at the head: the old queue (at most the
-         * pacing depth) plays out and the new content follows seamlessly. */
-        uint64_t target = NTP2TS(commanded_start_ntp(start_unix_ms),
-                                 p->format.sample_rate);
-        if (target > p->head_ts) {
-            uint64_t pad = target - p->head_ts;
+         * member of a sync group is handed the same accepted instant, so a
+         * group splices sample-aligned by construction. The feasibility
+         * floor is the head itself: anything earlier would require
+         * discarding queued audio (the noise trigger), so such a request is
+         * corrected FORWARD to the head and the ack carries the truth. A
+         * start of 0 splices at the head — the earliest possible point. */
+        uint64_t head_ntp = TS2NTP(p->head_ts, p->format.sample_rate);
+        uint64_t requested =
+            start_unix_ms ? ap2_unix_ms_to_ntp(start_unix_ms) : 0;
+        if (requested > head_ntp) {
+            uint64_t target = NTP2TS(requested, p->format.sample_rate);
+            uint64_t pad = target > p->head_ts ? target - p->head_ts : 0;
             p->splice_pad_frames = (uint32_t)pad;
+            if (at_unix_ms) *at_unix_ms = start_unix_ms;
             LOG_INFO("[AP2] splice resume: padding %" PRIu64 " frames "
                      "(%" PRIu64 " ms) of silence to the commanded start",
                      pad, pad * 1000ULL / p->format.sample_rate);
         } else {
             p->splice_pad_frames = 0;
-            LOG_INFO("[AP2] splice resume at head (seq=%u rtptime=%u)",
-                     (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
+            if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(head_ntp);
+            if (start_unix_ms)
+                LOG_WARN("[AP2] splice resume: start %llu ms is behind the "
+                         "head; corrected forward to the head",
+                         (unsigned long long)start_unix_ms);
+            else
+                LOG_INFO("[AP2] splice resume at head (seq=%u rtptime=%u)",
+                         (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
         }
         /* A commanded start zeroes the drift baseline on both sides (MA
          * resets its accumulated shift on START). */
         p->reanchor_shifted_frames = 0;
         p->state = AP2_STREAMING;
         atomic_store(&p->media_healthy, true);
-        return true;
+        return AP2_COMMIT_OK;
     }
     /* A lapsed splice line (head at or behind the wall clock: the receiver
      * drained long ago — resume from a long park) falls through to the stock
@@ -2542,7 +2587,9 @@ bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
      * shape, which is clean; padding silence from a lapsed head would deliver
      * late frames, which is not. */
     p->splice_pad_frames = 0;
-    uint64_t start_ntp = commanded_start_ntp(start_unix_ms);
+    uint64_t start_ntp = 0;
+    ap2_resolve_start(start_unix_ms, now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS),
+                      &start_ntp, at_unix_ms);
     /* Re-base the frozen line: head_ts moves in the scheduling domain, the
      * wire timestamp follows it plus the per-process offset, and the next
      * sync packet freezes the new line from start_ntp. */
@@ -2560,9 +2607,9 @@ bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
     if (p->use_ptp && p->ctrl_sock >= 0 &&
         ap2_send_sync_packet_ptp(p, true) == AP2_SEND_FATAL) {
         atomic_store(&p->media_healthy, false);
-        return false;
+        return AP2_COMMIT_FAILED;
     }
-    return true;
+    return AP2_COMMIT_OK;
 }
 
 ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
@@ -3368,8 +3415,7 @@ uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p)
         return 0;
     /* head_ts lives in the frame-clock domain of the unix-epoch NTP wall
      * clock, so its audible instant is the direct inverse mapping. */
-    uint64_t ntp = TS2NTP(p->head_ts, p->format.sample_rate);
-    return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
+    return ap2_ntp_to_unix_ms(TS2NTP(p->head_ts, p->format.sample_rate));
 }
 
 /* Silence frames the audio loop still owes the wire before the next real

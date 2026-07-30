@@ -190,8 +190,14 @@ stdin, the single persistent audio input for the whole process lifetime.
 
 - Start / re-anchor: `START_UNIX_MS=<unix epoch ms>` then `ACTION=START`. The
   first `START` begins the session; a `START` after an `ACTION=FLUSH` re-anchors
-  the same live stream (no reconnect). `START_UNIX_MS=0` (or a past instant)
-  starts as soon as possible, at the minimum commanded-start lead.
+  the same live stream (no reconnect). `START_UNIX_MS=0` starts as soon as
+  possible. The start contract is VERIFIED: a feasible instant is scheduled
+  exactly, an infeasible one is corrected forward to the earliest feasible
+  instant (audio always flows), and the ack
+  `[STATUS] started requested_unix_ms=<ms> at_unix_ms=<ms>` always carries the
+  true scheduled instant — the caller compares the two, logs any correction,
+  and re-aligns a sync group by re-STARTing every member at the largest
+  reported instant.
 - `ACTION=FLUSH` — in-place warm flush for seek/next: flush the receiver (RTSP
   FLUSH), discard the internal ring, and drain stdin to empty; after the receiver
   accepts the flush, acks with `[STATUS] flushed` and keeps buffering the next

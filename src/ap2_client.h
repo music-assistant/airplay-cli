@@ -20,6 +20,7 @@
 
 #include "ap2_io.h"
 #include "ap2_mrp.h"
+#include "ap2_session.h"
 
 struct ap2cl_s;
 
@@ -170,9 +171,12 @@ bool ap2cl_connect(struct ap2cl_s *p);
 /* Disconnect from the device. */
 bool ap2cl_disconnect(struct ap2cl_s *p);
 
-/* Start playback at a commanded unix-epoch millisecond instant. A start of 0
- * or one already in the past is clamped to now + the minimum warm lead. */
-bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms);
+/* Start playback at a commanded unix-epoch millisecond instant. A feasible
+ * instant is scheduled exactly; an infeasible one (or 0) is corrected forward
+ * to now + the minimum lead. *at_unix_ms always receives the true scheduled
+ * instant so the caller can verify and log any correction. */
+ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
+                                uint64_t *at_unix_ms);
 
 /*
  * Warm-seek a live session in place. FLUSH then START (below) are the two
@@ -180,14 +184,19 @@ bool ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms);
  *
  * ap2cl_flush discards the receiver's buffered audio (RTSP FLUSH / libraop
  * flush) and stops sending, keeping the session and its sequence/nonce state.
+ * (Splice timeline: no receiver flush; the queue plays out instead.)
  *
- * ap2cl_resume re-bases the frozen timeline so the next written frame is
- * audible at start_unix_ms (unix epoch milliseconds); a start of 0 or one in
- * the past clamps to now + the minimum warm lead, so a new track's first
- * samples can never be clipped.
+ * ap2cl_resume schedules the next pending sample audible at start_unix_ms
+ * under the same contract as ap2cl_start: the splice timeline pads silence up
+ * to the instant, the stock path re-bases the frozen anchor onto it, and an
+ * infeasible instant is corrected forward to the earliest feasible one (the
+ * splice head, or now + the minimum warm lead) with the truth reported in
+ * *at_unix_ms — never silently misplaced or refused. A start of 0 picks the
+ * earliest instant directly.
  */
 bool ap2cl_flush(struct ap2cl_s *p);
-bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms);
+ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
+                                 uint64_t *at_unix_ms);
 
 /* Silence the receiver but keep the session warm: discard buffered audio,
  * publish the stopped state, drop to CONNECTED awaiting the next warm flush. */

@@ -114,7 +114,7 @@ static void test_native_flush_resume_reuses_rtsp_session(void)
     assert(client);
     ap2cl_force_native(client);
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
-    assert(ap2cl_start(client, 1700000000000ULL));
+    assert(ap2cl_start(client, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     /* The test bypasses native connect, so model a completed first send before
      * exercising the warm restart. */
     ap2cl_test_set_first_packet(client, false);
@@ -123,7 +123,7 @@ static void test_native_flush_resume_reuses_rtsp_session(void)
     assert(ap2cl_state(client) == AP2_CONNECTED);
     /* Warm seek: discard the receiver buffer, then re-anchor the timeline. */
     assert(ap2cl_flush(client));
-    assert(ap2cl_resume(client, 1700000005000ULL));
+    assert(ap2cl_resume(client, 1700000005000ULL, NULL) == AP2_COMMIT_OK);
     assert(ap2cl_state(client) == AP2_STREAMING);
     assert(ap2cl_test_first_packet(client));
 
@@ -164,7 +164,7 @@ static void test_native_flush_rejects_receiver_error(void)
     assert(client);
     ap2cl_force_native(client);
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
-    assert(ap2cl_start(client, 1700000000000ULL));
+    assert(ap2cl_start(client, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     assert(!ap2cl_flush(client));
 
     assert(pthread_join(peer_thread, NULL) == 0);
@@ -426,7 +426,7 @@ static void test_splice_timeline_warm_path(void)
     ap2cl_force_native(client);
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
     ap2cl_test_set_splice(client, true);
-    assert(ap2cl_start(client, 0));
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
     ap2cl_test_set_first_packet(client, false);
     ap2cl_test_set_anchor_valid(client, true);
 
@@ -440,7 +440,7 @@ static void test_splice_timeline_warm_path(void)
      * burst): the gap to a future commanded instant becomes silence padding
      * the audio loop sends as ordinary contiguous chunks. */
     uint64_t start_ms = ((uint64_t)time(NULL) + 3) * 1000ULL;
-    assert(ap2cl_resume(client, start_ms));
+    assert(ap2cl_resume(client, start_ms, NULL) == AP2_COMMIT_OK);
     assert(ap2cl_state(client) == AP2_STREAMING);
     assert(ap2cl_test_anchor_valid(client));
     assert(!ap2cl_test_first_packet(client));
@@ -456,7 +456,7 @@ static void test_splice_timeline_warm_path(void)
     ap2cl_standby(client);
     assert(ap2cl_state(client) == AP2_CONNECTED);
     assert(ap2cl_test_anchor_valid(client));
-    assert(ap2cl_resume(client, 0));
+    assert(ap2cl_resume(client, 0, NULL) == AP2_COMMIT_OK);
     assert(ap2cl_state(client) == AP2_STREAMING);
 
     /* The whole warm path put nothing on the RTSP socket. */
