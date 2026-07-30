@@ -7,9 +7,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <arpa/inet.h>
+#include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "ap2_bplist.h"
@@ -36,6 +39,12 @@ uint64_t ap2cl_test_head_ts(struct ap2cl_s *p);
 void ap2cl_test_set_head_ts(struct ap2cl_s *p, uint64_t head);
 uint64_t ap2cl_test_timeline_reanchors(struct ap2cl_s *p);
 uint32_t ap2cl_test_rtp_timestamp(struct ap2cl_s *p);
+int ap2cl_test_start_rtx(struct ap2cl_s *p);
+void ap2cl_test_stop_rtx(struct ap2cl_s *p);
+void ap2cl_test_rtx_store(struct ap2cl_s *p, uint16_t seq,
+                          const uint8_t *pkt, int len);
+unsigned long long ap2cl_test_rtx_answered(struct ap2cl_s *p);
+unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p);
 
 typedef struct {
     int fd;
@@ -776,8 +785,74 @@ static void test_route_explicit_airplay2(void)
     puts("ap2_client explicit airplay2 route tests passed");
 }
 
+/* Play the receiver end: ask a live responder for packets over the control
+ * port and check what comes back. */
+static void test_retransmit_responder(void)
+{
+    ap2_device_info_t device = {
+        .name = "rtx", .address = "127.0.0.1", .port = 7000};
+    ap2_audio_format_t format = {
+        .sample_rate = 44100, .bit_depth = 16, .channels = 2};
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+
+    int ctrl_port = ap2cl_test_start_rtx(client);
+    assert(ctrl_port > 0);
+
+    /* Two packets the receiver will claim it lost, plus one never sent. */
+    uint8_t pkt_a[64], pkt_b[64];
+    for (size_t i = 0; i < sizeof(pkt_a); i++) { pkt_a[i] = (uint8_t)i; }
+    for (size_t i = 0; i < sizeof(pkt_b); i++) { pkt_b[i] = (uint8_t)(0xF0 ^ i); }
+    ap2cl_test_rtx_store(client, 1000, pkt_a, (int)sizeof(pkt_a));
+    ap2cl_test_rtx_store(client, 1001, pkt_b, (int)sizeof(pkt_b));
+
+    int peer = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(peer >= 0);
+    struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+    setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port = htons((uint16_t)ctrl_port);
+
+    /* marker|0x55, request seq 7, first missing seq 1000, count 2 */
+    uint8_t req[8] = {0x80, 0xd5, 0x00, 0x07, 0x03, 0xe8, 0x00, 0x02};
+    assert(sendto(peer, req, sizeof(req), 0,
+                  (struct sockaddr *)&to, sizeof(to)) == (ssize_t)sizeof(req));
+
+    bool seen_a = false, seen_b = false;
+    for (int i = 0; i < 2; i++) {
+        uint8_t resp[512];
+        ssize_t n = recv(peer, resp, sizeof(resp), 0);
+        assert(n == 4 + (ssize_t)sizeof(pkt_a));
+        assert(resp[0] == 0x80 && resp[1] == 0xd6);
+        assert(((resp[2] << 8) | resp[3]) == 7);   /* echoes the request seq */
+        if (!memcmp(resp + 4, pkt_a, sizeof(pkt_a))) seen_a = true;
+        if (!memcmp(resp + 4, pkt_b, sizeof(pkt_b))) seen_b = true;
+    }
+    assert(seen_a && seen_b);
+    assert(ap2cl_test_rtx_answered(client) == 2);
+
+    /* A packet that has already aged out is counted, not answered. */
+    uint8_t stale[8] = {0x80, 0xd5, 0x00, 0x08, 0x00, 0x2a, 0x00, 0x01};
+    assert(sendto(peer, stale, sizeof(stale), 0,
+                  (struct sockaddr *)&to, sizeof(to)) == (ssize_t)sizeof(stale));
+    for (int i = 0; i < 30 && ap2cl_test_rtx_expired(client) == 0; i++)
+        usleep(50000);
+    assert(ap2cl_test_rtx_expired(client) == 1);
+    assert(ap2cl_test_rtx_answered(client) == 2);
+
+    close(peer);
+    ap2cl_test_stop_rtx(client);
+    ap2cl_destroy(client);
+    puts("ap2_client retransmit responder tests passed");
+}
+
 int main(void)
 {
+    test_retransmit_responder();
     test_route_with_password();
     test_route_explicit_airplay2();
     test_info_format_tables();

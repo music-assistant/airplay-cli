@@ -91,11 +91,37 @@ extern log_level *loglevel;
  * for a full header block plus the start of a TLV/plist body. */
 #define AP2_DIAG_RESPONSE_MAX        1536
 #define AP2_DIAG_BODY_MAX            512
+/* Retransmit history. Receivers ask for lost audio on the RTP control port
+ * (type 0x55 request / 0x56 response, marker bit set). A request is only worth
+ * answering while the packet is still ahead of the receiver's play point, so
+ * the ring only has to outlast the send window (77175 frames = 1.75 s): 512
+ * packets is 4.1 s at 352 frames/packet, comfortably more. */
+#define AP2_RTX_RING_SLOTS           512
+#define AP2_RTX_MAX_PKT              2048
+#define AP2_RTX_CTRL_POLL_MS         200
+/* Initial-fill pacing. The window gate alone lets the whole 1.75 s send window
+ * go out back-to-back at stream start (measured: ~99 packets in 7 ms), which
+ * overruns a receiver's socket buffer and costs a contiguous run of packets it
+ * then has to ask back. Spacing releases ~1 ms apart fills the window in about
+ * 220 ms — still far ahead of any commanded start lead, but paced enough that
+ * the receiver keeps up. Steady state needs one packet per ~8 ms, so this
+ * never throttles normal playback. */
+#define AP2_FILL_MIN_PACKET_GAP_US   1000
 
 typedef enum {
     FLOW_RAOP_COMPAT = 0,
     FLOW_NATIVE_AP2,
 } ap2_flow_t;
+
+/* One sent audio packet kept for retransmission, stored on the wire exactly as
+ * it went out (header, ciphertext, tag and nonce suffix) so a resend is a byte
+ * copy — re-encrypting would need the original nonce anyway. */
+struct ap2_rtx_slot {
+    uint16_t seq;
+    uint16_t len;
+    bool valid;
+    uint8_t data[AP2_RTX_MAX_PKT];
+};
 
 struct ap2cl_s {
     /* Configuration */
@@ -194,6 +220,18 @@ struct ap2cl_s {
                                      needs its own truth */
     uint64_t reanchor_shifted_frames; /* cumulative shift since the last start/
                                         * resume, for [STATUS] REANCHOR */
+    /* Retransmit history and the control-port reader that serves it. The ring
+     * is written by the audio thread and read by the reader thread. */
+    struct ap2_rtx_slot *rtx_ring;
+    pthread_mutex_t rtx_lock;
+    pthread_t rtx_thread;
+    atomic_bool rtx_stop;
+    bool rtx_thread_started;
+    atomic_ullong rtx_requested;   /* packets asked for */
+    atomic_ullong rtx_answered;    /* packets resent */
+    atomic_ullong rtx_expired;     /* asked for but no longer in the ring */
+    /* Initial-fill pacing: monotonic microseconds of the last release. */
+    uint64_t pace_last_release_us;
 
     /* Frozen realtime anchor line (PTP): the rtp<->wall mapping is fixed once
      * at stream start and every periodic time-announce extrapolates along it.
@@ -671,6 +709,144 @@ static int ap2_rtsp_send_tracked(
     return ap2_rtsp_send_ex_tracked(
         p, method, uri, body, body_len, ct, NULL,
         resp_body, resp_len, request_started);
+}
+
+/* Keep a sent packet available for retransmission. Called on the audio thread
+ * right after the packet goes out; the ring is indexed by sequence number so a
+ * request is a direct lookup and old entries retire on their own. */
+static void ap2_rtx_store(struct ap2cl_s *p, uint16_t seq,
+                          const uint8_t *pkt, int len)
+{
+    if (!p->rtx_ring || len <= 0 || len > AP2_RTX_MAX_PKT) return;
+    struct ap2_rtx_slot *slot = &p->rtx_ring[seq % AP2_RTX_RING_SLOTS];
+    pthread_mutex_lock(&p->rtx_lock);
+    slot->seq = seq;
+    slot->len = (uint16_t)len;
+    slot->valid = true;
+    memcpy(slot->data, pkt, (size_t)len);
+    pthread_mutex_unlock(&p->rtx_lock);
+}
+
+/* Answer one requested sequence number. The response is the classic RAOP
+ * resend: a 4-byte control header (marker | type 0x56, echoing the request's
+ * own sequence) wrapping the original packet verbatim. */
+static bool ap2_rtx_resend(struct ap2cl_s *p, uint16_t seq, uint16_t req_seq,
+                           const struct sockaddr_in *to)
+{
+    if (!p->rtx_ring) return false;
+    uint8_t out[4 + AP2_RTX_MAX_PKT];
+    int len = 0;
+    pthread_mutex_lock(&p->rtx_lock);
+    struct ap2_rtx_slot *slot = &p->rtx_ring[seq % AP2_RTX_RING_SLOTS];
+    if (slot->valid && slot->seq == seq) {
+        len = slot->len;
+        memcpy(out + 4, slot->data, (size_t)len);
+    }
+    pthread_mutex_unlock(&p->rtx_lock);
+    if (!len) {
+        atomic_fetch_add(&p->rtx_expired, 1);
+        return false;
+    }
+    out[0] = 0x80;
+    out[1] = 0xd6;
+    out[2] = (uint8_t)(req_seq >> 8);
+    out[3] = (uint8_t)(req_seq & 0xFF);
+    /* Answer where the request came from rather than the configured control
+     * address: it is the same endpoint for a well-behaved receiver, and it
+     * keeps working if the device asks from a different source port. */
+    ap2_send_result_t r = ap2_io_send_datagram_deadline(
+        p->ctrl_sock, out, (size_t)(len + 4),
+        (const struct sockaddr *)to, sizeof(*to),
+        ap2_io_monotonic_ms() + AP2_UDP_SEND_TIMEOUT_MS);
+    if (r != AP2_SEND_SENT) return false;
+    atomic_fetch_add(&p->rtx_answered, 1);
+    return true;
+}
+
+/* Serve the RTP control port: receivers report lost audio there and wait for
+ * it to come back. Left unread the requests simply pile up in the socket
+ * buffer and the receiver keeps a permanent hole in its stream. */
+static void *ap2_rtx_thread_main(void *arg)
+{
+    struct ap2cl_s *p = arg;
+    uint64_t last_report = ap2_io_monotonic_ms();
+    LOG_DEBUG("[AP2] retransmit responder started (ring=%d packets)",
+              AP2_RTX_RING_SLOTS);
+    while (!atomic_load(&p->rtx_stop)) {
+        struct pollfd pfd = {.fd = p->ctrl_sock, .events = POLLIN};
+        int pr = poll(&pfd, 1, AP2_RTX_CTRL_POLL_MS);
+        if (pr > 0 && (pfd.revents & POLLIN)) {
+            for (int i = 0; i < 256; i++) {
+                uint8_t buf[512];
+                struct sockaddr_in from;
+                socklen_t from_len = sizeof(from);
+                /* MSG_DONTWAIT rather than relying on the socket's flags: the
+                 * loop must always fall back to the poll so a stop request is
+                 * seen within one poll interval. */
+                ssize_t n = recvfrom(p->ctrl_sock, buf, sizeof(buf),
+                                     MSG_DONTWAIT,
+                                     (struct sockaddr *)&from, &from_len);
+                if (n < 8) break;
+                /* Type 0x55 with the marker bit: [2:4] the request's own
+                 * sequence, [4:6] first missing RTP sequence, [6:8] count. */
+                if ((buf[1] & 0x7f) != 0x55) continue;
+                uint16_t req_seq = (uint16_t)((buf[2] << 8) | buf[3]);
+                uint16_t first = (uint16_t)((buf[4] << 8) | buf[5]);
+                uint16_t count = (uint16_t)((buf[6] << 8) | buf[7]);
+                if (!count || count > AP2_RTX_RING_SLOTS)
+                    count = count ? AP2_RTX_RING_SLOTS : 1;
+                atomic_fetch_add(&p->rtx_requested, count);
+                for (uint16_t k = 0; k < count; k++)
+                    ap2_rtx_resend(p, (uint16_t)(first + k), req_seq, &from);
+            }
+        }
+        uint64_t now = ap2_io_monotonic_ms();
+        unsigned long long asked = atomic_load(&p->rtx_requested);
+        if (asked && now - last_report >= 5000) {
+            last_report = now;
+            LOG_DEBUG("[AP2] retransmit: %llu requested, %llu resent, "
+                      "%llu already retired",
+                      asked, atomic_load(&p->rtx_answered),
+                      atomic_load(&p->rtx_expired));
+        }
+    }
+    LOG_DEBUG("[AP2] retransmit responder stopped (%llu requested, %llu resent, "
+              "%llu already retired)",
+              atomic_load(&p->rtx_requested), atomic_load(&p->rtx_answered),
+              atomic_load(&p->rtx_expired));
+    return NULL;
+}
+
+static bool ap2_rtx_start(struct ap2cl_s *p)
+{
+    if (p->ctrl_sock < 0) return false;
+    p->rtx_ring = calloc(AP2_RTX_RING_SLOTS, sizeof(*p->rtx_ring));
+    if (!p->rtx_ring) {
+        LOG_ERROR("[AP2] Cannot allocate retransmit ring");
+        return false;
+    }
+    atomic_store(&p->rtx_stop, false);
+    int err = pthread_create(&p->rtx_thread, NULL, ap2_rtx_thread_main, p);
+    if (err) {
+        LOG_ERROR("[AP2] Cannot start retransmit responder: %s", strerror(err));
+        free(p->rtx_ring);
+        p->rtx_ring = NULL;
+        return false;
+    }
+    p->rtx_thread_started = true;
+    return true;
+}
+
+static void ap2_rtx_stop(struct ap2cl_s *p)
+{
+    if (!p) return;
+    if (p->rtx_thread_started) {
+        atomic_store(&p->rtx_stop, true);
+        pthread_join(p->rtx_thread, NULL);
+        p->rtx_thread_started = false;
+    }
+    free(p->rtx_ring);
+    p->rtx_ring = NULL;
 }
 
 static void ap2_service_mrp_input(struct ap2cl_s *p)
@@ -1739,6 +1915,9 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         atomic_store(&p->rtsp_dead, true);
         return false;
     }
+    /* Non-fatal: without the responder the stream still plays, it just cannot
+     * repair receiver-side loss. */
+    ap2_rtx_start(p);
     ap2_set_connect_error(p, AP2_CONNECT_ERROR_NONE, 0, "%s", "");
     LOG_INFO("[AP2] Native AP2 session ready");
     return true;
@@ -1867,6 +2046,17 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
             p->rt_anchor_pos0 = p->rtp_timestamp;
         }
         p->rt_anchor_valid = true;
+        /* The frozen schedule handed to the receiver. audible_in_ms is how long
+         * the device still has between this announce and the instant its first
+         * sample must be rendering — the budget a woken-from-standby amp has to
+         * bring its output path up. */
+        int64_t audible_in_ms =
+            ((int64_t)(p->rt_anchor_wall0 - wall) / 1000000LL)
+            + (int64_t)p->latency_ms;
+        LOG_INFO("[AP2] anchor frozen: wall0=%" PRIu64 "ns pos0=%u "
+                 "latency_ms=%u start_ntp=%" PRIu64 " audible_in_ms=%" PRId64,
+                 p->rt_anchor_wall0, p->rt_anchor_pos0, p->latency_ms,
+                 p->start_ntp, audible_in_ms);
     }
     int64_t wall_delta_ns = wall >= p->rt_anchor_wall0
                                 ? (int64_t)(wall - p->rt_anchor_wall0)
@@ -2043,6 +2233,10 @@ static ap2_send_result_t ap2_native_send_chunk(
         p->data_sock, pkt, (size_t)actual_pkt_size,
         (const struct sockaddr *)&p->data_addr, sizeof(p->data_addr),
         ap2_io_monotonic_ms() + AP2_UDP_SEND_TIMEOUT_MS);
+    /* Keep the wire bytes before releasing them: a receiver can ask for this
+     * packet back at any point inside its buffer window. */
+    if (result == AP2_SEND_SENT)
+        ap2_rtx_store(p, (uint16_t)p->seq_number, pkt, actual_pkt_size);
     free(pkt);
 
     if (result == AP2_SEND_SENT) {
@@ -2153,6 +2347,11 @@ struct ap2cl_s *ap2cl_create(
     pthread_mutex_init(&p->rtsp_lock, NULL);
     pthread_mutex_init(&p->mrp_lock, NULL);
     pthread_mutex_init(&p->mrp_publish_lock, NULL);
+    pthread_mutex_init(&p->rtx_lock, NULL);
+    atomic_init(&p->rtx_stop, true);
+    atomic_init(&p->rtx_requested, 0);
+    atomic_init(&p->rtx_answered, 0);
+    atomic_init(&p->rtx_expired, 0);
     atomic_init(&p->rtsp_dead, false);
     atomic_init(&p->media_healthy, true);
     atomic_init(&p->feedback_failures, 0);
@@ -2188,6 +2387,8 @@ bool ap2cl_destroy(struct ap2cl_s *p)
 {
     if (!p) return false;
     ap2_feedback_stop(p);
+    /* Must join before the control socket closes: the responder polls it. */
+    ap2_rtx_stop(p);
     /* Preserve the on-wire shutdown sequence (final MediaRemote stopped state,
      * MRP disconnect, RTSP TEARDOWN) on the normal EOF path too. */
     if (p->state != AP2_DOWN || p->sock_fd >= 0)
@@ -2206,6 +2407,7 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     pthread_mutex_destroy(&p->rtsp_lock);
     pthread_mutex_destroy(&p->mrp_lock);
     pthread_mutex_destroy(&p->mrp_publish_lock);
+    pthread_mutex_destroy(&p->rtx_lock);
     if (p->data_sock >= 0) close(p->data_sock);
     if (p->ctrl_sock >= 0) close(p->ctrl_sock);
     if (p->events_sock >= 0) close(p->events_sock);
@@ -2312,6 +2514,7 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     if (!p) return false;
     if (p->flow == FLOW_NATIVE_AP2) {
         ap2_feedback_stop(p);
+        ap2_rtx_stop(p);
         /* Publish the final stopped state before disconnecting MediaRemote,
          * while the encrypted RTSP session is still live. */
         ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
@@ -2707,7 +2910,16 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
         uint64_t now_ntp = raopcl_get_ntp(NULL);
         uint64_t now_ts = NTP2TS(now_ntp, p->format.sample_rate);
         uint64_t window = ap2_pacing_window_frames(p);
-        return (now_ts + window) >= p->head_ts;
+        if ((now_ts + window) < p->head_ts) return false;
+        /* Space the releases. The window gate alone would hand the receiver
+         * the whole window at once at stream start, which overruns its socket
+         * buffer; steady state is far slower than this floor and unaffected. */
+        uint64_t now_us = ap2_io_monotonic_ms() * 1000ULL;
+        if (p->pace_last_release_us &&
+            now_us - p->pace_last_release_us < AP2_FILL_MIN_PACKET_GAP_US)
+            return false;
+        p->pace_last_release_us = now_us;
+        return true;
     }
     if (!p->raopcl) return false;
     return raopcl_accept_frames(p->raopcl);
@@ -3674,5 +3886,47 @@ uint64_t ap2cl_test_timeline_reanchors(struct ap2cl_s *p)
 uint32_t ap2cl_test_rtp_timestamp(struct ap2cl_s *p)
 {
     return p->rtp_timestamp;
+}
+
+/* Bind the control socket to an ephemeral local port and start the retransmit
+ * responder against it, so a test can play the receiver end. */
+int ap2cl_test_start_rtx(struct ap2cl_s *p)
+{
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    p->ctrl_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    if (p->ctrl_sock < 0) return -1;
+    if (bind(p->ctrl_sock, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+        return -1;
+    socklen_t len = sizeof(addr);
+    if (getsockname(p->ctrl_sock, (struct sockaddr *)&addr, &len) != 0)
+        return -1;
+    if (!ap2_rtx_start(p)) return -1;
+    return ntohs(addr.sin_port);
+}
+
+void ap2cl_test_stop_rtx(struct ap2cl_s *p)
+{
+    ap2_rtx_stop(p);
+    if (p->ctrl_sock >= 0) { close(p->ctrl_sock); p->ctrl_sock = -1; }
+}
+
+void ap2cl_test_rtx_store(struct ap2cl_s *p, uint16_t seq,
+                          const uint8_t *pkt, int len)
+{
+    ap2_rtx_store(p, seq, pkt, len);
+}
+
+unsigned long long ap2cl_test_rtx_answered(struct ap2cl_s *p)
+{
+    return atomic_load(&p->rtx_answered);
+}
+
+unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p)
+{
+    return atomic_load(&p->rtx_expired);
 }
 #endif
