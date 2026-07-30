@@ -199,10 +199,11 @@ stdin, the single persistent audio input for the whole process lifetime.
   `[STATUS] audio buffered_ms=<ms>` line fires again when the next track's feed
   has a complete packet buffered, or its final short packet reaches EOF.
   On Apple receivers the native flow instead runs a splice timeline (no receiver
-  flush, one immutable anchor line; any discard or re-anchor makes them emit a
-  short noise burst): the queued audio — kept shallow, reported as
+  flush, one immutable anchor line; any discard, re-anchor or stamp jump makes
+  them emit a short noise burst): the queued audio — kept shallow, reported as
   `warm_lead_ms` on the `[STATUS] latency` line — plays out and the next `START`
-  splices the new track at the commanded instant by skipping stamps forward.
+  splices the new track at the commanded instant, filling the gap with encoded
+  silence so the bitstream stays contiguous.
   The ack then reads `[STATUS] flushed head_unix_ms=<ms>` (the audible instant
   of the frozen delivery head); the commanded start must land beyond every
   member's head or that member splices at its own head instead.

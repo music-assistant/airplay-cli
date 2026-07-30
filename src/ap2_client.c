@@ -182,6 +182,9 @@ struct ap2cl_s {
     bool splice_timeline;         /* Apple receiver: discard-free warm path on
                                      one immutable anchor line (see the splice
                                      comments at flush/resume/standby) */
+    uint32_t splice_pad_frames;   /* silence frames still to send before the
+                                     next real sample so it lands exactly on
+                                     the commanded splice instant */
     uint64_t reanchor_shifted_frames; /* cumulative shift since the last start/
                                         * resume, for [STATUS] REANCHOR */
 
@@ -2413,6 +2416,7 @@ void ap2cl_standby(struct ap2cl_s *p)
          * reported was this FLUSH). The frozen anchor line survives the park;
          * the splice resume skips forward on it. */
         LOG_INFO("[AP2] splice standby: draining the queue, keeping the line");
+        p->splice_pad_frames = 0;
         ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
         p->state = AP2_CONNECTED;
         return;
@@ -2459,6 +2463,7 @@ bool ap2cl_flush(struct ap2cl_s *p)
         LOG_INFO("[AP2] splice flush: keeping the receiver queue "
                  "(head seq=%u rtptime=%u)",
                  (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
+        p->splice_pad_frames = 0;   /* the next resume computes a fresh pad */
         return true;
     }
     char hdr[64];
@@ -2496,30 +2501,31 @@ bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
     }
 
     if (atomic_load(&p->rtsp_dead)) return false;
-    if (p->splice_timeline && p->rt_anchor_valid) {
-        /* Splice resume: the anchor line frozen at the first START is
-         * immutable for the whole session — a line move under a live receiver
-         * is one of the measured noise triggers. The commanded start instead
-         * selects the splice point ON that line: stamps skip forward (never
-         * backward, and the sequence stays contiguous, so the receiver sees a
-         * content edit rather than packet loss) to the commanded instant and
-         * the skipped span renders as silence. Every member of a sync group
-         * is handed the same instant, so a group splices sample-aligned by
-         * construction. A start at or behind the current head splices at the
-         * head: the old queue (at most the pacing depth) plays out and the
-         * new content follows seamlessly. A resume after a long park lands
-         * the same way — the skip re-times the next frame to the commanded
-         * instant, so frames are never late (the remaining noise trigger). */
+    if (p->splice_timeline && p->rt_anchor_valid &&
+        p->head_ts > NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate)) {
+        /* Splice resume (hot line: the receiver still holds queued audio).
+         * The anchor line frozen at the first START is immutable for the
+         * whole session, and the wire must stay bitstream-continuous —
+         * a line move, a timestamp jump, and late frames are each an audible
+         * noise trigger on Apple receivers (all measured). The commanded
+         * start therefore selects the splice point ON the line, and the gap
+         * between the frozen head and that instant is FILLED with encoded
+         * silence: sequence numbers and timestamps advance normally and the
+         * first real sample lands exactly on the commanded instant. Every
+         * member of a sync group is handed the same instant, so a group
+         * splices sample-aligned by construction. A start at or behind the
+         * current head splices at the head: the old queue (at most the
+         * pacing depth) plays out and the new content follows seamlessly. */
         uint64_t target = NTP2TS(commanded_start_ntp(start_unix_ms),
                                  p->format.sample_rate);
         if (target > p->head_ts) {
-            uint64_t skip = target - p->head_ts;
-            LOG_INFO("[AP2] splice resume: skipping %" PRIu64 " frames "
-                     "(%" PRIu64 " ms) to the commanded start",
-                     skip, skip * 1000ULL / p->format.sample_rate);
-            p->head_ts = target;
-            p->rtp_timestamp = (uint32_t)(p->rtp_timestamp + skip);
+            uint64_t pad = target - p->head_ts;
+            p->splice_pad_frames = (uint32_t)pad;
+            LOG_INFO("[AP2] splice resume: padding %" PRIu64 " frames "
+                     "(%" PRIu64 " ms) of silence to the commanded start",
+                     pad, pad * 1000ULL / p->format.sample_rate);
         } else {
+            p->splice_pad_frames = 0;
             LOG_INFO("[AP2] splice resume at head (seq=%u rtptime=%u)",
                      (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
         }
@@ -2530,6 +2536,12 @@ bool ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms)
         atomic_store(&p->media_healthy, true);
         return true;
     }
+    /* A lapsed splice line (head at or behind the wall clock: the receiver
+     * drained long ago — resume from a long park) falls through to the stock
+     * re-anchor: a fresh line over a long-idle pipeline is the session-start
+     * shape, which is clean; padding silence from a lapsed head would deliver
+     * late frames, which is not. */
+    p->splice_pad_frames = 0;
     uint64_t start_ntp = commanded_start_ntp(start_unix_ms);
     /* Re-base the frozen line: head_ts moves in the scheduling domain, the
      * wire timestamp follows it plus the per-process offset, and the next
@@ -2630,25 +2642,23 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
     if (p->splice_timeline) {
         /* Splice recovery, same immutable-line rule as seek/resume: when the
          * input stalls long enough that the head falls inside the minimum
-         * lead, skip stamps forward so the resuming audio is never late; the
-         * receiver renders the skipped span as silence. Playback shifts later
-         * by the skip, reported as REANCHOR exactly like the stock path so MA
-         * keeps tracking the drift; the anchor line and the wire offset are
-         * untouched, so no sync re-announce is needed (the measured noise
-         * trigger on Apple receivers). */
+         * lead, queue silence padding up to now plus the recovery lead. The
+         * audio loop sends it as ordinary encoded chunks, so the wire stays
+         * bitstream-continuous through the stall (a stamp jump, a line move
+         * and late frames are each an audible noise trigger). Playback shifts
+         * later by the pad, reported as REANCHOR exactly like the stock path
+         * so MA keeps tracking the drift. */
         if (p->head_ts > now_ts + floor) return false;
-        uint64_t target = now_ts + recovery_lead;
-        uint64_t skip = target - p->head_ts;
-        p->head_ts = target;
-        p->rtp_timestamp = (uint32_t)(p->rtp_timestamp + skip);
+        uint64_t pad = now_ts + recovery_lead - p->head_ts;
+        p->splice_pad_frames += (uint32_t)pad;
         p->timeline_reanchors++;
-        p->reanchor_shifted_frames += skip;
-        LOG_WARN("[AP2] Splice-skipped after PCM starvation: shifted_frames="
+        p->reanchor_shifted_frames += pad;
+        LOG_WARN("[AP2] Splice-padded after PCM starvation: shifted_frames="
                  "%" PRIu64 " lead_frames=%" PRIu64 " count=%" PRIu64,
-                 skip, recovery_lead, p->timeline_reanchors);
+                 pad, recovery_lead, p->timeline_reanchors);
         fprintf(stderr, "[STATUS] REANCHOR shifted_frames=%" PRIu64
                 " total_shifted_frames=%" PRIu64 " sample_rate=%d\n",
-                skip, p->reanchor_shifted_frames, p->format.sample_rate);
+                pad, p->reanchor_shifted_frames, p->format.sample_rate);
         fflush(stderr);
         return true;
     }
@@ -2729,18 +2739,30 @@ void ap2cl_play(struct ap2cl_s *p)
     }
     if (p->flow == FLOW_NATIVE_AP2 && p->splice_timeline &&
         p->rt_anchor_valid) {
-        /* Un-pause on the frozen line: the paused wall time is never sent, so
-         * skip stamps to now plus the minimum lead — otherwise every frame
-         * after the pause would deliver late (a measured noise trigger). */
+        uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
         uint64_t target =
-            NTP2TS(raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS),
-                   p->format.sample_rate);
-        if (target > p->head_ts) {
-            uint64_t skip = target - p->head_ts;
-            LOG_INFO("[AP2] splice un-pause: skipping %" PRIu64 " frames",
-                     skip);
-            p->head_ts = target;
-            p->rtp_timestamp = (uint32_t)(p->rtp_timestamp + skip);
+            now_ts + MS2TS(AP2_MIN_WARM_LEAD_MS, p->format.sample_rate);
+        if (p->head_ts > now_ts) {
+            /* Un-pause on the hot line: fill the paused span with silence so
+             * the wire stays bitstream-continuous and the remaining content
+             * resumes at now plus the minimum lead — a stamp jump or late
+             * frames are each an audible noise trigger. */
+            if (target > p->head_ts) {
+                p->splice_pad_frames = (uint32_t)(target - p->head_ts);
+                LOG_INFO("[AP2] splice un-pause: padding %u silence frames",
+                         (unsigned)p->splice_pad_frames);
+            }
+        } else {
+            /* Lapsed line (receiver drained long ago): re-anchor fresh over
+             * the idle pipeline, the clean session-start shape. */
+            p->splice_pad_frames = 0;
+            p->start_ntp = raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+            p->head_ts = NTP2TS(p->start_ntp, p->format.sample_rate);
+            p->rtp_timestamp = (uint32_t)p->head_ts +
+                               atomic_load(&p->rtp_offset);
+            p->rt_anchor_valid = false;
+            p->first_packet = true;
+            LOG_INFO("[AP2] splice un-pause after drain: fresh anchor line");
         }
     }
     p->state = AP2_STREAMING;
@@ -3348,6 +3370,22 @@ uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p)
      * clock, so its audible instant is the direct inverse mapping. */
     uint64_t ntp = TS2NTP(p->head_ts, p->format.sample_rate);
     return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
+}
+
+/* Silence frames the audio loop still owes the wire before the next real
+ * sample (splice timeline): the pad bridges the frozen head and the commanded
+ * splice instant with ordinary encoded chunks so sequence numbers and
+ * timestamps stay contiguous. The loop consumes it as it sends. */
+uint32_t ap2cl_splice_pad_frames(struct ap2cl_s *p)
+{
+    return p ? p->splice_pad_frames : 0;
+}
+
+void ap2cl_splice_pad_consume(struct ap2cl_s *p, uint32_t frames)
+{
+    if (!p) return;
+    p->splice_pad_frames = frames < p->splice_pad_frames
+                               ? p->splice_pad_frames - frames : 0;
 }
 
 int ap2cl_render_latency_ms(struct ap2cl_s *p) { return p ? p->dev_render_ms : 0; }

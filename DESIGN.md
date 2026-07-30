@@ -593,9 +593,11 @@ capture.
   a splice timeline: the anchor line frozen at the first START is immutable for
   the whole session, no flush verb is ever sent, and every warm boundary
   (seek/next FLUSH+START, standby park/resume, pause/un-pause, starvation
-  recovery) is expressed as a forward-only stamp skip on that line — the
-  sequence stays contiguous, so the receiver sees a content edit rather than
-  loss, and the skipped span renders as silence. The commanded START selects
+  recovery) keeps the wire bitstream-continuous — a forward stamp jump is
+  audible too, so the gap up to the commanded instant is FILLED with encoded
+  silence sent as ordinary chunks (sequence numbers and timestamps advance
+  normally; the final partial pad shares a chunk with the first real samples,
+  keeping the splice sample-exact). The commanded START selects
   the splice instant on the line (the same instant for every member of a sync
   group, so a group splices sample-aligned); the pacing depth is kept shallow
   (600 ms) because the receiver's queued audio plays out before a splice is

@@ -342,6 +342,12 @@ int ap2cl_warm_lead_ms(struct ap2cl_s *p);
  * every member's queued audio. 0 = no constraint (not on the splice path). */
 uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p);
 
+/* Silence frames still owed to the wire before the next real sample (splice
+ * timeline): the audio loop prepends them as ordinary encoded chunks so the
+ * bitstream stays contiguous, and consumes the pad as it sends. */
+uint32_t ap2cl_splice_pad_frames(struct ap2cl_s *p);
+void ap2cl_splice_pad_consume(struct ap2cl_s *p, uint32_t frames);
+
 /* Get current state. */
 ap2_state_t ap2cl_state(struct ap2cl_s *p);
 

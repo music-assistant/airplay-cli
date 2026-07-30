@@ -1149,49 +1149,66 @@ static int run_airplay2(cli_config_t *cfg)
                 eof_reported = false;
                 eof_time = 0;
             }
-            int n = ap2_session_read(
-                g_session, buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf, 250);
-            if (n == -2) {
-                pthread_mutex_unlock(&g_audio_send_lock);
-                break;
-            }
-            if (n == -1) {
-                LOG_INFO("End of AirPlay 2 input stream, draining buffer...");
-                input_ended = true;
-                eof_time = raopcl_get_ntp(NULL);
-                pthread_mutex_unlock(&g_audio_send_lock);
-                continue;
-            }
-            if (n == 0) {
-                /* A zero read while idle-primed (post-FLUSH awaiting START) or
-                 * in standby is by design, not starvation: the timeline is
-                 * frozen and a recovery re-anchor here would announce anchor
-                 * jumps to a receiver still rendering its buffered audio. Only
-                 * a stall of a genuinely playing stream is an input gap. */
-                if (ap2_session_state(g_session) != AP2_SESSION_PLAYING) {
+            /* Splice pad (Apple splice timeline): silence owed to the wire
+             * before the next real sample, sent as ordinary encoded chunks so
+             * sequence numbers and timestamps stay contiguous (any stamp jump
+             * is an audible noise burst). A partial pad occupies the head of
+             * the chunk and the first real samples complete it, so the splice
+             * lands sample-exact on the commanded instant. */
+            uint32_t pad = ap2cl_splice_pad_frames(g_ap2cl);
+            uint32_t pad_frames_now = pad < AP2_FRAMES_PER_CHUNK
+                                          ? pad : AP2_FRAMES_PER_CHUNK;
+            int pad_bytes = (int)pad_frames_now * ap2_input_bpf;
+            int want = AP2_FRAMES_PER_CHUNK * ap2_input_bpf - pad_bytes;
+            int n = 0;
+            if (want > 0) {
+                n = ap2_session_read(g_session, buf + pad_bytes, want, 250);
+                if (n == -2) {
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    break;
+                }
+                if (n == -1) {
+                    LOG_INFO("End of AirPlay 2 input stream, draining buffer...");
+                    input_ended = true;
+                    eof_time = raopcl_get_ntp(NULL);
                     pthread_mutex_unlock(&g_audio_send_lock);
                     continue;
                 }
-                if (!starving) {
-                    starving = true;
-                    starvation_started = raopcl_get_ntp(NULL);
-                    LOG_WARN("[AP2] PCM input starved; waiting in 250 ms intervals");
-                    ap2cl_log_diagnostics(g_ap2cl);
+                if (n == 0) {
+                    /* A zero read while idle-primed (post-FLUSH awaiting
+                     * START) or in standby is by design, not starvation: the
+                     * timeline is frozen and a recovery re-anchor here would
+                     * announce anchor jumps to a receiver still rendering its
+                     * buffered audio. Only a stall of a genuinely playing
+                     * stream is an input gap. */
+                    if (ap2_session_state(g_session) != AP2_SESSION_PLAYING) {
+                        pthread_mutex_unlock(&g_audio_send_lock);
+                        continue;
+                    }
+                    if (!starving) {
+                        starving = true;
+                        starvation_started = raopcl_get_ntp(NULL);
+                        LOG_WARN("[AP2] PCM input starved; waiting in 250 ms intervals");
+                        ap2cl_log_diagnostics(g_ap2cl);
+                    }
+                    ap2cl_recover_input_gap(g_ap2cl);
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    continue;
                 }
-                ap2cl_recover_input_gap(g_ap2cl);
-                pthread_mutex_unlock(&g_audio_send_lock);
-                continue;
+                if (starving) {
+                    uint32_t stalled_ms =
+                        (uint32_t)NTP2MS(raopcl_get_ntp(NULL) -
+                                         starvation_started);
+                    LOG_INFO("[AP2] PCM input recovered after %u ms", stalled_ms);
+                    ap2cl_log_diagnostics(g_ap2cl);
+                    starving = false;
+                }
             }
+            if (pad_bytes)
+                memset(buf, 0, (size_t)pad_bytes);
             n = pad_final_pcm_chunk(
-                buf, n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf, ap2_input_bpf);
-            if (starving) {
-                uint32_t stalled_ms =
-                    (uint32_t)NTP2MS(raopcl_get_ntp(NULL) -
-                                     starvation_started);
-                LOG_INFO("[AP2] PCM input recovered after %u ms", stalled_ms);
-                ap2cl_log_diagnostics(g_ap2cl);
-                starving = false;
-            }
+                buf, pad_bytes + n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf,
+                ap2_input_bpf);
 
             int af = n / ap2_input_bpf;
             uint8_t *send = buf;
@@ -1207,7 +1224,10 @@ static int run_airplay2(cli_config_t *cfg)
                 pthread_mutex_unlock(&g_audio_send_lock);
                 break;
             }
-            frames += af;
+            ap2cl_splice_pad_consume(g_ap2cl, pad_frames_now);
+            /* Pad silence is not media content: elapsed counts only the real
+             * samples so the position base stays on the new track's start. */
+            frames += af - (int)pad_frames_now;
             pthread_mutex_unlock(&g_audio_send_lock);
         } else {
             /* Paused, or connected and awaiting the commanded first START. */

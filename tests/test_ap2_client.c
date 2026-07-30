@@ -9,6 +9,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ap2_bplist.h"
@@ -435,17 +436,21 @@ static void test_splice_timeline_warm_path(void)
     /* Warm seek: flush keeps the receiver queue and the anchor line... */
     assert(ap2cl_flush(client));
     assert(ap2cl_test_anchor_valid(client));
-    /* ...and resume skips stamps forward to the commanded instant with the
-     * head/timestamp relation intact (a content edit, not a restart). */
-    assert(ap2cl_resume(client, 0));
+    /* ...and resume never touches the stamps (a jump is an audible noise
+     * burst): the gap to a future commanded instant becomes silence padding
+     * the audio loop sends as ordinary contiguous chunks. */
+    uint64_t start_ms = ((uint64_t)time(NULL) + 3) * 1000ULL;
+    assert(ap2cl_resume(client, start_ms));
     assert(ap2cl_state(client) == AP2_STREAMING);
     assert(ap2cl_test_anchor_valid(client));
     assert(!ap2cl_test_first_packet(client));
-    uint64_t head_after = ap2cl_test_head_ts(client);
-    uint32_t rtp_after = ap2cl_test_rtp_timestamp(client);
-    assert(head_after >= head_before);
-    assert((uint32_t)(rtp_after - rtp_before) ==
-           (uint32_t)(head_after - head_before));
+    assert(ap2cl_test_head_ts(client) == head_before);
+    assert(ap2cl_test_rtp_timestamp(client) == rtp_before);
+    /* ~3 s to the commanded instant at 44.1 kHz, minus the queued head. */
+    uint32_t pad = ap2cl_splice_pad_frames(client);
+    assert(pad > 44100 && pad < 4 * 44100);
+    ap2cl_splice_pad_consume(client, pad);
+    assert(ap2cl_splice_pad_frames(client) == 0);
 
     /* Park: no flush verb either; the line survives for the next resume. */
     ap2cl_standby(client);
