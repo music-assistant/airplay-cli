@@ -228,7 +228,8 @@ grandmaster — but MA spawns one cliairplay per device. The split
 - **Control channel** — localhost UDP `127.0.0.1:9010` (deliberately not
   nqptp's 9000, so a real nqptp serving receivers on the same host cannot
   collide): `R <ip>` register receiver, `U <ip>` unregister, `?` liveness
-  probe; nqptp's `T`/`B`/`E`/`P` are accepted, with `T` treated as an
+  probe, `Q <ip>` query the receiver's clock-exchange streak (§6, clock
+  readiness); nqptp's `T`/`B`/`E`/`P` are accepted, with `T` treated as an
   additive register (each stream registers its own receiver; the daemon
   aggregates).
 - **Streams with `--ptp-shared`** — probe the daemon, attach the shm
@@ -257,6 +258,38 @@ always reports the true scheduled instant — the caller compares the two, logs
 corrections, and re-aligns a group by re-STARTing every member at the largest
 reported instant. The minimum lead (250 ms; 200 ms on RAOP) covers only the
 commit round-trips since the connection and the feed are already up.
+
+**Receiver clock readiness (clock-verified anchors).** A commanded start is
+only audible on time if the receiver's PTP servo can seat it: a third-party
+receiver seats its render position once, with whatever clock state it has at
+the anchor instant, and keeps that seat for the whole session (measured on a
+rejoining Sonos pair as a permanent echo), while Apple receivers converge a
+still-settling servo onto the line. The timing engine (in-process or daemon)
+tracks each receiver's **probe streak** — the uninterrupted run of
+Delay_Req/Pdelay_Req received from that IP, reset by a 3 s gap — and the
+daemon answers `Q <ip>` with the streak ages. Readiness = streak start
++ 2.3 s (the measured Sonos servo-lock window), with Apple models also
+granted the observed fast bound (third exchange + 250 ms). Enforcement:
+
+- **At commit**, a live streak folds readiness into the feasibility floor,
+  so an anchor before readiness is corrected forward through the normal
+  started-ack contract (which group starts re-converge from as usual).
+- **After a cold commit** (no live streak yet — a rejoining receiver resumes
+  probing only ~0.7-1.5 s AFTER the START ack, so commit-time enforcement is
+  impossible), the audio loop keeps verifying while the pacing gate still
+  holds every frame. Once the streak appears, an anchor at or beyond
+  readiness logs `[STATUS] clock_verified margin_ms=`. One short of it is
+  handled by START intent: a `START_JOIN=1` start (a late joiner that must
+  land on the group's already-live timeline — the permanent-echo case) is
+  moved forward pre-send (a fresh announce over an idle pipeline, the clean
+  session-start shape) and reported as `[STATUS] anchor_corrected
+  requested_unix_ms= from_unix_ms= at_unix_ms=` so the caller re-syncs that
+  member; a group/solo ORIGIN start only logs the shortfall — its receivers
+  self-seat a fresh session within ~20 ms, and moving one member of a group
+  origin desyncs the group (ear-confirmed). Anchors without runway to act
+  (solo starts at the minimum lead) are never armed, and a window that
+  closes without a probe leaves the anchor standing, logged unverified —
+  the legacy behavior.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its

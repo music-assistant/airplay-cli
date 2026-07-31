@@ -136,8 +136,11 @@ void ap2_ptp_shm_reader_close(struct ap2_ptp_shm_reader *r);
  *   T <ip> [<ip> ...]   nqptp-compatible alias for register (ADD; see note)
  *   B | E | P           begin / end / pause (accepted + acked; no-op for a sender)
  *   ? | PING            liveness probe
+ *   Q <ip>              query the receiver's clock-exchange streak
  * The daemon replies to the datagram's source with a short ack, e.g.
  *   "OK peers=2 gm=0123456789abcdef role=grandmaster"
+ * except Q, whose ack carries the streak snapshot instead (zeros = cold clock):
+ *   "OK ip=10.0.0.5 count=7 first_ms=6400 last_ms=120 third_ms=4400"
  *
  * NOTE: nqptp's "T" REPLACES its peer list; ours ADDS, because each streaming
  * process registers its own receiver independently and the daemon aggregates

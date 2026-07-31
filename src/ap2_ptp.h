@@ -123,6 +123,33 @@ uint64_t ap2_ptp_master_clock_id(struct ap2_ptp_ctx *ctx);
  */
 uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx);
 
+/*
+ * Snapshot of a receiver's clock-exchange streak: the uninterrupted run of
+ * Delay_Req/Pdelay_Req timing probes received from that IP by this engine
+ * (or by the shared daemon). Ages are milliseconds before now. count==0
+ * means the clock is cold: no probe ever seen, or the most recent one is
+ * older than the streak gap.
+ */
+struct ap2_ptp_exchange {
+    uint32_t count;      /* probes in the current uninterrupted streak */
+    uint64_t first_ms;   /* age of the streak's first probe */
+    uint64_t last_ms;    /* age of the most recent probe */
+    uint64_t third_ms;   /* age of the streak's third probe (0 while count < 3) */
+};
+
+/*
+ * Report the live clock-exchange streak for receiver `ip`: read from this
+ * engine directly, or queried from the shared daemon over the control channel
+ * (Q verb) when this context is attached to one — the caller does not need to
+ * know which.
+ *
+ * :param ip: receiver IP to look up.
+ * :param out: receives the streak snapshot; zeroed when this returns false.
+ * :returns: false if the peer has no live streak (cold clock) or the shared
+ *           daemon is unreachable.
+ */
+bool ap2_ptp_peer_exchange(struct ap2_ptp_ctx *ctx, const char *ip, struct ap2_ptp_exchange *out);
+
 /* ---- shared daemon clock (multi-room: one engine, many streams) ---- */
 
 /*

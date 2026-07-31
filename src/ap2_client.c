@@ -84,6 +84,22 @@ extern log_level *loglevel;
  * after the connection and the audio feed are both confirmed, so no setup
  * slack is needed on top. */
 #define AP2_MIN_WARM_LEAD_MS         250
+/* Receiver clock readiness, measured from its PTP probe streak (Delay_Req/
+ * Pdelay_Req RX tracked per peer by the timing engine or the shared daemon).
+ * A third-party receiver seats its render position once, with whatever
+ * servo state it has at the anchor instant, and keeps that seat for the
+ * whole session — so its anchor must clear the full measured servo-lock
+ * window from the streak start (Sonos Era 100: 1.7-2.3 s). Apple receivers
+ * converge a still-settling servo onto the anchor and are ready shortly
+ * after their third exchange. */
+#define AP2_CLOCK_LOCK_MS            2300
+#define AP2_CLOCK_SETTLE_MS          250
+#define AP2_CLOCK_SEAT_EXCHANGES     3
+#define AP2_CLOCK_VERIFY_POLL_MS     250
+/* Verification needs room to act before the initial fill starts releasing
+ * real frames at anchor - pacing depth: anchors closer than the depth plus
+ * one poll round plus slack can never be corrected, so they are not armed. */
+#define AP2_CLOCK_VERIFY_MIN_WINDOW_MS (AP2_SPLICE_PACING_MS + 500)
 /* Receiver queue depth on the splice timeline (§ splice below): the
  * depth IS the audible latency of a warm splice, so it stays shallow. */
 #define AP2_SPLICE_PACING_MS         600
@@ -223,6 +239,28 @@ struct ap2cl_s {
                                      content_paused, published as stopped */
     uint64_t reanchor_shifted_frames; /* cumulative shift since the last start/
                                         * resume, for [STATUS] REANCHOR */
+    /* Clock verification of a start committed before the receiver's first
+     * timing probe (cold clock). clock_verify_lock guards this block plus
+     * the ctrl poller's snapshot; the anchor rebase a correction performs
+     * runs on the audio-loop thread under its send lock, serialized against
+     * a concurrent commit by this lock (commits disarm before touching the
+     * anchor). */
+    pthread_mutex_t clock_verify_lock;
+    bool clock_verify_armed;
+    bool clock_verify_enforce;     /* join start: correct, don't just observe */
+    bool start_join_pending;       /* latched by ap2cl_set_start_join */
+    bool apple_model;              /* model=/am= names an Apple receiver */
+    uint64_t clock_verify_requested_unix_ms;
+    uint64_t clock_verify_anchor_unix_ms;
+    uint64_t clock_verify_packets_at_arm;
+    uint64_t clock_verify_next_poll_ntp;
+    bool clock_verify_have_exchange;
+    struct ap2_ptp_exchange clock_verify_exchange;
+    /* Shared-daemon mode queries the streak over UDP (blocking); this poller
+     * keeps the snapshot fresh so the audio loop never blocks on it. */
+    pthread_t clock_verify_thread;
+    bool clock_verify_thread_started;
+    atomic_bool clock_verify_thread_stop;
     /* Retransmit history and the control-port reader that serves it. The ring
      * is written by the audio thread and read by the reader thread. */
     struct ap2_rtx_slot *rtx_ring;
@@ -290,6 +328,8 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                                      bool force);
 static bool ap2_set_nonblocking(int fd, const char *name);
 static void ap2_raop_session_cleanup(struct ap2cl_s *p);
+static void ap2_clock_verify_disarm(struct ap2cl_s *p);
+static void ap2_clock_verify_reap_poller(struct ap2cl_s *p);
 
 static void ap2_remote_command_received(
     ap2_remote_command_t command, void *userdata)
@@ -1026,6 +1066,26 @@ static bool ap2_features_has_ptp(const char *txt)
 static bool ap2_splice_denied(const char *txt, const char *am)
 {
     static const char *const prefixes[] = { NULL };
+    const char *model = txt ? strstr(txt, "model=") : NULL;
+    if (model) model += strlen("model=");
+    for (size_t i = 0; prefixes[i]; i++) {
+        size_t len = strlen(prefixes[i]);
+        if (model && strncmp(model, prefixes[i], len) == 0) return true;
+        if (am && strncmp(am, prefixes[i], len) == 0) return true;
+    }
+    return false;
+}
+
+/* Apple receivers, from the `model=` (_airplay TXT) / `am=` (_raop) field.
+ * They converge a still-settling PTP servo onto a committed anchor (solo
+ * Apple TV starts render exactly on anchors well inside the servo-lock
+ * window), so clock readiness grants them the fast observed bound; a
+ * third-party receiver keeps whatever seat it takes at the anchor instant. */
+static bool ap2_apple_model(const char *txt, const char *am)
+{
+    static const char *const prefixes[] = {
+        "AppleTV", "AudioAccessory", "iPhone", "iPad", "iPod", "Mac", NULL,
+    };
     const char *model = txt ? strstr(txt, "model=") : NULL;
     if (model) model += strlen("model=");
     for (size_t i = 0; prefixes[i]; i++) {
@@ -2351,6 +2411,8 @@ struct ap2cl_s *ap2cl_create(
     pthread_mutex_init(&p->mrp_lock, NULL);
     pthread_mutex_init(&p->mrp_publish_lock, NULL);
     pthread_mutex_init(&p->rtx_lock, NULL);
+    pthread_mutex_init(&p->clock_verify_lock, NULL);
+    atomic_init(&p->clock_verify_thread_stop, true);
     atomic_init(&p->rtx_stop, true);
     atomic_init(&p->rtx_requested, 0);
     atomic_init(&p->rtx_answered, 0);
@@ -2390,6 +2452,8 @@ bool ap2cl_destroy(struct ap2cl_s *p)
 {
     if (!p) return false;
     ap2_feedback_stop(p);
+    ap2_clock_verify_disarm(p);
+    ap2_clock_verify_reap_poller(p);
     /* Must join before the control socket closes: the responder polls it. */
     ap2_rtx_stop(p);
     /* Preserve the on-wire shutdown sequence (final MediaRemote stopped state,
@@ -2411,6 +2475,7 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     pthread_mutex_destroy(&p->mrp_lock);
     pthread_mutex_destroy(&p->mrp_publish_lock);
     pthread_mutex_destroy(&p->rtx_lock);
+    pthread_mutex_destroy(&p->clock_verify_lock);
     if (p->data_sock >= 0) close(p->data_sock);
     if (p->ctrl_sock >= 0) close(p->ctrl_sock);
     if (p->events_sock >= 0) close(p->events_sock);
@@ -2464,6 +2529,12 @@ void ap2cl_set_ptp_shared(struct ap2cl_s *p, bool enable)
     LOG_INFO("[AP2] Shared PTP daemon clock %s", enable ? "preferred" : "disabled");
 }
 
+void ap2cl_set_start_join(struct ap2cl_s *p, bool join)
+{
+    if (!p) return;
+    p->start_join_pending = join;
+}
+
 void ap2cl_set_remote_command_callback(
     struct ap2cl_s *p, ap2_remote_command_cb_t callback, void *userdata)
 {
@@ -2492,6 +2563,7 @@ bool ap2cl_connect(struct ap2cl_s *p)
     if (p->flow == FLOW_NATIVE_AP2) {
         p->splice_timeline =
             !ap2_splice_denied(p->device.txt_records, p->am);
+        p->apple_model = ap2_apple_model(p->device.txt_records, p->am);
         if (p->splice_timeline) {
             LOG_INFO("[AP2] splice timeline (discard-free warm path, "
                      "%d ms queue depth)", AP2_SPLICE_PACING_MS);
@@ -2560,6 +2632,137 @@ static uint64_t ap2_ntp_to_unix_ms(uint64_t ntp)
     return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
 }
 
+/* ---- Receiver clock readiness (PTP probe streak) ---- */
+
+/* Earliest instant (unix ms) the receiver can seat an anchor, from a live
+ * probe-streak snapshot. Third-party receivers get the full servo-lock
+ * window from the streak start; Apple models also honor the observed fast
+ * bound (third exchange + settle), whichever is earlier. */
+static uint64_t ap2_clock_ready_from(const struct ap2cl_s *p,
+                                     const struct ap2_ptp_exchange *ex,
+                                     uint64_t now_unix_ms)
+{
+    uint64_t first_ms = ex->first_ms < now_unix_ms ? ex->first_ms : now_unix_ms;
+    uint64_t ready = now_unix_ms - first_ms + AP2_CLOCK_LOCK_MS;
+    if (p->apple_model && ex->count >= AP2_CLOCK_SEAT_EXCHANGES) {
+        uint64_t third_ms =
+            ex->third_ms < now_unix_ms ? ex->third_ms : now_unix_ms;
+        uint64_t fast = now_unix_ms - third_ms + AP2_CLOCK_SETTLE_MS;
+        if (fast < ready) ready = fast;
+    }
+    return ready;
+}
+
+/* Live probe streak for this session's receiver. Blocks up to the control
+ * timeout in shared-daemon mode, so the audio loop must go through the
+ * poller snapshot instead of calling this. */
+static bool ap2_clock_query(struct ap2cl_s *p, struct ap2_ptp_exchange *ex)
+{
+    return ap2_ptp_peer_exchange(p->ptp, p->device.address, ex);
+}
+
+/* Raise a commit's feasibility floor to the receiver's clock readiness. With
+ * no live streak the clock is cold: the floor is left alone (the receiver
+ * only begins probing after the anchor line is announced, so there is
+ * nothing to measure yet) and *clock_cold tells the commit to arm the
+ * post-commit verification instead. */
+static uint64_t ap2_clock_floor(struct ap2cl_s *p, uint64_t floor_ntp,
+                                bool *clock_cold)
+{
+    *clock_cold = false;
+    if (p->flow != FLOW_NATIVE_AP2 || !p->use_ptp) return floor_ntp;
+    struct ap2_ptp_exchange ex;
+    if (!ap2_clock_query(p, &ex)) {
+        *clock_cold = true;
+        return floor_ntp;
+    }
+    uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    uint64_t ready_ms = ap2_clock_ready_from(p, &ex, now_ms);
+    uint64_t ready_ntp = ap2_unix_ms_to_ntp(ready_ms);
+    if (ready_ntp <= floor_ntp) return floor_ntp;
+    LOG_INFO("[AP2] receiver clock floor: probe streak %" PRIu64 " ms old "
+             "(%u exchanges), ready in %" PRIu64 " ms",
+             ex.first_ms, ex.count, ready_ms - now_ms);
+    return ready_ntp;
+}
+
+/* Stop the verification without an event (new commit, flush, teardown). The
+ * poller is signalled here and joined by the next arm or the destroy. */
+static void ap2_clock_verify_disarm(struct ap2cl_s *p)
+{
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_verify_armed = false;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    atomic_store(&p->clock_verify_thread_stop, true);
+}
+
+static void ap2_clock_verify_reap_poller(struct ap2cl_s *p)
+{
+    if (!p->clock_verify_thread_started) return;
+    atomic_store(&p->clock_verify_thread_stop, true);
+    pthread_join(p->clock_verify_thread, NULL);
+    p->clock_verify_thread_started = false;
+}
+
+/* Shared-daemon mode: keep the probe-streak snapshot fresh over the control
+ * channel so the audio loop's poll never blocks on UDP. */
+static void *ap2_clock_verify_poller(void *arg)
+{
+    struct ap2cl_s *p = arg;
+    while (!atomic_load(&p->clock_verify_thread_stop)) {
+        struct ap2_ptp_exchange ex;
+        bool have = ap2_clock_query(p, &ex);
+        pthread_mutex_lock(&p->clock_verify_lock);
+        bool armed = p->clock_verify_armed;
+        p->clock_verify_have_exchange = have;
+        if (have) p->clock_verify_exchange = ex;
+        pthread_mutex_unlock(&p->clock_verify_lock);
+        if (!armed) break;
+        for (int i = 0; i < AP2_CLOCK_VERIFY_POLL_MS / 50 &&
+                        !atomic_load(&p->clock_verify_thread_stop); i++)
+            usleep(50000);
+    }
+    return NULL;
+}
+
+/* Arm the post-commit verification for a cold-clock commit: the receiver's
+ * probe streak is expected to begin only after the anchor announce, and the
+ * committed instant must then be checked against the observed readiness.
+ * Only a join-marked start (landing on an already-live group timeline) is
+ * ENFORCED with a forward correction; an origin start is observed and
+ * reported only — its receivers self-seat a fresh session cleanly, and
+ * moving one member of a group origin desyncs the group (ear-confirmed).
+ * Anchors without enough runway to act before the initial fill are not
+ * armed (their fill starts immediately; nothing could be corrected). */
+static void ap2_clock_verify_arm(struct ap2cl_s *p, uint64_t requested_unix_ms,
+                                 uint64_t at_unix_ms, bool enforce)
+{
+    if (!p->splice_timeline || !p->use_ptp) return;
+    uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    if (at_unix_ms < now_ms + AP2_CLOCK_VERIFY_MIN_WINDOW_MS) return;
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_verify_armed = true;
+    p->clock_verify_enforce = enforce;
+    p->clock_verify_requested_unix_ms = requested_unix_ms;
+    p->clock_verify_anchor_unix_ms = at_unix_ms;
+    p->clock_verify_packets_at_arm = p->audio_packets_sent;
+    p->clock_verify_next_poll_ntp = 0;
+    p->clock_verify_have_exchange = false;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    LOG_INFO("[AP2] clock verification armed (%s): cold receiver clock, "
+             "anchor in %" PRIu64 " ms", enforce ? "join, enforcing" : "observe",
+             at_unix_ms - now_ms);
+    if (ap2_ptp_shared_active(p->ptp)) {
+        ap2_clock_verify_reap_poller(p);
+        atomic_store(&p->clock_verify_thread_stop, false);
+        if (pthread_create(&p->clock_verify_thread, NULL,
+                           ap2_clock_verify_poller, p) == 0)
+            p->clock_verify_thread_started = true;
+        else
+            atomic_store(&p->clock_verify_thread_stop, true);
+    }
+}
+
 /* Resolve a commanded start: a request at or beyond `floor_ntp` is honored
  * exactly; one behind it (or 0) is corrected FORWARD to the floor — audio
  * always flows, never silently misplaced or refused. *ntp_start receives the
@@ -2598,12 +2801,19 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
                                 uint64_t *at_unix_ms)
 {
     if (!p) return AP2_COMMIT_FAILED;
+    ap2_clock_verify_disarm(p);
+    bool join = p->start_join_pending;
+    p->start_join_pending = false;
     p->content_paused = false;
     p->content_stopped = false;
     uint64_t ntp_start = 0;
-    ap2_resolve_start(start_unix_ms,
-                      raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS),
-                      &ntp_start, at_unix_ms);
+    bool clock_cold = false;
+    uint64_t floor_ntp =
+        ap2_clock_floor(p, raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS),
+                        &clock_cold);
+    uint64_t at_local = 0;
+    ap2_resolve_start(start_unix_ms, floor_ntp, &ntp_start, &at_local);
+    if (at_unix_ms) *at_unix_ms = at_local;
     if (p->flow == FLOW_NATIVE_AP2) {
         /* Offset the RTP timeline per process: streams in one group share
          * ntpstart, and with identical pos0 two sessions from one host are
@@ -2640,6 +2850,7 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
             atomic_store(&p->media_healthy, false);
             return AP2_COMMIT_FAILED;
         }
+        if (clock_cold) ap2_clock_verify_arm(p, start_unix_ms, at_local, join);
         return AP2_COMMIT_OK;
     }
     if (!p->raopcl) return AP2_COMMIT_FAILED;
@@ -2661,6 +2872,7 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
 void ap2cl_standby(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return;
+    ap2_clock_verify_disarm(p);
     p->content_paused = false;
     p->content_stopped = false;
     if (p->flow != FLOW_NATIVE_AP2) {
@@ -2707,6 +2919,7 @@ void ap2cl_standby(struct ap2cl_s *p)
 bool ap2cl_flush(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return false;
+    ap2_clock_verify_disarm(p);
 
     if (p->flow != FLOW_NATIVE_AP2)
         return raop_session_flush(p->raopcl);
@@ -2755,6 +2968,9 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
                                  uint64_t *at_unix_ms)
 {
     if (!p || p->state == AP2_DOWN) return AP2_COMMIT_FAILED;
+    ap2_clock_verify_disarm(p);
+    bool join = p->start_join_pending;
+    p->start_join_pending = false;
     p->content_paused = false;
     p->content_stopped = false;
 
@@ -2841,8 +3057,12 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
         ap2cl_flush(p);
     }
     uint64_t start_ntp = 0;
-    ap2_resolve_start(start_unix_ms, now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS),
-                      &start_ntp, at_unix_ms);
+    bool clock_cold = false;
+    uint64_t floor_ntp =
+        ap2_clock_floor(p, now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS), &clock_cold);
+    uint64_t at_local = 0;
+    ap2_resolve_start(start_unix_ms, floor_ntp, &start_ntp, &at_local);
+    if (at_unix_ms) *at_unix_ms = at_local;
     /* Re-base the frozen line: head_ts moves in the scheduling domain, the
      * wire timestamp follows it plus the per-process offset, and the next
      * sync packet freezes the new line from start_ntp. */
@@ -2862,6 +3082,7 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
         atomic_store(&p->media_healthy, false);
         return AP2_COMMIT_FAILED;
     }
+    if (clock_cold) ap2_clock_verify_arm(p, start_unix_ms, at_local, join);
     return AP2_COMMIT_OK;
 }
 
@@ -3056,6 +3277,117 @@ bool ap2cl_recover_delivery_gap(struct ap2cl_s *p)
     return ap2_splice_pad_to_lead(p, now_ts, now_ts, "delivery stall");
 }
 
+/* Move a committed anchor line that has not carried any audio yet onto a
+ * later instant. With a distant anchor the pacing gate holds every frame
+ * until anchor - depth, so the receiver has only seen announces of the old
+ * line and re-seats cleanly on the fresh one (the session-start shape); the
+ * content mapping moves with the line, keeping the first pending sample on
+ * the commanded contract. */
+static void ap2_rebase_pending_anchor(struct ap2cl_s *p, uint64_t at_unix_ms)
+{
+    uint64_t ntp = ap2_unix_ms_to_ntp(at_unix_ms);
+    p->start_ntp = ntp;
+    p->head_ts = NTP2TS(ntp, p->format.sample_rate);
+    p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
+    p->rt_anchor_valid = false;
+    p->first_packet = true;
+    if (p->ctrl_sock >= 0 &&
+        ap2_send_sync_packet_ptp(p, true) == AP2_SEND_FATAL)
+        LOG_WARN("[AP2] corrected-anchor announce failed; the next send "
+                 "retries it");
+}
+
+ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
+                                                  ap2_clock_verify_event_t *ev)
+{
+    if (!p || !ev) return AP2_CLOCK_VERIFY_IDLE;
+    memset(ev, 0, sizeof(*ev));
+    pthread_mutex_lock(&p->clock_verify_lock);
+    if (!p->clock_verify_armed) {
+        pthread_mutex_unlock(&p->clock_verify_lock);
+        return AP2_CLOCK_VERIFY_IDLE;
+    }
+    uint64_t now_ntp = raopcl_get_ntp(NULL);
+    uint64_t now_ms = ap2_ntp_to_unix_ms(now_ntp);
+    uint64_t anchor_ms = p->clock_verify_anchor_unix_ms;
+    bool sent = p->audio_packets_sent != p->clock_verify_packets_at_arm;
+
+    /* Probe-streak snapshot: the poller keeps it fresh in shared-daemon
+     * mode (ages go stale by at most one poll round, which only pushes the
+     * computed readiness later — the safe direction); the in-process engine
+     * is queried directly (its own lock only, never the network). */
+    struct ap2_ptp_exchange ex;
+    bool have = false;
+    if (p->clock_verify_have_exchange) {
+        have = true;
+        ex = p->clock_verify_exchange;
+    } else if (!p->clock_verify_thread_started &&
+               !ap2_ptp_shared_active(p->ptp) &&
+               now_ntp >= p->clock_verify_next_poll_ntp) {
+        p->clock_verify_next_poll_ntp =
+            now_ntp + MS2NTP(AP2_CLOCK_VERIFY_POLL_MS);
+        have = ap2_clock_query(p, &ex);
+    }
+
+    ap2_clock_verify_result_t result = AP2_CLOCK_VERIFY_IDLE;
+    if (have) {
+        uint64_t ready_ms = ap2_clock_ready_from(p, &ex, now_ms);
+        ev->requested_unix_ms = p->clock_verify_requested_unix_ms;
+        ev->from_unix_ms = anchor_ms;
+        if (ready_ms <= anchor_ms) {
+            ev->at_unix_ms = anchor_ms;
+            ev->margin_ms = (int64_t)(anchor_ms - ready_ms);
+            result = AP2_CLOCK_VERIFY_VERIFIED;
+            LOG_INFO("[AP2] clock verified: probe streak began %" PRIu64
+                     " ms before the anchor, readiness margin %" PRId64 " ms",
+                     ex.first_ms, ev->margin_ms);
+        } else if (!p->clock_verify_enforce) {
+            /* Origin start: the shortfall is reported for lead tuning but
+             * the anchor stands — the receiver self-seats a fresh session
+             * (measured within ~20 ms), while moving one member of a group
+             * origin would desync it. */
+            ev->at_unix_ms = anchor_ms;
+            result = AP2_CLOCK_VERIFY_UNVERIFIED;
+            LOG_WARN("[AP2] receiver clock ready %" PRIu64 " ms after the "
+                     "origin anchor; anchor stands (observe only)",
+                     ready_ms - anchor_ms);
+        } else if (!sent) {
+            /* One lead of slack beyond readiness, mirroring every other
+             * forward correction: the instant must still be ahead once the
+             * caller's ack round-trips. */
+            ev->at_unix_ms = ready_ms + AP2_MIN_WARM_LEAD_MS;
+            ap2_rebase_pending_anchor(p, ev->at_unix_ms);
+            result = AP2_CLOCK_VERIFY_CORRECTED;
+            LOG_WARN("[AP2] anchor %" PRIu64 " ms precedes receiver clock "
+                     "readiness by %" PRIu64 " ms; corrected forward to %"
+                     PRIu64, anchor_ms, ready_ms - anchor_ms, ev->at_unix_ms);
+        } else {
+            /* Readiness resolved late, after real frames went out: the line
+             * cannot move without a stamp jump. The receiver will seat
+             * roughly this late; the caller's session-level resync is the
+             * remaining remedy. */
+            ev->at_unix_ms = anchor_ms;
+            result = AP2_CLOCK_VERIFY_UNVERIFIED;
+            LOG_WARN("[AP2] receiver clock ready %" PRIu64 " ms after the "
+                     "anchor with audio already on the wire; expect a late "
+                     "seat", ready_ms - anchor_ms);
+        }
+    } else if (sent || now_ms + AP2_CLOCK_VERIFY_POLL_MS >=
+                           anchor_ms - AP2_SPLICE_PACING_MS) {
+        ev->requested_unix_ms = p->clock_verify_requested_unix_ms;
+        ev->from_unix_ms = anchor_ms;
+        ev->at_unix_ms = anchor_ms;
+        result = AP2_CLOCK_VERIFY_UNVERIFIED;
+        LOG_WARN("[AP2] anchor window closed without a receiver clock probe; "
+                 "anchor stands unverified");
+    }
+    if (result != AP2_CLOCK_VERIFY_IDLE) p->clock_verify_armed = false;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    if (result != AP2_CLOCK_VERIFY_IDLE)
+        atomic_store(&p->clock_verify_thread_stop, true);
+    return result;
+}
+
 void ap2cl_log_diagnostics(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || *loglevel < lSDEBUG) return;
@@ -3143,6 +3475,7 @@ void ap2cl_play(struct ap2cl_s *p)
 void ap2cl_stop(struct ap2cl_s *p)
 {
     if (!p) return;
+    ap2_clock_verify_disarm(p);
     p->content_paused = false;
     p->content_stopped = false;
     if (p->raopcl) raopcl_stop(p->raopcl);
@@ -3953,5 +4286,47 @@ unsigned long long ap2cl_test_rtx_answered(struct ap2cl_s *p)
 unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p)
 {
     return atomic_load(&p->rtx_expired);
+}
+
+void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable)
+{
+    p->use_ptp = enable;
+}
+
+void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple)
+{
+    p->apple_model = apple;
+}
+
+bool ap2cl_test_apple_model_default(const char *txt, const char *am)
+{
+    return ap2_apple_model(txt, am);
+}
+
+/* Plant a probe-streak snapshot where the shared-daemon poller would put
+ * one, so the verification poll consumes it on its next call. */
+void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
+                                      uint64_t first_ms, uint64_t third_ms)
+{
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_verify_have_exchange = true;
+    p->clock_verify_exchange.count = count;
+    p->clock_verify_exchange.first_ms = first_ms;
+    p->clock_verify_exchange.last_ms = 0;
+    p->clock_verify_exchange.third_ms = third_ms;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+}
+
+bool ap2cl_test_clock_verify_armed(struct ap2cl_s *p)
+{
+    pthread_mutex_lock(&p->clock_verify_lock);
+    bool armed = p->clock_verify_armed;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    return armed;
+}
+
+void ap2cl_test_bump_audio_sent(struct ap2cl_s *p)
+{
+    p->audio_packets_sent++;
 }
 #endif

@@ -228,6 +228,42 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p);
  * only; call before reading each chunk. Returns true when it padded. */
 bool ap2cl_recover_delivery_gap(struct ap2cl_s *p);
 
+/* Outcome of one clock-verification poll (see ap2cl_clock_verify_poll). */
+typedef enum {
+    AP2_CLOCK_VERIFY_IDLE = 0,     /* nothing armed, or nothing new yet */
+    AP2_CLOCK_VERIFY_VERIFIED,     /* receiver clock ready before the anchor */
+    AP2_CLOCK_VERIFY_CORRECTED,    /* anchor moved forward to readiness */
+    AP2_CLOCK_VERIFY_UNVERIFIED,   /* window closed without a probe streak */
+} ap2_clock_verify_result_t;
+
+typedef struct {
+    uint64_t requested_unix_ms;    /* instant commanded on the START (0 = picked) */
+    uint64_t from_unix_ms;         /* previously scheduled audible instant */
+    uint64_t at_unix_ms;           /* now-scheduled audible instant */
+    int64_t margin_ms;             /* readiness margin before the anchor (verified) */
+} ap2_clock_verify_event_t;
+
+/*
+ * Advance the clock verification of a start that was committed before the
+ * receiver's first timing probe (a rejoining receiver resumes its clock
+ * exchange only after the START is acked). Armed automatically by such
+ * commits; the audio loop calls this every iteration under its send lock and
+ * reports VERIFIED/CORRECTED events on the status channel. On a join-marked
+ * start (ap2cl_set_start_join) a correction moves the still-unsent anchor
+ * line forward to the receiver's verified readiness instant, so *ev carries
+ * the new truth for the caller's ack; other starts only observe and report.
+ */
+ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
+                                                  ap2_clock_verify_event_t *ev);
+
+/* Mark the next commanded start as a late join onto an already-live group
+ * timeline: receiver clock readiness is then ENFORCED — a cold-clock anchor
+ * the receiver cannot be ready for is corrected forward once the probe
+ * streak appears. Cleared by every commit. A group/solo ORIGIN start must
+ * not set it: its receivers self-seat a fresh session cleanly, and moving
+ * one member of a group origin would desync the group. */
+void ap2cl_set_start_join(struct ap2cl_s *p, bool join);
+
 /* Emit native pacing, packet-drop, and anchor diagnostics at debug level 10. */
 void ap2cl_log_diagnostics(struct ap2cl_s *p);
 

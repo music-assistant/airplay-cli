@@ -45,6 +45,13 @@ void ap2cl_test_rtx_store(struct ap2cl_s *p, uint16_t seq,
                           const uint8_t *pkt, int len);
 unsigned long long ap2cl_test_rtx_answered(struct ap2cl_s *p);
 unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p);
+void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable);
+void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
+bool ap2cl_test_apple_model_default(const char *txt, const char *am);
+void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
+                                      uint64_t first_ms, uint64_t third_ms);
+bool ap2cl_test_clock_verify_armed(struct ap2cl_s *p);
+void ap2cl_test_bump_audio_sent(struct ap2cl_s *p);
 
 typedef struct {
     int fd;
@@ -866,6 +873,139 @@ static void test_retransmit_responder(void)
     puts("ap2_client retransmit responder tests passed");
 }
 
+static uint64_t test_now_unix_ms(void)
+{
+    struct timeval tv;
+    gettimeofday(&tv, NULL);
+    return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+}
+
+static void test_apple_model_resolution(void)
+{
+    assert(ap2cl_test_apple_model_default(
+        "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE", NULL));
+    assert(ap2cl_test_apple_model_default(NULL, "AudioAccessory5,1"));
+    assert(ap2cl_test_apple_model_default("model=Mac16,10", NULL));
+    assert(!ap2cl_test_apple_model_default("model=Era 100", NULL));
+    assert(!ap2cl_test_apple_model_default("model=HW-LS60D", NULL));
+    assert(!ap2cl_test_apple_model_default(NULL, "Era 100"));
+    assert(!ap2cl_test_apple_model_default(NULL, NULL));
+    puts("ap2_client apple model resolution tests passed");
+}
+
+/* A start committed before the receiver's first timing probe arms the
+ * post-commit verification; the poll then verifies, corrects forward, or
+ * closes the window, exactly once per commit. */
+static void test_clock_verified_anchor(void)
+{
+    ap2_device_info_t device = {
+        .name = "clock test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=Era 100",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, true);
+    ap2cl_test_set_use_ptp(client, true);
+    ap2_clock_verify_event_t ev;
+
+    /* Cold clock at commit: the commanded instant stands, verification arms. */
+    uint64_t start_ms = test_now_unix_ms() + 5000;
+    uint64_t at = 0;
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(at == start_ms);
+    assert(ap2cl_test_clock_verify_armed(client));
+
+    /* No probe yet and a wide-open window: nothing to report. */
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_IDLE);
+    assert(ap2cl_test_clock_verify_armed(client));
+
+    /* A streak whose lock window ends before the anchor verifies it. */
+    ap2cl_test_inject_clock_exchange(client, 2, 100, 0);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_VERIFIED);
+    assert(ev.margin_ms > 2000 && ev.margin_ms < 3500);
+    assert(!ap2cl_test_clock_verify_armed(client));
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_IDLE);
+
+    /* An origin start short of readiness is observed, never moved. */
+    start_ms = test_now_unix_ms() + 1500;
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_test_clock_verify_armed(client));
+    uint64_t origin_head = ap2cl_test_head_ts(client);
+    ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_UNVERIFIED);
+    assert(ap2cl_test_head_ts(client) == origin_head);
+    assert(!ap2cl_test_clock_verify_armed(client));
+
+    /* A join-marked start short of readiness moves the still-unsent line
+     * forward by the shortfall plus the retry slack, wire head following. */
+    start_ms = test_now_unix_ms() + 1500;
+    ap2cl_set_start_join(client, true);
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_test_clock_verify_armed(client));
+    ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_CORRECTED);
+    assert(ev.from_unix_ms == start_ms);
+    assert(ev.at_unix_ms > start_ms + 800);
+    assert(ev.at_unix_ms < start_ms + 2000);
+    uint64_t head_ms_at_rate =
+        ap2cl_test_head_ts(client) * 1000ULL / format.sample_rate;
+    assert(head_ms_at_rate + 5 > ev.at_unix_ms &&
+           head_ms_at_rate < ev.at_unix_ms + 5);
+    assert(!ap2cl_test_clock_verify_armed(client));
+
+    /* The Apple fast bound (third exchange + settle) verifies an anchor the
+     * full lock window would have corrected. */
+    ap2cl_test_set_apple_model(client, true);
+    start_ms = test_now_unix_ms() + 1500;
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    ap2cl_test_inject_clock_exchange(client, 3, 400, 200);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_VERIFIED);
+    assert(!ap2cl_test_clock_verify_armed(client));
+    ap2cl_test_set_apple_model(client, false);
+
+    /* Audio already on the wire closes the window: without a probe the
+     * anchor stands unverified... */
+    start_ms = test_now_unix_ms() + 5000;
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    ap2cl_test_bump_audio_sent(client);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_UNVERIFIED);
+    assert(!ap2cl_test_clock_verify_armed(client));
+
+    /* ...and even a join cannot move a line with audio already on it. */
+    start_ms = test_now_unix_ms() + 1500;
+    ap2cl_set_start_join(client, true);
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    uint64_t head_before = ap2cl_test_head_ts(client);
+    ap2cl_test_bump_audio_sent(client);
+    ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_UNVERIFIED);
+    assert(ap2cl_test_head_ts(client) == head_before);
+    assert(!ap2cl_test_clock_verify_armed(client));
+
+    /* An anchor without room to act before the fill never arms. */
+    assert(ap2cl_start(client, 0, &at) == AP2_COMMIT_OK);
+    assert(!ap2cl_test_clock_verify_armed(client));
+
+    /* A flush disarms a pending verification. */
+    start_ms = test_now_unix_ms() + 5000;
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_test_clock_verify_armed(client));
+    assert(ap2cl_flush(client));
+    assert(!ap2cl_test_clock_verify_armed(client));
+
+    ap2cl_destroy(client);
+    puts("ap2_client clock verified anchor tests passed");
+}
+
 int main(void)
 {
     test_retransmit_responder();
@@ -879,6 +1019,8 @@ int main(void)
     test_splice_delivery_gap_recovery();
     test_splice_pause_keeps_line_hot();
     test_feedback_miss_tolerated_then_recovered();
+    test_apple_model_resolution();
+    test_clock_verified_anchor();
 
     ap2_device_info_t device = {
         .name = "test",
