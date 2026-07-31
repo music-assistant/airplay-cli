@@ -98,7 +98,7 @@ int main(void)
     mock_now = unix_ms_to_ntp(now_ms);
     reset_mocks();
 
-    assert(raop_session_commit(&client, future_ms));
+    assert(raop_session_commit(&client, future_ms, NULL) == AP2_COMMIT_OK);
     assert(last_client == &client);
     assert(pause_calls == 0);
     assert(stop_calls == 1);
@@ -109,7 +109,7 @@ int main(void)
 
     client.state = RAOP_STREAMING;
     const uint64_t replacement_ms = future_ms + 5000;
-    assert(raop_session_commit(&client, replacement_ms));
+    assert(raop_session_commit(&client, replacement_ms, NULL) == AP2_COMMIT_OK);
     assert(last_client == &client);
     assert(pause_calls == 0);
     assert(stop_calls == 2);
@@ -119,7 +119,7 @@ int main(void)
            unix_ms_to_ntp(replacement_ms));
 
     client.state = RAOP_FLUSHED;
-    assert(raop_session_commit(&client, 0));
+    assert(raop_session_commit(&client, 0, NULL) == AP2_COMMIT_OK);
     assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
            mock_now + MS2NTP(200));
 
@@ -136,7 +136,7 @@ int main(void)
     /* Standby keeps the same connected libraop client reusable. A later
      * commanded START only re-anchors it; no reconnect API is involved. */
     const uint64_t post_standby_ms = replacement_ms + 5000;
-    assert(raop_session_commit(&client, post_standby_ms));
+    assert(raop_session_commit(&client, post_standby_ms, NULL) == AP2_COMMIT_OK);
     assert(last_client == &client);
     assert(start_calls == 4);
     assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
@@ -170,7 +170,7 @@ int main(void)
     reset_mocks();
     client.state = RAOP_FLUSHED;
     const uint64_t resume_ms = 1700000123000ULL;
-    assert(raop_session_start_at(&client, resume_ms));
+    assert(raop_session_start_at(&client, resume_ms, NULL) == AP2_COMMIT_OK);
     assert(stop_calls == 0);
     assert(flush_calls == 0);
     assert(start_calls == 1);
@@ -181,14 +181,14 @@ int main(void)
      * stream would replay the receiver backlog against the new timeline. */
     reset_mocks();
     client.state = RAOP_STREAMING;
-    assert(!raop_session_start_at(&client, resume_ms));
+    assert(raop_session_start_at(&client, resume_ms, NULL) != AP2_COMMIT_OK);
     assert(start_calls == 0);
 
     client.state = RAOP_DOWN;
-    assert(!raop_session_commit(&client, future_ms));
+    assert(raop_session_commit(&client, future_ms, NULL) != AP2_COMMIT_OK);
     assert(!raop_session_standby(&client));
     assert(!raop_session_flush(&client));
-    assert(!raop_session_start_at(&client, future_ms));
+    assert(raop_session_start_at(&client, future_ms, NULL) != AP2_COMMIT_OK);
     assert(!raop_session_pause(&client));
     assert(!raop_session_resume(&client));
 

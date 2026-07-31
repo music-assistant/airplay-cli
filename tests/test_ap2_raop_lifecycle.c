@@ -288,7 +288,7 @@ static bool test_standby_reuses_raop_compatible_connection(void)
     CHECK(client != NULL);
     CHECK(ap2cl_connect(client));
     struct raopcl_s *transport_client = &mock.clients[1];
-    CHECK(ap2cl_start(client, 1700000003000ULL));
+    CHECK(ap2cl_start(client, 1700000003000ULL, NULL) == AP2_COMMIT_OK);
     CHECK(ap2cl_state(client) == AP2_STREAMING);
     CHECK(mock.starts == 1);
 
@@ -304,7 +304,7 @@ static bool test_standby_reuses_raop_compatible_connection(void)
      * flush stops the flushed stream again, resume re-arms start-at. No extra
      * receiver flush, so mock.flushes stays 1. */
     CHECK(ap2cl_flush(client));
-    CHECK(ap2cl_resume(client, 1700000008000ULL));
+    CHECK(ap2cl_resume(client, 1700000008000ULL, NULL) == AP2_COMMIT_OK);
     CHECK(ap2cl_state(client) == AP2_STREAMING);
     CHECK(mock.last_transport_client == transport_client);
     CHECK(mock.stops == 2);

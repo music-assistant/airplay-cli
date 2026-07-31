@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <stdatomic.h>
@@ -8,6 +9,7 @@
 #include <string.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "ap2_bplist.h"
@@ -26,6 +28,11 @@ void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
 bool ap2cl_test_first_packet(struct ap2cl_s *p);
 void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet);
+void ap2cl_test_set_splice(struct ap2cl_s *p, bool enable);
+void ap2cl_test_set_anchor_valid(struct ap2cl_s *p, bool valid);
+bool ap2cl_test_anchor_valid(struct ap2cl_s *p);
+uint64_t ap2cl_test_head_ts(struct ap2cl_s *p);
+uint32_t ap2cl_test_rtp_timestamp(struct ap2cl_s *p);
 
 typedef struct {
     int fd;
@@ -107,7 +114,7 @@ static void test_native_flush_resume_reuses_rtsp_session(void)
     assert(client);
     ap2cl_force_native(client);
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
-    assert(ap2cl_start(client, 1700000000000ULL));
+    assert(ap2cl_start(client, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     /* The test bypasses native connect, so model a completed first send before
      * exercising the warm restart. */
     ap2cl_test_set_first_packet(client, false);
@@ -116,7 +123,7 @@ static void test_native_flush_resume_reuses_rtsp_session(void)
     assert(ap2cl_state(client) == AP2_CONNECTED);
     /* Warm seek: discard the receiver buffer, then re-anchor the timeline. */
     assert(ap2cl_flush(client));
-    assert(ap2cl_resume(client, 1700000005000ULL));
+    assert(ap2cl_resume(client, 1700000005000ULL, NULL) == AP2_COMMIT_OK);
     assert(ap2cl_state(client) == AP2_STREAMING);
     assert(ap2cl_test_first_packet(client));
 
@@ -157,7 +164,7 @@ static void test_native_flush_rejects_receiver_error(void)
     assert(client);
     ap2cl_force_native(client);
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
-    assert(ap2cl_start(client, 1700000000000ULL));
+    assert(ap2cl_start(client, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     assert(!ap2cl_flush(client));
 
     assert(pthread_join(peer_thread, NULL) == 0);
@@ -392,6 +399,77 @@ static void test_route_with_password(void)
     puts("ap2_client route password selection tests passed");
 }
 
+/* The Apple splice timeline never sends a flush verb and never rebases: the
+ * warm boundary is a forward-only stamp skip on one immutable anchor line.
+ * The RTSP socket must stay silent across flush + standby, and resume must
+ * keep the sequence/timestamp relation contiguous. */
+static void test_splice_timeline_warm_path(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    assert(fcntl(sockets[1], F_SETFL, O_NONBLOCK) == 0);
+
+    ap2_device_info_t device = {
+        .name = "splice test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_splice(client, true);
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
+    ap2cl_test_set_first_packet(client, false);
+    ap2cl_test_set_anchor_valid(client, true);
+
+    uint64_t head_before = ap2cl_test_head_ts(client);
+    uint32_t rtp_before = ap2cl_test_rtp_timestamp(client);
+
+    /* Warm seek: flush keeps the receiver queue and the anchor line... */
+    assert(ap2cl_flush(client));
+    assert(ap2cl_test_anchor_valid(client));
+    /* ...and resume never touches the stamps (a jump is an audible noise
+     * burst): the gap to a future commanded instant becomes silence padding
+     * the audio loop sends as ordinary contiguous chunks. */
+    uint64_t start_ms = ((uint64_t)time(NULL) + 3) * 1000ULL;
+    assert(ap2cl_resume(client, start_ms, NULL) == AP2_COMMIT_OK);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+    assert(ap2cl_test_anchor_valid(client));
+    assert(!ap2cl_test_first_packet(client));
+    assert(ap2cl_test_head_ts(client) == head_before);
+    assert(ap2cl_test_rtp_timestamp(client) == rtp_before);
+    /* ~3 s to the commanded instant at 44.1 kHz, minus the queued head. */
+    uint32_t pad = ap2cl_splice_pad_frames(client);
+    assert(pad > 44100 && pad < 4 * 44100);
+    ap2cl_splice_pad_consume(client, pad);
+    assert(ap2cl_splice_pad_frames(client) == 0);
+
+    /* Park: no flush verb either; the line survives for the next resume. */
+    ap2cl_standby(client);
+    assert(ap2cl_state(client) == AP2_CONNECTED);
+    assert(ap2cl_test_anchor_valid(client));
+    assert(ap2cl_resume(client, 0, NULL) == AP2_COMMIT_OK);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+
+    /* The whole warm path put nothing on the RTSP socket. */
+    char scratch[16];
+    assert(recv(sockets[1], scratch, sizeof(scratch), 0) == -1);
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+}
+
 /* An explicit --protocol airplay2 reaches the native flow on exactly the same
  * terms as auto, so an AirPlay-2-only receiver (no _raop service to fall back
  * on) is not routed into a RAOP-compatible flow it cannot answer. Only a real
@@ -489,6 +567,7 @@ int main(void)
     test_info_format_tables();
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
+    test_splice_timeline_warm_path();
     test_feedback_miss_tolerated_then_recovered();
 
     ap2_device_info_t device = {

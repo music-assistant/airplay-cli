@@ -32,6 +32,7 @@ typedef struct {
     atomic_int resumes;
     atomic_int stops;
     atomic_int flushed_status;
+    atomic_int flushed_head_status;
     atomic_int audio_status;
     atomic_int idle_timeouts;
     uint64_t last_start_unix_ms;
@@ -52,12 +53,14 @@ static bool flush(void *transport)
     return state->flush_succeeds;
 }
 
-static bool commit(void *transport, uint64_t start_unix_ms)
+static ap2_commit_result_t commit(void *transport, uint64_t start_unix_ms,
+                                  uint64_t *at_unix_ms)
 {
     test_state_t *state = transport;
     state->last_start_unix_ms = start_unix_ms;
+    if (at_unix_ms) *at_unix_ms = start_unix_ms;
     atomic_fetch_add(&state->commits, 1);
-    return true;
+    return AP2_COMMIT_OK;
 }
 
 static void resume(void *transport)
@@ -74,6 +77,8 @@ static void status(const char *line)
 {
     if (strcmp(line, "[STATUS] flushed") == 0)
         atomic_fetch_add(&status_state->flushed_status, 1);
+    else if (strncmp(line, "[STATUS] flushed head_unix_ms=1785445251000", 43) == 0)
+        atomic_fetch_add(&status_state->flushed_head_status, 1);
     else if (strncmp(line, "[STATUS] audio ", 15) == 0)
         atomic_fetch_add(&status_state->audio_status, 1);
     else if (strcmp(line, "[STATUS] idle_timeout") == 0)
@@ -89,6 +94,7 @@ static void state_init(test_state_t *state)
     atomic_init(&state->resumes, 0);
     atomic_init(&state->stops, 0);
     atomic_init(&state->flushed_status, 0);
+    atomic_init(&state->flushed_head_status, 0);
     atomic_init(&state->audio_status, 0);
     atomic_init(&state->idle_timeouts, 0);
     state->flush_succeeds = true;
@@ -174,7 +180,7 @@ static void test_start_streams_the_input(void)
     feed(write_fd, audio, sizeof(audio));
 
     const uint64_t audible = 1770000000123ULL;
-    assert(ap2_session_start(session, audible));
+    assert(ap2_session_start(session, audible, NULL) == AP2_COMMIT_OK);
     assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
     assert(ap2_session_epoch(session) == 1);
     assert(atomic_load(&state.commits) == 1);
@@ -204,7 +210,7 @@ static void test_ready_and_reads_wait_for_a_complete_packet(void)
     feed(write_fd, first + sizeof(first) - 1, 1);
     assert(wait_for_count(&state.audio_status, 1, 1000));
 
-    assert(ap2_session_start(session, 1700000000000ULL));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     read_exact(session, first, sizeof(first));
 
     feed(write_fd, second, sizeof(second) - 1);
@@ -229,7 +235,7 @@ static void test_short_read_is_released_at_eof(void)
     feed(write_fd, audio, sizeof(audio));
     assert(close(write_fd) == 0);
     assert(wait_for_count(&state.audio_status, 1, 1000));
-    assert(ap2_session_start(session, 1700000000000ULL));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
 
     uint8_t got[sizeof(audio) + 1];
     assert(ap2_session_read(session, got, sizeof(got), 1000) ==
@@ -256,7 +262,7 @@ static void test_flush_drains_and_reanchors(void)
     feed(write_fd, old_audio, sizeof(old_audio));
     /* The one-shot audio signal announces the feed is flowing (pre-START). */
     assert(wait_for_count(&state.audio_status, 1, 1000));
-    assert(ap2_session_start(session, 1700000000000ULL));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     read_exact(session, old_audio, sizeof(old_audio));
     assert(atomic_load(&state.audio_status) == 1);
 
@@ -278,7 +284,7 @@ static void test_flush_drains_and_reanchors(void)
      * announce themselves again. */
     feed(write_fd, new_audio, sizeof(new_audio));
     assert(wait_for_count(&state.audio_status, 2, 1000));
-    assert(ap2_session_start(session, 1700000005000ULL));
+    assert(ap2_session_start(session, 1700000005000ULL, NULL) == AP2_COMMIT_OK);
     assert(atomic_load(&state.commits) == 2);
     assert(ap2_session_epoch(session) == 2);
     assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
@@ -304,7 +310,7 @@ static void test_flush_while_idle_before_start(void)
 
     static const uint8_t audio[] = {0x01, 0x02, 0x03, 0x04};
     feed(write_fd, audio, sizeof(audio));
-    assert(ap2_session_start(session, 0));
+    assert(ap2_session_start(session, 0, NULL) == AP2_COMMIT_OK);
     read_exact(session, audio, sizeof(audio));
 
     ap2_session_destroy(session);
@@ -321,7 +327,7 @@ static void test_failed_flush_preserves_pending_audio(void)
 
     feed(write_fd, audio, sizeof(audio));
     assert(wait_for_count(&state.audio_status, 1, 1000));
-    assert(ap2_session_start(session, 1700000000000ULL));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     state.flush_succeeds = false;
 
     assert(!ap2_session_flush(session));
@@ -345,7 +351,7 @@ static void test_standby_then_resume(void)
     struct ap2_session_s *session = create_session(&state, 0, &write_fd);
 
     feed(write_fd, audio, sizeof(audio));
-    assert(ap2_session_start(session, 1700000000000ULL));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     read_exact(session, audio, sizeof(audio));
 
     assert(ap2_session_standby(session));
@@ -354,7 +360,7 @@ static void test_standby_then_resume(void)
 
     static const uint8_t more[] = {0x30, 0x31, 0x32};
     feed(write_fd, more, sizeof(more));
-    assert(ap2_session_start(session, 1700000005000ULL));
+    assert(ap2_session_start(session, 1700000005000ULL, NULL) == AP2_COMMIT_OK);
     assert(atomic_load(&state.commits) == 2);
     assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
     read_exact(session, more, sizeof(more));
@@ -393,7 +399,7 @@ static void test_destroy_is_prompt_with_open_writer(void)
 
     static const uint8_t audio[] = {0x40, 0x41};
     feed(write_fd, audio, sizeof(audio));
-    assert(ap2_session_start(session, 1700000000000ULL));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
     read_exact(session, audio, sizeof(audio));
 
     uint64_t started = ap2_io_monotonic_ms();
@@ -403,9 +409,48 @@ static void test_destroy_is_prompt_with_open_writer(void)
     assert(close(write_fd) == 0);
 }
 
+/* A transport reporting its frozen-head instant gets it onto the flushed ack
+ * (splice members ride it so the caller anchors warm starts beyond the head);
+ * transports without the optional op keep the plain ack. */
+static uint64_t warm_head_fixed(void *transport)
+{
+    (void)transport;
+    return 1785445251000ULL;
+}
+
+static void test_flush_ack_carries_warm_head(void)
+{
+    test_state_t state;
+    state_init(&state);
+    ap2_session_ops_t ops = {
+        .quiesce = quiesce,
+        .flush = flush,
+        .commit = commit,
+        .resume = resume,
+        .stop = stop,
+        .status = status,
+        .warm_head_unix_ms = warm_head_fixed,
+        .transport = &state,
+    };
+    int input[2];
+    assert(pipe(input) == 0);
+    struct ap2_session_s *session =
+        ap2_session_create(&ops, 1000, 1, 0, input[0]);
+    assert(session);
+    assert(close(input[0]) == 0);
+
+    assert(ap2_session_flush(session));
+    assert(atomic_load(&state.flushed_head_status) == 1);
+    assert(atomic_load(&state.flushed_status) == 0);
+
+    ap2_session_destroy(session);
+    assert(close(input[1]) == 0);
+}
+
 int main(void)
 {
     test_start_streams_the_input();
+    test_flush_ack_carries_warm_head();
     test_ready_and_reads_wait_for_a_complete_packet();
     test_short_read_is_released_at_eof();
     test_flush_drains_and_reanchors();

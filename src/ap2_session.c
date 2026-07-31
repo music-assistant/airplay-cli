@@ -318,28 +318,33 @@ void ap2_session_destroy(struct ap2_session_s *s)
     free(s);
 }
 
-bool ap2_session_start(struct ap2_session_s *s, uint64_t start_unix_ms)
+ap2_commit_result_t ap2_session_start(struct ap2_session_s *s,
+                                      uint64_t start_unix_ms,
+                                      uint64_t *at_unix_ms)
 {
-    if (!s) return false;
+    if (!s) return AP2_COMMIT_FAILED;
     pthread_mutex_lock(&s->lock);
     bool ended = s->state == AP2_SESSION_ENDED;
     pthread_mutex_unlock(&s->lock);
-    if (ended) return false;
+    if (ended) return AP2_COMMIT_FAILED;
 
     /* Stop the audio loop between chunks, do the transport work, then swap to
      * PLAYING. On the first start commit begins the session; after a FLUSH it
-     * re-bases the frozen anchor. */
+     * re-bases the frozen anchor. The transport corrects an infeasible
+     * instant forward and reports the truth in *at_unix_ms. */
     s->ops.quiesce(s->ops.transport);
-    if (!s->ops.commit(s->ops.transport, start_unix_ms)) {
+    ap2_commit_result_t result =
+        s->ops.commit(s->ops.transport, start_unix_ms, at_unix_ms);
+    if (result != AP2_COMMIT_OK) {
         s->ops.resume(s->ops.transport);
         LOG_ERROR("[SESSION] transport commit failed");
-        return false;
+        return result;
     }
     pthread_mutex_lock(&s->lock);
     if (s->state == AP2_SESSION_ENDED) {
         pthread_mutex_unlock(&s->lock);
         s->ops.resume(s->ops.transport);
-        return false;
+        return AP2_COMMIT_FAILED;
     }
     s->epoch++;
     s->state = AP2_SESSION_PLAYING;
@@ -347,7 +352,7 @@ bool ap2_session_start(struct ap2_session_s *s, uint64_t start_unix_ms)
     pthread_cond_broadcast(&s->can_write);
     pthread_mutex_unlock(&s->lock);
     s->ops.resume(s->ops.transport);
-    return true;
+    return AP2_COMMIT_OK;
 }
 
 bool ap2_session_flush(struct ap2_session_s *s)
@@ -389,8 +394,17 @@ bool ap2_session_flush(struct ap2_session_s *s)
     pthread_cond_broadcast(&s->can_read);
     pthread_mutex_unlock(&s->lock);
 
+    /* Capture the warm-head instant while sends are still quiesced: the
+     * splice keepalive may advance the head the moment the transport resumes,
+     * and the ack must report the head this flush actually froze. */
+    uint64_t head_unix_ms = s->ops.warm_head_unix_ms
+        ? s->ops.warm_head_unix_ms(s->ops.transport) : 0;
     s->ops.resume(s->ops.transport);
-    emit(s, "[STATUS] flushed");
+    if (head_unix_ms)
+        emit(s, "[STATUS] flushed head_unix_ms=%llu",
+             (unsigned long long)head_unix_ms);
+    else
+        emit(s, "[STATUS] flushed");
     return true;
 }
 

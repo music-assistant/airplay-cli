@@ -420,8 +420,21 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
     } else if (strcmp(key, "START_UNIX_MS") == 0) {
         g_pend_start_unix_ms = strtoull(value, NULL, 10);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "START") == 0) {
-        if (!g_session || !ap2_session_start(g_session, g_pend_start_unix_ms))
+        /* The verified start contract: the ack always reports the true
+         * scheduled instant, so the caller compares it with the request,
+         * logs any correction loudly, and re-aligns a group by re-STARTing
+         * every member at the largest reported instant. */
+        uint64_t at_ms = 0;
+        ap2_commit_result_t started = g_session
+            ? ap2_session_start(g_session, g_pend_start_unix_ms, &at_ms)
+            : AP2_COMMIT_FAILED;
+        if (started == AP2_COMMIT_OK) {
+            status_print("[STATUS] started requested_unix_ms=%" PRIu64
+                         " at_unix_ms=%" PRIu64,
+                         g_pend_start_unix_ms, at_ms);
+        } else {
             status_error("START failed");
+        }
         g_pend_start_unix_ms = 0;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "FLUSH") == 0) {
         if (!g_session || !ap2_session_flush(g_session))
@@ -508,32 +521,36 @@ static void send_initial_metadata(const cli_config_t *cfg)
 
 /* ---- Session engine transport callbacks ---- */
 
-static bool session_commit(void *transport, uint64_t start_unix_ms)
+static ap2_commit_result_t session_commit(void *transport,
+                                          uint64_t start_unix_ms,
+                                          uint64_t *at_unix_ms)
 {
     cli_config_t *cfg = transport;
-    bool committed;
+    ap2_commit_result_t committed;
     /* The first START begins the session; a START after a FLUSH re-anchors the
-     * flushed stream (no second receiver flush, no crypto/sequence reset). */
+     * flushed stream (no second receiver flush, no crypto/sequence reset). An
+     * infeasible instant is corrected forward by the transport, which reports
+     * the true scheduled instant so the ack can carry it to the caller. */
     if (cfg->protocol == PROTO_RAOP) {
         struct raopcl_s *client = g_raopcl;
-        if (!client) return false;
+        if (!client) return AP2_COMMIT_FAILED;
         committed = !g_first_start_done
-            ? raop_session_commit(client, start_unix_ms)
-            : raop_session_start_at(client, start_unix_ms);
+            ? raop_session_commit(client, start_unix_ms, at_unix_ms)
+            : raop_session_start_at(client, start_unix_ms, at_unix_ms);
     } else {
         struct ap2cl_s *client = g_ap2cl;
-        if (!client) return false;
+        if (!client) return AP2_COMMIT_FAILED;
         committed = !g_first_start_done
-            ? ap2cl_start(client, start_unix_ms)
-            : ap2cl_resume(client, start_unix_ms);
+            ? ap2cl_start(client, start_unix_ms, at_unix_ms)
+            : ap2cl_resume(client, start_unix_ms, at_unix_ms);
     }
-    if (!committed) return false;
+    if (committed != AP2_COMMIT_OK) return committed;
 
     /* Metadata-gated receivers must receive a placeholder before audio. */
     if (!g_first_start_done) send_initial_metadata(cfg);
     g_first_start_done = true;
     g_status = STATUS_PLAYING;
-    return true;
+    return AP2_COMMIT_OK;
 }
 
 /* Discard the receiver's buffered audio in place for a warm seek and mark the
@@ -563,6 +580,15 @@ static void session_stop_op(void *transport)
         ap2cl_standby(g_ap2cl);
     }
     if (g_status == STATUS_PLAYING) g_status = STATUS_PAUSED;
+}
+
+/* Audible instant of the delivery head frozen by a FLUSH (splice timeline
+ * only): rides the flushed ack so MA anchors the warm START beyond it. */
+static uint64_t session_warm_head_unix_ms(void *transport)
+{
+    cli_config_t *cfg = transport;
+    if (cfg->protocol == PROTO_RAOP) return 0;
+    return g_ap2cl ? ap2cl_splice_head_unix_ms(g_ap2cl) : 0;
 }
 
 static void session_status_line(const char *line)
@@ -683,6 +709,7 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf,
         .resume = session_resume,
         .stop = session_stop_op,
         .status = session_status_line,
+        .warm_head_unix_ms = session_warm_head_unix_ms,
         .transport = cfg,
     };
     g_session = ap2_session_create(
@@ -1022,9 +1049,13 @@ static int run_airplay2(cli_config_t *cfg)
         int lead_ms = 0;
         uint32_t dev_min = 0, dev_max = 0;
         ap2cl_latency_info(g_ap2cl, &lead_ms, &dev_min, &dev_max);
+        /* warm_lead_ms: minimum lead a warm commanded START needs for exact
+         * placement on the splice timeline (0 = no constraint). MA anchors
+         * group seeks beyond the largest member value. */
         printf("[STATUS] latency lead_ms=%d device_min_frames=%u device_max_frames=%u "
-               "device_render_ms=%d\n",
-               lead_ms, dev_min, dev_max, ap2cl_render_latency_ms(g_ap2cl));
+               "device_render_ms=%d warm_lead_ms=%d\n",
+               lead_ms, dev_min, dev_max, ap2cl_render_latency_ms(g_ap2cl),
+               ap2cl_warm_lead_ms(g_ap2cl));
         fflush(stdout);
     }
 
@@ -1096,7 +1127,9 @@ static int run_airplay2(cli_config_t *cfg)
            emitting a "playing" status that would revive the sender's play state) */
         if (g_status == STATUS_PLAYING && !input_ended && now - last > MS2NTP(1000)) {
             last = now;
-            uint32_t latency_frames = MS2TS(cfg->latency_ms, cfg->sample_rate);
+            /* Delivery runs ahead of audibility by the pacing depth (shallow
+             * on the splice timeline, the latency lead otherwise). */
+            uint32_t latency_frames = ap2cl_audible_lag_frames(g_ap2cl);
             if (frames > latency_frames) {
                 uint32_t elapsed = TS2MS(frames - latency_frames, cfg->sample_rate);
                 status_playing(elapsed);
@@ -1133,40 +1166,66 @@ static int run_airplay2(cli_config_t *cfg)
                 eof_reported = false;
                 eof_time = 0;
             }
-            int n = ap2_session_read(
-                g_session, buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf, 250);
-            if (n == -2) {
-                pthread_mutex_unlock(&g_audio_send_lock);
-                break;
-            }
-            if (n == -1) {
-                LOG_INFO("End of AirPlay 2 input stream, draining buffer...");
-                input_ended = true;
-                eof_time = raopcl_get_ntp(NULL);
-                pthread_mutex_unlock(&g_audio_send_lock);
-                continue;
-            }
-            if (n == 0) {
-                if (!starving) {
-                    starving = true;
-                    starvation_started = raopcl_get_ntp(NULL);
-                    LOG_WARN("[AP2] PCM input starved; waiting in 250 ms intervals");
-                    ap2cl_log_diagnostics(g_ap2cl);
+            /* Splice pad (Apple splice timeline): silence owed to the wire
+             * before the next real sample, sent as ordinary encoded chunks so
+             * sequence numbers and timestamps stay contiguous (any stamp jump
+             * is an audible noise burst). A partial pad occupies the head of
+             * the chunk and the first real samples complete it, so the splice
+             * lands sample-exact on the commanded instant. */
+            uint32_t pad = ap2cl_splice_pad_frames(g_ap2cl);
+            uint32_t pad_frames_now = pad < AP2_FRAMES_PER_CHUNK
+                                          ? pad : AP2_FRAMES_PER_CHUNK;
+            int pad_bytes = (int)pad_frames_now * ap2_input_bpf;
+            int want = AP2_FRAMES_PER_CHUNK * ap2_input_bpf - pad_bytes;
+            int n = 0;
+            if (want > 0) {
+                n = ap2_session_read(g_session, buf + pad_bytes, want, 250);
+                if (n == -2) {
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    break;
                 }
-                ap2cl_recover_input_gap(g_ap2cl);
-                pthread_mutex_unlock(&g_audio_send_lock);
-                continue;
+                if (n == -1) {
+                    LOG_INFO("End of AirPlay 2 input stream, draining buffer...");
+                    input_ended = true;
+                    eof_time = raopcl_get_ntp(NULL);
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    continue;
+                }
+                if (n == 0) {
+                    /* A zero read while idle-primed (post-FLUSH awaiting
+                     * START) or in standby is by design, not starvation: the
+                     * timeline is frozen and a recovery re-anchor here would
+                     * announce anchor jumps to a receiver still rendering its
+                     * buffered audio. Only a stall of a genuinely playing
+                     * stream is an input gap. */
+                    if (ap2_session_state(g_session) != AP2_SESSION_PLAYING) {
+                        pthread_mutex_unlock(&g_audio_send_lock);
+                        continue;
+                    }
+                    if (!starving) {
+                        starving = true;
+                        starvation_started = raopcl_get_ntp(NULL);
+                        LOG_WARN("[AP2] PCM input starved; waiting in 250 ms intervals");
+                        ap2cl_log_diagnostics(g_ap2cl);
+                    }
+                    ap2cl_recover_input_gap(g_ap2cl);
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    continue;
+                }
+                if (starving) {
+                    uint32_t stalled_ms =
+                        (uint32_t)NTP2MS(raopcl_get_ntp(NULL) -
+                                         starvation_started);
+                    LOG_INFO("[AP2] PCM input recovered after %u ms", stalled_ms);
+                    ap2cl_log_diagnostics(g_ap2cl);
+                    starving = false;
+                }
             }
+            if (pad_bytes)
+                memset(buf, 0, (size_t)pad_bytes);
             n = pad_final_pcm_chunk(
-                buf, n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf, ap2_input_bpf);
-            if (starving) {
-                uint32_t stalled_ms =
-                    (uint32_t)NTP2MS(raopcl_get_ntp(NULL) -
-                                     starvation_started);
-                LOG_INFO("[AP2] PCM input recovered after %u ms", stalled_ms);
-                ap2cl_log_diagnostics(g_ap2cl);
-                starving = false;
-            }
+                buf, pad_bytes + n, AP2_FRAMES_PER_CHUNK * ap2_input_bpf,
+                ap2_input_bpf);
 
             int af = n / ap2_input_bpf;
             uint8_t *send = buf;
@@ -1182,10 +1241,48 @@ static int run_airplay2(cli_config_t *cfg)
                 pthread_mutex_unlock(&g_audio_send_lock);
                 break;
             }
-            frames += af;
+            ap2cl_splice_pad_consume(g_ap2cl, pad_frames_now);
+            /* Pad silence is not media content: elapsed counts only the real
+             * samples so the position base stays on the new track's start. */
+            frames += af - (int)pad_frames_now;
             pthread_mutex_unlock(&g_audio_send_lock);
         } else {
-            /* Paused, or connected and awaiting the commanded first START. */
+            /* Paused, or connected and awaiting the commanded first START.
+             * On the splice timeline the idle-primed window between a FLUSH
+             * and the next START keeps sending silence: if the wire went
+             * quiet here, a slow next-track spin-up would lapse the line and
+             * force a fresh re-anchor — an audible noise trigger on Apple
+             * receivers (the track-transition blip). Contiguous silence keeps
+             * every boundary a hot splice; the resume pad still lands the new
+             * content on the commanded instant. Pause and standby park the
+             * client out of AP2_STREAMING, so they drain as before. */
+            if (g_first_start_done && cfg->protocol == PROTO_AIRPLAY2 &&
+                ap2_session_state(g_session) == AP2_SESSION_IDLE &&
+                ap2cl_splice_hot(g_ap2cl)) {
+                pthread_mutex_lock(&g_audio_send_lock);
+                if (ap2_session_state(g_session) == AP2_SESSION_IDLE &&
+                    ap2cl_splice_hot(g_ap2cl) &&
+                    ap2cl_accept_frames(g_ap2cl)) {
+                    memset(buf, 0,
+                           (size_t)AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
+                    uint8_t *send = buf;
+                    if (ap2_alac_buf && cfg->bit_depth > 16) {
+                        truncate_32to24(
+                            buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf,
+                            ap2_alac_buf);
+                        send = ap2_alac_buf;
+                    }
+                    if (ap2cl_send_chunk(g_ap2cl, send,
+                                         AP2_FRAMES_PER_CHUNK) ==
+                        AP2_SEND_FATAL) {
+                        status_error("AirPlay 2 realtime send failed");
+                        playback_failed = true;
+                        pthread_mutex_unlock(&g_audio_send_lock);
+                        break;
+                    }
+                }
+                pthread_mutex_unlock(&g_audio_send_lock);
+            }
             usleep(1000);
         }
     }

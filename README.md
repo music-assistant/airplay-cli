@@ -66,8 +66,9 @@ without reconnecting. A caller can wait for the one-shot
 `[STATUS] audio buffered_ms=<ms>` line — emitted once the (new) track has a
 complete audio packet buffered, or its final short packet reaches EOF — before
 it commands the start, then send the same start value to every member of a sync
-group. A `START_UNIX_MS` of 0 or in the past clamps to now plus the minimum
-commanded-start lead (250 ms, 200 ms on RAOP).
+group. A `START_UNIX_MS` of 0 or one the transport cannot honor is corrected
+forward to the earliest feasible instant (250 ms minimum lead, 200 ms on RAOP)
+and the `[STATUS] started` ack always reports the true scheduled instant.
 
 Delivery is not gated on the start time: frames are released up to the
 receiver's buffer window ahead of each frame's deadline (the device-reported
@@ -192,14 +193,30 @@ stdin, the single persistent audio input for the whole process lifetime.
 
 - Start / re-anchor: `START_UNIX_MS=<unix epoch ms>` then `ACTION=START`. The
   first `START` begins the session; a `START` after an `ACTION=FLUSH` re-anchors
-  the same live stream (no reconnect). `START_UNIX_MS=0` (or a past instant)
-  starts as soon as possible, at the minimum commanded-start lead.
+  the same live stream (no reconnect). `START_UNIX_MS=0` starts as soon as
+  possible. The start contract is VERIFIED: a feasible instant is scheduled
+  exactly, an infeasible one is corrected forward to the earliest feasible
+  instant (audio always flows), and the ack
+  `[STATUS] started requested_unix_ms=<ms> at_unix_ms=<ms>` always carries the
+  true scheduled instant — the caller compares the two, logs any correction,
+  and re-aligns a sync group by re-STARTing every member at the largest
+  reported instant.
 - `ACTION=FLUSH` — in-place warm flush for seek/next: flush the receiver (RTSP
   FLUSH), discard the internal ring, and drain stdin to empty; after the receiver
   accepts the flush, acks with `[STATUS] flushed` and keeps buffering the next
-  track while sending nothing until the next `START` (idle-primed). The one-shot
+  track while sending nothing until the next `START` (idle-primed; the Apple
+  splice timeline sends keepalive silence instead). The one-shot
   `[STATUS] audio buffered_ms=<ms>` line fires again when the next track's feed
   has a complete packet buffered, or its final short packet reaches EOF.
+  On Apple receivers the native flow instead runs a splice timeline (no receiver
+  flush, one immutable anchor line; any discard, re-anchor or stamp jump makes
+  them emit a short noise burst): the queued audio — kept shallow, reported as
+  `warm_lead_ms` on the `[STATUS] latency` line — plays out and the next `START`
+  splices the new track at the commanded instant, filling the gap with encoded
+  silence so the bitstream stays contiguous.
+  The ack then reads `[STATUS] flushed head_unix_ms=<ms>` (the audible instant
+  of the frozen delivery head); the commanded start must land beyond every
+  member's head or that member splices at its own head instead.
 - Session lifecycle: `ACTION=STANDBY` (silence the receiver, keep the connection
   warm), `ACTION=DISCONNECT` (end the session).
 - Transport: `ACTION=PLAY|PAUSE|STOP`.

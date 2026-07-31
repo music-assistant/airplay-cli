@@ -249,9 +249,14 @@ restart marker and sync announcement for the new timeline. The caller can gate
 the command on the one-shot `[STATUS] audio buffered_ms=` line — emitted once a
 complete transport packet is buffered (or the final short packet reaches EOF),
 and re-armed by each FLUSH — so it commits a start only after the feed is ready.
-A T of 0 or in the past clamps to now plus the minimum commanded-start lead
-(250 ms; 200 ms on RAOP), which covers only the commit round-trips since the
-connection and the feed are already up.
+The contract is VERIFIED: a feasible T is scheduled exactly; a T of 0 or one
+the transport cannot honor is corrected FORWARD to the earliest feasible
+instant plus one lead of retry slack (the feasibility floor moves with the
+wall clock), and the `[STATUS] started requested_unix_ms= at_unix_ms=` ack
+always reports the true scheduled instant — the caller compares the two, logs
+corrections, and re-aligns a group by re-STARTing every member at the largest
+reported instant. The minimum lead (250 ms; 200 ms on RAOP) covers only the
+commit round-trips since the connection and the feed are already up.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its
@@ -577,12 +582,40 @@ capture.
   the pre-flush audio the caller stopped writing — then, after the receiver
   accepts the flush, acks `[STATUS] flushed` and releases the reader onto the
   empty ring. The stream is then idle-primed: it keeps buffering the next track
-  but sends nothing until the next `START`, which re-anchors it. The one-shot
+  and sends nothing until the next `START` (on the Apple splice timeline it
+  sends keepalive silence instead, so the immutable line cannot lapse across a
+  slow next-track spin-up). The next `START` re-anchors it. The one-shot
   `[STATUS] audio` signal (§6) is re-armed by the flush and fires after one
   complete transport packet is buffered, or when a final short packet reaches
   EOF. Partial PCM remains in the ring until a full packet is available; only
   the final EOF packet is padded with silence. The sender waits in bounded
   intervals so control failures remain visible during producer starvation.
+- **Apple splice timeline** — Apple's own receivers (tvOS/audioOS/macOS;
+  `model=`/`am=` prefix match) emit a ~100 ms noise burst on their native
+  realtime lane at any buffer discard (classic FLUSH with any RTP-Info, and
+  FLUSHBUFFERED alike), any anchor re-announce, and any late-frame delivery
+  (measured A/B on an Apple TV 4K, tvOS 27, 2026-07-30: the only clean warm
+  transitions were a natural drain and a bitstream-continuous splice; Apple
+  senders never exercise this corner — realtime streams are live and music
+  seeks ride the buffered lane). Native sessions to Apple models therefore run
+  a splice timeline: the anchor line frozen at the first START is immutable for
+  the whole session, no flush verb is ever sent, and every warm boundary
+  (seek/next FLUSH+START, standby park/resume, pause/un-pause, starvation
+  recovery) keeps the wire bitstream-continuous — a forward stamp jump is
+  audible too, so the gap up to the commanded instant is FILLED with encoded
+  silence sent as ordinary chunks (sequence numbers and timestamps advance
+  normally; the final partial pad shares a chunk with the first real samples,
+  keeping the splice sample-exact). The commanded START selects
+  the splice instant on the line (the same instant for every member of a sync
+  group, so a group splices sample-aligned); the pacing depth is kept shallow
+  (600 ms) because the receiver's queued audio plays out before a splice is
+  audible. A commanded instant at or behind a member's head splices at that
+  member's own head instead — silently breaking the shared instant — so the
+  flush ack carries the frozen head's audible instant
+  (`[STATUS] flushed head_unix_ms=<ms>`), the depth rides `warm_lead_ms` on
+  the `[STATUS] latency` line, and the caller anchors every warm START beyond
+  all members' heads (plus their sync adjustments). Third-party receivers
+  keep the flush + re-anchor path below, which they handle cleanly.
 - **Realtime send outcomes** — local UDP backpressure is a bounded transient
   drop that advances sequence, RTP, and scheduling timestamps. Encode,
   allocation, encryption, socket, and control failures are terminal and produce
