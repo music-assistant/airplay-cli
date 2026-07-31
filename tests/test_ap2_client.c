@@ -559,10 +559,13 @@ static void test_splice_delivery_gap_recovery(void)
     assert(close(capture[0]) == 0);
 
     assert(padded);
-    /* ~1.75 s of lapse plus the 600 ms recovery lead, with slack for the
-     * wall clock advancing between start and guard. */
+    /* ~1.75 s of lapse plus the 600 ms recovery lead. The wall clock keeps
+     * advancing between start and guard, so the upper bound is a loose
+     * sanity rail (a doubled shift would be ~207k frames — and the refire
+     * check below pins stacking exactly); the lower bound is the
+     * deterministic minimum. */
     uint32_t pad = ap2cl_splice_pad_frames(client);
-    assert(pad > 103000 && pad < 110000);
+    assert(pad > 103000 && pad < 176400);
     assert(ap2cl_test_timeline_reanchors(client) == 1);
     /* Bitstream continuity: the pad is queued, the stamps never move and the
      * anchor line stays frozen. */
