@@ -222,6 +222,7 @@ stdin, the single persistent audio input for the whole process lifetime.
 - Transport: `ACTION=PLAY|PAUSE|STOP`.
 - `VOLUME=<0-100>`.
 - Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
+  `ITEMID=<stable per-track id>`,
   `ARTWORK=<local file path or http:// imageproxy URL>`, followed by
   `ACTION=SENDMETA` to push the set.
 
@@ -234,6 +235,13 @@ start, so audio starts regardless of whether the caller ever sends `SENDMETA`.
 Pair-verified native Apple sessions additionally mirror these updates over
 MediaRemote `POST /command`, including explicit play/pause/stop state. Set
 `CLIAIRPLAY_MRP=0` only to disable that path for comparison or diagnosis.
+`ITEMID` keys the now-playing item identity: metadata re-sent under the same
+id updates the item in place (a tag refinement never presents as a new
+track), while a new id is a track change that starts at 0:00; without ids,
+identity falls back to the title/artist/album tuple. Byte-identical
+`ARTWORK=` re-sends are ignored, and a `PROGRESS=` correction rides a lean
+merge update on MediaRemote sessions, so a seek never redraws the receiver's
+now-playing screen.
 Metadata strings are encoded as Unicode binary-plist strings; artwork is
 signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
