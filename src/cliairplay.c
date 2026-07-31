@@ -41,7 +41,7 @@
 #include "raop_session.h"
 #include "artwork.h"
 
-#define VERSION "0.3.3"
+#define VERSION "0.4.0"
 /* Overridden at build time from the git tag for tagged releases (see Makefile). */
 #ifndef CLIAIRPLAY_VERSION
 #define CLIAIRPLAY_VERSION VERSION
