@@ -21,13 +21,19 @@ static uint64_t ntp_to_unix_ms(uint64_t ntp)
 static void resolve_start(uint64_t start_unix_ms, uint64_t *audible_ntp,
                           uint64_t *at_unix_ms)
 {
-    uint64_t floor = raopcl_get_ntp(NULL) +
-                     MS2NTP(RAOP_SESSION_MIN_START_LEAD_MS);
+    uint64_t lead = MS2NTP(RAOP_SESSION_MIN_START_LEAD_MS);
+    uint64_t floor = raopcl_get_ntp(NULL) + lead;
     uint64_t requested = start_unix_ms ? unix_ms_to_ntp(start_unix_ms) : 0;
-    *audible_ntp = requested > floor ? requested : floor;
-    if (at_unix_ms)
-        *at_unix_ms = requested > floor ? start_unix_ms
-                                        : ntp_to_unix_ms(floor);
+    if (requested > floor) {
+        *audible_ntp = requested;
+        if (at_unix_ms) *at_unix_ms = start_unix_ms;
+        return;
+    }
+    /* Corrected forward with one extra lead of slack (the floor moves with
+     * the wall clock, so a corrective retry at a bare floor would chase it);
+     * a request of 0 takes the floor directly. */
+    *audible_ntp = start_unix_ms ? floor + lead : floor;
+    if (at_unix_ms) *at_unix_ms = ntp_to_unix_ms(*audible_ntp);
 }
 
 ap2_commit_result_t raop_session_commit(struct raopcl_s *client,

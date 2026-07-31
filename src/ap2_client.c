@@ -2364,14 +2364,22 @@ static void ap2_resolve_start(uint64_t start_unix_ms, uint64_t floor_ntp,
         if (at_unix_ms) *at_unix_ms = start_unix_ms;
         return;
     }
-    *ntp_start = floor_ntp;
-    if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(floor_ntp);
-    if (start_unix_ms)
+    if (start_unix_ms) {
+        /* Corrected forward with one extra lead of slack: the floor moves
+         * with the wall clock, so a corrective retry at a bare floor would
+         * chase it forever. A request of 0 takes the floor directly (no
+         * retry follows a pick). */
+        *ntp_start = floor_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+        if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(*ntp_start);
         LOG_WARN("[AP2] start %llu ms is %llu ms behind the feasibility "
                  "floor; corrected forward",
                  (unsigned long long)start_unix_ms,
                  (unsigned long long)(ap2_ntp_to_unix_ms(floor_ntp) -
                                       start_unix_ms));
+        return;
+    }
+    *ntp_start = floor_ntp;
+    if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(floor_ntp);
 }
 
 ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
@@ -2563,16 +2571,28 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
             LOG_INFO("[AP2] splice resume: padding %" PRIu64 " frames "
                      "(%" PRIu64 " ms) of silence to the commanded start",
                      pad, pad * 1000ULL / p->format.sample_rate);
+        } else if (start_unix_ms) {
+            /* Corrected forward — one minimum lead BEYOND the head, not AT
+             * it: the idle keepalive advances the head 1:1 with the wall
+             * clock, so an ack naming the head itself sends the caller's
+             * corrective retry chasing a target that has always just moved
+             * (measured: +212/+418/+15 ms rounds without convergence). One
+             * lead of slack absorbs the command round-trip, so the retry at
+             * the reported instant lands exactly. */
+            uint64_t corrected_ntp =
+                head_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+            uint64_t target = NTP2TS(corrected_ntp, p->format.sample_rate);
+            p->splice_pad_frames =
+                (uint32_t)(target > p->head_ts ? target - p->head_ts : 0);
+            if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(corrected_ntp);
+            LOG_WARN("[AP2] splice resume: start %llu ms is behind the head; "
+                     "corrected forward to head + %d ms",
+                     (unsigned long long)start_unix_ms, AP2_MIN_WARM_LEAD_MS);
         } else {
             p->splice_pad_frames = 0;
             if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(head_ntp);
-            if (start_unix_ms)
-                LOG_WARN("[AP2] splice resume: start %llu ms is behind the "
-                         "head; corrected forward to the head",
-                         (unsigned long long)start_unix_ms);
-            else
-                LOG_INFO("[AP2] splice resume at head (seq=%u rtptime=%u)",
-                         (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
+            LOG_INFO("[AP2] splice resume at head (seq=%u rtptime=%u)",
+                     (unsigned)p->seq_number, (unsigned)p->rtp_timestamp);
         }
         /* A commanded start zeroes the drift baseline on both sides (MA
          * resets its accumulated shift on START). */
