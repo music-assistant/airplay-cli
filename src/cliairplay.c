@@ -1302,17 +1302,19 @@ static int run_airplay2(cli_config_t *cfg)
             frames += af - (int)pad_frames_now;
             pthread_mutex_unlock(&g_audio_send_lock);
         } else {
-            /* Paused, or connected and awaiting the commanded first START.
-             * On the splice timeline every armed window keeps sending
-             * silence: the idle-primed gap between a FLUSH and the next
-             * START (a slow next-track spin-up must not lapse the line —
-             * the track-transition blip), and a content pause (a receiver
-             * whose queue underruns while the session stays armed pops at
-             * the pause press — measured by ear A/B on an Apple TV 4K,
-             * 2026-07-31). Contiguous silence keeps every boundary a hot
-             * splice; the resume pad still lands the new content on the
-             * commanded instant. Standby and stop park the client out of
-             * AP2_STREAMING, so they drain as before. */
+            /* Paused, parked in standby, or connected and awaiting the
+             * commanded first START. On the splice timeline every armed
+             * window keeps sending silence: the idle-primed gap between a
+             * FLUSH and the next START (a slow next-track spin-up must not
+             * lapse the line — the track-transition blip), a content pause,
+             * and a standby park (MA's group pause parks members through
+             * standby — a receiver whose queue underruns while the session
+             * stays armed pops at the pause press, measured by ear A/B on
+             * an Apple TV 4K, 2026-07-31). Contiguous silence keeps every
+             * boundary a hot splice; the resume pad still lands the new
+             * content on the commanded instant. Stop and teardown end the
+             * feed — a teardown with audio still queued is clean — and the
+             * session engine's idle timeout still ends a forgotten park. */
             if (g_first_start_done && cfg->protocol == PROTO_AIRPLAY2 &&
                 ap2cl_splice_hot(g_ap2cl)) {
                 pthread_mutex_lock(&g_audio_send_lock);
