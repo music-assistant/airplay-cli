@@ -218,6 +218,9 @@ struct ap2cl_s {
                                      the wire stays fed (state remains
                                      AP2_STREAMING), so the MRP playback state
                                      needs its own truth */
+    bool content_stopped;         /* splice standby: the content is stopped
+                                     (parked) on the same armed-line shape as
+                                     content_paused, published as stopped */
     uint64_t reanchor_shifted_frames; /* cumulative shift since the last start/
                                         * resume, for [STATUS] REANCHOR */
     /* Retransmit history and the control-port reader that serves it. The ring
@@ -2596,6 +2599,7 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
 {
     if (!p) return AP2_COMMIT_FAILED;
     p->content_paused = false;
+    p->content_stopped = false;
     uint64_t ntp_start = 0;
     ap2_resolve_start(start_unix_ms,
                       raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS),
@@ -2645,28 +2649,35 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
     return AP2_COMMIT_OK;
 }
 
-/* Silence the receiver but keep the session warm (persistent standby):
- * discard buffered audio with an RTSP FLUSH, publish the stopped playback
- * state, and drop back to CONNECTED so a later warm flush can restart. */
+/* Park the stream but keep the session warm (persistent standby). On the
+ * splice timeline the CONTENT stops while the armed line keeps carrying
+ * silence: a queue underrun while the session stays armed is an audible
+ * noise burst on Apple receivers (measured at the group pause press, which
+ * parks members through standby), and a line kept hot makes the next resume
+ * a splice instead of a fresh anchor. The stock path discards buffered audio
+ * with an RTSP FLUSH and drops back to CONNECTED so a later warm flush can
+ * restart. Both publish the stopped playback state; the session engine's
+ * idle timeout still ends a park nothing ever resumes. */
 void ap2cl_standby(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return;
     p->content_paused = false;
+    p->content_stopped = false;
     if (p->flow != FLOW_NATIVE_AP2) {
         if (p->raopcl) raop_session_standby(p->raopcl);
         p->state = AP2_CONNECTED;
         return;
     }
     if (p->splice_timeline) {
-        /* Splice park: stop delivering and let the shallow queue drain
-         * naturally — the flush verb is the noise trigger, and a starved
-         * receiver pads silence cleanly (the end-of-playback burst users
-         * reported was this FLUSH). The frozen anchor line survives the park;
-         * the splice resume skips forward on it. */
-        LOG_INFO("[AP2] splice standby: draining the queue, keeping the line");
+        /* Splice park: the client stays AP2_STREAMING and the audio loop
+         * keeps the line fed with encoded silence — draining the shallow
+         * queue here is the underrun noise trigger. content_stopped keeps
+         * the published now-playing state truthful meanwhile; the frozen
+         * anchor line survives the park for a hot-splice resume. */
+        LOG_INFO("[AP2] splice standby: content stopped, keeping the line fed");
+        p->content_stopped = true;
         p->splice_pad_frames = 0;
         ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
-        p->state = AP2_CONNECTED;
         return;
     }
     if (!atomic_load(&p->rtsp_dead)) {
@@ -2745,6 +2756,7 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
 {
     if (!p || p->state == AP2_DOWN) return AP2_COMMIT_FAILED;
     p->content_paused = false;
+    p->content_stopped = false;
 
     if (p->flow != FLOW_NATIVE_AP2) {
         ap2_commit_result_t r =
@@ -3064,6 +3076,7 @@ void ap2cl_log_diagnostics(struct ap2cl_s *p)
 void ap2cl_pause(struct ap2cl_s *p)
 {
     if (!p) return;
+    p->content_stopped = false;
     if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
     if (p->splice_timeline) {
         /* Splice pause stops the CONTENT, never the wire: an Apple receiver
@@ -3089,6 +3102,7 @@ void ap2cl_play(struct ap2cl_s *p)
 {
     if (!p) return;
     p->content_paused = false;
+    p->content_stopped = false;
     if (p->raopcl) {
         int lat = raopcl_latency(p->raopcl);
         uint64_t now = raopcl_get_ntp(NULL);
@@ -3130,6 +3144,7 @@ void ap2cl_stop(struct ap2cl_s *p)
 {
     if (!p) return;
     p->content_paused = false;
+    p->content_stopped = false;
     if (p->raopcl) raopcl_stop(p->raopcl);
     ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
     p->rt_anchor_valid = false;
@@ -3296,6 +3311,19 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
     return status >= 200 && status < 300;
 }
 
+/* Playback state to publish: the splice keepalive keeps the client
+ * AP2_STREAMING through content pauses and standby parks, so the published
+ * state follows the content flags, not the wire. */
+static ap2_mrp_playback_state_t ap2_mrp_current_playback_state(
+    struct ap2cl_s *p)
+{
+    if (p->content_stopped) return AP2_MRP_PLAYBACK_STOPPED;
+    if (p->state == AP2_PAUSED || p->content_paused)
+        return AP2_MRP_PLAYBACK_PAUSED;
+    return p->state == AP2_STREAMING ? AP2_MRP_PLAYBACK_PLAYING
+                                     : AP2_MRP_PLAYBACK_STOPPED;
+}
+
 /* Lazily create MediaRemote for pair-verified native sessions and attach the
  * encrypted reverse event channel before advertising any controllable state.
  * Transient-paired third-party speakers never receive these Apple-specific
@@ -3324,7 +3352,11 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
         return;
     }
     p->events_sock = -1;
-    ap2_mrp_set_playing(p->mrp, p->state == AP2_STREAMING);
+    ap2_mrp_playback_state_t state = ap2_mrp_current_playback_state(p);
+    if (state == AP2_MRP_PLAYBACK_STOPPED)
+        ap2_mrp_set_stopped(p->mrp);
+    else
+        ap2_mrp_set_playing(p->mrp, state == AP2_MRP_PLAYBACK_PLAYING);
     atomic_store(&p->mrp_event_health, ap2_mrp_event_status(p->mrp));
 }
 
@@ -3420,10 +3452,7 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
  * keeping it detached from its system now-playing player when these are absent. */
 static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
 {
-    ap2_mrp_playback_state_t state =
-        p->state == AP2_PAUSED || p->content_paused ? AP2_MRP_PLAYBACK_PAUSED :
-        p->state == AP2_STREAMING ? AP2_MRP_PLAYBACK_PLAYING :
-                                    AP2_MRP_PLAYBACK_STOPPED;
+    ap2_mrp_playback_state_t state = ap2_mrp_current_playback_state(p);
 
     int st_cmd = ap2_mrp_post_command(
         p, ap2_mrp_build_supportedcommands_command,
@@ -3472,12 +3501,8 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized_with(
     if (!p->mrp_extended_registered) {
         ext_status = ap2_mrp_send_extended_registration(p);
     } else {
-        ap2_mrp_playback_state_t state =
-            p->state == AP2_PAUSED || p->content_paused
-                ? AP2_MRP_PLAYBACK_PAUSED :
-            p->state == AP2_STREAMING ? AP2_MRP_PLAYBACK_PLAYING :
-                                        AP2_MRP_PLAYBACK_STOPPED;
-        ext_status = ap2_mrp_send_playback_state(p, state, false);
+        ext_status = ap2_mrp_send_playback_state(
+            p, ap2_mrp_current_playback_state(p), false);
     }
     if (!ap2_mrp_status_ok(ext_status)) result.overall_status = ext_status;
     return result;

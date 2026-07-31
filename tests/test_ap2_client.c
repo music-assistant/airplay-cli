@@ -487,12 +487,23 @@ static void test_splice_timeline_warm_path(void)
     ap2cl_splice_pad_consume(client, pad);
     assert(ap2cl_splice_pad_frames(client) == 0);
 
-    /* Park: no flush verb either; the line survives for the next resume. */
+    /* Park: no flush verb either, and the client stays ARMED — a queue
+     * underrun while the session stays armed is itself an audible noise
+     * trigger on Apple receivers (the pop at a group pause press, which
+     * parks members through standby), so the audio loop must keep feeding
+     * the line silence; only the published playback state stops. */
     ap2cl_standby(client);
-    assert(ap2cl_state(client) == AP2_CONNECTED);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+    assert(ap2cl_splice_hot(client));
     assert(ap2cl_test_anchor_valid(client));
+    assert(ap2cl_test_head_ts(client) == head_before);
+    assert(ap2cl_test_rtp_timestamp(client) == rtp_before);
+    /* The resume splices on the hot line: stamps continue, no re-anchor. */
     assert(ap2cl_resume(client, 0, NULL) == AP2_COMMIT_OK);
     assert(ap2cl_state(client) == AP2_STREAMING);
+    assert(!ap2cl_test_first_packet(client));
+    assert(ap2cl_test_head_ts(client) == head_before);
+    assert(ap2cl_test_rtp_timestamp(client) == rtp_before);
 
     /* The whole warm path put nothing on the RTSP socket. */
     char scratch[16];
@@ -510,8 +521,10 @@ static void test_splice_timeline_warm_path(void)
  * The guard must splice-pad the timeline forward — silence on the immutable
  * line, no stamp jump, no RTSP verb — and report the shift as a REANCHOR,
  * instead of letting the loop burst real frames on past timestamps (an
- * audible noise trigger on Apple receivers). A healthy head, a pending pad,
- * a non-splice stream and a parked session must each leave it silent. */
+ * audible noise trigger on Apple receivers). A healthy head, a pending pad
+ * and a non-splice stream must each leave it silent; a parked (standby)
+ * window never consults it — the audio loop gates the guard on the session
+ * engine's PLAYING state while its keepalive keeps the armed line fed. */
 static void test_splice_delivery_gap_recovery(void)
 {
     int sockets[2];
@@ -604,10 +617,13 @@ static void test_splice_delivery_gap_recovery(void)
     assert(ap2cl_splice_pad_frames(client) == 0);
     ap2cl_test_set_splice(client, true);
 
-    /* A parked session is a frozen timeline by design, not a stall. */
+    /* A standby park keeps the session armed so the audio loop can keep the
+     * line fed with silence — an underrun while armed is itself an audible
+     * noise trigger. The guard is never consulted while parked (the loop
+     * gates it on the session engine's PLAYING state). */
     ap2cl_standby(client);
-    assert(ap2cl_state(client) == AP2_CONNECTED);
-    assert(!ap2cl_recover_delivery_gap(client));
+    assert(ap2cl_state(client) == AP2_STREAMING);
+    assert(ap2cl_splice_hot(client));
     assert(ap2cl_test_timeline_reanchors(client) == 1);
 
     /* The whole recovery put nothing on the RTSP socket. */

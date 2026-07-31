@@ -200,8 +200,11 @@ bool ap2cl_flush(struct ap2cl_s *p);
 ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
                                  uint64_t *at_unix_ms);
 
-/* Silence the receiver but keep the session warm: discard buffered audio,
- * publish the stopped state, drop to CONNECTED awaiting the next warm flush. */
+/* Park the stream but keep the session warm: the splice timeline stops the
+ * content while the armed line keeps carrying silence (an underrun while
+ * armed is an audible noise trigger); the stock path discards buffered audio
+ * and drops to CONNECTED awaiting the next warm flush. Both publish the
+ * stopped playback state. */
 void ap2cl_standby(struct ap2cl_s *p);
 
 /* Send a chunk of PCM audio data.

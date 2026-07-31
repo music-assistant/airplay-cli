@@ -639,8 +639,9 @@ capture.
   a queue UNDERRUN while the session stays armed pops as well — heard as a
   burst at the pause press — while a teardown with audio still queued is
   clean. An armed splice line is therefore never allowed to run dry: the
-  idle-primed FLUSH→START gap, a content pause, and the post-EOF drain/idle
-  window each keep the wire fed with encoded silence, and a delivery stall
+  idle-primed FLUSH→START gap, a content pause, a standby park (a group
+  pause parks members through standby), and the post-EOF drain/idle window
+  each keep the wire fed with encoded silence, and a delivery stall
   longer than the pacing depth splice-pads the timeline forward (reported as
   REANCHOR) instead of bursting the queued content on past timestamps when
   sending resumes. The 2026-07-31 fleet A/B validated the same mechanism on
