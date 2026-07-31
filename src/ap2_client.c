@@ -84,7 +84,7 @@ extern log_level *loglevel;
  * after the connection and the audio feed are both confirmed, so no setup
  * slack is needed on top. */
 #define AP2_MIN_WARM_LEAD_MS         250
-/* Receiver queue depth on the Apple splice timeline (§ splice below): the
+/* Receiver queue depth on the splice timeline (§ splice below): the
  * depth IS the audible latency of a warm splice, so it stays shallow. */
 #define AP2_SPLICE_PACING_MS         600
 /* Raw bytes kept from a failed exchange for the auth diagnostics dump: enough
@@ -179,9 +179,10 @@ struct ap2cl_s {
     uint64_t sync_packets_dropped;
     atomic_uint feedback_failures;
     uint64_t timeline_reanchors;
-    bool splice_timeline;         /* Apple receiver: discard-free warm path on
-                                     one immutable anchor line (see the splice
-                                     comments at flush/resume/standby) */
+    bool splice_timeline;         /* discard-free warm path on one immutable
+                                     anchor line — the native default; false
+                                     only for deny-listed receivers (see the
+                                     splice comments at flush/resume/standby) */
     uint32_t splice_pad_frames;   /* silence frames still to send before the
                                      next real sample so it lands exactly on
                                      the commanded splice instant */
@@ -824,23 +825,25 @@ static bool ap2_features_has_ptp(const char *txt)
     return AP2_FEAT(ap2_txt_features(txt), AP2_FEAT_PTP) != 0;
 }
 
-/* Apple's own AirPlay receivers (tvOS/audioOS/macOS; `model=` in the _airplay
- * TXT, `am=` on _raop) share a receiver daemon whose realtime lane emits a
- * short noise burst on any buffer discard (FLUSH and FLUSHBUFFERED alike), any
- * anchor re-announce, and any late-frame delivery — measured A/B on hardware
- * (Apple TV 4K, tvOS 27, 2026-07-30; the only clean warm transitions were a
- * natural drain and a bitstream-continuous splice). Third-party receivers
- * handle the classic flush + re-anchor warm path cleanly, so only Apple models
- * take the splice timeline. */
-static bool ap2_apple_model(const char *txt, const char *am)
+/* Splice-timeline deny-list: receivers that need the classic flush +
+ * re-anchor warm path instead of the splice timeline (§DESIGN.md). The
+ * splice timeline is the default for every native session: Apple's own
+ * receivers REQUIRE it (their realtime lane emits a short noise burst on any
+ * buffer discard, anchor re-announce, or late-frame delivery — measured A/B
+ * on an Apple TV 4K, tvOS 27, 2026-07-30; the only clean warm transitions
+ * were a natural drain and a bitstream-continuous splice), and the
+ * 2026-07-31 fleet A/B cleared the third-party park (Sonos Era 100 pair and
+ * solo, Sonos Bookshelf, WiiM Pro, Edifier MS50A, Samsung HW-LS60D:
+ * cold/seek/next/pause/park/keepalive/late-join/group runs, delivery-stall
+ * ladders) on the same mechanism. Add a `model=` (_airplay TXT) / `am=`
+ * (_raop) prefix here only when a receiver measures splice-hostile on
+ * hardware. */
+static bool ap2_splice_denied(const char *txt, const char *am)
 {
-    static const char *const prefixes[] = {
-        "AppleTV", "AudioAccessory", "AirPort", "HomePod",
-        "Mac", "iMac", "iPhone", "iPad", "iPod",
-    };
+    static const char *const prefixes[] = { NULL };
     const char *model = txt ? strstr(txt, "model=") : NULL;
     if (model) model += strlen("model=");
-    for (size_t i = 0; i < sizeof(prefixes) / sizeof(prefixes[0]); i++) {
+    for (size_t i = 0; prefixes[i]; i++) {
         size_t len = strlen(prefixes[i]);
         if (model && strncmp(model, prefixes[i], len) == 0) return true;
         if (am && strncmp(am, prefixes[i], len) == 0) return true;
@@ -2276,11 +2279,15 @@ bool ap2cl_connect(struct ap2cl_s *p)
     if (!p) return false;
     ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0, "connect failed");
     if (p->flow == FLOW_NATIVE_AP2) {
-        p->splice_timeline = ap2_apple_model(p->device.txt_records, p->am);
-        if (p->splice_timeline)
-            LOG_INFO("[AP2] Apple receiver: splice timeline active "
-                     "(discard-free warm path, %d ms queue depth)",
-                     AP2_SPLICE_PACING_MS);
+        p->splice_timeline =
+            !ap2_splice_denied(p->device.txt_records, p->am);
+        if (p->splice_timeline) {
+            LOG_INFO("[AP2] splice timeline (discard-free warm path, "
+                     "%d ms queue depth)", AP2_SPLICE_PACING_MS);
+        } else {
+            LOG_INFO("[AP2] deny-listed receiver: classic flush + re-anchor "
+                     "warm path");
+        }
         LOG_INFO("[AP2] Connecting via native AP2 flow to %s:%d",
                  p->device.address, p->device.port);
         return ap2_native_connect(p);
@@ -3518,6 +3525,11 @@ void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet)
 void ap2cl_test_set_splice(struct ap2cl_s *p, bool enable)
 {
     p->splice_timeline = enable;
+}
+
+bool ap2cl_test_splice_default(const char *txt, const char *am)
+{
+    return !ap2_splice_denied(txt, am);
 }
 
 void ap2cl_test_set_anchor_valid(struct ap2cl_s *p, bool valid)

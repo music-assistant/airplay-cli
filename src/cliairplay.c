@@ -1166,7 +1166,7 @@ static int run_airplay2(cli_config_t *cfg)
                 eof_reported = false;
                 eof_time = 0;
             }
-            /* Splice pad (Apple splice timeline): silence owed to the wire
+            /* Splice pad (splice timeline): silence owed to the wire
              * before the next real sample, sent as ordinary encoded chunks so
              * sequence numbers and timestamps stay contiguous (any stamp jump
              * is an audible noise burst). A partial pad occupies the head of

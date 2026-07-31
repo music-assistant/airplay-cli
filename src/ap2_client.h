@@ -339,7 +339,7 @@ void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint
 int ap2cl_render_latency_ms(struct ap2cl_s *p);
 
 /* Frames between the delivery head and the audible position (elapsed
- * reporting): the shallow pacing depth on the Apple splice timeline, the
+ * reporting): the shallow pacing depth on the splice timeline, the
  * latency lead otherwise. */
 uint32_t ap2cl_audible_lag_frames(struct ap2cl_s *p);
 
