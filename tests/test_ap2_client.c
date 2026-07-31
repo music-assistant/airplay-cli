@@ -29,6 +29,7 @@ void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
 bool ap2cl_test_first_packet(struct ap2cl_s *p);
 void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet);
 void ap2cl_test_set_splice(struct ap2cl_s *p, bool enable);
+bool ap2cl_test_splice_default(const char *txt, const char *am);
 void ap2cl_test_set_anchor_valid(struct ap2cl_s *p, bool valid);
 bool ap2cl_test_anchor_valid(struct ap2cl_s *p);
 uint64_t ap2cl_test_head_ts(struct ap2cl_s *p);
@@ -399,7 +400,30 @@ static void test_route_with_password(void)
     puts("ap2_client route password selection tests passed");
 }
 
-/* The Apple splice timeline never sends a flush verb and never rebases: the
+/* The splice timeline is the default for every native session; the deny-list
+ * (classic flush + re-anchor fallback) ships empty. The 2026-07-31 fleet A/B
+ * cleared the third-party park on the splice mechanism — adding a deny entry
+ * must consciously update this pin. */
+static void test_splice_default_resolution(void)
+{
+    /* Apple receivers (the mechanism is REQUIRED there). */
+    assert(ap2cl_test_splice_default(
+        "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE", NULL));
+    assert(ap2cl_test_splice_default(NULL, "AudioAccessory5,1"));
+    /* The validated third-party park. */
+    assert(ap2cl_test_splice_default(
+        "model=Era 100 features=0x445F8A00,0x801C340", NULL));
+    assert(ap2cl_test_splice_default(
+        "model=WiiM Pro Receiver features=0x445F8A00,0x1C340", NULL));
+    assert(ap2cl_test_splice_default(
+        "model=JBL MA9100HP features=0x445F8A00,0x1C340", NULL));
+    assert(ap2cl_test_splice_default(NULL, "Era 100"));
+    /* No TXT at all still defaults to the splice timeline. */
+    assert(ap2cl_test_splice_default(NULL, NULL));
+    puts("ap2_client splice default resolution tests passed");
+}
+
+/* The splice timeline never sends a flush verb and never rebases: the
  * warm boundary is a forward-only stamp skip on one immutable anchor line.
  * The RTSP socket must stay silent across flush + standby, and resume must
  * keep the sequence/timestamp relation contiguous. */
@@ -567,6 +591,7 @@ int main(void)
     test_info_format_tables();
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
+    test_splice_default_resolution();
     test_splice_timeline_warm_path();
     test_feedback_miss_tolerated_then_recovered();
 
