@@ -591,9 +591,10 @@ capture.
   EOF. Partial PCM remains in the ring until a full packet is available; only
   the final EOF packet is padded with silence. The sender waits in bounded
   intervals so control failures remain visible during producer starvation.
-- **Splice timeline** — every native session runs one mechanism for warm
-  boundaries: the anchor line frozen at the first START is immutable for the
-  whole session, no flush verb is ever sent, and every warm boundary
+- **Splice timeline** — the default warm-boundary mechanism for every native
+  session (deny-listed receivers, below, are the exception): the anchor line
+  frozen at the first START is immutable for the whole session, no flush verb
+  is ever sent on this path, and every warm boundary
   (seek/next FLUSH+START, standby park/resume, pause/un-pause, starvation
   recovery) keeps the wire bitstream-continuous — the gap up to the commanded
   instant is FILLED with encoded silence sent as ordinary chunks (sequence
