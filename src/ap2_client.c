@@ -2657,7 +2657,7 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
  * a splice instead of a fresh anchor. The stock path discards buffered audio
  * with an RTSP FLUSH and drops back to CONNECTED so a later warm flush can
  * restart. Both publish the stopped playback state; the session engine's
- * idle timeout still ends a park nothing ever resumes. */
+ * idle timeout still ends a park that nothing ever resumes. */
 void ap2cl_standby(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return;
