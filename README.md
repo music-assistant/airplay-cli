@@ -66,8 +66,9 @@ without reconnecting. A caller can wait for the one-shot
 `[STATUS] audio buffered_ms=<ms>` line — emitted once the (new) track has a
 complete audio packet buffered, or its final short packet reaches EOF — before
 it commands the start, then send the same start value to every member of a sync
-group. A `START_UNIX_MS` of 0 or in the past clamps to now plus the minimum
-commanded-start lead (250 ms, 200 ms on RAOP).
+group. A `START_UNIX_MS` of 0 or one the transport cannot honor is corrected
+forward to the earliest feasible instant (250 ms minimum lead, 200 ms on RAOP)
+and the `[STATUS] started` ack always reports the true scheduled instant.
 
 Delivery is not gated on the start time: frames are released up to the
 receiver's buffer window ahead of each frame's deadline (the device-reported
@@ -201,7 +202,8 @@ stdin, the single persistent audio input for the whole process lifetime.
 - `ACTION=FLUSH` — in-place warm flush for seek/next: flush the receiver (RTSP
   FLUSH), discard the internal ring, and drain stdin to empty; after the receiver
   accepts the flush, acks with `[STATUS] flushed` and keeps buffering the next
-  track while sending nothing until the next `START` (idle-primed). The one-shot
+  track while sending nothing until the next `START` (idle-primed; the Apple
+  splice timeline sends keepalive silence instead). The one-shot
   `[STATUS] audio buffered_ms=<ms>` line fires again when the next track's feed
   has a complete packet buffered, or its final short packet reaches EOF.
   On Apple receivers the native flow instead runs a splice timeline (no receiver

@@ -248,9 +248,14 @@ restart marker and sync announcement for the new timeline. The caller can gate
 the command on the one-shot `[STATUS] audio buffered_ms=` line — emitted once a
 complete transport packet is buffered (or the final short packet reaches EOF),
 and re-armed by each FLUSH — so it commits a start only after the feed is ready.
-A T of 0 or in the past clamps to now plus the minimum commanded-start lead
-(250 ms; 200 ms on RAOP), which covers only the commit round-trips since the
-connection and the feed are already up.
+The contract is VERIFIED: a feasible T is scheduled exactly; a T of 0 or one
+the transport cannot honor is corrected FORWARD to the earliest feasible
+instant plus one lead of retry slack (the feasibility floor moves with the
+wall clock), and the `[STATUS] started requested_unix_ms= at_unix_ms=` ack
+always reports the true scheduled instant — the caller compares the two, logs
+corrections, and re-aligns a group by re-STARTing every member at the largest
+reported instant. The minimum lead (250 ms; 200 ms on RAOP) covers only the
+commit round-trips since the connection and the feed are already up.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its
@@ -576,7 +581,9 @@ capture.
   the pre-flush audio the caller stopped writing — then, after the receiver
   accepts the flush, acks `[STATUS] flushed` and releases the reader onto the
   empty ring. The stream is then idle-primed: it keeps buffering the next track
-  but sends nothing until the next `START`, which re-anchors it. The one-shot
+  and sends nothing until the next `START` (on the Apple splice timeline it
+  sends keepalive silence instead, so the immutable line cannot lapse across a
+  slow next-track spin-up). The next `START` re-anchors it. The one-shot
   `[STATUS] audio` signal (§6) is re-armed by the flush and fires after one
   complete transport packet is buffered, or when a final short packet reaches
   EOF. Partial PCM remains in the ring until a full packet is available; only
