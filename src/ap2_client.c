@@ -3392,11 +3392,21 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
     pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
+    bool have_mrp = p->mrp != NULL;
     if (p->mrp)
         ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000,
                              p->state == AP2_STREAMING);
     pthread_mutex_unlock(&p->mrp_lock);
     pthread_mutex_unlock(&p->mrp_publish_lock);
+    if (have_mrp) {
+        /* MediaRemote owns now-playing on this receiver; the timeline rides
+         * the mergePolicy-"update" push that follows this call. The legacy
+         * SET_PARAMETER progress line exists for receivers without the MRP
+         * bridge (Sonos-class) — sending both makes an Apple TV process the
+         * same seek twice, and its legacy path visibly re-renders the
+         * now-playing screen. */
+        return true;
+    }
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* progress: <start>/<current>/<end>, all in the STREAM's RTP timestamp
          * units (the per-process timeline offset included, so the values match
