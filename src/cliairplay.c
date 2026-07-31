@@ -259,7 +259,9 @@ static void mrp_status_report(int status)
 static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info,
                                       int command_status)
 {
-    if (!info || info->result == AP2_MRP_ARTWORK_NOT_APPLICABLE) return;
+    if (!info || info->result == AP2_MRP_ARTWORK_NOT_APPLICABLE ||
+        info->result == AP2_MRP_ARTWORK_UNCHANGED)
+        return;
     if (info->result == AP2_MRP_ARTWORK_ACCEPTED) {
         status_print("[STATUS] mrp artwork=posted status=%d bytes=%zu "
                      "width=%u height=%u precision=%u sof=0x%02x "
@@ -341,6 +343,7 @@ static struct {
     char *title;    /* owned (strdup'd); NULL until first set */
     char *artist;
     char *album;
+    char *item_id;  /* sender's stable per-track identity (ITEMID key) */
     int duration;
     int progress;
 } g_metadata;
@@ -368,6 +371,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         metadata_set(&g_metadata.artist, value);
     } else if (strcmp(key, "ALBUM") == 0) {
         metadata_set(&g_metadata.album, value);
+    } else if (strcmp(key, "ITEMID") == 0) {
+        metadata_set(&g_metadata.item_id, value);
     } else if (strcmp(key, "DURATION") == 0) {
         g_metadata.duration = atoi(value);
     } else if (strcmp(key, "PROGRESS") == 0) {
@@ -376,7 +381,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             raopcl_set_progress_ms(g_raopcl, g_metadata.progress * 1000, g_metadata.duration * 1000);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_set_progress(g_ap2cl, g_metadata.progress, g_metadata.duration);
-            mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+            mrp_status_report(ap2cl_mrp_push_progress(g_ap2cl));
         }
     } else if (strcmp(key, "ARTWORK") == 0) {
         uint8_t *image = NULL;
@@ -496,7 +501,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_set_metadata(g_ap2cl, metadata_str(g_metadata.title),
                                metadata_str(g_metadata.artist),
-                               metadata_str(g_metadata.album), g_metadata.duration);
+                               metadata_str(g_metadata.album), g_metadata.duration,
+                               metadata_str(g_metadata.item_id));
             mrp_status_report(ap2cl_mrp_push(g_ap2cl));
         }
     }
@@ -514,7 +520,8 @@ static void send_initial_metadata(const cli_config_t *cfg)
                         "asal", 's', metadata_str(g_metadata.album), "astn", 'i', 1);
     } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
         ap2cl_set_metadata(g_ap2cl, title, metadata_str(g_metadata.artist),
-                           metadata_str(g_metadata.album), g_metadata.duration);
+                           metadata_str(g_metadata.album), g_metadata.duration,
+                           metadata_str(g_metadata.item_id));
         mrp_status_report(ap2cl_mrp_push(g_ap2cl));
     }
 }

@@ -158,6 +158,8 @@ struct ap2cl_s {
     atomic_int mrp_event_health;
     bool mrp_device_registered;
     bool mrp_extended_registered;
+    bool mrp_progress_push_full;  /* receiver rejected the "update" policy;
+                                     timeline pushes use the full replace */
     int mrp_last_playback_state;
     ap2_remote_command_cb_t remote_command_cb;
     void *remote_command_userdata;
@@ -3073,14 +3075,11 @@ typedef bool (*ap2_mrp_command_builder_t)(struct ap2_mrp_ctx *,
 
 static int ap2_mrp_post_command(struct ap2cl_s *p,
                                 ap2_mrp_command_builder_t builder,
-                                const char *tag,
-                                uint64_t *artwork_generation)
+                                const char *tag)
 {
     uint8_t *body = NULL; int body_len = 0;
     pthread_mutex_lock(&p->mrp_lock);
     bool built = p->mrp && builder(p->mrp, &body, &body_len);
-    if (built && artwork_generation)
-        *artwork_generation = ap2_mrp_artwork_generation(p->mrp);
     pthread_mutex_unlock(&p->mrp_lock);
     if (!built) return -1;
     uint8_t *resp = NULL;
@@ -3110,7 +3109,7 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
 
     int status = ap2_mrp_post_command(
         p, ap2_mrp_build_playbackstate_command,
-        "[MRP] /command updateMRPlaybackState", NULL);
+        "[MRP] /command updateMRPlaybackState");
     if (ap2_mrp_status_ok(status))
         p->mrp_last_playback_state = state;
     return status;
@@ -3148,11 +3147,11 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
 
     int st_cmd = ap2_mrp_post_command(
         p, ap2_mrp_build_supportedcommands_command,
-        "[MRP] /command updateMRSupportedCommands", NULL);
+        "[MRP] /command updateMRSupportedCommands");
     int st_state = ap2_mrp_send_playback_state(p, state, true);
     int st_client = ap2_mrp_post_command(
         p, ap2_mrp_build_nowplayingclient_command,
-        "[MRP] /command updateMRNowPlayingClient", NULL);
+        "[MRP] /command updateMRNowPlayingClient");
 
     p->mrp_extended_registered =
         ap2_mrp_status_ok(st_cmd) && ap2_mrp_status_ok(st_state) &&
@@ -3167,7 +3166,8 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
 
 static int ap2cl_mrp_register_serialized(struct ap2cl_s *p);
 
-static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
+static ap2_mrp_push_result_t ap2cl_mrp_push_serialized_with(
+    struct ap2cl_s *p, ap2_mrp_command_builder_t builder)
 {
     ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return result;
@@ -3182,18 +3182,11 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
         return result;
     }
 
-    uint64_t artwork_generation = 0;
     int status = ap2_mrp_post_command(
-        p, ap2_mrp_build_nowplaying_command,
-        "[MRP] /command updateMRNowPlayingInfo", &artwork_generation);
+        p, builder, "[MRP] /command updateMRNowPlayingInfo");
     result.nowplaying_status = status;
     result.overall_status = status;
     if (!ap2_mrp_status_ok(status)) return result;
-    pthread_mutex_lock(&p->mrp_lock);
-    if (p->mrp)
-        ap2_mrp_mark_artwork_sent_if_generation(
-            p->mrp, artwork_generation);
-    pthread_mutex_unlock(&p->mrp_lock);
 
     int ext_status;
     if (!p->mrp_extended_registered) {
@@ -3209,6 +3202,11 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
     return result;
 }
 
+static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
+{
+    return ap2cl_mrp_push_serialized_with(p, ap2_mrp_build_nowplaying_command);
+}
+
 ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p)
 {
     ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
@@ -3222,6 +3220,31 @@ ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p)
 int ap2cl_mrp_push(struct ap2cl_s *p)
 {
     return ap2cl_mrp_push_ex(p).overall_status;
+}
+
+int ap2cl_mrp_push_progress(struct ap2cl_s *p)
+{
+    ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
+    if (!p) return result.overall_status;
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    if (!p->mrp_progress_push_full) {
+        result = ap2cl_mrp_push_serialized_with(
+            p, ap2_mrp_build_nowplaying_progress_command);
+        /* A receiver that rejects the "update" merge policy outright gets
+         * the full replace shape from now on (bytes riding along); only an
+         * HTTP-level rejection demotes — transport failures stay retryable
+         * on the lean shape. */
+        if (result.nowplaying_status >= 300) {
+            LOG_WARN("[MRP] timeline update push rejected (%d); "
+                     "using full now-playing pushes for this session",
+                     result.nowplaying_status);
+            p->mrp_progress_push_full = true;
+        }
+    }
+    if (p->mrp_progress_push_full)
+        result = ap2cl_mrp_push_serialized(p);
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+    return result.overall_status;
 }
 
 /* MRP data-channel (path B) status for the [STATUS] mrp line:
@@ -3256,7 +3279,7 @@ static int ap2cl_mrp_register_serialized(struct ap2cl_s *p)
 
     int status = ap2_mrp_post_command(
         p, ap2_mrp_build_deviceinfo_command,
-        "[MRP] /command DEVICE_INFO", NULL);
+        "[MRP] /command DEVICE_INFO");
     p->mrp_device_registered = ap2_mrp_status_ok(status);
     return p->mrp_device_registered ? 1 : 0;
 }
@@ -3271,14 +3294,15 @@ int ap2cl_mrp_register(struct ap2cl_s *p)
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
-                        const char *album, int duration)
+                        const char *album, int duration, const char *item_id)
 {
     if (!p) return false;
     pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     if (p->mrp)
-        ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000);
+        ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000,
+                             item_id);
     pthread_mutex_unlock(&p->mrp_lock);
     pthread_mutex_unlock(&p->mrp_publish_lock);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
@@ -3293,12 +3317,12 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
                        const char *data, ap2_mrp_artwork_info_t *mrp_info,
                        ap2_mrp_push_result_t *mrp_push)
 {
+    ap2_mrp_artwork_info_t local_info;
+    if (!mrp_info) mrp_info = &local_info;
     if (mrp_push) *mrp_push = ap2_mrp_push_result_empty();
-    if (mrp_info) {
-        memset(mrp_info, 0, sizeof(*mrp_info));
-        mrp_info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
-        mrp_info->bytes = size > 0 ? (size_t)size : 0;
-    }
+    memset(mrp_info, 0, sizeof(*mrp_info));
+    mrp_info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
+    mrp_info->bytes = size > 0 ? (size_t)size : 0;
     if (!p) return false;
     pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
@@ -3308,6 +3332,13 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
         ap2_mrp_set_artwork(p->mrp, content_type, (const uint8_t *)data,
                             size, mrp_info);
     pthread_mutex_unlock(&p->mrp_lock);
+    if (mrp_info->result == AP2_MRP_ARTWORK_UNCHANGED) {
+        /* The receiver already holds these exact bytes under the current
+         * identifier; re-sending on either path would only make it re-render
+         * its Now Playing UI. */
+        pthread_mutex_unlock(&p->mrp_publish_lock);
+        return true;
+    }
     bool dmap_ok = false;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* Preserve the DMAP/SET_PARAMETER path for receivers such as Sonos;
@@ -3361,11 +3392,21 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
     pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
+    bool have_mrp = p->mrp != NULL;
     if (p->mrp)
         ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000,
                              p->state == AP2_STREAMING);
     pthread_mutex_unlock(&p->mrp_lock);
     pthread_mutex_unlock(&p->mrp_publish_lock);
+    if (have_mrp) {
+        /* MediaRemote owns now-playing on this receiver; the timeline rides
+         * the mergePolicy-"update" push that follows this call. The legacy
+         * SET_PARAMETER progress line exists for receivers without the MRP
+         * bridge (Sonos-class) — sending both makes an Apple TV process the
+         * same seek twice, and its legacy path visibly re-renders the
+         * now-playing screen. */
+        return true;
+    }
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         /* progress: <start>/<current>/<end>, all in the STREAM's RTP timestamp
          * units (the per-process timeline offset included, so the values match

@@ -208,8 +208,7 @@ struct ap2_mrp_ctx {
     uint8_t *artwork;
     int artwork_len;
     char artwork_id[17];      /* 16-hex ArtworkIdentifier for the current art */
-    bool artwork_sent;        /* bytes already pushed once (then ref by id) */
-    uint64_t artwork_generation;
+    char *item_id;            /* sender's stable per-track identity ("" = none) */
     uint64_t np_uid;          /* per-track now-playing UniqueIdentifier */
 
     time_t last_state_push;
@@ -239,6 +238,7 @@ const char *ap2_mrp_artwork_result_name(ap2_mrp_artwork_result_t result)
     switch (result) {
     case AP2_MRP_ARTWORK_NOT_APPLICABLE:    return "not_applicable";
     case AP2_MRP_ARTWORK_ACCEPTED:          return "accepted";
+    case AP2_MRP_ARTWORK_UNCHANGED:         return "unchanged";
     case AP2_MRP_ARTWORK_INVALID_ARGUMENT:  return "invalid_argument";
     case AP2_MRP_ARTWORK_UNSUPPORTED_TYPE:  return "unsupported_type";
     case AP2_MRP_ARTWORK_STAGING_LIMIT:     return "staging_limit";
@@ -331,7 +331,6 @@ static void mrp_reset_artwork(struct ap2_mrp_ctx *m)
     free(m->artwork_mime);
     m->artwork_mime = NULL;
     m->artwork_id[0] = '\0';
-    m->artwork_sent = false;
 }
 
 /* ---- Small helpers ---- */
@@ -386,6 +385,13 @@ static void mrp_replace_str(char **dst, const char *src)
 {
     free(*dst);
     *dst = mrp_strdup(src);
+}
+
+/* NULL-safe equality; NULL compares equal to the empty string, matching how
+ * the now-playing fields are serialized. */
+static bool mrp_str_eq(const char *a, const char *b)
+{
+    return strcmp(a ? a : "", b ? b : "") == 0;
 }
 
 /* ---- Growable byte buffer ---- */
@@ -1431,6 +1437,7 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     free(m->title);
     free(m->artist);
     free(m->album);
+    free(m->item_id);
     free(m->artwork_mime);
     free(m->artwork);
     free(m);
@@ -1575,19 +1582,51 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
 
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
                           const char *artist, const char *album,
-                          int duration_ms)
+                          int duration_ms, const char *item_id)
 {
     if (!m) return false;
+    /* The UniqueIdentifier must stay stable across a track's pushes: the
+     * receiver keys its now-playing item on it, so a fresh uid on a redundant
+     * re-send (registration burst, warm seek, progress correction) reads as a
+     * brand-new item and resets the receiver's Now Playing UI. Mint one only
+     * when the track actually changes — keyed on the sender's item id when
+     * both sides have one, because the text tuple is NOT stable for one
+     * track: the server may refine tags mid-track (library enrichment
+     * settling after playback start), and such a refinement must update the
+     * existing item, not present as a new track. Random 63-bit, matching the
+     * large uint64 a real sender emits. */
+    bool have_ids = m->item_id && *m->item_id && item_id && *item_id;
+    bool track_changed = have_ids
+        ? strcmp(m->item_id, item_id) != 0
+        : (!mrp_str_eq(m->title, title) ||
+           !mrp_str_eq(m->artist, artist) ||
+           !mrp_str_eq(m->album, album));
+    if (track_changed && m->np_uid != 0) {
+        LOG_INFO("[MRP] now-playing item changed: \"%s\" (id %s) -> "
+                 "\"%s\" (id %s)",
+                 m->title ? m->title : "", m->item_id ? m->item_id : "-",
+                 title ? title : "", item_id ? item_id : "-");
+    }
     mrp_replace_str(&m->title, title);
     mrp_replace_str(&m->artist, artist);
     mrp_replace_str(&m->album, album);
+    mrp_replace_str(&m->item_id, item_id);
     m->duration_ms = duration_ms > 0 ? duration_ms : 0;
-    /* New track: fresh UniqueIdentifier (stable across this track's progress
-     * pushes; changing it per push would reset the receiver's now-playing UI).
-     * Random 63-bit, matching the large uint64 a real sender emits. */
-    uint64_t uid = 0;
-    RAND_bytes((uint8_t *)&uid, sizeof(uid));
-    m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
+    if (track_changed || m->np_uid == 0) {
+        uint64_t uid = 0;
+        RAND_bytes((uint8_t *)&uid, sizeof(uid));
+        m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
+        if (track_changed) {
+            /* The old track's staged artwork must not ride the new item; the
+             * caller stages the new track's art (or none) right after this. */
+            mrp_reset_artwork(m);
+            /* A new item starts at zero. Keeping the previous track's elapsed
+             * would push the new title at the old position; the sender's
+             * settled correction follows only when it starts elsewhere. */
+            m->elapsed_ms = 0;
+            m->elapsed_set_at = mrp_cf_now();
+        }
+    }
     m->state_generation++;
     m->state_dirty = true;
     return true;
@@ -1615,6 +1654,19 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
         return false;
     }
 
+    /* A redundant re-send of the retained image is a no-op: keeping the
+     * ArtworkIdentifier means the receiver never invalidates and re-resolves
+     * the art it is already showing (an identifier flip re-renders the
+     * receiver's Now Playing UI even when the pixels are identical). */
+    if (m->artwork && m->artwork_len == len &&
+        memcmp(m->artwork, data, (size_t)len) == 0 &&
+        mrp_str_eq(m->artwork_mime, mime)) {
+        LOG_INFO("[MRP] artwork unchanged (%d bytes); keeping identifier %s",
+                 len, m->artwork_id);
+        info->result = AP2_MRP_ARTWORK_UNCHANGED;
+        return true;
+    }
+
     uint8_t *copy = malloc((size_t)len);
     char *mime_copy = mrp_strdup(mime);
     if (!copy || !mime_copy) {
@@ -1631,16 +1683,13 @@ bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,
     m->artwork_len = len;
     free(m->artwork_mime);
     m->artwork_mime = mime_copy;
-    /* Fresh artwork: new ArtworkIdentifier and re-arm the one-shot byte send.
-     * Like a real sender, the /command push carries the bytes once and then
-     * references them by identifier (ap2_mrp_build_nowplaying_command). */
+    /* Fresh artwork: new ArtworkIdentifier for the new pixels. The bytes ride
+     * every now-playing push while retained (ap2_mrp_build_nowplaying_command). */
     uint8_t idb[8];
     RAND_bytes(idb, sizeof(idb));
     snprintf(m->artwork_id, sizeof(m->artwork_id),
              "%02x%02x%02x%02x%02x%02x%02x%02x",
              idb[0], idb[1], idb[2], idb[3], idb[4], idb[5], idb[6], idb[7]);
-    m->artwork_sent = false;
-    m->artwork_generation++;
     m->state_generation++;
     m->state_dirty = true;
     m->state_include_artwork = true;
@@ -1820,14 +1869,17 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
         ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkMIMEType",
                         ap2_pl_string(m->artwork_mime ? m->artwork_mime
                                                       : "image/jpeg"));
-        /* Carry the bytes only on the first push for this artwork; later pushes
-         * reference it by identifier (the receiver caches by id), exactly as a
-         * real sender does — avoids re-sending ~tens of KB on every progress
-         * tick over the shared RTSP channel. */
-        if (!m->artwork_sent) {
-            ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkData",
-                            ap2_pl_data(m->artwork, (size_t)m->artwork_len));
-        }
+        /* The npi-text bridge REPLACES the receiver's whole now-playing info
+         * on every push: a push carrying only the ArtworkIdentifier drops the
+         * artwork on tvOS (hardware-verified on tvOS 26/27 — artworkAvailable
+         * flips false on an elapsed-only push with stable identifiers). The
+         * bytes therefore ride EVERY push while artwork is retained. Pushes
+         * are rare by design (seek, track change, play/pause; the receiver
+         * extrapolates steady-state progress), so the cost stays a few tens
+         * of KB on the control channel, and a receiver that dropped its art
+         * self-heals on the next push. */
+        ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkData",
+                        ap2_pl_data(m->artwork, (size_t)m->artwork_len));
     }
 
     ap2_pl_node *params = ap2_pl_dict();
@@ -1845,22 +1897,48 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     return true;
 }
 
-void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m)
+bool ap2_mrp_build_nowplaying_progress_command(struct ap2_mrp_ctx *m,
+                                               uint8_t **out, int *out_len)
 {
-    if (m && m->artwork && m->artwork_len > 0)
-        m->artwork_sent = true;
-}
+    if (!m || !out || !out_len) return false;
+    /* Pure timeline correction (seek): mergePolicy "update" carrying only the
+     * timeline fields. A "replace" push would need the artwork bytes riding
+     * along (any replace without ArtworkData drops the receiver's art — with
+     * or without the identifier keys, both hardware-verified), and a
+     * bytes-carrying push makes tvOS visibly re-decode and re-set the cover.
+     * The "update" shape measured on tvOS 26/27: HTTP 200, elapsed lands as
+     * an in-place content-item update, artworkAvailable stays true, no state
+     * re-render. The dict stays minimal on purpose — no Duration (a total
+     * that changes re-lays-out the receiver's Now Playing screen) and no
+     * UniqueIdentifier (re-asserting the item identity invites a refresh);
+     * the update applies to the current now-playing item. A receiver that
+     * rejects the policy gets the full replace push instead
+     * (ap2cl_mrp_push_progress falls back per session). */
+    ap2_pl_node *info = ap2_pl_dict();
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoElapsedTime",
+                    ap2_pl_real((double)m->elapsed_ms / 1000.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoPlaybackRate",
+                    ap2_pl_real(m->playback_state == AP2_MRP_PLAYBACK_PLAYING
+                                    ? 1.0 : 0.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoDefaultPlaybackRate",
+                    ap2_pl_real(1.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoTimestamp",
+                    ap2_pl_date(m->elapsed_set_at > 0.0 ? m->elapsed_set_at
+                                                        : mrp_cf_now()));
 
-uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m)
-{
-    return m ? m->artwork_generation : 0;
-}
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "type", ap2_pl_string("npi-text"));
+    ap2_pl_dict_set(params, "mergePolicy", ap2_pl_string("update"));
+    ap2_pl_dict_set(params, "params", info);
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("updateMRNowPlayingInfo"));
+    ap2_pl_dict_set(root, "params", params);
 
-void ap2_mrp_mark_artwork_sent_if_generation(
-    struct ap2_mrp_ctx *m, uint64_t generation)
-{
-    if (m && m->artwork_generation == generation)
-        ap2_mrp_mark_artwork_sent(m);
+    int len = ap2_pl_serialize(root, out);
+    ap2_pl_free(root);
+    if (len <= 0) return false;
+    *out_len = len;
+    return true;
 }
 
 /* Wrap a serialized protobuf as the bplist {"params": {"data": <varint length +

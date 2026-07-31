@@ -10,6 +10,7 @@
 
 #include "cross_log.h"
 #include "artwork.h"
+#include "ap2_bplist.h"
 #include "ap2_client.h"
 #include "ap2_mrp_sync.h"
 
@@ -254,7 +255,8 @@ static bool test_nowplaying_command_payload(void)
         "11111111-1111-1111-1111-111111111111",
         "22222222-2222-2222-2222-222222222222", NULL);
     CHECK(mrp != NULL);
-    CHECK(ap2_mrp_set_metadata(mrp, "Title", "Artist", "Album", 180000));
+    CHECK(ap2_mrp_set_metadata(mrp, "Title", "Artist", "Album", 180000,
+                               "item-1"));
     CHECK(ap2_mrp_set_progress(mrp, 15000, 180000, true));
 
     ap2_mrp_artwork_info_t info;
@@ -280,16 +282,121 @@ static bool test_nowplaying_command_payload(void)
     CHECK(bytes_contain(first, (size_t)first_len,
                         k_baseline_jpeg, sizeof(k_baseline_jpeg)));
 
-    ap2_mrp_mark_artwork_sent(mrp);
-    uint8_t *cached = NULL;
-    int cached_len = 0;
-    CHECK(ap2_mrp_build_nowplaying_command(mrp, &cached, &cached_len));
-    CHECK(cached_len < first_len);
-    CHECK(!bytes_contain_string(
-        cached, (size_t)cached_len,
+    /* The npi-text bridge replaces the receiver's whole now-playing info on
+     * every push, so the artwork bytes must ride every build (tvOS drops the
+     * art on any push that carries only the identifier). */
+    uint8_t *again = NULL;
+    int again_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &again, &again_len));
+    CHECK(bytes_contain_string(
+        again, (size_t)again_len,
         "kMRMediaRemoteNowPlayingInfoArtworkData"));
+    CHECK(bytes_contain(again, (size_t)again_len,
+                        k_baseline_jpeg, sizeof(k_baseline_jpeg)));
+    free(again);
+
+    /* Re-sending the identical image is a no-op that keeps the identifier. */
+    CHECK(ap2_mrp_set_artwork(mrp, "image/jpeg", k_baseline_jpeg,
+                              (int)sizeof(k_baseline_jpeg), &info));
+    CHECK(info.result == AP2_MRP_ARTWORK_UNCHANGED);
+
+    /* Re-sending the same track keeps the UniqueIdentifier (a fresh uid on a
+     * redundant metadata push would read as a new item and orphan the art). */
+    uint64_t uid_first = 0;
+    CHECK(ap2_bplist_find_uint(
+        first, (size_t)first_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_first));
+    CHECK(uid_first != 0);
+    CHECK(ap2_mrp_set_metadata(mrp, "Title", "Artist", "Album", 180000,
+                               "item-1"));
+    uint8_t *stable = NULL;
+    int stable_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &stable, &stable_len));
+    uint64_t uid_stable = 0;
+    CHECK(ap2_bplist_find_uint(
+        stable, (size_t)stable_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_stable));
+    CHECK(uid_stable == uid_first);
+    CHECK(bytes_contain_string(
+        stable, (size_t)stable_len,
+        "kMRMediaRemoteNowPlayingInfoArtworkData"));
+    free(stable);
+
+    /* Tag refinement: the text tuple changes but the item id does not (the
+     * server's library enrichment can settle after playback starts). The
+     * item — uid and retained artwork — must stay, with the new strings. */
+    CHECK(ap2_mrp_set_metadata(mrp, "Title (remastered)", "Artist", "Album",
+                               180000, "item-1"));
+    uint8_t *refined = NULL;
+    int refined_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &refined, &refined_len));
+    uint64_t uid_refined = 0;
+    CHECK(ap2_bplist_find_uint(
+        refined, (size_t)refined_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_refined));
+    CHECK(uid_refined == uid_first);
+    CHECK(bytes_contain_string(refined, (size_t)refined_len,
+                               "Title (remastered)"));
+    CHECK(bytes_contain_string(
+        refined, (size_t)refined_len,
+        "kMRMediaRemoteNowPlayingInfoArtworkData"));
+    free(refined);
+
+    /* A pure timeline correction (seek) is a mergePolicy-"update" push with
+     * only the timeline fields: no "replace" and no artwork keys (a replace
+     * without the bytes drops the receiver's art; one with the bytes makes
+     * it visibly re-render the cover), and no duration or item identity
+     * either — a changing total or a re-asserted identity re-lays-out the
+     * receiver's Now Playing screen. */
+    CHECK(ap2_mrp_set_progress(mrp, 120000, 180000, true));
+    uint8_t *progress_cmd = NULL;
+    int progress_cmd_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_progress_command(
+        mrp, &progress_cmd, &progress_cmd_len));
+    CHECK(bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
+                               "kMRMediaRemoteNowPlayingInfoElapsedTime"));
+    CHECK(!bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
+                                "replace"));
+    CHECK(!bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
+                                "kMRMediaRemoteNowPlayingInfoArtwork"));
+    CHECK(!bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
+                                "kMRMediaRemoteNowPlayingInfoDuration"));
+    CHECK(!bytes_contain_string(
+        progress_cmd, (size_t)progress_cmd_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier"));
+    free(progress_cmd);
+
+    /* A real track change (new item id) mints a new uid and drops the stale
+     * artwork; the caller stages the new track's art right after. */
+    CHECK(ap2_mrp_set_metadata(mrp, "Other Title", "Artist", "Album", 200000,
+                               "item-2"));
+    uint8_t *changed = NULL;
+    int changed_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &changed, &changed_len));
+    uint64_t uid_changed = 0;
+    CHECK(ap2_bplist_find_uint(
+        changed, (size_t)changed_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_changed));
+    CHECK(uid_changed != uid_first);
+    CHECK(!bytes_contain_string(
+        changed, (size_t)changed_len,
+        "kMRMediaRemoteNowPlayingInfoArtworkIdentifier"));
+
+    /* Without item ids on either side, identity falls back to the text
+     * tuple: same strings keep the item, different strings change it. */
+    CHECK(ap2_mrp_set_metadata(mrp, "Other Title", "Artist", "Album", 200000,
+                               NULL));
+    uint8_t *legacy = NULL;
+    int legacy_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &legacy, &legacy_len));
+    uint64_t uid_legacy = 0;
+    CHECK(ap2_bplist_find_uint(
+        legacy, (size_t)legacy_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_legacy));
+    CHECK(uid_legacy == uid_changed);
+    free(legacy);
     free(first);
-    free(cached);
+    free(changed);
 
     uint8_t *large = make_padded_jpeg(153600);
     CHECK(large != NULL);

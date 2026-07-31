@@ -243,9 +243,12 @@ bool ap2cl_feedback(struct ap2cl_s *p);
 /* Set volume (0-100). */
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
 
-/* Set metadata (DAAP format). */
+/* Set metadata (DAAP format). item_id is the sender's stable per-track
+ * identity ("" = none): MediaRemote keys its now-playing item on it, so
+ * later tag refinements for the same item update in place instead of
+ * presenting as a new track. */
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
-                        const char *album, int duration);
+                        const char *album, int duration, const char *item_id);
 
 /*
  * Set artwork on the existing DMAP path and, when applicable, stage it for
@@ -269,6 +272,10 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
  * CLIAIRPLAY_MRP=0 disables it. Returns the HTTP status, 0 on registration
  * failure, or -1 when the push does not apply to this session. */
 int ap2cl_mrp_push(struct ap2cl_s *p);
+
+/* Same, but with the timeline-correction body shape (see
+ * ap2_mrp_build_nowplaying_progress_command) for seek progress updates. */
+int ap2cl_mrp_push_progress(struct ap2cl_s *p);
 
 /* Serialized push with request-scoped overall and now-playing statuses. */
 ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p);

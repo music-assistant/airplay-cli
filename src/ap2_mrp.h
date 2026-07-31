@@ -50,6 +50,7 @@ typedef enum {
 typedef enum {
     AP2_MRP_ARTWORK_NOT_APPLICABLE = 0,
     AP2_MRP_ARTWORK_ACCEPTED,
+    AP2_MRP_ARTWORK_UNCHANGED,
     AP2_MRP_ARTWORK_INVALID_ARGUMENT,
     AP2_MRP_ARTWORK_UNSUPPORTED_TYPE,
     AP2_MRP_ARTWORK_STAGING_LIMIT,
@@ -151,11 +152,18 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m);
  * Set the now-playing track metadata. Values are copied; NULL is treated as
  * empty. Takes effect on the next feedback-worker state push.
  *
+ * The now-playing item identity (UniqueIdentifier and retained artwork) is
+ * keyed on item_id when both the stored and incoming ids are non-empty:
+ * title/artist/album changes under the same item_id are tag refinements that
+ * update the existing item in place. Without ids, identity falls back to the
+ * title/artist/album tuple.
+ *
  * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param item_id: sender's stable per-track identity ("" or NULL = none).
  */
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
                           const char *artist, const char *album,
-                          int duration_ms);
+                          int duration_ms, const char *item_id);
 
 /*
  * Set the now-playing artwork.
@@ -166,6 +174,11 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
  * internal staging/allocation policy; it does not claim a receiver byte,
  * dimension, component, or JPEG-profile limit. Rejected input clears prior
  * MRP artwork so a new track cannot retain stale cover art.
+ *
+ * Bytes identical to the retained image are a no-op reported as
+ * AP2_MRP_ARTWORK_UNCHANGED: the ArtworkIdentifier is kept so a redundant
+ * re-send (the server re-pushes artwork around seeks and anchors) cannot make
+ * the receiver invalidate and re-resolve the art it is already showing.
  *
  * :param mime: image MIME type; must be "image/jpeg".
  * :param data: image bytes (copied).
@@ -248,11 +261,12 @@ int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
-/* Mark the one-shot artwork bytes as accepted after a successful POST. */
-void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
-uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m);
-void ap2_mrp_mark_artwork_sent_if_generation(
-    struct ap2_mrp_ctx *m, uint64_t generation);
+/* Build the now-playing body for a pure timeline correction (seek): a
+ * mergePolicy "update" push carrying only the timeline fields, so the
+ * receiver keeps its artwork untouched (a replace push without the bytes
+ * drops it; one with the bytes visibly re-renders it). */
+bool ap2_mrp_build_nowplaying_progress_command(struct ap2_mrp_ctx *m,
+                                               uint8_t **out, int *out_len);
 
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before
