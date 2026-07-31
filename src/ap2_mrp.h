@@ -13,7 +13,7 @@
  * Design and protocol notes live in DESIGN.md §8.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef __AP2_MRP_H_

@@ -12,7 +12,7 @@
  * the cmdpipe thread is never wedged.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <errno.h>

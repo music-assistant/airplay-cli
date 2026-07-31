@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2024-2026 Music Assistant Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #ifndef __ARTWORK_H_
 #define __ARTWORK_H_
 

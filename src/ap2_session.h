@@ -59,7 +59,7 @@
  *   [STATUS] idle_timeout
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef __AP2_SESSION_H_

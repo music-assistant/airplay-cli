@@ -13,7 +13,7 @@
  *    Supports: 24-bit/48kHz ALAC, encrypted audio
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <stdio.h>

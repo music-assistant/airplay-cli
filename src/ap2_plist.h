@@ -5,7 +5,7 @@
  * booleans, and data (byte arrays). Just enough for AP2 SETUP payloads.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef __AP2_PLIST_H_

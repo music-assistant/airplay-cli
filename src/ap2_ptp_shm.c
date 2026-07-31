@@ -6,7 +6,7 @@
  * channel used to register receiver IPs with the daemon.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <stdio.h>

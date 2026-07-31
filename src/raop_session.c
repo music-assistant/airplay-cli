@@ -1,3 +1,8 @@
+/*
+ * Copyright (C) 2024-2026 Music Assistant Contributors
+ * SPDX-License-Identifier: Apache-2.0
+ */
+
 #include "raop_session.h"
 
 #include "raop_client.h"

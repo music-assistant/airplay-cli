@@ -8,7 +8,7 @@
  * Copyright (C) Philippe <philippe_44@outlook.com>
  * Copyright (C) 2024-2026 Music Assistant Contributors
  *
- * See LICENSE
+ * SPDX-License-Identifier: GPL-2.0-or-later
  */
 
 #include <stdio.h>
