@@ -608,7 +608,8 @@ capture.
   were a natural drain and a bitstream-continuous splice (Apple senders never
   exercise this corner — realtime streams are live and music seeks ride the
   buffered lane). The 2026-07-31 fleet A/B validated the same mechanism on
-  the third-party park (Sonos Era 100 pair, WiiM Pro, JBL MA9100HP:
+  the third-party park (Sonos Era 100 pair and solo, Sonos Bookshelf, WiiM
+  Pro, Edifier MS50A, Samsung HW-LS60D:
   cold/seek/next/pause/park/keepalive/late-join/group runs plus
   delivery-stall ladders), so it is the default for everyone; a code-level
   deny-list (`ap2_splice_denied`, empty) keeps the classic flush + re-anchor

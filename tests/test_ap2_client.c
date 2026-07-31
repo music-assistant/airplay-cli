@@ -410,13 +410,13 @@ static void test_splice_default_resolution(void)
     assert(ap2cl_test_splice_default(
         "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE", NULL));
     assert(ap2cl_test_splice_default(NULL, "AudioAccessory5,1"));
-    /* The validated third-party park. */
+    /* Third-party receivers stay on the default. */
     assert(ap2cl_test_splice_default(
         "model=Era 100 features=0x445F8A00,0x801C340", NULL));
     assert(ap2cl_test_splice_default(
         "model=WiiM Pro Receiver features=0x445F8A00,0x1C340", NULL));
     assert(ap2cl_test_splice_default(
-        "model=JBL MA9100HP features=0x445F8A00,0x1C340", NULL));
+        "model=HW-LS60D features=0xC05F8A00,0x1C340", NULL));
     assert(ap2cl_test_splice_default(NULL, "Era 100"));
     /* No TXT at all still defaults to the splice timeline. */
     assert(ap2cl_test_splice_default(NULL, NULL));

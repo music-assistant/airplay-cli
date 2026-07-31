@@ -832,11 +832,12 @@ static bool ap2_features_has_ptp(const char *txt)
  * buffer discard, anchor re-announce, or late-frame delivery — measured A/B
  * on an Apple TV 4K, tvOS 27, 2026-07-30; the only clean warm transitions
  * were a natural drain and a bitstream-continuous splice), and the
- * 2026-07-31 fleet A/B cleared the third-party park (Sonos Era 100 pair,
- * WiiM Pro, JBL MA9100HP: cold/seek/next/pause/park/keepalive/late-join/
- * group runs, delivery-stall ladders) on the same mechanism. Add a `model=`
- * (_airplay TXT) / `am=` (_raop) prefix here only when a receiver measures
- * splice-hostile on hardware. */
+ * 2026-07-31 fleet A/B cleared the third-party park (Sonos Era 100 pair and
+ * solo, Sonos Bookshelf, WiiM Pro, Edifier MS50A, Samsung HW-LS60D:
+ * cold/seek/next/pause/park/keepalive/late-join/group runs, delivery-stall
+ * ladders) on the same mechanism. Add a `model=` (_airplay TXT) / `am=`
+ * (_raop) prefix here only when a receiver measures splice-hostile on
+ * hardware. */
 static bool ap2_splice_denied(const char *txt, const char *am)
 {
     static const char *const prefixes[] = { NULL };
