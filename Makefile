@@ -124,7 +124,9 @@ CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
 LIBCODECS_PATCHED = $(CODECS)/$(HOST)/$(PLATFORM)/libcodecs_patched.a
 LIBRARY = $(LIBCODECS_PATCHED) $(MDNS)/$(HOST)/$(PLATFORM)/libmdns.a
 
-ifneq ($(STATIC),)
+ifeq ($(STATIC),)
+LDFLAGS += -lcrypto
+else
 LIBRARY += $(OPENSSL)/libopenssl.a
 DEFINES += -DSSL_STATIC_LIB
 endif
