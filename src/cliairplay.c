@@ -976,6 +976,23 @@ static int run_raop(cli_config_t *cfg)
 
 /* ---- AirPlay 2 playback loop ---- */
 
+/* One chunk of encoded silence on the live splice line — the keepalive for
+ * every armed window without content (idle-primed FLUSH->START gap, content
+ * pause, post-EOF drain/idle). The wire stays bitstream-continuous and the
+ * receiver's queue never underruns. Returns false on a fatal send failure. */
+static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
+                                   uint8_t *alac_buf, int input_bpf)
+{
+    memset(buf, 0, (size_t)AP2_FRAMES_PER_CHUNK * input_bpf);
+    uint8_t *send = buf;
+    if (alac_buf && cfg->bit_depth > 16) {
+        truncate_32to24(buf, AP2_FRAMES_PER_CHUNK * input_bpf, alac_buf);
+        send = alac_buf;
+    }
+    return ap2cl_send_chunk(g_ap2cl, send, AP2_FRAMES_PER_CHUNK) !=
+           AP2_SEND_FATAL;
+}
+
 static int run_airplay2(cli_config_t *cfg)
 {
     ap2_device_info_t device = {
@@ -1144,15 +1161,36 @@ static int run_airplay2(cli_config_t *cfg)
         }
 
         if (input_ended) {
-            /* Input consumed: let the receiver drain, report once, then idle
-             * awaiting the next START or the idle timeout. */
+            /* Input consumed: the content drains on schedule and eof is
+             * reported once; then idle awaiting the next START or the idle
+             * timeout. An armed splice line keeps carrying silence through
+             * the drain and the idle wait: a receiver whose queue underruns
+             * while the session stays armed pops audibly (the end-of-playback
+             * burst on Apple receivers), while a later teardown with silence
+             * still queued is clean. */
             bool drained = !ap2cl_is_playing(g_ap2cl) ||
                            now - eof_time > MS2NTP(cfg->latency_ms + 2000);
             if (drained && !eof_reported) {
                 eof_reported = true;
                 status_eof();
             }
-            usleep(drained ? 50000 : 10000);
+            if (cfg->protocol == PROTO_AIRPLAY2 &&
+                ap2cl_splice_hot(g_ap2cl)) {
+                pthread_mutex_lock(&g_audio_send_lock);
+                if (ap2cl_splice_hot(g_ap2cl) &&
+                    ap2cl_accept_frames(g_ap2cl) &&
+                    !ap2_send_silence_chunk(cfg, buf, ap2_alac_buf,
+                                            ap2_input_bpf)) {
+                    status_error("AirPlay 2 realtime send failed");
+                    playback_failed = true;
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    break;
+                }
+                pthread_mutex_unlock(&g_audio_send_lock);
+                usleep(1000);
+            } else {
+                usleep(drained ? 50000 : 10000);
+            }
             continue;
         }
 
@@ -1173,6 +1211,16 @@ static int run_airplay2(cli_config_t *cfg)
                 eof_reported = false;
                 eof_time = 0;
             }
+            /* Delivery-stall guard (splice timeline): a stall longer than
+             * the pacing depth — process freeze, network dropout — leaves
+             * the head behind the wall clock with input still queued, which
+             * the zero-read starvation recovery below can never see. Pad the
+             * timeline forward before reading, or this iteration would send
+             * real content on past timestamps (an audible noise trigger on
+             * Apple receivers). Gated like that recovery: a frozen head
+             * outside session-PLAYING is a parked timeline, not a stall. */
+            if (ap2_session_state(g_session) == AP2_SESSION_PLAYING)
+                ap2cl_recover_delivery_gap(g_ap2cl);
             /* Splice pad (splice timeline): silence owed to the wire
              * before the next real sample, sent as ordinary encoded chunks so
              * sequence numbers and timestamps stay contiguous (any stamp jump
@@ -1255,38 +1303,28 @@ static int run_airplay2(cli_config_t *cfg)
             pthread_mutex_unlock(&g_audio_send_lock);
         } else {
             /* Paused, or connected and awaiting the commanded first START.
-             * On the splice timeline the idle-primed window between a FLUSH
-             * and the next START keeps sending silence: if the wire went
-             * quiet here, a slow next-track spin-up would lapse the line and
-             * force a fresh re-anchor — an audible noise trigger on Apple
-             * receivers (the track-transition blip). Contiguous silence keeps
-             * every boundary a hot splice; the resume pad still lands the new
-             * content on the commanded instant. Pause and standby park the
-             * client out of AP2_STREAMING, so they drain as before. */
+             * On the splice timeline every armed window keeps sending
+             * silence: the idle-primed gap between a FLUSH and the next
+             * START (a slow next-track spin-up must not lapse the line —
+             * the track-transition blip), and a content pause (a receiver
+             * whose queue underruns while the session stays armed pops at
+             * the pause press — measured by ear A/B on an Apple TV 4K,
+             * 2026-07-31). Contiguous silence keeps every boundary a hot
+             * splice; the resume pad still lands the new content on the
+             * commanded instant. Standby and stop park the client out of
+             * AP2_STREAMING, so they drain as before. */
             if (g_first_start_done && cfg->protocol == PROTO_AIRPLAY2 &&
-                ap2_session_state(g_session) == AP2_SESSION_IDLE &&
                 ap2cl_splice_hot(g_ap2cl)) {
                 pthread_mutex_lock(&g_audio_send_lock);
-                if (ap2_session_state(g_session) == AP2_SESSION_IDLE &&
+                if (g_status == STATUS_PAUSED &&
                     ap2cl_splice_hot(g_ap2cl) &&
-                    ap2cl_accept_frames(g_ap2cl)) {
-                    memset(buf, 0,
-                           (size_t)AP2_FRAMES_PER_CHUNK * ap2_input_bpf);
-                    uint8_t *send = buf;
-                    if (ap2_alac_buf && cfg->bit_depth > 16) {
-                        truncate_32to24(
-                            buf, AP2_FRAMES_PER_CHUNK * ap2_input_bpf,
-                            ap2_alac_buf);
-                        send = ap2_alac_buf;
-                    }
-                    if (ap2cl_send_chunk(g_ap2cl, send,
-                                         AP2_FRAMES_PER_CHUNK) ==
-                        AP2_SEND_FATAL) {
-                        status_error("AirPlay 2 realtime send failed");
-                        playback_failed = true;
-                        pthread_mutex_unlock(&g_audio_send_lock);
-                        break;
-                    }
+                    ap2cl_accept_frames(g_ap2cl) &&
+                    !ap2_send_silence_chunk(cfg, buf, ap2_alac_buf,
+                                            ap2_input_bpf)) {
+                    status_error("AirPlay 2 realtime send failed");
+                    playback_failed = true;
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    break;
                 }
                 pthread_mutex_unlock(&g_audio_send_lock);
             }

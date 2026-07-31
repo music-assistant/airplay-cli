@@ -635,7 +635,15 @@ capture.
   on an Apple TV 4K, tvOS 27, 2026-07-30: the only clean warm transitions
   were a natural drain and a bitstream-continuous splice (Apple senders never
   exercise this corner — realtime streams are live and music seeks ride the
-  buffered lane). The 2026-07-31 fleet A/B validated the same mechanism on
+  buffered lane). A further ear-measured trigger (Apple TV 4K, 2026-07-31):
+  a queue UNDERRUN while the session stays armed pops as well — heard as a
+  burst at the pause press — while a teardown with audio still queued is
+  clean. An armed splice line is therefore never allowed to run dry: the
+  idle-primed FLUSH→START gap, a content pause, and the post-EOF drain/idle
+  window each keep the wire fed with encoded silence, and a delivery stall
+  longer than the pacing depth splice-pads the timeline forward (reported as
+  REANCHOR) instead of bursting the queued content on past timestamps when
+  sending resumes. The 2026-07-31 fleet A/B validated the same mechanism on
   the third-party park (Sonos Era 100 pair and solo, Sonos Bookshelf, WiiM
   Pro, Edifier MS50A, Samsung HW-LS60D:
   cold/seek/next/pause/park/keepalive/late-join/group runs plus
