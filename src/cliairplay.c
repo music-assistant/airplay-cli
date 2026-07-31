@@ -172,6 +172,7 @@ static struct ap2_session_s *g_session = NULL;
 static pthread_mutex_t g_audio_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_first_start_done = false;
 static uint64_t g_pend_start_unix_ms = 0;
+static bool g_pend_start_join = false;
 
 static void session_quiesce(void *transport)
 {
@@ -203,6 +204,29 @@ static void status_eof(void)
 static void status_error(const char *msg)
 {
     status_print("[ERROR] %s", msg);
+}
+
+/* Advance the receiver-clock verification of a cold-clock START (armed by
+ * the client when it commits before the receiver's first timing probe) and
+ * surface the outcome. A correction reports the new audible instant so the
+ * caller re-aligns the group; a verification only confirms the ack already
+ * sent. Called from the audio loop under g_audio_send_lock. */
+static void clock_verify_tick(void)
+{
+    ap2_clock_verify_event_t ev;
+    switch (ap2cl_clock_verify_poll(g_ap2cl, &ev)) {
+    case AP2_CLOCK_VERIFY_CORRECTED:
+        status_print("[STATUS] anchor_corrected requested_unix_ms=%" PRIu64
+                     " from_unix_ms=%" PRIu64 " at_unix_ms=%" PRIu64,
+                     ev.requested_unix_ms, ev.from_unix_ms, ev.at_unix_ms);
+        break;
+    case AP2_CLOCK_VERIFY_VERIFIED:
+        status_print("[STATUS] clock_verified margin_ms=%" PRId64,
+                     ev.margin_ms);
+        break;
+    default:
+        break;
+    }
 }
 
 /* Machine-readable failure codes Music Assistant matches on. */
@@ -424,6 +448,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         }
     } else if (strcmp(key, "START_UNIX_MS") == 0) {
         g_pend_start_unix_ms = strtoull(value, NULL, 10);
+    } else if (strcmp(key, "START_JOIN") == 0) {
+        g_pend_start_join = atoi(value) != 0;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "START") == 0) {
         /* The verified start contract: the ack always reports the true
          * scheduled instant, so the caller compares it with the request,
@@ -441,6 +467,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             status_error("START failed");
         }
         g_pend_start_unix_ms = 0;
+        g_pend_start_join = false;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "FLUSH") == 0) {
         if (!g_session || !ap2_session_flush(g_session))
             status_error("FLUSH failed");
@@ -547,6 +574,7 @@ static ap2_commit_result_t session_commit(void *transport,
     } else {
         struct ap2cl_s *client = g_ap2cl;
         if (!client) return AP2_COMMIT_FAILED;
+        ap2cl_set_start_join(client, g_pend_start_join);
         committed = !g_first_start_done
             ? ap2cl_start(client, start_unix_ms, at_unix_ms)
             : ap2cl_resume(client, start_unix_ms, at_unix_ms);
@@ -1197,8 +1225,17 @@ static int run_airplay2(cli_config_t *cfg)
         /* Send audio chunk */
         if (g_status == STATUS_PLAYING) {
             pthread_mutex_lock(&g_audio_send_lock);
-            if (g_status != STATUS_PLAYING ||
-                !ap2cl_accept_frames(g_ap2cl)) {
+            if (g_status != STATUS_PLAYING) {
+                pthread_mutex_unlock(&g_audio_send_lock);
+                usleep(1000);
+                continue;
+            }
+            /* Before the pacing gate: a distant anchor keeps the gate closed
+             * until anchor minus the pacing window, and the verification of
+             * a cold-clock START must keep advancing through exactly that
+             * quiet stretch. */
+            clock_verify_tick();
+            if (!ap2cl_accept_frames(g_ap2cl)) {
                 pthread_mutex_unlock(&g_audio_send_lock);
                 usleep(1000);
                 continue;

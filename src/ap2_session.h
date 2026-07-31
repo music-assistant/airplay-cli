@@ -36,6 +36,18 @@
  * Command pipe verbs (newline-terminated KEY=VALUE, existing verbs unchanged):
  *   START_UNIX_MS=<ms|0>      audible start instant; 0 = ASAP at the minimum
  *                             warm lead
+ *   START_JOIN=<0|1>          the next START lands on an already-live group
+ *                             timeline (a late joiner): the transport must
+ *                             ENFORCE receiver clock readiness — fold it into
+ *                             the feasibility floor and correct a committed
+ *                             anchor forward if the receiver's clock cannot
+ *                             be ready for it (`[STATUS] anchor_corrected`).
+ *                             Without it a fresh start is the group/solo
+ *                             origin: readiness is observed and reported but
+ *                             never enforced (the receivers self-seat a
+ *                             fresh session cleanly; moving one member of a
+ *                             group origin would desync it). Cleared after
+ *                             each START.
  *   ACTION=START|FLUSH|STANDBY|DISCONNECT
  *
  * Status lines (stderr):

@@ -100,6 +100,10 @@ extern log_level *loglevel;
 
 #define PTP_MAX_PEERS       8
 
+/* Per-peer exchange-streak slots, deliberately sized above PTP_MAX_PEERS so
+ * evicted history (see ptp_track_exchange) is rare. */
+#define PTP_EXCHANGE_SLOTS  16
+
 /* ---- BMCA / slave tuning ---- */
 
 /* Offset smoothing: fold each new local->master sample as an EMA with gain
@@ -114,6 +118,11 @@ extern log_level *loglevel;
 /* Revert to grandmaster if the elected peer stops announcing for this long
  * (3x the 1 s announce interval, so a couple of dropped Announces don't flap). */
 #define PTP_PEER_SILENCE_NS    3000000000ULL      /* 3 s */
+
+/* A receiver mid-session probes at least ~1 Hz, so 3 s of silence means its
+ * PTP client stopped (session teardown); the next probe then starts a NEW
+ * streak, which is what clock-readiness is measured from. */
+#define PTP_EXCHANGE_GAP_NS    3000000000ULL      /* silence that ends a probe streak */
 
 /* An IEEE-1588 best-master dataset: the grandmaster attributes carried in an
  * Announce (or synthesised for ourselves), enough to run the dataset
@@ -183,6 +192,15 @@ struct ap2_ptp_ctx {
     uint16_t pending_sync_seq;
     uint64_t pending_sync_rx_ns;    /* t2: local reception time of the Sync */
     int64_t pending_sync_corr_ns;   /* correctionField carried on the Sync */
+
+    /* ---- receiver exchange-streak tracking (guarded by lock) ---- */
+    /* Per-peer probe-streak state; see PTP_EXCHANGE_GAP_NS and
+     * ptp_track_exchange(). addr.s_addr == 0 marks a free slot. */
+    struct {
+        struct in_addr addr;
+        uint64_t first_ns, third_ns, last_ns;
+        uint32_t count;
+    } exchange[PTP_EXCHANGE_SLOTS];
 
     /* ---- shared daemon clock (streaming side, --ptp-shared) ---- */
     /* When shm_active, the master getters below read the elected clock from the
@@ -832,6 +850,44 @@ static void ptp_handle_follow_up(struct ap2_ptp_ctx *ctx, const uint8_t *buf, in
               " -> off=%" PRId64 "ns", seq, t1, t2, corr_sync + corr_fup, offset);
 }
 
+/* Record one Delay_Req/Pdelay_Req probe from `addr` into its exchange-streak
+ * slot: extends the streak if the gap since the last probe is within
+ * PTP_EXCHANGE_GAP_NS, otherwise starts a fresh one. Tracked in any BMCA role,
+ * independent of whether we currently answer as grandmaster. */
+static void ptp_track_exchange(struct ap2_ptp_ctx *ctx, struct in_addr addr, uint64_t rx)
+{
+    pthread_mutex_lock(&ctx->lock);
+
+    int slot = -1, free_slot = -1, oldest = -1;
+    for (int i = 0; i < PTP_EXCHANGE_SLOTS; i++) {
+        if (ctx->exchange[i].addr.s_addr == addr.s_addr) { slot = i; break; }
+        if (ctx->exchange[i].addr.s_addr == 0 && free_slot < 0) free_slot = i;
+        if (oldest < 0 || ctx->exchange[i].last_ns < ctx->exchange[oldest].last_ns) oldest = i;
+    }
+
+    bool fresh_slot = (slot < 0);
+    if (fresh_slot) {
+        slot = (free_slot >= 0) ? free_slot : oldest;
+        ctx->exchange[slot].addr = addr;
+    }
+
+    /* The unsigned delta wraps huge when CLOCK_REALTIME stepped backwards
+     * past last_ns, deliberately landing in the reset branch: receivers
+     * slave to this clock, so any timebase step makes their servos
+     * re-converge and the streak must restart from it. */
+    if (fresh_slot || (rx - ctx->exchange[slot].last_ns) > PTP_EXCHANGE_GAP_NS) {
+        ctx->exchange[slot].first_ns = rx;
+        ctx->exchange[slot].third_ns = 0;
+        ctx->exchange[slot].count = 1;
+    } else if (ctx->exchange[slot].count < UINT32_MAX) {
+        ctx->exchange[slot].count++;
+        if (ctx->exchange[slot].count == 3) ctx->exchange[slot].third_ns = rx;
+    }
+    ctx->exchange[slot].last_ns = rx;
+
+    pthread_mutex_unlock(&ctx->lock);
+}
+
 static void *ptp_thread_func(void *arg)
 {
     struct ap2_ptp_ctx *ctx = (struct ap2_ptp_ctx *)arg;
@@ -905,6 +961,7 @@ static void *ptp_thread_func(void *arg)
 
             switch (msg_type) {
             case PTP_MSG_DELAY_REQ:
+                ptp_track_exchange(ctx, src.sin_addr, rx);
                 /* Only the grandmaster answers Delay_Req. */
                 if (gm && n >= PTP_HDR_LEN + 10) {
                     LOG_DEBUG("[PTP] RX Delay_Req from %s", srcip);
@@ -912,6 +969,7 @@ static void *ptp_thread_func(void *arg)
                 }
                 break;
             case PTP_MSG_PDELAY_REQ:
+                ptp_track_exchange(ctx, src.sin_addr, rx);
                 /* Peer-delay is answered in ANY role (grandmaster, slave or
                  * holding): it is a link-local measurement, not master-scoped,
                  * and an ignored probe can cost us asCapable status. */
@@ -1271,6 +1329,62 @@ uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx)
     return (uint64_t)((int64_t)local + off);
 }
 
+bool ap2_ptp_peer_exchange(struct ap2_ptp_ctx *ctx, const char *ip, struct ap2_ptp_exchange *out)
+{
+    if (out) memset(out, 0, sizeof(*out));
+    if (!ctx || !ip || !*ip || !out) return false;
+
+    if (ctx->shm_active) {
+        /* Query the daemon over the control channel; it holds the tracking
+         * table since streaming processes never see the Delay_Req/Pdelay_Req
+         * traffic themselves in shared mode. */
+        char cmd[64];
+        snprintf(cmd, sizeof(cmd), "Q %s", ip);
+        char ack[256] = {0};
+        if (!ap2_ptp_ctrl_send(cmd, 250, ack, sizeof(ack))) return false;
+
+        unsigned int count = 0;
+        unsigned long long first_ms = 0, last_ms = 0, third_ms = 0;
+        int got = sscanf(ack, "OK ip=%*s count=%u first_ms=%llu last_ms=%llu third_ms=%llu",
+                         &count, &first_ms, &last_ms, &third_ms);
+        if (got != 4 || count == 0) return false;
+
+        out->count = count;
+        out->first_ms = first_ms;
+        out->last_ms = last_ms;
+        out->third_ms = third_ms;
+        return true;
+    }
+
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip, &addr) != 1) return false;
+
+    pthread_mutex_lock(&ctx->lock);
+    uint64_t now = ap2_ptp_now_ns(ctx);
+    int slot = -1;
+    for (int i = 0; i < PTP_EXCHANGE_SLOTS; i++) {
+        if (ctx->exchange[i].addr.s_addr == addr.s_addr) { slot = i; break; }
+    }
+    bool ok = false;
+    if (slot >= 0 && ctx->exchange[slot].count > 0) {
+        /* A streak older than the gap is a cold clock, not a live one — it
+         * will start fresh on the next probe anyway. */
+        uint64_t last_ns = ctx->exchange[slot].last_ns;
+        uint64_t age_ns = (now > last_ns) ? now - last_ns : 0;
+        if (age_ns <= PTP_EXCHANGE_GAP_NS) {
+            uint64_t first_ns = ctx->exchange[slot].first_ns;
+            uint64_t third_ns = ctx->exchange[slot].third_ns;
+            out->count = ctx->exchange[slot].count;
+            out->first_ms = ((now > first_ns) ? now - first_ns : 0) / 1000000ULL;
+            out->last_ms = age_ns / 1000000ULL;
+            out->third_ms = (out->count >= 3 && now > third_ns) ? (now - third_ns) / 1000000ULL : 0;
+            ok = true;
+        }
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    return ok;
+}
+
 /* ---- shared daemon clock: streaming-side attach + peer registration ---- */
 
 bool ap2_ptp_shared_active(struct ap2_ptp_ctx *ctx)
@@ -1435,6 +1549,26 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
             changed = true;
         }
         break;
+    }
+    case 'Q': {  /* query a receiver's exchange streak */
+        char *ip = strtok_r(NULL, " \t\r\n", &save);
+        struct in_addr tmp;
+        if (!ip || inet_pton(AF_INET, ip, &tmp) != 1) {
+            const char *err = "ERR usage: Q <ip>";
+            sendto(sock, err, strlen(err), 0, (struct sockaddr *)&src, sl);
+            return;
+        }
+        /* ctx is the daemon's own engine context (shm_active is always false
+         * here), so this takes ap2_ptp_peer_exchange()'s in-process branch. */
+        struct ap2_ptp_exchange ex;
+        ap2_ptp_peer_exchange(ctx, ip, &ex);
+        char qack[160];
+        int qn = snprintf(qack, sizeof(qack),
+                          "OK ip=%s count=%u first_ms=%" PRIu64 " last_ms=%" PRIu64
+                          " third_ms=%" PRIu64, ip, ex.count, ex.first_ms, ex.last_ms,
+                          ex.third_ms);
+        sendto(sock, qack, qn, 0, (struct sockaddr *)&src, sl);
+        return;
     }
     case 'K': /* session is active: send timing to current peers immediately */
         pthread_mutex_lock(&ctx->lock);
