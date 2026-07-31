@@ -7,16 +7,17 @@ usage()
     cat <<'EOF'
 Usage: scripts/debug_cmdpipe_start.sh <raop|airplay2> <speaker-ip> <raw-pcm-file> [stream options...]
 
-Launches one command-only AirPlay session, stages generation 0 through PREPARE,
-and sends START with a computed audible unix-ms instant. AirPlay 2 also launches
-the shared PTP daemon. The PCM file must match the stream format (default:
-s16le 44100 stereo).
+Launches one AirPlay session with the PCM file on stdin, waits for the
+buffered-audio prime, commands START at a computed audible unix-ms instant,
+and drains to EOF. AirPlay 2 also launches the shared PTP daemon. The PCM
+file must match the stream format (default: s16le 44100 stereo).
 
 Environment:
   CLIAIRPLAY_BIN        Binary to run (default: native bin/cliairplay-* path)
   PTP_INTERFACE         Optional local IP passed to ptp-daemon with --if
-  START_DELAY_MS        Future start lead in milliseconds (default: 3000)
-  CONNECT_TIMEOUT_SEC   Connection/prime timeout (default: 30)
+  START_DELAY_MS        Future start lead in milliseconds (default: 3000);
+                        0 sends START_UNIX_MS=0 (transport picks the earliest)
+  CONNECT_TIMEOUT_SEC   Connection/prime/start timeout (default: 30)
   SESSION_TIMEOUT_SEC   EOF timeout after START (default: 300)
 
 Examples:
@@ -29,8 +30,8 @@ Examples:
     --port 7000 --auth <credentials> --name HomePod
 
 For AirPlay 2, the PTP daemon needs permission to bind UDP 319/320 (root or the
-documented Linux capability). Logs and FIFOs live in a private temporary
-directory that is removed on exit.
+documented Linux capability). Logs and the command FIFO live in a private
+temporary directory that is removed on exit.
 EOF
 }
 
@@ -94,24 +95,22 @@ connect_timeout=${CONNECT_TIMEOUT_SEC:-30}
 session_timeout=${SESSION_TIMEOUT_SEC:-300}
 workdir=$(mktemp -d "${TMPDIR:-/tmp}/cliairplay-debug.XXXXXX")
 cmdpipe="$workdir/commands.fifo"
-audio_pipe="$workdir/generation-0.fifo"
 ptp_log="$workdir/ptp.log"
 session_log="$workdir/session.log"
 ptp_pid=
 session_pid=
-audio_pid=
 
-mkfifo "$cmdpipe" "$audio_pipe"
+mkfifo "$cmdpipe"
 
 cleanup()
 {
     trap - EXIT HUP INT TERM
-    for pid in "$audio_pid" "$session_pid" "$ptp_pid"; do
+    for pid in "$session_pid" "$ptp_pid"; do
         if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
             kill "$pid" 2>/dev/null || true
         fi
     done
-    for pid in "$audio_pid" "$session_pid" "$ptp_pid"; do
+    for pid in "$session_pid" "$ptp_pid"; do
         if [ -n "$pid" ]; then
             wait "$pid" 2>/dev/null || true
         fi
@@ -150,43 +149,43 @@ if [ "$protocol" = airplay2 ]; then
     ptp_pid=$!
     sleep 1
     if ! kill -0 "$ptp_pid" 2>/dev/null; then
-        echo "PTP daemon failed to start:" >&2
-        cat "$ptp_log" >&2
-        exit 1
+        if grep -q "another daemon running" "$ptp_log"; then
+            echo "Reusing the already-running shared PTP daemon."
+            ptp_pid=
+        else
+            echo "PTP daemon failed to start:" >&2
+            cat "$ptp_log" >&2
+            exit 1
+        fi
     fi
 fi
 
 if [ "$protocol" = airplay2 ]; then
     "$CLIAIRPLAY_BIN" --protocol airplay2 --ptp-shared \
-        --cmdpipe "$cmdpipe" "$@" "$speaker_ip" >"$session_log" 2>&1 &
+        --cmdpipe "$cmdpipe" "$@" "$speaker_ip" \
+        <"$pcm_file" >"$session_log" 2>&1 &
 else
     "$CLIAIRPLAY_BIN" --protocol raop \
-        --cmdpipe "$cmdpipe" "$@" "$speaker_ip" >"$session_log" 2>&1 &
+        --cmdpipe "$cmdpipe" "$@" "$speaker_ip" \
+        <"$pcm_file" >"$session_log" 2>&1 &
 fi
 session_pid=$!
 wait_for_log "[STATUS] connected" "$connect_timeout"
+wait_for_log "[STATUS] audio buffered_ms=" "$connect_timeout"
 
-cat "$pcm_file" >"$audio_pipe" &
-audio_pid=$!
+if [ "$start_delay_ms" -eq 0 ]; then
+    audible_start_ms=0
+else
+    audible_start_ms=$(($(date +%s) * 1000 + start_delay_ms))
+fi
 {
-    printf 'GENERATION=0\n'
-    printf 'AUDIO=%s\n' "$audio_pipe"
-    printf 'POSITION_MS=0\n'
-    printf 'ACTION=PREPARE\n'
-} >"$cmdpipe"
-wait_for_log "[STATUS] primed generation=0" "$connect_timeout"
-
-audible_start_ms=$(($(date +%s) * 1000 + start_delay_ms))
-{
-    printf 'GENERATION=0\n'
     printf 'START_UNIX_MS=%s\n' "$audible_start_ms"
     printf 'ACTION=START\n'
 } >"$cmdpipe"
-echo "Generation 0 scheduled for audible unix-ms $audible_start_ms"
+echo "START commanded for audible unix-ms $audible_start_ms (0 = earliest)"
+wait_for_log "[STATUS] started" "$connect_timeout"
 
-wait "$audio_pid"
-audio_pid=
-wait_for_log "[STATUS] eof generation=0" "$session_timeout"
+wait_for_log "[STATUS] eof" "$session_timeout"
 printf 'ACTION=DISCONNECT\n' >"$cmdpipe"
 wait "$session_pid"
 session_pid=
