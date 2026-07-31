@@ -2556,7 +2556,7 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
         uint64_t head_ntp = TS2NTP(p->head_ts, p->format.sample_rate);
         uint64_t requested =
             start_unix_ms ? ap2_unix_ms_to_ntp(start_unix_ms) : 0;
-        if (requested > head_ntp) {
+        if (start_unix_ms && requested >= head_ntp) {
             uint64_t target = NTP2TS(requested, p->format.sample_rate);
             uint64_t pad = target > p->head_ts ? target - p->head_ts : 0;
             p->splice_pad_frames = (uint32_t)pad;

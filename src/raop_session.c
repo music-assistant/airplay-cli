@@ -24,7 +24,7 @@ static void resolve_start(uint64_t start_unix_ms, uint64_t *audible_ntp,
     uint64_t lead = MS2NTP(RAOP_SESSION_MIN_START_LEAD_MS);
     uint64_t floor = raopcl_get_ntp(NULL) + lead;
     uint64_t requested = start_unix_ms ? unix_ms_to_ntp(start_unix_ms) : 0;
-    if (requested > floor) {
+    if (start_unix_ms && requested >= floor) {
         *audible_ntp = requested;
         if (at_unix_ms) *at_unix_ms = start_unix_ms;
         return;

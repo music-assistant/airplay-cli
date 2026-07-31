@@ -172,9 +172,11 @@ bool ap2cl_connect(struct ap2cl_s *p);
 bool ap2cl_disconnect(struct ap2cl_s *p);
 
 /* Start playback at a commanded unix-epoch millisecond instant. A feasible
- * instant is scheduled exactly; an infeasible one (or 0) is corrected forward
- * to now + the minimum lead. *at_unix_ms always receives the true scheduled
- * instant so the caller can verify and log any correction. */
+ * instant is scheduled exactly; an infeasible nonzero one is corrected
+ * forward to the earliest feasible instant plus one lead of retry slack (the
+ * floor moves with the wall clock), and 0 takes the earliest instant
+ * directly. *at_unix_ms always receives the true scheduled instant so the
+ * caller can verify and log any correction. */
 ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
                                 uint64_t *at_unix_ms);
 
@@ -189,10 +191,10 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
  * ap2cl_resume schedules the next pending sample audible at start_unix_ms
  * under the same contract as ap2cl_start: the splice timeline pads silence up
  * to the instant, the stock path re-bases the frozen anchor onto it, and an
- * infeasible instant is corrected forward to the earliest feasible one (the
- * splice head, or now + the minimum warm lead) with the truth reported in
- * *at_unix_ms — never silently misplaced or refused. A start of 0 picks the
- * earliest instant directly.
+ * infeasible nonzero instant is corrected forward to the earliest feasible
+ * one (the splice head, or now + the minimum warm lead) plus one lead of
+ * retry slack, with the truth reported in *at_unix_ms — never silently
+ * misplaced or refused. A start of 0 picks the earliest instant directly.
  */
 bool ap2cl_flush(struct ap2cl_s *p);
 ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,

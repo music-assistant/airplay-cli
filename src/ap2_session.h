@@ -49,7 +49,12 @@
  *                                       can re-align a group by re-STARTing
  *                                       every member at max(at). requested=0
  *                                       means the transport picked.)
- *   [STATUS] flushed                   (FLUSH completed; stream idle-primed)
+ *   [STATUS] flushed [head_unix_ms=<ms>]
+ *                                      (FLUSH completed; stream idle-primed.
+ *                                       Splice-timeline transports append the
+ *                                       audible instant of the frozen
+ *                                       delivery head as the caller's warm
+ *                                       anchor hint.)
  *   [STATUS] eof                       (input stream ended)
  *   [STATUS] idle_timeout
  *

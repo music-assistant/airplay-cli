@@ -394,11 +394,12 @@ bool ap2_session_flush(struct ap2_session_s *s)
     pthread_cond_broadcast(&s->can_read);
     pthread_mutex_unlock(&s->lock);
 
-    s->ops.resume(s->ops.transport);
-    /* The head froze at quiesce and no sends happen while idle-primed, so the
-     * transport's warm-head instant is stable to read after the resume. */
+    /* Capture the warm-head instant while sends are still quiesced: the
+     * splice keepalive may advance the head the moment the transport resumes,
+     * and the ack must report the head this flush actually froze. */
     uint64_t head_unix_ms = s->ops.warm_head_unix_ms
         ? s->ops.warm_head_unix_ms(s->ops.transport) : 0;
+    s->ops.resume(s->ops.transport);
     if (head_unix_ms)
         emit(s, "[STATUS] flushed head_unix_ms=%llu",
              (unsigned long long)head_unix_ms);

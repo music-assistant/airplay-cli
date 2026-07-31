@@ -9,10 +9,11 @@
 struct raopcl_s;
 
 /* Commit the first START on an existing RAOP connection: a feasible audible
- * first-sample unix time is scheduled exactly; an infeasible one (or 0) is
- * corrected forward to now + the minimum RAOP lead, with the true instant
- * reported in *at_unix_ms so the caller can verify and log. A currently
- * streaming stream is flushed before re-anchoring. */
+ * first-sample unix time is scheduled exactly; an infeasible nonzero one is
+ * corrected forward to the earliest feasible instant plus one lead of retry
+ * slack (the floor moves with the wall clock), a 0 takes the floor directly,
+ * and the true instant always lands in *at_unix_ms so the caller can verify
+ * and log. A currently streaming stream is flushed before re-anchoring. */
 ap2_commit_result_t raop_session_commit(struct raopcl_s *client,
                                         uint64_t start_unix_ms,
                                         uint64_t *at_unix_ms);
