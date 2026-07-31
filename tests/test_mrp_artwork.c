@@ -343,9 +343,11 @@ static bool test_nowplaying_command_payload(void)
     free(refined);
 
     /* A pure timeline correction (seek) is a mergePolicy-"update" push with
-     * only the timeline fields: no "replace" and no artwork keys, because a
-     * replace without the bytes drops the receiver's art and one with the
-     * bytes makes it visibly re-render the cover. */
+     * only the timeline fields: no "replace" and no artwork keys (a replace
+     * without the bytes drops the receiver's art; one with the bytes makes
+     * it visibly re-render the cover), and no duration or item identity
+     * either — a changing total or a re-asserted identity re-lays-out the
+     * receiver's Now Playing screen. */
     CHECK(ap2_mrp_set_progress(mrp, 120000, 180000, true));
     uint8_t *progress_cmd = NULL;
     int progress_cmd_len = 0;
@@ -357,11 +359,11 @@ static bool test_nowplaying_command_payload(void)
                                 "replace"));
     CHECK(!bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
                                 "kMRMediaRemoteNowPlayingInfoArtwork"));
-    uint64_t uid_progress = 0;
-    CHECK(ap2_bplist_find_uint(
+    CHECK(!bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
+                                "kMRMediaRemoteNowPlayingInfoDuration"));
+    CHECK(!bytes_contain_string(
         progress_cmd, (size_t)progress_cmd_len,
-        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_progress));
-    CHECK(uid_progress == uid_first);
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier"));
     free(progress_cmd);
 
     /* A real track change (new item id) mints a new uid and drops the stale

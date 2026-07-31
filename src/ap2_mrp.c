@@ -1901,12 +1901,13 @@ bool ap2_mrp_build_nowplaying_progress_command(struct ap2_mrp_ctx *m,
      * bytes-carrying push makes tvOS visibly re-decode and re-set the cover.
      * The "update" shape measured on tvOS 26/27: HTTP 200, elapsed lands as
      * an in-place content-item update, artworkAvailable stays true, no state
-     * re-render. A receiver that rejects the policy gets the full replace
-     * push instead (ap2cl_mrp_push_progress falls back per session). */
+     * re-render. The dict stays minimal on purpose — no Duration (a total
+     * that changes re-lays-out the receiver's Now Playing screen) and no
+     * UniqueIdentifier (re-asserting the item identity invites a refresh);
+     * the update applies to the current now-playing item. A receiver that
+     * rejects the policy gets the full replace push instead
+     * (ap2cl_mrp_push_progress falls back per session). */
     ap2_pl_node *info = ap2_pl_dict();
-    if (m->duration_ms > 0)
-        ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoDuration",
-                        ap2_pl_real((double)m->duration_ms / 1000.0));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoElapsedTime",
                     ap2_pl_real((double)m->elapsed_ms / 1000.0));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoPlaybackRate",
@@ -1917,8 +1918,6 @@ bool ap2_mrp_build_nowplaying_progress_command(struct ap2_mrp_ctx *m,
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoTimestamp",
                     ap2_pl_date(m->elapsed_set_at > 0.0 ? m->elapsed_set_at
                                                         : mrp_cf_now()));
-    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoUniqueIdentifier",
-                    ap2_pl_int((int64_t)m->np_uid));
 
     ap2_pl_node *params = ap2_pl_dict();
     ap2_pl_dict_set(params, "type", ap2_pl_string("npi-text"));
