@@ -17,8 +17,8 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
 
 - **RAOP (AirPlay 1)** via libraop: ALAC (compressed by default), NTP timing,
   optional RSA payload encryption, legacy Apple TV pairing.
-- **AirPlay 2 RAOP-compat**: auth-setup + the RAOP flow — the proven path for
-  AirPlay 2 receivers without stored credentials.
+- **AirPlay 2 RAOP-compat**: auth-setup + the RAOP flow — the fallback for
+  AirPlay 2 receivers that can neither pair-verify nor pair transiently.
 - **AirPlay 2 native**: HAP pairing (transient, or pair-verify with stored
   credentials), encrypted RTSP, binary-plist SETUP, ChaCha20-Poly1305 audio,
   realtime (type 96) streaming with PTP or NTP timing.
@@ -104,9 +104,11 @@ cliairplay --ptp-daemon [--if <ip>] &
 # Grant only the privileged-port capability instead of running as root:
 sudo setcap cap_net_bind_service=+ep /path/to/cliairplay
 
-# Per device, connect a command-only session:
-cliairplay --protocol airplay2 --ptp-shared --cmdpipe /tmp/cap1 ... <ip1>
-cliairplay --protocol airplay2 --ptp-shared --cmdpipe /tmp/cap2 ... <ip2>
+# Per device, connect a command-only session. --ptp selects PTP timing (or pass
+# --txt and let the SupportsPTP bit do it); --ptp-shared then attaches the
+# daemon's clock instead of running an in-process engine.
+cliairplay --protocol airplay2 --ptp --ptp-shared --cmdpipe /tmp/cap1 ... <ip1>
+cliairplay --protocol airplay2 --ptp --ptp-shared --cmdpipe /tmp/cap2 ... <ip2>
 
 # Wait until both report [STATUS] audio, then send the same start to both:
 # START_UNIX_MS=<T>
@@ -131,7 +133,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 
 | Option | Description |
 |--------|-------------|
-| `--protocol <auto\|raop\|airplay2>` | Streaming protocol (default: `auto`, which resolves the full route — RAOP vs AirPlay 2, native vs compat, PTP vs NTP — from the mDNS TXT records in `--txt`). `raop`/`airplay2` force the protocol; `airplay2` uses the native flow with `--auth` or `--ap2-native`, the RAOP-compat flow otherwise. |
+| `--protocol <auto\|raop\|airplay2>` | Streaming protocol (default: `auto`, which resolves the full route — RAOP vs AirPlay 2, native vs compat, PTP vs NTP — from the mDNS TXT records in `--txt`). `raop`/`airplay2` force the protocol; `airplay2` picks native vs RAOP-compat on the same terms as `auto`, and goes native when `--txt` advertises no features at all (an AirPlay-2-only receiver). |
 
 ### Common
 
@@ -165,13 +167,13 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | Option | Description |
 |--------|-------------|
 | `--auth <hex>` | HAP credentials (192 hex chars, from `--pair-setup`). Selects the native flow with pair-verify. |
-| `--ap2-native` | Force the native flow without credentials (transient pairing). Without this or `--auth`, an explicit `--protocol airplay2` uses the RAOP-compat flow. |
+| `--ap2-native` | Force the native flow without credentials (transient pairing), whatever the TXT advertises. |
 | `--txt <k=v ...>` | mDNS TXT records of the `_airplay._tcp` service; drives route auto-selection. |
 | `--publish-ip <ip>` | Address advertised to devices (timing-peer lists) when it differs from the bind address (Docker bridge, NAT). |
 | `--name <name>` | Device name (native flow). |
 | `--hostname <host>` | Device hostname (native flow). |
 | `--ptp` | Force PTP grandmaster timing (binds UDP 319/320, needs privilege). Default: auto by the SupportsPTP feature bit. |
-| `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. |
+| `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. Picks the clock *source*, not the timing mode — pair it with `--ptp` or a `--txt` advertising SupportsPTP. |
 
 ### Utility / daemon modes
 

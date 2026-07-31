@@ -392,9 +392,100 @@ static void test_route_with_password(void)
     puts("ap2_client route password selection tests passed");
 }
 
+/* An explicit --protocol airplay2 reaches the native flow on exactly the same
+ * terms as auto, so an AirPlay-2-only receiver (no _raop service to fall back
+ * on) is not routed into a RAOP-compatible flow it cannot answer. Only a real
+ * pairing blocker drops it back to RAOP-compat. */
+static void test_route_explicit_airplay2(void)
+{
+    /* features bit 48 (AirPlay 2 + pairing) => "0x0,0x10000" */
+    const char *txt = "features=0x0,0x10000 flags=0x4";
+
+    ap2_route_t transient = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, txt, NULL, false, false, 16, false, false, false);
+    assert(!transient.use_raop && transient.native && transient.transient);
+    assert(strcmp(transient.reason, "native AP2, transient, realtime") == 0);
+
+    /* Pairing bit 46 alone: auto would not even call this device AirPlay 2, but
+     * the explicit flag does, and it pairs transiently just the same. */
+    ap2_route_t hk_only = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, "features=0x0,0x4000", NULL, false, false, 16,
+        false, false, false);
+    assert(hk_only.native && hk_only.transient);
+
+    /* A receiver that advertises no features at all is the case the explicit
+     * flag exists for: trust the caller and pair transiently. */
+    ap2_route_t featureless = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, "model=Generic1,1 srcvers=770.8.1", NULL, false,
+        false, 16, false, false, false);
+    assert(featureless.native && featureless.transient);
+    ap2_route_t no_txt = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, NULL, NULL, false, false, 16, false, false, false);
+    assert(no_txt.native && no_txt.transient);
+    /* A features field that enumerates nothing, or one we cannot parse, says
+     * exactly as much as no field at all — all three take the same route. */
+    ap2_route_t zero_features = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, "features=0x0,0x0", NULL, false, false, 16, false,
+        false, false);
+    assert(zero_features.native && zero_features.transient);
+    ap2_route_t unparseable = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, "features=nonsense", NULL, false, false, 16, false,
+        false, false);
+    assert(unparseable.native && unparseable.transient);
+
+    /* That trust is explicit-only: auto still reads the same TXT as legacy. */
+    ap2_route_t featureless_auto = ap2_resolve_route(
+        AP2_PROTO_AUTO, "model=Generic1,1 srcvers=770.8.1", NULL, false, false,
+        16, false, false, false);
+    assert(featureless_auto.use_raop);
+
+    /* PIN or legacy pairing: native cannot work either, so RAOP-compat stays
+     * the last attempt worth making. */
+    ap2_route_t pin_required = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, "features=0x0,0x10000 flags=0x8", NULL, false,
+        false, 16, false, false, false);
+    assert(!pin_required.use_raop && !pin_required.native);
+    assert(strcmp(pin_required.reason, "AirPlay 2 (RAOP-compat)") == 0);
+
+    ap2_route_t legacy_pairing = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, "features=0x0,0x10000 flags=0x200", NULL, false,
+        false, 16, false, false, false);
+    assert(!legacy_pairing.use_raop && !legacy_pairing.native);
+
+    /* A required password we do not hold blocks transient pairing; supplying
+     * one unblocks it, exactly as under auto. */
+    ap2_route_t pw_missing = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, txt, "true", false, false, 16, false, false, false);
+    assert(!pw_missing.native);
+    ap2_route_t pw_supplied = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, txt, "true", false, true, 16, false, false, false);
+    assert(pw_supplied.native && pw_supplied.transient);
+    assert(strcmp(pw_supplied.reason, "native AP2, password, realtime") == 0);
+
+    /* Stored credentials still select pair-verify over transient pairing. */
+    ap2_route_t with_creds = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, txt, NULL, true, false, 16, false, false, false);
+    assert(with_creds.native && !with_creds.transient);
+    assert(strcmp(with_creds.reason, "native AP2, pair-verify, realtime") == 0);
+
+    /* An AirPlay 2 receiver without the pairing bits keeps the proven
+     * RAOP-compatible flow (features bit 38 only). */
+    ap2_route_t compat_only = ap2_resolve_route(
+        AP2_PROTO_AIRPLAY2, "features=0x0,0x40", NULL, false, false, 16, false,
+        false, false);
+    assert(!compat_only.use_raop && !compat_only.native);
+
+    /* --protocol raop is untouched by any of this. */
+    ap2_route_t forced_raop = ap2_resolve_route(
+        AP2_PROTO_RAOP, txt, NULL, false, false, 16, false, false, false);
+    assert(forced_raop.use_raop);
+    puts("ap2_client explicit airplay2 route tests passed");
+}
+
 int main(void)
 {
     test_route_with_password();
+    test_route_explicit_airplay2();
     test_info_format_tables();
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
