@@ -288,7 +288,6 @@ static void test_artwork_snapshot_generation(const uint8_t secret[KEY_SIZE])
 
     assert(ap2_mrp_set_artwork(
         mrp, "image/jpeg", first_art, (int)sizeof(first_art), NULL));
-    uint64_t first_generation = ap2_mrp_artwork_generation(mrp);
     uint8_t *first_snapshot = NULL;
     int first_len = 0;
     assert(ap2_mrp_build_nowplaying_command(
@@ -296,24 +295,26 @@ static void test_artwork_snapshot_generation(const uint8_t secret[KEY_SIZE])
     assert(contains_bytes(
         first_snapshot, first_len, first_art, (int)sizeof(first_art)));
 
+    /* Replacement art replaces the staged bytes... */
     assert(ap2_mrp_set_artwork(
         mrp, "image/jpeg", second_art, (int)sizeof(second_art), NULL));
-    ap2_mrp_mark_artwork_sent_if_generation(mrp, first_generation);
-
     uint8_t *second_snapshot = NULL;
     int second_len = 0;
     assert(ap2_mrp_build_nowplaying_command(
         mrp, &second_snapshot, &second_len));
     assert(contains_bytes(
         second_snapshot, second_len, second_art, (int)sizeof(second_art)));
+    assert(!contains_bytes(
+        second_snapshot, second_len, first_art, (int)sizeof(first_art)));
 
-    uint64_t second_generation = ap2_mrp_artwork_generation(mrp);
-    ap2_mrp_mark_artwork_sent_if_generation(mrp, second_generation);
+    /* ...and the bytes ride every later snapshot too: the npi-text bridge
+     * replaces the receiver's whole now-playing info per push, so a snapshot
+     * without the bytes would drop the receiver's artwork. */
     uint8_t *reference_snapshot = NULL;
     int reference_len = 0;
     assert(ap2_mrp_build_nowplaying_command(
         mrp, &reference_snapshot, &reference_len));
-    assert(!contains_bytes(
+    assert(contains_bytes(
         reference_snapshot, reference_len,
         second_art, (int)sizeof(second_art)));
 

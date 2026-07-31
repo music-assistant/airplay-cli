@@ -259,7 +259,9 @@ static void mrp_status_report(int status)
 static void mrp_artwork_status_report(const ap2_mrp_artwork_info_t *info,
                                       int command_status)
 {
-    if (!info || info->result == AP2_MRP_ARTWORK_NOT_APPLICABLE) return;
+    if (!info || info->result == AP2_MRP_ARTWORK_NOT_APPLICABLE ||
+        info->result == AP2_MRP_ARTWORK_UNCHANGED)
+        return;
     if (info->result == AP2_MRP_ARTWORK_ACCEPTED) {
         status_print("[STATUS] mrp artwork=posted status=%d bytes=%zu "
                      "width=%u height=%u precision=%u sof=0x%02x "

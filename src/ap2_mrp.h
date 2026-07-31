@@ -50,6 +50,7 @@ typedef enum {
 typedef enum {
     AP2_MRP_ARTWORK_NOT_APPLICABLE = 0,
     AP2_MRP_ARTWORK_ACCEPTED,
+    AP2_MRP_ARTWORK_UNCHANGED,
     AP2_MRP_ARTWORK_INVALID_ARGUMENT,
     AP2_MRP_ARTWORK_UNSUPPORTED_TYPE,
     AP2_MRP_ARTWORK_STAGING_LIMIT,
@@ -167,6 +168,11 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
  * dimension, component, or JPEG-profile limit. Rejected input clears prior
  * MRP artwork so a new track cannot retain stale cover art.
  *
+ * Bytes identical to the retained image are a no-op reported as
+ * AP2_MRP_ARTWORK_UNCHANGED: the ArtworkIdentifier is kept so a redundant
+ * re-send (the server re-pushes artwork around seeks and anchors) cannot make
+ * the receiver invalidate and re-resolve the art it is already showing.
+ *
  * :param mime: image MIME type; must be "image/jpeg".
  * :param data: image bytes (copied).
  * :param len: image byte count.
@@ -247,12 +253,6 @@ int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
  */
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
-
-/* Mark the one-shot artwork bytes as accepted after a successful POST. */
-void ap2_mrp_mark_artwork_sent(struct ap2_mrp_ctx *m);
-uint64_t ap2_mrp_artwork_generation(struct ap2_mrp_ctx *m);
-void ap2_mrp_mark_artwork_sent_if_generation(
-    struct ap2_mrp_ctx *m, uint64_t generation);
 
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before

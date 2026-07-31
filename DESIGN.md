@@ -406,7 +406,7 @@ Inner keys: `Title`, `Artist`, `Album`, `Duration`, `ElapsedTime`,
 track's progress pushes), `ArtworkData` (JPEG bytes), `ArtworkMIMEType`,
 `ArtworkIdentifier`.
 
-**Artwork evidence, probing, and send-once behavior.** AirPlaySender requests
+**Artwork evidence, probing, and per-push bytes.** AirPlaySender requests
 600x600 artwork from MediaRemote, and the captured iPhone command used a
 600x600, three-component baseline JPEG of about 43 KB. These establish a known
 sender shape, not a receiver maximum. No Apple source or hardware measurement
@@ -427,9 +427,29 @@ staging-allocation guard leaves room for the hardware matrix below and is
 explicitly not a receiver limit. Rejection clears previous MRP artwork,
 preventing stale cover art. No image codec is embedded in production code.
 
-Staged JPEG bytes ride only the *first* push for a given image, tagged with a
-fresh `ArtworkIdentifier`; later pushes carry the identifier without the bytes,
-so artwork is not re-sent on every progress tick over the shared RTSP channel.
+Staged JPEG bytes ride **every** now-playing push while artwork is retained.
+The `npi-text` / `mergePolicy: "replace"` bridge replaces the receiver's whole
+now-playing info per push: hardware measurement (Apple TV 4K, tvOS 26/27, via
+the receiver's own MRP `SET_STATE` re-broadcasts) shows that a push carrying
+only the `ArtworkIdentifier` — same `UniqueIdentifier`, same identifier, no
+`ArtworkData` — flips `artworkAvailable` to false, i.e. the receiver does not
+cache-and-restore artwork by identifier across replace pushes. An earlier
+send-once model (bytes on the first push, identifier-only afterwards) therefore
+lost cover art on every elapsed-only correction. Pushes are rare by design
+(seek, track change, play/pause; steady-state progress is extrapolated
+receiver-side, never streamed), so per-push bytes cost a few tens of KB on the
+control channel at human-action frequency, and a receiver that dropped its art
+self-heals on the next push.
+
+Identity churn is equally destructive and equally guarded: `set_metadata`
+mints a fresh `UniqueIdentifier` only when title/artist/album actually change
+(a redundant re-send under a fresh uid reads as a new item and orphans
+delivered artwork), a track change drops the previous track's staged art so it
+cannot ride the new item, and re-staging byte-identical artwork is a reported
+no-op (`unchanged`) that keeps the current `ArtworkIdentifier` — an identifier
+flip alone makes the receiver invalidate and re-resolve what it is already
+showing, which re-renders its Now Playing UI.
+
 The complete registration/now-playing/extended-state sequence is serialized;
 its return value carries request-scoped overall and `updateMRNowPlayingInfo`
 statuses, so concurrent pushes cannot overwrite the artwork response.
