@@ -381,7 +381,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             raopcl_set_progress_ms(g_raopcl, g_metadata.progress * 1000, g_metadata.duration * 1000);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_set_progress(g_ap2cl, g_metadata.progress, g_metadata.duration);
-            mrp_status_report(ap2cl_mrp_push(g_ap2cl));
+            mrp_status_report(ap2cl_mrp_push_progress(g_ap2cl));
         }
     } else if (strcmp(key, "ARTWORK") == 0) {
         uint8_t *image = NULL;

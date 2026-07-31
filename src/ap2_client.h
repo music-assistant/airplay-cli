@@ -273,6 +273,10 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s);
  * failure, or -1 when the push does not apply to this session. */
 int ap2cl_mrp_push(struct ap2cl_s *p);
 
+/* Same, but with the timeline-correction body shape (see
+ * ap2_mrp_build_nowplaying_progress_command) for seek progress updates. */
+int ap2cl_mrp_push_progress(struct ap2cl_s *p);
+
 /* Serialized push with request-scoped overall and now-playing statuses. */
 ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p);
 

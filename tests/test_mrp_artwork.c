@@ -342,6 +342,28 @@ static bool test_nowplaying_command_payload(void)
         "kMRMediaRemoteNowPlayingInfoArtworkData"));
     free(refined);
 
+    /* A pure timeline correction (seek) is a mergePolicy-"update" push with
+     * only the timeline fields: no "replace" and no artwork keys, because a
+     * replace without the bytes drops the receiver's art and one with the
+     * bytes makes it visibly re-render the cover. */
+    CHECK(ap2_mrp_set_progress(mrp, 120000, 180000, true));
+    uint8_t *progress_cmd = NULL;
+    int progress_cmd_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_progress_command(
+        mrp, &progress_cmd, &progress_cmd_len));
+    CHECK(bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
+                               "kMRMediaRemoteNowPlayingInfoElapsedTime"));
+    CHECK(!bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
+                                "replace"));
+    CHECK(!bytes_contain_string(progress_cmd, (size_t)progress_cmd_len,
+                                "kMRMediaRemoteNowPlayingInfoArtwork"));
+    uint64_t uid_progress = 0;
+    CHECK(ap2_bplist_find_uint(
+        progress_cmd, (size_t)progress_cmd_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_progress));
+    CHECK(uid_progress == uid_first);
+    free(progress_cmd);
+
     /* A real track change (new item id) mints a new uid and drops the stale
      * artwork; the caller stages the new track's art right after. */
     CHECK(ap2_mrp_set_metadata(mrp, "Other Title", "Artist", "Album", 200000,

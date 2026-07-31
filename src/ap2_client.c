@@ -158,6 +158,8 @@ struct ap2cl_s {
     atomic_int mrp_event_health;
     bool mrp_device_registered;
     bool mrp_extended_registered;
+    bool mrp_progress_push_full;  /* receiver rejected the "update" policy;
+                                     timeline pushes use the full replace */
     int mrp_last_playback_state;
     ap2_remote_command_cb_t remote_command_cb;
     void *remote_command_userdata;
@@ -3164,7 +3166,8 @@ static int ap2_mrp_send_extended_registration(struct ap2cl_s *p)
 
 static int ap2cl_mrp_register_serialized(struct ap2cl_s *p);
 
-static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
+static ap2_mrp_push_result_t ap2cl_mrp_push_serialized_with(
+    struct ap2cl_s *p, ap2_mrp_command_builder_t builder)
 {
     ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return result;
@@ -3180,8 +3183,7 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
     }
 
     int status = ap2_mrp_post_command(
-        p, ap2_mrp_build_nowplaying_command,
-        "[MRP] /command updateMRNowPlayingInfo");
+        p, builder, "[MRP] /command updateMRNowPlayingInfo");
     result.nowplaying_status = status;
     result.overall_status = status;
     if (!ap2_mrp_status_ok(status)) return result;
@@ -3200,6 +3202,11 @@ static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
     return result;
 }
 
+static ap2_mrp_push_result_t ap2cl_mrp_push_serialized(struct ap2cl_s *p)
+{
+    return ap2cl_mrp_push_serialized_with(p, ap2_mrp_build_nowplaying_command);
+}
+
 ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p)
 {
     ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
@@ -3213,6 +3220,31 @@ ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p)
 int ap2cl_mrp_push(struct ap2cl_s *p)
 {
     return ap2cl_mrp_push_ex(p).overall_status;
+}
+
+int ap2cl_mrp_push_progress(struct ap2cl_s *p)
+{
+    ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
+    if (!p) return result.overall_status;
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    if (!p->mrp_progress_push_full) {
+        result = ap2cl_mrp_push_serialized_with(
+            p, ap2_mrp_build_nowplaying_progress_command);
+        /* A receiver that rejects the "update" merge policy outright gets
+         * the full replace shape from now on (bytes riding along); only an
+         * HTTP-level rejection demotes — transport failures stay retryable
+         * on the lean shape. */
+        if (result.nowplaying_status >= 300) {
+            LOG_WARN("[MRP] timeline update push rejected (%d); "
+                     "using full now-playing pushes for this session",
+                     result.nowplaying_status);
+            p->mrp_progress_push_full = true;
+        }
+    }
+    if (p->mrp_progress_push_full)
+        result = ap2cl_mrp_push_serialized(p);
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+    return result.overall_status;
 }
 
 /* MRP data-channel (path B) status for the [STATUS] mrp line:

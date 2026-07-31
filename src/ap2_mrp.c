@@ -1890,6 +1890,51 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     return true;
 }
 
+bool ap2_mrp_build_nowplaying_progress_command(struct ap2_mrp_ctx *m,
+                                               uint8_t **out, int *out_len)
+{
+    if (!m || !out || !out_len) return false;
+    /* Pure timeline correction (seek): mergePolicy "update" carrying only the
+     * timeline fields. A "replace" push would need the artwork bytes riding
+     * along (any replace without ArtworkData drops the receiver's art — with
+     * or without the identifier keys, both hardware-verified), and a
+     * bytes-carrying push makes tvOS visibly re-decode and re-set the cover.
+     * The "update" shape measured on tvOS 26/27: HTTP 200, elapsed lands as
+     * an in-place content-item update, artworkAvailable stays true, no state
+     * re-render. A receiver that rejects the policy gets the full replace
+     * push instead (ap2cl_mrp_push_progress falls back per session). */
+    ap2_pl_node *info = ap2_pl_dict();
+    if (m->duration_ms > 0)
+        ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoDuration",
+                        ap2_pl_real((double)m->duration_ms / 1000.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoElapsedTime",
+                    ap2_pl_real((double)m->elapsed_ms / 1000.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoPlaybackRate",
+                    ap2_pl_real(m->playback_state == AP2_MRP_PLAYBACK_PLAYING
+                                    ? 1.0 : 0.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoDefaultPlaybackRate",
+                    ap2_pl_real(1.0));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoTimestamp",
+                    ap2_pl_date(m->elapsed_set_at > 0.0 ? m->elapsed_set_at
+                                                        : mrp_cf_now()));
+    ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoUniqueIdentifier",
+                    ap2_pl_int((int64_t)m->np_uid));
+
+    ap2_pl_node *params = ap2_pl_dict();
+    ap2_pl_dict_set(params, "type", ap2_pl_string("npi-text"));
+    ap2_pl_dict_set(params, "mergePolicy", ap2_pl_string("update"));
+    ap2_pl_dict_set(params, "params", info);
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("updateMRNowPlayingInfo"));
+    ap2_pl_dict_set(root, "params", params);
+
+    int len = ap2_pl_serialize(root, out);
+    ap2_pl_free(root);
+    if (len <= 0) return false;
+    *out_len = len;
+    return true;
+}
+
 /* Wrap a serialized protobuf as the bplist {"params": {"data": <varint length +
  * protobuf>}} that carries MRP messages — over the type-130 channel normally,
  * or over POST /command when that channel is unavailable (a real iPhone falls

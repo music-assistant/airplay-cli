@@ -427,19 +427,27 @@ staging-allocation guard leaves room for the hardware matrix below and is
 explicitly not a receiver limit. Rejection clears previous MRP artwork,
 preventing stale cover art. No image codec is embedded in production code.
 
-Staged JPEG bytes ride **every** now-playing push while artwork is retained.
-The `npi-text` / `mergePolicy: "replace"` bridge replaces the receiver's whole
-now-playing info per push: hardware measurement (Apple TV 4K, tvOS 26/27, via
-the receiver's own MRP `SET_STATE` re-broadcasts) shows that a push carrying
-only the `ArtworkIdentifier` — same `UniqueIdentifier`, same identifier, no
-`ArtworkData` — flips `artworkAvailable` to false, i.e. the receiver does not
-cache-and-restore artwork by identifier across replace pushes. An earlier
-send-once model (bytes on the first push, identifier-only afterwards) therefore
-lost cover art on every elapsed-only correction. Pushes are rare by design
-(seek, track change, play/pause; steady-state progress is extrapolated
-receiver-side, never streamed), so per-push bytes cost a few tens of KB on the
-control channel at human-action frequency, and a receiver that dropped its art
-self-heals on the next push.
+Staged JPEG bytes ride **every** `replace` now-playing push while artwork is
+retained. The `npi-text` / `mergePolicy: "replace"` bridge replaces the
+receiver's whole now-playing info per push: hardware measurement (Apple TV 4K,
+tvOS 26/27, via the receiver's own MRP `SET_STATE` re-broadcasts) shows that a
+replace push without `ArtworkData` flips `artworkAvailable` to false — with
+the identifier keys present or omitted entirely, both measured — i.e. the
+receiver neither caches by identifier nor preserves absent keys. An earlier
+send-once model (bytes on the first push, identifier-only afterwards)
+therefore lost cover art on every elapsed-only correction. Replace pushes are
+rare by design (track/artwork change, play/pause), so per-push bytes cost a
+few tens of KB on the control channel at human-action frequency, and a
+receiver that dropped its art self-heals on the next push.
+
+Pure timeline corrections (seek) use `mergePolicy: "update"` instead,
+carrying only the timeline fields and no artwork keys: a bytes-carrying
+replace push makes tvOS visibly re-decode and re-set the cover on every seek.
+Measured on the same hardware, the update push returns 200, the new elapsed
+lands as an in-place content-item update (no `SET_STATE` re-render), and
+`artworkAvailable` stays true. A receiver that rejects the policy with an
+HTTP error automatically gets full replace pushes for the rest of the session
+(`ap2cl_mrp_push_progress`).
 
 Identity churn is equally destructive and equally guarded: `set_metadata`
 mints a fresh `UniqueIdentifier` only when title/artist/album actually change

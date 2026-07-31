@@ -261,6 +261,13 @@ int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
+/* Build the now-playing body for a pure timeline correction (seek): a
+ * mergePolicy "update" push carrying only the timeline fields, so the
+ * receiver keeps its artwork untouched (a replace push without the bytes
+ * drops it; one with the bytes visibly re-renders it). */
+bool ap2_mrp_build_nowplaying_progress_command(struct ap2_mrp_ctx *m,
+                                               uint8_t **out, int *out_len);
+
 /*
  * Build the origin-registration bodies a real iPhone POSTs to /command before
  * pushing now-playing (DESIGN.md §8), for the same encrypted RTSP channel:
