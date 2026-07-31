@@ -2,7 +2,7 @@
  * AirPlay 2 PTP - Header
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #ifndef __AP2_PTP_H_

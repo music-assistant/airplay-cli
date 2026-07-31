@@ -28,7 +28,7 @@
  *   Nonce: 4 zero bytes + 8-byte LE counter (incrementing per direction)
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <stdio.h>

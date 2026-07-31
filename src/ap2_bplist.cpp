@@ -2,7 +2,7 @@
  * C wrapper for bplist (binary plist) reader/writer
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <cstdint>

@@ -8,7 +8,7 @@
  * This version sets: 16-bit=1, 20-bit=2, 24-bit=3, 32-bit=4.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
- * See LICENSE
+ * SPDX-License-Identifier: Apache-2.0
  */
 
 #include <cstdlib>

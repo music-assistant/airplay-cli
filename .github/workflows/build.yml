@@ -199,10 +199,14 @@ jobs:
     permissions:
       contents: write
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          persist-credentials: false
       - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: artifacts
-      - name: Collect binaries and checksums
+      - name: Collect binaries, checksums and license notices
         run: |
           binaries=(
             cliairplay-linux-aarch64
@@ -215,6 +219,7 @@ jobs:
             cp "artifacts/$binary/$binary" "release/$binary"
           done
           chmod +x release/cliairplay-*
+          cp LICENSE THIRD_PARTY_NOTICES.md release/
           (cd release && sha256sum "${binaries[@]}" > SHA256SUMS)
           ls -la release
       # gh uploads assets to a temporary draft and publishes only after every
@@ -257,7 +262,9 @@ jobs:
       - name: Verify asset contract and checksums
         run: |
           assets=(
+            LICENSE
             SHA256SUMS
+            THIRD_PARTY_NOTICES.md
             cliairplay-linux-aarch64
             cliairplay-linux-x86_64
             cliairplay-macos-arm64

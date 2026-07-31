@@ -358,4 +358,17 @@ copied:
 
 ## License
 
-See LICENSE files in respective directories.
+This project as a whole — and the released binaries — are distributed under
+the **GNU General Public License, version 3** ([LICENSE](LICENSE)). That
+follows from what the binary contains: the RAOP core descends from the
+GPL-2.0-or-later raop_play, and the bundled mDNS discovery client (mdnssd)
+is GPL-3.0.
+
+The sources written for this project (`src/`) carry per-file
+`SPDX-License-Identifier: Apache-2.0` headers and may be reused under that
+license on their own. The one exception is `src/cliairplay.c`, which derives
+from libraop's `cliraop.c` and is therefore GPL-2.0-or-later.
+
+Every bundled third-party component, with its copyright notices and license
+texts, is inventoried in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md),
+which also ships with every binary release.
