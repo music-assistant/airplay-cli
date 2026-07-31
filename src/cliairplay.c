@@ -1173,6 +1173,16 @@ static int run_airplay2(cli_config_t *cfg)
                 eof_reported = false;
                 eof_time = 0;
             }
+            /* Delivery-stall guard (splice timeline): a stall longer than
+             * the pacing depth — process freeze, network dropout — leaves
+             * the head behind the wall clock with input still queued, which
+             * the zero-read starvation recovery below can never see. Pad the
+             * timeline forward before reading, or this iteration would send
+             * real content on past timestamps (an audible noise trigger on
+             * Apple receivers). Gated like that recovery: a frozen head
+             * outside session-PLAYING is a parked timeline, not a stall. */
+            if (ap2_session_state(g_session) == AP2_SESSION_PLAYING)
+                ap2cl_recover_delivery_gap(g_ap2cl);
             /* Splice pad (splice timeline): silence owed to the wire
              * before the next real sample, sent as ordinary encoded chunks so
              * sequence numbers and timestamps stay contiguous (any stamp jump

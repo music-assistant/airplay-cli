@@ -219,6 +219,12 @@ bool ap2cl_accept_frames(struct ap2cl_s *p);
 /* Re-anchor a realtime stream after PCM starvation exhausts its pacing lead. */
 bool ap2cl_recover_input_gap(struct ap2cl_s *p);
 
+/* Splice-pad a realtime stream whose delivery head lapsed behind the wall
+ * clock (a delivery stall longer than the pacing depth, with input still
+ * queued) so the loop never sends frames on past timestamps. Splice timeline
+ * only; call before reading each chunk. Returns true when it padded. */
+bool ap2cl_recover_delivery_gap(struct ap2cl_s *p);
+
 /* Emit native pacing, packet-drop, and anchor diagnostics at debug level 10. */
 void ap2cl_log_diagnostics(struct ap2cl_s *p);
 

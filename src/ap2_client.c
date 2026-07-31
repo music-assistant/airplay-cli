@@ -2706,6 +2706,42 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
     return raopcl_accept_frames(p->raopcl);
 }
 
+/* Shared splice-pad recovery (input starvation and delivery stalls): queue
+ * silence padding from the EFFECTIVE head — the frozen head plus any pad
+ * already owed — up to now plus the recovery lead, on the same immutable
+ * line. The audio loop sends the pad as ordinary encoded chunks, so the wire
+ * stays bitstream-continuous through the stall (a stamp jump, a line move
+ * and late frames are each an audible noise trigger). Playback shifts later
+ * by the pad, reported as REANCHOR so MA keeps tracking the drift. Gating on
+ * the effective head makes repeated calls idempotent while a queued pad
+ * drains: once silence covering the gap is owed, the timeline is already
+ * recovered and another call must not stack a second shift on top. Fires
+ * only when the effective head is at or behind `lapse_ts` (each caller's
+ * notion of "too late"). */
+static bool ap2_splice_pad_to_lead(struct ap2cl_s *p, uint64_t now_ts,
+                                   uint64_t lapse_ts, const char *cause)
+{
+    uint64_t window = ap2_pacing_window_frames(p);
+    uint64_t latency = MS2TS(p->latency_ms, p->format.sample_rate);
+    uint64_t recovery_lead = latency < window ? latency : window;
+    uint64_t effective_head = p->head_ts + p->splice_pad_frames;
+    if (effective_head > lapse_ts) return false;
+    uint64_t target = now_ts + recovery_lead;
+    if (target <= effective_head) return false;
+    uint64_t pad = target - effective_head;
+    p->splice_pad_frames += (uint32_t)pad;
+    p->timeline_reanchors++;
+    p->reanchor_shifted_frames += pad;
+    LOG_WARN("[AP2] Splice-padded after %s: shifted_frames="
+             "%" PRIu64 " lead_frames=%" PRIu64 " count=%" PRIu64,
+             cause, pad, recovery_lead, p->timeline_reanchors);
+    fprintf(stderr, "[STATUS] REANCHOR shifted_frames=%" PRIu64
+            " total_shifted_frames=%" PRIu64 " sample_rate=%d\n",
+            pad, p->reanchor_shifted_frames, p->format.sample_rate);
+    fflush(stderr);
+    return true;
+}
+
 bool ap2cl_recover_input_gap(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->state != AP2_STREAMING)
@@ -2718,27 +2754,11 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
     uint64_t recovery_lead = latency < window ? latency : window;
 
     if (p->splice_timeline) {
-        /* Splice recovery, same immutable-line rule as seek/resume: when the
-         * input stalls long enough that the head falls inside the minimum
-         * lead, queue silence padding up to now plus the recovery lead. The
-         * audio loop sends it as ordinary encoded chunks, so the wire stays
-         * bitstream-continuous through the stall (a stamp jump, a line move
-         * and late frames are each an audible noise trigger). Playback shifts
-         * later by the pad, reported as REANCHOR exactly like the stock path
-         * so MA keeps tracking the drift. */
-        if (p->head_ts > now_ts + floor) return false;
-        uint64_t pad = now_ts + recovery_lead - p->head_ts;
-        p->splice_pad_frames += (uint32_t)pad;
-        p->timeline_reanchors++;
-        p->reanchor_shifted_frames += pad;
-        LOG_WARN("[AP2] Splice-padded after PCM starvation: shifted_frames="
-                 "%" PRIu64 " lead_frames=%" PRIu64 " count=%" PRIu64,
-                 pad, recovery_lead, p->timeline_reanchors);
-        fprintf(stderr, "[STATUS] REANCHOR shifted_frames=%" PRIu64
-                " total_shifted_frames=%" PRIu64 " sample_rate=%d\n",
-                pad, p->reanchor_shifted_frames, p->format.sample_rate);
-        fflush(stderr);
-        return true;
+        /* Input is dry, so the recovery is anticipatory: pad as soon as the
+         * head falls inside the minimum lead — with nothing left to send the
+         * lapse is otherwise inevitable. */
+        return ap2_splice_pad_to_lead(p, now_ts, now_ts + floor,
+                                      "PCM starvation");
     }
 
     ap2_timeline_recovery_t recovery;
@@ -2776,6 +2796,33 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
             p->format.sample_rate);
     fflush(stderr);
     return true;
+}
+
+bool ap2cl_recover_delivery_gap(struct ap2cl_s *p)
+{
+    if (!p || p->flow != FLOW_NATIVE_AP2 || p->state != AP2_STREAMING ||
+        !p->splice_timeline)
+        return false;
+
+    /* DELIVERY stalled (process freeze, network dropout) longer than the
+     * shallow pacing depth: the head lapsed behind the wall clock while the
+     * input ring still holds audio, so the starvation recovery above never
+     * sees it — and without this guard the audio loop bursts the queued
+     * content on past timestamps until the head catches back up (late-frame
+     * delivery, an audible noise trigger on Apple receivers; log signature
+     * "TX PTP sync ... ahead=-N"). Pad the timeline forward instead, exactly
+     * like the starvation recovery.
+     *
+     * Unlike that recovery this trigger is strictly "behind now", not the
+     * anticipatory minimum-lead floor: content is still queued here, and a
+     * stall shorter than the pacing depth leaves the head between now and
+     * the depth — the receiver's queue never ran dry and the pending frames
+     * are on time, so padding would insert an audible silence gap into
+     * otherwise unbroken audio. It also keeps this guard, which runs every
+     * send iteration, quiet in the moments after a start resolved to the
+     * feasibility floor (head sits just under now + floor by construction). */
+    uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
+    return ap2_splice_pad_to_lead(p, now_ts, now_ts, "delivery stall");
 }
 
 void ap2cl_log_diagnostics(struct ap2cl_s *p)
@@ -3586,6 +3633,20 @@ bool ap2cl_test_anchor_valid(struct ap2cl_s *p)
 uint64_t ap2cl_test_head_ts(struct ap2cl_s *p)
 {
     return p->head_ts;
+}
+
+/* Move the delivery head as a stall would find it: the wire timestamp stays
+ * locked to the head (they advance together in the send path), so the
+ * head<->rtp invariant survives the manipulation. */
+void ap2cl_test_set_head_ts(struct ap2cl_s *p, uint64_t head)
+{
+    p->head_ts = head;
+    p->rtp_timestamp = (uint32_t)head + atomic_load(&p->rtp_offset);
+}
+
+uint64_t ap2cl_test_timeline_reanchors(struct ap2cl_s *p)
+{
+    return p->timeline_reanchors;
 }
 
 uint32_t ap2cl_test_rtp_timestamp(struct ap2cl_s *p)
