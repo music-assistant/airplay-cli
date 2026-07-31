@@ -2607,6 +2607,15 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
      * shape, which is clean; padding silence from a lapsed head would deliver
      * late frames, which is not. */
     p->splice_pad_frames = 0;
+    if (p->state == AP2_STREAMING && !p->splice_timeline) {
+        /* A re-anchor on an already-streaming stock stream (the corrective
+         * round of a group start) must discard the receiver's audio from the
+         * previous anchor first: without the flush the receiver keeps
+         * rendering the buffered frames on the OLD line and stays offset by
+         * the correction delta until the next clean anchor (measured on
+         * Sonos as a persistent few-hundred-ms group desync). */
+        ap2cl_flush(p);
+    }
     uint64_t start_ntp = 0;
     ap2_resolve_start(start_unix_ms, now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS),
                       &start_ntp, at_unix_ms);
