@@ -871,6 +871,10 @@ static void ptp_track_exchange(struct ap2_ptp_ctx *ctx, struct in_addr addr, uin
         ctx->exchange[slot].addr = addr;
     }
 
+    /* The unsigned delta wraps huge when CLOCK_REALTIME stepped backwards
+     * past last_ns, deliberately landing in the reset branch: receivers
+     * slave to this clock, so any timebase step makes their servos
+     * re-converge and the streak must restart from it. */
     if (fresh_slot || (rx - ctx->exchange[slot].last_ns) > PTP_EXCHANGE_GAP_NS) {
         ctx->exchange[slot].first_ns = rx;
         ctx->exchange[slot].third_ns = 0;
