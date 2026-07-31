@@ -1616,9 +1616,16 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
         uint64_t uid = 0;
         RAND_bytes((uint8_t *)&uid, sizeof(uid));
         m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
-        /* The old track's staged artwork must not ride the new item; the
-         * caller stages the new track's art (or none) right after this. */
-        if (track_changed) mrp_reset_artwork(m);
+        if (track_changed) {
+            /* The old track's staged artwork must not ride the new item; the
+             * caller stages the new track's art (or none) right after this. */
+            mrp_reset_artwork(m);
+            /* A new item starts at zero. Keeping the previous track's elapsed
+             * would push the new title at the old position; the sender's
+             * settled correction follows only when it starts elsewhere. */
+            m->elapsed_ms = 0;
+            m->elapsed_set_at = mrp_cf_now();
+        }
     }
     m->state_generation++;
     m->state_dirty = true;
