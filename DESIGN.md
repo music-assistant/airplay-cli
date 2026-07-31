@@ -282,9 +282,14 @@ granted the observed fast bound (third exchange + 250 ms). Enforcement:
   handled by START intent: a `START_JOIN=1` start (a late joiner that must
   land on the group's already-live timeline — the permanent-echo case) is
   moved forward pre-send (a fresh announce over an idle pipeline, the clean
-  session-start shape) and reported as `[STATUS] anchor_corrected
-  requested_unix_ms= from_unix_ms= at_unix_ms=` so the caller re-syncs that
-  member; a group/solo ORIGIN start only logs the shortfall — its receivers
+  session-start shape) **with the queued content advanced by the same
+  amount** — every frame is still held by the pacing gate, so cutting the
+  correction off the head of the prime puts the first retained sample
+  exactly where the group timeline schedules it and the member joins in
+  sync immediately. The cut rides the report (`[STATUS] anchor_corrected
+  requested_unix_ms= from_unix_ms= at_unix_ms= content_cut_ms=`) and the
+  caller only re-bases its reported position by the cut — no re-join, no
+  other action. A group/solo ORIGIN start only logs the shortfall — its receivers
   self-seat a fresh session within ~20 ms, and moving one member of a group
   origin desyncs the group (ear-confirmed). Anchors without runway to act
   (solo starts at the minimum lead) are never armed, and a window that

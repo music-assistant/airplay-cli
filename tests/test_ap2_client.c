@@ -946,21 +946,35 @@ static void test_clock_verified_anchor(void)
     assert(!ap2cl_test_clock_verify_armed(client));
 
     /* A join-marked start short of readiness moves the still-unsent line
-     * forward by the shortfall plus the retry slack, wire head following. */
+     * forward by the shortfall plus the retry slack (wire head following)
+     * and advances the queued content by exactly the correction, so the
+     * retained content still lands on the group timeline. */
     start_ms = test_now_unix_ms() + 1500;
     ap2cl_set_start_join(client, true);
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
     assert(ap2cl_test_clock_verify_armed(client));
+    assert(ap2cl_content_skip_bytes(client) == 0);
     ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_CORRECTED);
     assert(ev.from_unix_ms == start_ms);
     assert(ev.at_unix_ms > start_ms + 800);
     assert(ev.at_unix_ms < start_ms + 2000);
+    assert(ev.content_cut_ms == ev.at_unix_ms - ev.from_unix_ms);
     uint64_t head_ms_at_rate =
         ap2cl_test_head_ts(client) * 1000ULL / format.sample_rate;
     assert(head_ms_at_rate + 5 > ev.at_unix_ms &&
            head_ms_at_rate < ev.at_unix_ms + 5);
+    /* 16-bit stereo: 4 bytes per input frame. */
+    assert(ap2cl_content_skip_bytes(client) ==
+           ev.content_cut_ms * format.sample_rate / 1000 * 4);
+    ap2cl_content_skip_consume(client, 128);
+    assert(ap2cl_content_skip_bytes(client) ==
+           ev.content_cut_ms * format.sample_rate / 1000 * 4 - 128);
     assert(!ap2cl_test_clock_verify_armed(client));
+
+    /* A new commit clears an undrained cut. */
+    assert(ap2cl_start(client, 0, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_content_skip_bytes(client) == 0);
 
     /* The Apple fast bound (third exchange + settle) verifies an anchor the
      * full lock window would have corrected. */

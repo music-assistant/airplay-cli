@@ -230,6 +230,10 @@ struct ap2cl_s {
     uint32_t splice_pad_frames;   /* silence frames still to send before the
                                      next real sample so it lands exactly on
                                      the commanded splice instant */
+    uint32_t content_skip_bytes;  /* queued input to discard after a corrected
+                                     join, so the retained content lands on
+                                     the group timeline (see
+                                     ap2cl_content_skip_bytes) */
     bool content_paused;          /* splice pause: the content is paused but
                                      the wire stays fed (state remains
                                      AP2_STREAMING), so the MRP playback state
@@ -2806,6 +2810,7 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
     p->start_join_pending = false;
     p->content_paused = false;
     p->content_stopped = false;
+    p->content_skip_bytes = 0;
     uint64_t ntp_start = 0;
     bool clock_cold = false;
     uint64_t floor_ntp =
@@ -2875,6 +2880,7 @@ void ap2cl_standby(struct ap2cl_s *p)
     ap2_clock_verify_disarm(p);
     p->content_paused = false;
     p->content_stopped = false;
+    p->content_skip_bytes = 0;
     if (p->flow != FLOW_NATIVE_AP2) {
         if (p->raopcl) raop_session_standby(p->raopcl);
         p->state = AP2_CONNECTED;
@@ -2920,6 +2926,7 @@ bool ap2cl_flush(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return false;
     ap2_clock_verify_disarm(p);
+    p->content_skip_bytes = 0;
 
     if (p->flow != FLOW_NATIVE_AP2)
         return raop_session_flush(p->raopcl);
@@ -2973,6 +2980,7 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
     p->start_join_pending = false;
     p->content_paused = false;
     p->content_stopped = false;
+    p->content_skip_bytes = 0;
 
     if (p->flow != FLOW_NATIVE_AP2) {
         ap2_commit_result_t r =
@@ -3357,10 +3365,26 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
              * caller's ack round-trips. */
             ev->at_unix_ms = ready_ms + AP2_MIN_WARM_LEAD_MS;
             ap2_rebase_pending_anchor(p, ev->at_unix_ms);
+            /* Advance the queued content past the correction: the join's
+             * content was mapped to the original instant, so without the cut
+             * the member would render exactly that far behind the group for
+             * the whole session. Every frame is still unsent (the pacing
+             * gate holds them until anchor minus the window), and the
+             * carrier frame size mirrors the audio loop's input format. */
+            ev->content_cut_ms = ev->at_unix_ms - anchor_ms;
+            uint64_t cut_frames =
+                ev->content_cut_ms * p->format.sample_rate / 1000ULL;
+            int input_bpf =
+                (p->format.bit_depth <= 16 ? 2 : 4) * p->format.channels;
+            p->content_skip_bytes =
+                (uint32_t)(cut_frames * (uint64_t)input_bpf);
             result = AP2_CLOCK_VERIFY_CORRECTED;
             LOG_WARN("[AP2] anchor %" PRIu64 " ms precedes receiver clock "
                      "readiness by %" PRIu64 " ms; corrected forward to %"
-                     PRIu64, anchor_ms, ready_ms - anchor_ms, ev->at_unix_ms);
+                     PRIu64 " and content advanced %" PRIu64 " ms to keep "
+                     "the join on the group timeline",
+                     anchor_ms, ready_ms - anchor_ms, ev->at_unix_ms,
+                     ev->content_cut_ms);
         } else {
             /* Readiness resolved late, after real frames went out: the line
              * cannot move without a stamp jump. The receiver will seat
@@ -3478,6 +3502,7 @@ void ap2cl_stop(struct ap2cl_s *p)
     ap2_clock_verify_disarm(p);
     p->content_paused = false;
     p->content_stopped = false;
+    p->content_skip_bytes = 0;
     if (p->raopcl) raopcl_stop(p->raopcl);
     ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
     p->rt_anchor_valid = false;
@@ -4150,6 +4175,18 @@ void ap2cl_splice_pad_consume(struct ap2cl_s *p, uint32_t frames)
     if (!p) return;
     p->splice_pad_frames = frames < p->splice_pad_frames
                                ? p->splice_pad_frames - frames : 0;
+}
+
+uint32_t ap2cl_content_skip_bytes(struct ap2cl_s *p)
+{
+    return p ? p->content_skip_bytes : 0;
+}
+
+void ap2cl_content_skip_consume(struct ap2cl_s *p, uint32_t bytes)
+{
+    if (!p) return;
+    p->content_skip_bytes = bytes < p->content_skip_bytes
+                                ? p->content_skip_bytes - bytes : 0;
 }
 
 int ap2cl_render_latency_ms(struct ap2cl_s *p) { return p ? p->dev_render_ms : 0; }

@@ -67,6 +67,22 @@
  *                                       audible instant of the frozen
  *                                       delivery head as the caller's warm
  *                                       anchor hint.)
+ *   [STATUS] clock_verified margin_ms=<ms>
+ *                                      (a START committed before the
+ *                                       receiver's first clock probe was
+ *                                       verified once its exchange resumed;
+ *                                       informational)
+ *   [STATUS] anchor_corrected requested_unix_ms=<ms> from_unix_ms=<ms>
+ *            at_unix_ms=<ms> content_cut_ms=<ms>
+ *                                      (a join START committed before the
+ *                                       receiver's clock exchange moved to
+ *                                       the verified readiness instant, and
+ *                                       the queued content was advanced by
+ *                                       the same amount so the join still
+ *                                       lands on the group timeline — the
+ *                                       caller re-bases its reported
+ *                                       position by content_cut_ms and
+ *                                       takes no other action)
  *   [STATUS] eof                       (input stream ended)
  *   [STATUS] idle_timeout
  *
