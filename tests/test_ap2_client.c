@@ -610,6 +610,79 @@ static void test_splice_delivery_gap_recovery(void)
     puts("ap2_client splice delivery-gap recovery tests passed");
 }
 
+/* A splice pause stops the content, never the wire: the client must stay in
+ * AP2_STREAMING with the line hot (the audio loop keeps feeding silence), so
+ * a receiver whose queue would otherwise underrun while the session stays
+ * armed never pops (the pause-press burst, ear-measured on an Apple TV 4K).
+ * The un-pause splices back in on the same line — no stamp move, no
+ * re-anchor. The stock timeline keeps its parked pause. */
+static void test_splice_pause_keeps_line_hot(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    assert(fcntl(sockets[1], F_SETFL, O_NONBLOCK) == 0);
+
+    ap2_device_info_t device = {
+        .name = "pause keepalive test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_splice(client, true);
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
+    ap2cl_test_set_first_packet(client, false);
+    ap2cl_test_set_anchor_valid(client, true);
+    uint64_t head_before = ap2cl_test_head_ts(client);
+    uint32_t rtp_before = ap2cl_test_rtp_timestamp(client);
+
+    ap2cl_pause(client);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+    assert(ap2cl_is_playing(client));
+    assert(ap2cl_splice_hot(client));
+    assert(ap2cl_test_anchor_valid(client));
+    assert(ap2cl_test_head_ts(client) == head_before);
+    assert(ap2cl_test_rtp_timestamp(client) == rtp_before);
+    assert(ap2cl_splice_pad_frames(client) == 0);
+
+    ap2cl_play(client);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+    assert(!ap2cl_test_first_packet(client));
+    assert(ap2cl_test_anchor_valid(client));
+    assert(ap2cl_test_head_ts(client) == head_before);
+    assert(ap2cl_test_rtp_timestamp(client) == rtp_before);
+    /* A hot un-pause may owe silence up to the minimum lead, never more —
+     * and never moves a stamp. */
+    assert(ap2cl_splice_pad_frames(client) < 22050);
+
+    /* The stock (deny-listed) timeline keeps the parked pause. */
+    ap2cl_test_set_splice(client, false);
+    ap2cl_pause(client);
+    assert(ap2cl_state(client) == AP2_PAUSED);
+    assert(!ap2cl_is_playing(client));
+    assert(!ap2cl_test_anchor_valid(client));
+
+    /* Neither pause shape touches the RTSP socket. */
+    char scratch[16];
+    assert(recv(sockets[1], scratch, sizeof(scratch), 0) == -1);
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client splice pause keepalive tests passed");
+}
+
 /* An explicit --protocol airplay2 reaches the native flow on exactly the same
  * terms as auto, so an AirPlay-2-only receiver (no _raop service to fall back
  * on) is not routed into a RAOP-compatible flow it cannot answer. Only a real
@@ -710,6 +783,7 @@ int main(void)
     test_splice_default_resolution();
     test_splice_timeline_warm_path();
     test_splice_delivery_gap_recovery();
+    test_splice_pause_keeps_line_hot();
     test_feedback_miss_tolerated_then_recovered();
 
     ap2_device_info_t device = {
