@@ -877,29 +877,22 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
         return r;
     }
 
-    /* 2. Native AP2 vs RAOP-compatible flow. Stored credentials or an explicit
-     * override select native; in AUTO, transient-pairable devices (pairing bits,
-     * no PIN/legacy flag, and either no password required or one supplied) go
-     * native too — the device password doubles as the transient SRP secret, so a
-     * password-protected receiver no longer has to drop to RAOP-compat. Explicit
-     * --protocol airplay2 keeps the proven RAOP-compat default unless native is
-     * forced. */
-    bool native, transient = false;
-    if (have_credentials) {
-        native = true;            /* pair-verify with stored keys (Apple TV/HomePod) */
-    } else if (force_native) {
-        native = true;
-        transient = true;         /* no creds -> transient pairing */
-    } else if (pref == AP2_PROTO_AUTO &&
-               (AP2_FEAT(r.features, AP2_FEAT_HK_PAIRING) ||
-                AP2_FEAT(r.features, AP2_FEAT_COREUTILS)) &&
-               !(r.flags & (AP2_SF_PIN_REQUIRED | AP2_SF_LEGACY_PAIRING)) &&
-               (!has_pw || have_password)) {
-        native = true;
-        transient = true;
-    } else {
-        native = false;           /* RAOP-compatible fallback */
-    }
+    /* 2. Native AP2 vs RAOP-compatible flow. Stored credentials or --ap2-native
+     * select native outright; otherwise a transient-pairable device goes native,
+     * a supplied password doubling as its SRP secret. --protocol airplay2 also
+     * pairs when the features say nothing at all — absent, unparseable and a
+     * literal 0x0,0x0 all test as 0 here, deliberately — because that flag is
+     * the caller naming an AirPlay-2-only receiver, which has no _raop service
+     * behind it. Everything else (features without the pairing bits, or a
+     * blocker native cannot clear either) stays on RAOP-compat. */
+    bool pairable = AP2_FEAT(r.features, AP2_FEAT_HK_PAIRING) ||
+                    AP2_FEAT(r.features, AP2_FEAT_COREUTILS) ||
+                    (pref == AP2_PROTO_AIRPLAY2 && r.features == 0);
+    bool pairing_blocked = (r.flags & (AP2_SF_PIN_REQUIRED | AP2_SF_LEGACY_PAIRING)) != 0 ||
+                           (has_pw && !have_password);
+
+    bool native = have_credentials || force_native || (pairable && !pairing_blocked);
+    bool transient = native && !have_credentials;   /* stored keys => pair-verify */
 
     if (!native) {
         r.use_raop = false;
