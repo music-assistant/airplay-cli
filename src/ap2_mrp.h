@@ -152,11 +152,18 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m);
  * Set the now-playing track metadata. Values are copied; NULL is treated as
  * empty. Takes effect on the next feedback-worker state push.
  *
+ * The now-playing item identity (UniqueIdentifier and retained artwork) is
+ * keyed on item_id when both the stored and incoming ids are non-empty:
+ * title/artist/album changes under the same item_id are tag refinements that
+ * update the existing item in place. Without ids, identity falls back to the
+ * title/artist/album tuple.
+ *
  * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param item_id: sender's stable per-track identity ("" or NULL = none).
  */
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
                           const char *artist, const char *album,
-                          int duration_ms);
+                          int duration_ms, const char *item_id);
 
 /*
  * Set the now-playing artwork.

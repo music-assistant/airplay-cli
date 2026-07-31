@@ -208,6 +208,7 @@ struct ap2_mrp_ctx {
     uint8_t *artwork;
     int artwork_len;
     char artwork_id[17];      /* 16-hex ArtworkIdentifier for the current art */
+    char *item_id;            /* sender's stable per-track identity ("" = none) */
     uint64_t np_uid;          /* per-track now-playing UniqueIdentifier */
 
     time_t last_state_push;
@@ -1436,6 +1437,7 @@ void ap2_mrp_destroy(struct ap2_mrp_ctx *m)
     free(m->title);
     free(m->artist);
     free(m->album);
+    free(m->item_id);
     free(m->artwork_mime);
     free(m->artwork);
     free(m);
@@ -1580,21 +1582,35 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
 
 bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
                           const char *artist, const char *album,
-                          int duration_ms)
+                          int duration_ms, const char *item_id)
 {
     if (!m) return false;
     /* The UniqueIdentifier must stay stable across a track's pushes: the
      * receiver keys its now-playing item on it, so a fresh uid on a redundant
      * re-send (registration burst, warm seek, progress correction) reads as a
      * brand-new item and resets the receiver's Now Playing UI. Mint one only
-     * when the track actually changes. Random 63-bit, matching the large
-     * uint64 a real sender emits. */
-    bool track_changed = !mrp_str_eq(m->title, title) ||
-                         !mrp_str_eq(m->artist, artist) ||
-                         !mrp_str_eq(m->album, album);
+     * when the track actually changes — keyed on the sender's item id when
+     * both sides have one, because the text tuple is NOT stable for one
+     * track: the server may refine tags mid-track (library enrichment
+     * settling after playback start), and such a refinement must update the
+     * existing item, not present as a new track. Random 63-bit, matching the
+     * large uint64 a real sender emits. */
+    bool have_ids = m->item_id && *m->item_id && item_id && *item_id;
+    bool track_changed = have_ids
+        ? strcmp(m->item_id, item_id) != 0
+        : (!mrp_str_eq(m->title, title) ||
+           !mrp_str_eq(m->artist, artist) ||
+           !mrp_str_eq(m->album, album));
+    if (track_changed && m->np_uid != 0) {
+        LOG_INFO("[MRP] now-playing item changed: \"%s\" (id %s) -> "
+                 "\"%s\" (id %s)",
+                 m->title ? m->title : "", m->item_id ? m->item_id : "-",
+                 title ? title : "", item_id ? item_id : "-");
+    }
     mrp_replace_str(&m->title, title);
     mrp_replace_str(&m->artist, artist);
     mrp_replace_str(&m->album, album);
+    mrp_replace_str(&m->item_id, item_id);
     m->duration_ms = duration_ms > 0 ? duration_ms : 0;
     if (track_changed || m->np_uid == 0) {
         uint64_t uid = 0;

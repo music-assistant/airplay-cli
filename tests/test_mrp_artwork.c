@@ -255,7 +255,8 @@ static bool test_nowplaying_command_payload(void)
         "11111111-1111-1111-1111-111111111111",
         "22222222-2222-2222-2222-222222222222", NULL);
     CHECK(mrp != NULL);
-    CHECK(ap2_mrp_set_metadata(mrp, "Title", "Artist", "Album", 180000));
+    CHECK(ap2_mrp_set_metadata(mrp, "Title", "Artist", "Album", 180000,
+                               "item-1"));
     CHECK(ap2_mrp_set_progress(mrp, 15000, 180000, true));
 
     ap2_mrp_artwork_info_t info;
@@ -306,7 +307,8 @@ static bool test_nowplaying_command_payload(void)
         first, (size_t)first_len,
         "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_first));
     CHECK(uid_first != 0);
-    CHECK(ap2_mrp_set_metadata(mrp, "Title", "Artist", "Album", 180000));
+    CHECK(ap2_mrp_set_metadata(mrp, "Title", "Artist", "Album", 180000,
+                               "item-1"));
     uint8_t *stable = NULL;
     int stable_len = 0;
     CHECK(ap2_mrp_build_nowplaying_command(mrp, &stable, &stable_len));
@@ -320,9 +322,30 @@ static bool test_nowplaying_command_payload(void)
         "kMRMediaRemoteNowPlayingInfoArtworkData"));
     free(stable);
 
-    /* A real track change mints a new uid and drops the stale artwork; the
-     * caller stages the new track's art right after. */
-    CHECK(ap2_mrp_set_metadata(mrp, "Other Title", "Artist", "Album", 200000));
+    /* Tag refinement: the text tuple changes but the item id does not (the
+     * server's library enrichment can settle after playback starts). The
+     * item — uid and retained artwork — must stay, with the new strings. */
+    CHECK(ap2_mrp_set_metadata(mrp, "Title (remastered)", "Artist", "Album",
+                               180000, "item-1"));
+    uint8_t *refined = NULL;
+    int refined_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &refined, &refined_len));
+    uint64_t uid_refined = 0;
+    CHECK(ap2_bplist_find_uint(
+        refined, (size_t)refined_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_refined));
+    CHECK(uid_refined == uid_first);
+    CHECK(bytes_contain_string(refined, (size_t)refined_len,
+                               "Title (remastered)"));
+    CHECK(bytes_contain_string(
+        refined, (size_t)refined_len,
+        "kMRMediaRemoteNowPlayingInfoArtworkData"));
+    free(refined);
+
+    /* A real track change (new item id) mints a new uid and drops the stale
+     * artwork; the caller stages the new track's art right after. */
+    CHECK(ap2_mrp_set_metadata(mrp, "Other Title", "Artist", "Album", 200000,
+                               "item-2"));
     uint8_t *changed = NULL;
     int changed_len = 0;
     CHECK(ap2_mrp_build_nowplaying_command(mrp, &changed, &changed_len));
@@ -334,6 +357,20 @@ static bool test_nowplaying_command_payload(void)
     CHECK(!bytes_contain_string(
         changed, (size_t)changed_len,
         "kMRMediaRemoteNowPlayingInfoArtworkIdentifier"));
+
+    /* Without item ids on either side, identity falls back to the text
+     * tuple: same strings keep the item, different strings change it. */
+    CHECK(ap2_mrp_set_metadata(mrp, "Other Title", "Artist", "Album", 200000,
+                               NULL));
+    uint8_t *legacy = NULL;
+    int legacy_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &legacy, &legacy_len));
+    uint64_t uid_legacy = 0;
+    CHECK(ap2_bplist_find_uint(
+        legacy, (size_t)legacy_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_legacy));
+    CHECK(uid_legacy == uid_changed);
+    free(legacy);
     free(first);
     free(changed);
 

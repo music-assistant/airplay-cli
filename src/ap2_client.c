@@ -3262,14 +3262,15 @@ int ap2cl_mrp_register(struct ap2cl_s *p)
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
-                        const char *album, int duration)
+                        const char *album, int duration, const char *item_id)
 {
     if (!p) return false;
     pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     if (p->mrp)
-        ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000);
+        ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000,
+                             item_id);
     pthread_mutex_unlock(&p->mrp_lock);
     pthread_mutex_unlock(&p->mrp_publish_lock);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)

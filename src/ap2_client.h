@@ -243,9 +243,12 @@ bool ap2cl_feedback(struct ap2cl_s *p);
 /* Set volume (0-100). */
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
 
-/* Set metadata (DAAP format). */
+/* Set metadata (DAAP format). item_id is the sender's stable per-track
+ * identity ("" = none): MediaRemote keys its now-playing item on it, so
+ * later tag refinements for the same item update in place instead of
+ * presenting as a new track. */
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
-                        const char *album, int duration);
+                        const char *album, int duration, const char *item_id);
 
 /*
  * Set artwork on the existing DMAP path and, when applicable, stage it for
