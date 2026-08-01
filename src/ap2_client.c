@@ -101,6 +101,15 @@ extern log_level *loglevel;
 #define AP2_CLOCK_LOCK_MS            2300
 #define AP2_CLOCK_SETTLE_MS          250
 #define AP2_CLOCK_SEAT_EXCHANGES     3
+/* Nothing to measure for this long, counted from the last streak seen or from
+ * connect while none ever has been, means the receiver is not answering our
+ * clock at all — over four times the 1.078 s first-probe latency measured on a
+ * Samsung Music Frame, and well past the full AP2_CLOCK_LOCK_MS servo window
+ * on top of it, so a merely slow receiver cannot trip it. That margin is the
+ * whole point: this is a diagnosis threshold, not a deadline anything plans
+ * against, so it answers "is this receiver definitively not answering" and is
+ * deliberately slower than any caller's own wait for a readiness projection. */
+#define AP2_CLOCK_STALL_MS           5000
 /* Verification needs room to act before the initial fill starts releasing
  * real frames at anchor - pacing depth: anchors closer than the depth plus
  * one poll round plus slack can never be corrected, so they are not armed. */
@@ -280,6 +289,13 @@ struct ap2cl_s {
     uint64_t clock_verify_next_poll_ntp;
     bool clock_verify_have_exchange;
     struct ap2_ptp_exchange clock_verify_exchange;
+    uint64_t clock_connected_unix_ms; /* session connect instant, which the
+                                         receiver's probe window is measured
+                                         from (0 until the session is up) */
+    uint64_t clock_last_streak_unix_ms; /* last instant a streak was actually
+                                           observed, kept current by the
+                                           poller; takes over from the connect
+                                           instant once it is set */
     /* Shared-daemon mode queries the streak over UDP (blocking); this poller
      * keeps the snapshot fresh so the audio loop never blocks on it. */
     pthread_t clock_verify_thread;
@@ -359,6 +375,7 @@ static void ap2_raop_session_cleanup(struct ap2cl_s *p);
 static void ap2_clock_verify_disarm(struct ap2cl_s *p);
 static void ap2_clock_verify_reap_poller(struct ap2cl_s *p);
 static void ap2_clock_poller_ensure(struct ap2cl_s *p);
+static uint64_t ap2_ntp_to_unix_ms(uint64_t ntp);
 
 static void ap2_remote_command_received(
     ap2_remote_command_t command, void *userdata)
@@ -2007,8 +2024,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * clock about a second after connect, on its own schedule and with no
      * anchor announced (measured on a Samsung Music Frame, 187 probes over
      * 24 s with no START ever sent). Keep the shared-daemon snapshot fresh
-     * from now on so ap2cl_clock_readiness can report it without blocking. */
+     * from now on so ap2cl_clock_readiness can report it without blocking,
+     * and stamp the instant its stall window runs from. */
     atomic_store(&p->clock_poll_wanted, true);
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_connected_unix_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    pthread_mutex_unlock(&p->clock_verify_lock);
     ap2_clock_poller_ensure(p);
     if (!ap2_feedback_start(p)) {
         atomic_store(&p->rtsp_dead, true);
@@ -2756,10 +2777,18 @@ static void *ap2_clock_verify_poller(void *arg)
     while (!atomic_load(&p->clock_verify_thread_stop)) {
         struct ap2_ptp_exchange ex;
         bool have = ap2_clock_query(p, &ex);
+        uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
         pthread_mutex_lock(&p->clock_verify_lock);
         bool armed = p->clock_verify_armed;
         p->clock_verify_have_exchange = have;
-        if (have) p->clock_verify_exchange = ex;
+        if (have) {
+            p->clock_verify_exchange = ex;
+            /* The stall window is measured from here because this loop is the
+             * only thing that follows the receiver for a whole session:
+             * readiness reporting goes terminal at the first ready and stops
+             * asking until a flush or start re-arms it. */
+            p->clock_last_streak_unix_ms = now_ms;
+        }
         pthread_mutex_unlock(&p->clock_verify_lock);
         if (!armed && !atomic_load(&p->clock_poll_wanted)) break;
         for (int i = 0; i < AP2_CLOCK_VERIFY_POLL_MS / 50 &&
@@ -3541,15 +3570,39 @@ void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
         have = true;
         ex = p->clock_verify_exchange;
     }
+    /* The stall window runs from the last streak actually seen, and only from
+     * connect while none ever has been: a snapshot goes empty on a single lost
+     * Q round-trip as readily as on a receiver that stopped answering, so
+     * measuring from connect alone would call a healthy session stalled on one
+     * dropped datagram. The poller refreshes the mark every round, so a blip
+     * can never reach the window while a real loss gets the same grace as a
+     * cold start. */
+    uint64_t stall_from_ms =
+        p->clock_last_streak_unix_ms > p->clock_connected_unix_ms
+            ? p->clock_last_streak_unix_ms : p->clock_connected_unix_ms;
     pthread_mutex_unlock(&p->clock_verify_lock);
     /* The in-process engine answers from its own lock, so the audio loop may
      * ask it directly; shared-daemon mode must take the poller's snapshot,
      * whose staleness only ever pushes readiness later — the safe direction. */
     if (!have && !ap2_ptp_shared_active(p->ptp))
         have = ap2_clock_query(p, &ex);
-    if (!have) return;
 
     uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    if (!have) {
+        /* Nothing to measure this long after the receiver was last heard from
+         * means it is not slaved to our clock: it can seat no render position
+         * and renders silence however cleanly the audio paces. Reported as its
+         * own state because a cold receiver looks the same on the way there. */
+        if (stall_from_ms && now_ms >= stall_from_ms + AP2_CLOCK_STALL_MS)
+            out->state = AP2_CLOCK_STALLED;
+        return;
+    }
+    /* Carry the mark for the in-process engine, which runs no poller to keep
+     * it current; in shared-daemon mode the poller has it already. */
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_last_streak_unix_ms = now_ms;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+
     uint64_t ready_ms = ap2_clock_ready_from(p, &ex, now_ms);
     out->streak_ms = ex.first_ms;
     out->exchanges = ex.count;
@@ -4572,6 +4625,27 @@ void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
     p->clock_verify_exchange.first_ms = first_ms;
     p->clock_verify_exchange.last_ms = 0;
     p->clock_verify_exchange.third_ms = third_ms;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+}
+
+/* Retract the planted snapshot the way a poll that came back empty does, so a
+ * test can play a lost round-trip against a receiver that is still probing. */
+void ap2cl_test_clear_clock_exchange(struct ap2cl_s *p)
+{
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_verify_have_exchange = false;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+}
+
+/* Stamp the two instants the stall window is measured from — the connect a
+ * real session records in ap2_native_connect, and the last streak readiness
+ * itself observes — so a test can place that window wherever it needs it. */
+void ap2cl_test_set_clock_marks(struct ap2cl_s *p, uint64_t connected_ms,
+                                uint64_t last_streak_ms)
+{
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_connected_unix_ms = connected_ms;
+    p->clock_last_streak_unix_ms = last_streak_ms;
     pthread_mutex_unlock(&p->clock_verify_lock);
 }
 
