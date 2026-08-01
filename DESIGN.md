@@ -700,6 +700,18 @@ capture.
   sessions without it), independent of command-pipe metadata, artwork loading,
   and progress updates. The worker services encrypted reverse events after
   each feedback POST. RAOP paths use libraop's keepalive (~20 s).
+- **Receiver stream list** — each `/feedback` response carries the receiver's
+  own list of the streams it still holds for us,
+  `{"streams": [{"type": 96, "sr": 44100}]}`, logged at DEBUG every tick. An
+  empty list while the client is streaming means the receiver dropped the
+  stream under us and every packet is going nowhere; three consecutive empty
+  ticks (~6 s, past the transitions around SETUP/RECORD and a warm splice)
+  report it once per episode as `[STATUS] stream_dropped streams=0 ticks=<n>
+  interval_ms=<ms>`, and a stream coming back closes the episode. A receiver
+  that omits the key reports no stream status at all and is never faulted.
+  The list is what the receiver HOLDS, not what it renders: a Sonos Era 100
+  confirmed playing and a silent-class Samsung HW-LS60D answer with the same
+  single-entry body, so this detects a dropped stream, not a silent speaker.
 - **RTSP serialization** — one mutex serializes the RTSP channel, so the
   keepalive thread and the streaming path can never interleave frames on the
   encrypted channel.
