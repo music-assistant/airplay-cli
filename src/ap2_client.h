@@ -241,6 +241,8 @@ typedef struct {
     uint64_t from_unix_ms;         /* previously scheduled audible instant */
     uint64_t at_unix_ms;           /* now-scheduled audible instant */
     int64_t margin_ms;             /* readiness margin before the anchor (verified) */
+    uint64_t content_cut_ms;       /* content advanced past the correction so the
+                                      join still lands on the group timeline */
 } ap2_clock_verify_event_t;
 
 /*
@@ -410,6 +412,14 @@ uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p);
  * bitstream stays contiguous, and consumes the pad as it sends. */
 uint32_t ap2cl_splice_pad_frames(struct ap2cl_s *p);
 void ap2cl_splice_pad_consume(struct ap2cl_s *p, uint32_t frames);
+
+/* Input bytes still to be discarded from the head of the queued content
+ * (a corrected late join advances the content by exactly the correction, so
+ * the member's first retained sample is the one the group timeline schedules
+ * at the corrected instant): the audio loop drops them from its session
+ * reads before sending, consuming as it goes. */
+uint32_t ap2cl_content_skip_bytes(struct ap2cl_s *p);
+void ap2cl_content_skip_consume(struct ap2cl_s *p, uint32_t bytes);
 
 /* True while the splice timeline is live on the wire (audio sends legal);
  * gates the idle-window silence keepalive in the audio loop. */

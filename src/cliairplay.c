@@ -217,8 +217,10 @@ static void clock_verify_tick(void)
     switch (ap2cl_clock_verify_poll(g_ap2cl, &ev)) {
     case AP2_CLOCK_VERIFY_CORRECTED:
         status_print("[STATUS] anchor_corrected requested_unix_ms=%" PRIu64
-                     " from_unix_ms=%" PRIu64 " at_unix_ms=%" PRIu64,
-                     ev.requested_unix_ms, ev.from_unix_ms, ev.at_unix_ms);
+                     " from_unix_ms=%" PRIu64 " at_unix_ms=%" PRIu64
+                     " content_cut_ms=%" PRIu64,
+                     ev.requested_unix_ms, ev.from_unix_ms, ev.at_unix_ms,
+                     ev.content_cut_ms);
         break;
     case AP2_CLOCK_VERIFY_VERIFIED:
         status_print("[STATUS] clock_verified margin_ms=%" PRId64,
@@ -1311,6 +1313,37 @@ static int run_airplay2(cli_config_t *cfg)
                     LOG_INFO("[AP2] PCM input recovered after %u ms", stalled_ms);
                     ap2cl_log_diagnostics(g_ap2cl);
                     starving = false;
+                }
+                /* Corrected-join content cut: drop the bytes the correction
+                 * advanced past, so the first retained sample is the one the
+                 * group timeline schedules at the corrected instant. Only
+                 * successful reads get here (a timeout returns 0 and takes
+                 * the starvation path above), and mid-stream those carry the
+                 * full request — so a read is either dropped whole, or holds
+                 * the cut boundary and its dropped span is refilled so the
+                 * sent chunk stays full with no silence inside the content.
+                 * At EOF the refill comes back short (or not at all) and the
+                 * remainder ships as the normal padded final chunk. */
+                uint32_t drop = ap2cl_content_skip_bytes(g_ap2cl);
+                if (drop && n > 0) {
+                    if ((uint32_t)n <= drop) {
+                        ap2cl_content_skip_consume(g_ap2cl, (uint32_t)n);
+                        pthread_mutex_unlock(&g_audio_send_lock);
+                        continue;
+                    }
+                    memmove(buf + pad_bytes, buf + pad_bytes + drop,
+                            (size_t)((uint32_t)n - drop));
+                    n -= (int)drop;
+                    int extra = ap2_session_read(
+                        g_session, buf + pad_bytes + n, (int)drop, 250);
+                    if (extra == -2) {
+                        /* Session ended mid-refill: match the main read
+                         * path and stop without sending. */
+                        pthread_mutex_unlock(&g_audio_send_lock);
+                        break;
+                    }
+                    if (extra > 0) n += extra;
+                    ap2cl_content_skip_consume(g_ap2cl, drop);
                 }
             }
             if (pad_bytes)
