@@ -274,13 +274,28 @@ tracks each receiver's **probe streak** — the uninterrupted run of
 Delay_Req/Pdelay_Req received from that IP, reset by a 3 s gap — and the
 daemon answers `Q <ip>` with the streak ages. Readiness = streak start
 + 2.3 s (the measured Sonos servo-lock window), with Apple models also
-granted the observed fast bound (third exchange + 250 ms). Enforcement:
+granted the observed fast bound (third exchange + 250 ms).
+
+**Probing starts at CONNECT, not at the anchor announce.** A receiver begins
+sending Delay_Req about a second after the session connects, on its own
+schedule, with no anchor ever announced and no START ever sent — measured on a
+Samsung Music Frame (HW-LS60D): SETPEERS at T+0.00, first Delay_Req at
+T+1.078, then 187 probes over 24 s of pure idle. A cold-join field log agrees
+independently (streak began 1.04 s after SETPEERS, before which the anchor
+announce at T+0.20 had already gone out and changed nothing). So the ~1.05 s is
+the device's own latency and a START does not accelerate it. That makes
+readiness measurable BEFORE the first start, which is what
+`[STATUS] clock_ready` reports (below) — a caller that waits for it never has to
+guess a join headroom. Readiness is a property of the device (~1.08 s to the
+first probe plus the 2.3 s lock window ≈ 3.4 s after connect), so any fixed
+headroom is either too short to catch a probe or needlessly slow. Enforcement,
+for callers that start before readiness anyway:
 
 - **At commit**, a live streak folds readiness into the feasibility floor,
   so an anchor before readiness is corrected forward through the normal
   started-ack contract (which group starts re-converge from as usual).
-- **After a cold commit** (no live streak yet — a rejoining receiver resumes
-  probing only ~0.7-1.5 s AFTER the START ack, so commit-time enforcement is
+- **After a cold commit** (no live streak yet — a start committed within about
+  a second of connecting has nothing to measure, so commit-time enforcement is
   impossible), the audio loop keeps verifying while the pacing gate still
   holds every frame. Once the streak appears, an anchor at or beyond
   readiness logs `[STATUS] clock_verified margin_ms=`. One short of it is
@@ -332,6 +347,40 @@ granted the observed fast bound (third exchange + 250 ms). Enforcement:
   verification goes terminal once it can no longer act before it), so the
   caller never waits on a timeout of its own. A commit, flush or park that
   disarms the verification mid-flight releases the ack the same way.
+
+**Readiness pushed from connect.** Because probing starts at connect, the
+binary reports what it measures instead of leaving the caller to guess:
+
+```
+[STATUS] clock_ready mode=<ptp|ntp> state=<cold|probing|ready> streak_ms=<u64> exchanges=<u32> ready_in_ms=<u64> ready_at_unix_ms=<u64>
+```
+
+- `mode` is the **effective** timing, not the route intent: a PTP session that
+  fell back to the NTP responder because 319/320 could not be bound reports
+  `ntp`, which tells the caller readiness is not measurable here and it must
+  not wait for it. Legacy RAOP reports `ntp` too.
+- `state=cold` — no probe recorded yet. `ready_in_ms`/`ready_at_unix_ms` are 0
+  and mean nothing; ignore them. A receiver past the engine's peer limit
+  (`PTP_MAX_PEERS`, 8) gets no unicast timing and stays cold forever, so a
+  caller waiting on readiness needs its own timeout for that case.
+- `state=probing` — a live streak; `ready_at_unix_ms` is the projected
+  readiness instant to plan the anchor against.
+- `state=ready` — the projection has passed.
+- `streak_ms`/`exchanges` are the streak's first-probe age and probe count,
+  the same two numbers the commit-time floor logs, so field reports compare
+  directly.
+
+The first line is emitted immediately after `[STATUS] connected`,
+unconditionally and whatever the state, so a caller can always distinguish
+"not ready yet" from "this binary will never tell me". After that only a
+material change is reported — the state, or the projected instant a caller
+would plan against; the exchange count rides along as telemetry but never
+triggers a line by itself — sampled at most every 250 ms, ending at the first
+`state=ready`. `FLUSH` and `START` re-arm it for the next cycle. The projection
+is recomputed per emission and never cached. In shared-daemon mode the snapshot
+comes from the poller thread, started at connect, because the daemon's `Q`
+round-trip blocks and the audio loop must never make it inline; the in-process
+engine is queried directly under its own lock.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its

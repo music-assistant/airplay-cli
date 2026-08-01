@@ -95,7 +95,6 @@ extern log_level *loglevel;
 #define AP2_CLOCK_LOCK_MS            2300
 #define AP2_CLOCK_SETTLE_MS          250
 #define AP2_CLOCK_SEAT_EXCHANGES     3
-#define AP2_CLOCK_VERIFY_POLL_MS     250
 /* Verification needs room to act before the initial fill starts releasing
  * real frames at anchor - pacing depth: anchors closer than the depth plus
  * one poll round plus slack can never be corrected, so they are not armed. */
@@ -277,6 +276,10 @@ struct ap2cl_s {
     pthread_t clock_verify_thread;
     bool clock_verify_thread_started;
     atomic_bool clock_verify_thread_stop;
+    atomic_bool clock_poll_wanted;  /* readiness reporting (ap2cl_clock_readiness)
+                                       also reads the snapshot, so in shared mode
+                                       the poller runs from connect and outlives
+                                       every verification that uses it */
     /* Retransmit history and the control-port reader that serves it. The ring
      * is written by the audio thread and read by the reader thread. */
     struct ap2_rtx_slot *rtx_ring;
@@ -346,6 +349,7 @@ static bool ap2_set_nonblocking(int fd, const char *name);
 static void ap2_raop_session_cleanup(struct ap2cl_s *p);
 static void ap2_clock_verify_disarm(struct ap2cl_s *p);
 static void ap2_clock_verify_reap_poller(struct ap2cl_s *p);
+static void ap2_clock_poller_ensure(struct ap2cl_s *p);
 
 static void ap2_remote_command_received(
     ap2_remote_command_t command, void *userdata)
@@ -1990,6 +1994,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     if (atomic_load(&p->rtsp_dead)) return false;
     p->rtsp_established = true;
     p->state = AP2_CONNECTED;
+    /* Readiness is measurable from here: a cold receiver starts probing our
+     * clock about a second after connect, on its own schedule and with no
+     * anchor announced (measured on a Samsung Music Frame, 187 probes over
+     * 24 s with no START ever sent). Keep the shared-daemon snapshot fresh
+     * from now on so ap2cl_clock_readiness can report it without blocking. */
+    atomic_store(&p->clock_poll_wanted, true);
+    ap2_clock_poller_ensure(p);
     if (!ap2_feedback_start(p)) {
         atomic_store(&p->rtsp_dead, true);
         return false;
@@ -2429,6 +2440,7 @@ struct ap2cl_s *ap2cl_create(
     pthread_mutex_init(&p->rtx_lock, NULL);
     pthread_mutex_init(&p->clock_verify_lock, NULL);
     atomic_init(&p->clock_verify_thread_stop, true);
+    atomic_init(&p->clock_poll_wanted, false);
     atomic_init(&p->rtx_stop, true);
     atomic_init(&p->rtx_requested, 0);
     atomic_init(&p->rtx_answered, 0);
@@ -2678,10 +2690,11 @@ static bool ap2_clock_query(struct ap2cl_s *p, struct ap2_ptp_exchange *ex)
 }
 
 /* Raise a commit's feasibility floor to the receiver's clock readiness. With
- * no live streak the clock is cold: the floor is left alone (the receiver
- * only begins probing after the anchor line is announced, so there is
- * nothing to measure yet) and *clock_cold tells the commit to arm the
- * post-commit verification instead. */
+ * no live streak the clock is cold: the floor is left alone (a receiver that
+ * has just connected takes about a second to start probing, so an early
+ * commit has nothing to measure yet) and *clock_cold tells the commit to arm
+ * the post-commit verification instead. Callers that can wait should instead
+ * follow ap2cl_clock_readiness from connect and commit once it reports ready. */
 static uint64_t ap2_clock_floor(struct ap2cl_s *p, uint64_t floor_ntp,
                                 bool *clock_cold)
 {
@@ -2703,7 +2716,8 @@ static uint64_t ap2_clock_floor(struct ap2cl_s *p, uint64_t floor_ntp,
 }
 
 /* Stop the verification without an event (new commit, flush, teardown). The
- * poller is signalled here and joined by the next arm or the destroy. */
+ * poller is signalled here and joined by the next arm or the destroy, unless
+ * readiness reporting still wants its snapshot. */
 static void ap2_clock_verify_disarm(struct ap2cl_s *p)
 {
     pthread_mutex_lock(&p->clock_verify_lock);
@@ -2713,7 +2727,8 @@ static void ap2_clock_verify_disarm(struct ap2cl_s *p)
      * the instant that stands. */
     p->start_ack_deferred = false;
     pthread_mutex_unlock(&p->clock_verify_lock);
-    atomic_store(&p->clock_verify_thread_stop, true);
+    if (!atomic_load(&p->clock_poll_wanted))
+        atomic_store(&p->clock_verify_thread_stop, true);
 }
 
 static void ap2_clock_verify_reap_poller(struct ap2cl_s *p)
@@ -2737,7 +2752,7 @@ static void *ap2_clock_verify_poller(void *arg)
         p->clock_verify_have_exchange = have;
         if (have) p->clock_verify_exchange = ex;
         pthread_mutex_unlock(&p->clock_verify_lock);
-        if (!armed) break;
+        if (!armed && !atomic_load(&p->clock_poll_wanted)) break;
         for (int i = 0; i < AP2_CLOCK_VERIFY_POLL_MS / 50 &&
                         !atomic_load(&p->clock_verify_thread_stop); i++)
             usleep(50000);
@@ -2745,9 +2760,29 @@ static void *ap2_clock_verify_poller(void *arg)
     return NULL;
 }
 
+/* Run the snapshot poller in shared-daemon mode, where the streak query is a
+ * blocking UDP round-trip no caller on the audio loop may make. Idempotent, and
+ * serialized by the send lock: connect starts it before the command thread
+ * exists, and every later call comes from a commit, which the session engine
+ * brackets with that lock. */
+static void ap2_clock_poller_ensure(struct ap2cl_s *p)
+{
+    if (!ap2_ptp_shared_active(p->ptp)) return;
+    if (p->clock_verify_thread_started &&
+        !atomic_load(&p->clock_verify_thread_stop))
+        return;
+    ap2_clock_verify_reap_poller(p);
+    atomic_store(&p->clock_verify_thread_stop, false);
+    if (pthread_create(&p->clock_verify_thread, NULL,
+                       ap2_clock_verify_poller, p) == 0)
+        p->clock_verify_thread_started = true;
+    else
+        atomic_store(&p->clock_verify_thread_stop, true);
+}
+
 /* Arm the post-commit verification for a cold-clock commit: the receiver's
- * probe streak is expected to begin only after the anchor announce, and the
- * committed instant must then be checked against the observed readiness.
+ * probe streak had not begun when the instant was committed, so the committed
+ * instant must be checked against readiness once it does.
  * Only a join-marked start (landing on an already-live group timeline) is
  * ENFORCED with a forward correction; an origin start is observed and
  * reported only — its receivers self-seat a fresh session cleanly, and
@@ -2772,15 +2807,7 @@ static void ap2_clock_verify_arm(struct ap2cl_s *p, uint64_t requested_unix_ms,
     LOG_INFO("[AP2] clock verification armed (%s): cold receiver clock, "
              "anchor in %" PRIu64 " ms", enforce ? "join, enforcing" : "observe",
              at_unix_ms - now_ms);
-    if (ap2_ptp_shared_active(p->ptp)) {
-        ap2_clock_verify_reap_poller(p);
-        atomic_store(&p->clock_verify_thread_stop, false);
-        if (pthread_create(&p->clock_verify_thread, NULL,
-                           ap2_clock_verify_poller, p) == 0)
-            p->clock_verify_thread_started = true;
-        else
-            atomic_store(&p->clock_verify_thread_stop, true);
-    }
+    ap2_clock_poller_ensure(p);
 }
 
 /* Resolve a commanded start: a request at or beyond `floor_ntp` is honored
@@ -3479,9 +3506,47 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
         p->start_ack_deferred = false;
     }
     pthread_mutex_unlock(&p->clock_verify_lock);
-    if (result != AP2_CLOCK_VERIFY_IDLE)
+    if (result != AP2_CLOCK_VERIFY_IDLE &&
+        !atomic_load(&p->clock_poll_wanted))
         atomic_store(&p->clock_verify_thread_stop, true);
     return result;
+}
+
+bool ap2cl_uses_ptp(struct ap2cl_s *p)
+{
+    return p && p->flow == FLOW_NATIVE_AP2 && p->use_ptp;
+}
+
+void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
+{
+    if (!out) return;
+    memset(out, 0, sizeof(*out));
+    /* Without the PTP engine there is no probe streak to measure: NTP-timed
+     * sessions (and the RAOP-compat flow) report cold and stay there. */
+    if (!ap2cl_uses_ptp(p)) return;
+
+    struct ap2_ptp_exchange ex;
+    bool have = false;
+    pthread_mutex_lock(&p->clock_verify_lock);
+    if (p->clock_verify_have_exchange) {
+        have = true;
+        ex = p->clock_verify_exchange;
+    }
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    /* The in-process engine answers from its own lock, so the audio loop may
+     * ask it directly; shared-daemon mode must take the poller's snapshot,
+     * whose staleness only ever pushes readiness later — the safe direction. */
+    if (!have && !ap2_ptp_shared_active(p->ptp))
+        have = ap2_clock_query(p, &ex);
+    if (!have) return;
+
+    uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    uint64_t ready_ms = ap2_clock_ready_from(p, &ex, now_ms);
+    out->streak_ms = ex.first_ms;
+    out->exchanges = ex.count;
+    out->ready_at_unix_ms = ready_ms;
+    out->ready_in_ms = ready_ms > now_ms ? ready_ms - now_ms : 0;
+    out->state = ready_ms > now_ms ? AP2_CLOCK_PROBING : AP2_CLOCK_READY;
 }
 
 bool ap2cl_clock_verify_armed(struct ap2cl_s *p)

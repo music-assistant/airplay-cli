@@ -262,6 +262,41 @@ typedef struct {
 ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
                                                   ap2_clock_verify_event_t *ev);
 
+/* One sample of the receiver's probe streak: the rate at which the client
+ * refreshes it, and at which a caller reporting readiness should sample. */
+#define AP2_CLOCK_VERIFY_POLL_MS     250
+
+/* How far the receiver's clock has come since the session connected. */
+typedef enum {
+    AP2_CLOCK_COLD = 0,   /* no timing probe recorded yet */
+    AP2_CLOCK_PROBING,    /* probing; readiness is projected, not reached */
+    AP2_CLOCK_READY,      /* the projected readiness instant has passed */
+} ap2_clock_state_t;
+
+typedef struct {
+    ap2_clock_state_t state;
+    uint64_t streak_ms;        /* age of the streak's first probe */
+    uint32_t exchanges;        /* probes in the current uninterrupted streak */
+    uint64_t ready_in_ms;      /* 0 once ready; meaningless while cold */
+    uint64_t ready_at_unix_ms; /* projected readiness instant; 0 while cold */
+} ap2_clock_readiness_t;
+
+/* True when the session's EFFECTIVE timing is PTP. False for NTP-timed
+ * sessions — including a PTP session that fell back because 319/320 could not
+ * be bound — where clock readiness is not measurable. */
+bool ap2cl_uses_ptp(struct ap2cl_s *p);
+
+/*
+ * Sample the receiver's clock readiness, so a caller can pick a join anchor it
+ * can actually meet instead of guessing a headroom. A receiver begins probing
+ * our clock about a second after it connects, on its own schedule and without
+ * an anchor having been announced; readiness follows from the probe streak
+ * (see ap2_clock_ready_from). Safe to call from the audio loop: it never
+ * blocks on the network. Recompute per use — ready_at_unix_ms is a projection
+ * against the wall clock and must not be cached.
+ */
+void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out);
+
 /* True while a cold-clock verification can still produce a result. It goes
  * false on the resolving poll and on every disarm (commit, flush, park,
  * teardown), which is how a caller holding a withheld ack knows the
