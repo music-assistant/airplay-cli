@@ -78,6 +78,15 @@ int ap2_bplist_find_dict_uint_array_mask(const uint8_t *data, size_t len,
                                          const char *dict_key, const char *key,
                                          uint64_t *out);
 
+/*
+ * Count the entries of an array value found by key anywhere in a raw binary
+ * plist, e.g. the /feedback body's "streams". An empty array reports 0 and
+ * still returns 1, so "the receiver listed no streams" stays distinguishable
+ * from "the receiver never reported the key".
+ */
+int ap2_bplist_find_array_count(const uint8_t *data, size_t len,
+                                const char *key, size_t *out);
+
 /* Find a string value by key in the root dictionary only. */
 int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
                                char *out, size_t out_size);

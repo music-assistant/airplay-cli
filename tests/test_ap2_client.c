@@ -30,6 +30,7 @@ void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
 bool ap2cl_test_first_packet(struct ap2cl_s *p);
+unsigned ap2cl_test_feedback_idle_streams(struct ap2cl_s *p);
 void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet);
 void ap2cl_test_set_splice(struct ap2cl_s *p, bool enable);
 bool ap2cl_test_splice_default(const char *txt, const char *am);
@@ -374,6 +375,207 @@ static void test_info_format_tables(void)
                    "supportedAudioFormatsExtended", "audioStream", &mask) == 0);
     }
     puts("ap2_bplist /info format-table tests passed");
+}
+
+/* Real /feedback response bodies, byte-for-byte as a receiver sends them:
+ * { "streams": [] } — the receiver considers no stream active, the signature
+ * of one that ACKs everything and renders nothing. */
+static const uint8_t FEEDBACK_IDLE[] = {
+    'b','p','l','i','s','t','0','0',
+    0xD1, 0x01, 0x02,                       /* root dict */
+    0x57, 's','t','r','e','a','m','s',      /* 7-char key */
+    0xA0,                                   /* empty array */
+    0x08, 0x0B, 0x13,                       /* offset table */
+    0, 0, 0, 0, 0, 0, 1, 1,                 /* trailer: ofs/ref sizes */
+    0, 0, 0, 0, 0, 0, 0, 3,                 /* num objects */
+    0, 0, 0, 0, 0, 0, 0, 0,                 /* top object */
+    0, 0, 0, 0, 0, 0, 0, 0x14,              /* offset-table offset */
+};
+
+/* { "streams": [ { "type": 96 } ] } — one stream is live. */
+static const uint8_t FEEDBACK_ACTIVE[] = {
+    'b','p','l','i','s','t','0','0',
+    0xD1, 0x01, 0x02,
+    0x57, 's','t','r','e','a','m','s',
+    0xA1, 0x03,                             /* array of one */
+    0xD1, 0x04, 0x05,                       /* stream dict */
+    0x54, 't','y','p','e',
+    0x10, 0x60,                             /* int 96 (realtime) */
+    0x08, 0x0B, 0x13, 0x15, 0x18, 0x1D,
+    0, 0, 0, 0, 0, 0, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 6,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0x1F,
+};
+
+static void test_feedback_stream_counts(void)
+{
+    size_t streams = 99;
+    assert(ap2_bplist_find_array_count(
+               FEEDBACK_IDLE, sizeof(FEEDBACK_IDLE), "streams", &streams) == 1);
+    assert(streams == 0);
+    assert(ap2_bplist_find_array_count(
+               FEEDBACK_ACTIVE, sizeof(FEEDBACK_ACTIVE), "streams",
+               &streams) == 1);
+    assert(streams == 1);
+
+    /* An absent key is "the receiver reports no stream status", which must
+     * stay distinct from an empty list; so must a non-array value. */
+    assert(ap2_bplist_find_array_count(
+               FEEDBACK_IDLE, sizeof(FEEDBACK_IDLE), "stream", &streams) == 0);
+    assert(ap2_bplist_find_array_count(
+               INFO_LEGACY, sizeof(INFO_LEGACY), "streams", &streams) == 0);
+    assert(ap2_bplist_find_array_count(
+               INFO_LEGACY, sizeof(INFO_LEGACY), "bufferStream", &streams) == 0);
+
+    /* Truncated input must fail cleanly at every length, never crash. */
+    for (size_t len = 0; len < sizeof(FEEDBACK_ACTIVE); len++) {
+        assert(ap2_bplist_find_array_count(
+                   FEEDBACK_ACTIVE, len, "streams", &streams) == 0);
+    }
+    puts("ap2_bplist /feedback stream-count tests passed");
+}
+
+typedef struct {
+    int fd;
+    int beats;                  /* keepalives to answer */
+    const uint8_t *body;        /* NULL for a receiver that reports nothing */
+    size_t body_len;
+    bool ok;
+} feedback_body_peer_t;
+
+static void *run_feedback_body_peer(void *arg)
+{
+    feedback_body_peer_t *peer = arg;
+    peer->ok = false;
+    for (int beat = 0; beat < peer->beats; beat++) {
+        int cseq = 0;
+        if (!read_rtsp_request_cseq(peer->fd, "POST /feedback ", &cseq))
+            return NULL;
+        char header[192];
+        int header_len = snprintf(
+            header, sizeof(header),
+            "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
+            "Content-Type: application/x-apple-binary-plist\r\n"
+            "Content-Length: %zu\r\n\r\n", cseq, peer->body_len);
+        if (write(peer->fd, header, (size_t)header_len) != header_len)
+            return NULL;
+        if (peer->body_len &&
+            write(peer->fd, peer->body, peer->body_len) !=
+                (ssize_t)peer->body_len)
+            return NULL;
+    }
+    peer->ok = true;
+    return NULL;
+}
+
+/* Answer `beats` keepalives with `body` and return what the session captured
+ * on stderr while they ran (the test log level is silent, so only [STATUS]
+ * lines land there). */
+static void run_feedback_beats(struct ap2cl_s *client, int peer_fd, int beats,
+                               const uint8_t *body, size_t body_len,
+                               char *status_out, size_t status_size)
+{
+    feedback_body_peer_t peer = {
+        .fd = peer_fd,
+        .beats = beats,
+        .body = body,
+        .body_len = body_len,
+    };
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL,
+                          run_feedback_body_peer, &peer) == 0);
+
+    FILE *captured = tmpfile();
+    assert(captured);
+    int saved_stderr = dup(STDERR_FILENO);
+    assert(saved_stderr >= 0);
+    fflush(stderr);
+    assert(dup2(fileno(captured), STDERR_FILENO) >= 0);
+
+    for (int beat = 0; beat < beats; beat++) assert(ap2cl_feedback(client));
+
+    fflush(stderr);
+    assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
+    assert(close(saved_stderr) == 0);
+
+    rewind(captured);
+    size_t read_len = fread(status_out, 1, status_size - 1, captured);
+    status_out[read_len] = '\0';
+    assert(fclose(captured) == 0);
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+}
+
+/* A receiver that keeps answering 200 while reporting an empty stream list has
+ * dropped the stream we keep sending to. That is only a fault once it persists:
+ * the list is briefly empty around setup and warm splices, so the report
+ * lands on the tick that completes the streak, and exactly once per episode.
+ */
+static void test_feedback_idle_streams_reported(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    ap2_device_info_t device = {
+        .name = "feedback streams test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_splice(client, true);
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+
+    char status[1024];
+    /* A receiver that reports nothing at all (no body, no key) is never
+     * faulted — most non-Apple receivers answer this way. */
+    run_feedback_beats(client, sockets[1], 4, NULL, 0, status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 0);
+    assert(!strstr(status, "stream_dropped"));
+
+    /* A live stream keeps the streak at zero however long it runs. */
+    run_feedback_beats(client, sockets[1], 4, FEEDBACK_ACTIVE,
+                       sizeof(FEEDBACK_ACTIVE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 0);
+    assert(!strstr(status, "stream_dropped"));
+
+    /* Two empty ticks are still inside the tolerated transition window. */
+    run_feedback_beats(client, sockets[1], 2, FEEDBACK_IDLE,
+                       sizeof(FEEDBACK_IDLE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 2);
+    assert(!strstr(status, "stream_dropped"));
+
+    /* The third completes the streak and reports; the fourth stays quiet. */
+    run_feedback_beats(client, sockets[1], 2, FEEDBACK_IDLE,
+                       sizeof(FEEDBACK_IDLE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 4);
+    const char *report = strstr(status, "[STATUS] stream_dropped streams=0 "
+                                        "ticks=3 interval_ms=2000\n");
+    assert(report);
+    assert(!strstr(report + 1, "[STATUS] stream_dropped"));
+
+    /* The receiver rendering again closes the episode. */
+    run_feedback_beats(client, sockets[1], 1, FEEDBACK_ACTIVE,
+                       sizeof(FEEDBACK_ACTIVE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 0);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client feedback idle-stream report tests passed");
 }
 
 /* A password-protected receiver keeps its native AirPlay 2 route: the password
@@ -1257,6 +1459,7 @@ int main(void)
     test_route_with_password();
     test_route_explicit_airplay2();
     test_info_format_tables();
+    test_feedback_stream_counts();
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
     test_splice_default_resolution();
@@ -1264,6 +1467,7 @@ int main(void)
     test_splice_delivery_gap_recovery();
     test_splice_pause_keeps_line_hot();
     test_feedback_miss_tolerated_then_recovered();
+    test_feedback_idle_streams_reported();
     test_apple_model_resolution();
     test_pacing_window_rate_scaling();
     test_clock_verified_anchor();

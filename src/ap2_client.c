@@ -75,6 +75,12 @@ extern log_level *loglevel;
  * are tolerated up to this count (the final one kills), so a genuinely dead
  * channel is still detected within roughly misses x (interval + timeout). */
 #define AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES 3
+/* Consecutive feedback ticks the receiver may report an empty stream list
+ * while we believe we are streaming before it counts as a fault. The list is
+ * legitimately empty for a moment around SETUP/RECORD and while a receiver
+ * re-seats a warm splice, so only a sustained streak means the stream really
+ * is gone. */
+#define AP2_FEEDBACK_IDLE_STREAM_TICKS 3
 #define AP2_EVENT_POLL_INTERVAL_MS   100
 #define AP2_RTSP_RX_BUF_SIZE         16384
 #define AP2_UDP_SEND_TIMEOUT_MS      20
@@ -195,6 +201,9 @@ struct ap2cl_s {
     pthread_t feedback_thread;
     atomic_bool feedback_stop;
     bool feedback_thread_started;
+    /* Consecutive /feedback bodies that listed no active stream while the
+     * client believed it was streaming. Only the feedback worker touches it. */
+    unsigned feedback_idle_streams;
     struct ap2_hap_ctx *hap;      /* HAP encryption context */
     struct ap2_ptp_ctx *ptp;      /* Timing */
     /* MRP now-playing over POST /command (path A, see DESIGN.md §8):
@@ -3664,17 +3673,65 @@ void ap2cl_stop(struct ap2cl_s *p)
     p->state = AP2_DOWN;
 }
 
+/*
+ * Read the receiver's own view of the session out of a /feedback response:
+ * {"streams": [...]} lists the streams it still holds for us. An empty list
+ * while we believe we are streaming means the receiver dropped the stream
+ * under us and every packet we send is going nowhere — the POST answers 200
+ * either way, so nothing else on this channel reports it. Receivers that omit
+ * the key report no stream status at all, which is never a fault: only a
+ * present-but-empty list counts.
+ *
+ * The list is what the receiver HOLDS, not what it renders: measured
+ * 2026-08-02, a Sonos Era 100 confirmed playing (its own UPnP transport
+ * reported PLAYING) and a Samsung HW-LS60D both answered every tick with the
+ * identical body {"streams": [{"type": 96, "sr": 44100}]}. So a live entry
+ * does not prove audio is audible, and this is not a silence detector.
+ */
+static void ap2_feedback_note_streams(struct ap2cl_s *p, const uint8_t *resp,
+                                      int resp_len)
+{
+    size_t streams = 0;
+    if (!resp || resp_len <= 0 ||
+        !ap2_bplist_find_array_count(resp, (size_t)resp_len, "streams",
+                                     &streams)) {
+        p->feedback_idle_streams = 0;
+        return;
+    }
+
+    LOG_DEBUG("[AP2] /feedback streams=%zu", streams);
+    if (streams > 0 || p->state != AP2_STREAMING) {
+        if (p->feedback_idle_streams >= AP2_FEEDBACK_IDLE_STREAM_TICKS)
+            LOG_INFO("[AP2] receiver holds a stream again (streams=%zu)",
+                     streams);
+        p->feedback_idle_streams = 0;
+        return;
+    }
+    /* Report the fault once per episode; the recovery above closes it. */
+    if (++p->feedback_idle_streams != AP2_FEEDBACK_IDLE_STREAM_TICKS) return;
+    LOG_WARN("[AP2] Receiver holds no stream after %u feedback ticks while "
+             "streaming: it dropped the stream we are still sending to",
+             p->feedback_idle_streams);
+    /* Machine-readable counterpart on the same stderr channel as the binary's
+     * other [STATUS] lines, so Music Assistant can act on a dropped stream
+     * without scraping the human-readable log. */
+    fprintf(stderr, "[STATUS] stream_dropped streams=0 ticks=%u interval_ms=%d\n",
+            p->feedback_idle_streams, AP2_FEEDBACK_INTERVAL_MS);
+    fflush(stderr);
+}
+
 bool ap2cl_feedback(struct ap2cl_s *p)
 {
     /* Native flow only: the RAOP-compat flow rides libraop, whose keepalive
-     * is raopcl_keepalive(). The response body carries stream status we do
-     * not need; the POST itself is what resets the receiver's idle timer. */
+     * is raopcl_keepalive(). The POST itself is what resets the receiver's
+     * idle timer; its body carries the receiver's active-stream list. */
     if (!p || p->flow != FLOW_NATIVE_AP2 || p->sock_fd < 0) return false;
     uint8_t *resp = NULL; int resp_len = 0;
     bool request_started = false;
     int status = ap2_rtsp_send_tracked(
         p, "POST", "/feedback", NULL, 0, NULL,
         &resp, &resp_len, &request_started);
+    ap2_feedback_note_streams(p, resp, resp_len);
     free(resp);
     ap2_feedback_result_t result =
         ap2_io_feedback_result(status, request_started);
@@ -4387,6 +4444,11 @@ void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p)
 bool ap2cl_test_first_packet(struct ap2cl_s *p)
 {
     return p->first_packet;
+}
+
+unsigned ap2cl_test_feedback_idle_streams(struct ap2cl_s *p)
+{
+    return p->feedback_idle_streams;
 }
 
 void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet)
