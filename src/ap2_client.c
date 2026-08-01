@@ -2025,10 +2025,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * anchor announced (measured on a Samsung Music Frame, 187 probes over
      * 24 s with no START ever sent). Keep the shared-daemon snapshot fresh
      * from now on so ap2cl_clock_readiness can report it without blocking,
-     * and stamp the instant its stall window runs from. */
+     * and stamp the instant its stall window runs from. The streak mark starts
+     * clear: one left by an earlier session on this client describes a receiver
+     * that is no longer the one being measured. */
     atomic_store(&p->clock_poll_wanted, true);
     pthread_mutex_lock(&p->clock_verify_lock);
     p->clock_connected_unix_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    p->clock_last_streak_unix_ms = 0;
     pthread_mutex_unlock(&p->clock_verify_lock);
     ap2_clock_poller_ensure(p);
     if (!ap2_feedback_start(p)) {
@@ -3592,8 +3595,11 @@ void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
         /* Nothing to measure this long after the receiver was last heard from
          * means it is not slaved to our clock: it can seat no render position
          * and renders silence however cleanly the audio paces. Reported as its
-         * own state because a cold receiver looks the same on the way there. */
-        if (stall_from_ms && now_ms >= stall_from_ms + AP2_CLOCK_STALL_MS)
+         * own state because a cold receiver looks the same on the way there.
+         * Only a live session can be judged silent: the marks outlive teardown,
+         * so a reading taken once the session is down measures nothing. */
+        if (p->state != AP2_DOWN && stall_from_ms &&
+            now_ms >= stall_from_ms + AP2_CLOCK_STALL_MS)
             out->state = AP2_CLOCK_STALLED;
         return;
     }
@@ -4647,6 +4653,14 @@ void ap2cl_test_set_clock_marks(struct ap2cl_s *p, uint64_t connected_ms,
     p->clock_connected_unix_ms = connected_ms;
     p->clock_last_streak_unix_ms = last_streak_ms;
     pthread_mutex_unlock(&p->clock_verify_lock);
+}
+
+/* Place the session state a real connect and teardown move through, so a test
+ * can take a readiness reading against a live session and against a torn-down
+ * one — the marks outlive teardown, the verdict must not. */
+void ap2cl_test_set_session_state(struct ap2cl_s *p, ap2_state_t state)
+{
+    p->state = state;
 }
 
 void ap2cl_test_bump_audio_sent(struct ap2cl_s *p)

@@ -52,6 +52,7 @@ bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
                                       uint64_t first_ms, uint64_t third_ms);
 void ap2cl_test_clear_clock_exchange(struct ap2cl_s *p);
+void ap2cl_test_set_session_state(struct ap2cl_s *p, ap2_state_t state);
 void ap2cl_test_set_clock_marks(struct ap2cl_s *p, uint64_t connected_ms,
                                 uint64_t last_streak_ms);
 void ap2cl_test_bump_audio_sent(struct ap2cl_s *p);
@@ -1504,6 +1505,7 @@ static void test_clock_stall_detection(void)
     ap2cl_force_native(client);
     ap2cl_test_set_splice(client, true);
     ap2cl_test_set_use_ptp(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
     ap2_clock_readiness_t r;
 
     /* No session yet: nothing has started the window the stall is measured
@@ -1575,6 +1577,12 @@ static void test_clock_stall_detection(void)
                                test_now_unix_ms() - 6000);
     ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_STALLED);
+
+    /* Once the session is down there is no receiver to be silent: the marks
+     * survive teardown, so a reading taken afterwards must not read as one. */
+    ap2cl_test_set_session_state(client, AP2_DOWN);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
 
     ap2cl_destroy(client);
     puts("ap2_client clock stall detection tests passed");
