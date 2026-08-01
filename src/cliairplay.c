@@ -206,21 +206,86 @@ static void status_error(const char *msg)
     status_print("[ERROR] %s", msg);
 }
 
+/* The join's [STATUS] started, withheld at commit so the receiver-clock
+ * verification can answer it with the instant the receiver can actually seat
+ * (see ap2cl_start_ack_deferred). Exactly one ack leaves per START: the commit
+ * either prints it outright or latches it here, and every way the verification
+ * can end — a result, a disarm, a superseding commit, the loop ending — funnels
+ * through the single emission in start_ack_flush(). All of it runs under
+ * g_audio_send_lock, which the commit holds through the session engine's
+ * quiesce bracket. */
+static bool g_start_ack_pending = false;
+static uint64_t g_start_ack_requested_ms = 0;
+static uint64_t g_start_ack_at_ms = 0;
+/* Set by session_commit, read by the START handler that drove it — both on the
+ * command thread, so it never races the verification emitting the same ack. */
+static bool g_start_ack_withheld = false;
+
+static void status_started(uint64_t requested_ms, uint64_t at_ms)
+{
+    status_print("[STATUS] started requested_unix_ms=%" PRIu64
+                 " at_unix_ms=%" PRIu64, requested_ms, at_ms);
+}
+
+/* Emit a withheld ack with the instant that stands. A no-op when none is held,
+ * so every path out of the verification can call it unconditionally. */
+static void start_ack_flush(void)
+{
+    if (!g_start_ack_pending) return;
+    g_start_ack_pending = false;
+    status_started(g_start_ack_requested_ms, g_start_ack_at_ms);
+}
+
+/* Corrected-join content cut, tracked from the correction until the debt is
+ * settled. `anchor_corrected` reports the cut the correction ASKED for —
+ * arithmetic on two instants, computed before a single byte is examined — so
+ * the amount actually taken off the queued content is reported separately once
+ * the last byte is discarded. The two disagree only when the cut ends short
+ * (the input ran out, or a new commit superseded the corrected timeline). */
+static bool g_content_cut_active = false;
+static uint64_t g_content_cut_requested_ms = 0;
+static uint32_t g_content_cut_dropped = 0;
+static uint64_t g_content_cut_started_ntp = 0;
+
+static void content_cut_report(unsigned input_byte_rate)
+{
+    if (!g_content_cut_active) return;
+    g_content_cut_active = false;
+    uint64_t cut_ms = input_byte_rate
+        ? (uint64_t)g_content_cut_dropped * 1000ULL / input_byte_rate : 0;
+    status_print("[STATUS] content_cut requested_ms=%" PRIu64 " cut_ms=%" PRIu64
+                 " cut_bytes=%u drain_ms=%" PRIu64,
+                 g_content_cut_requested_ms, cut_ms, g_content_cut_dropped,
+                 (uint64_t)NTP2MS(raopcl_get_ntp(NULL) -
+                                  g_content_cut_started_ntp));
+}
+
 /* Advance the receiver-clock verification of a cold-clock START (armed by
  * the client when it commits before the receiver's first timing probe) and
- * surface the outcome. A correction reports the new audible instant so the
- * caller re-aligns the group; a verification only confirms the ack already
- * sent. Called from the audio loop under g_audio_send_lock. */
+ * surface the outcome. A join whose ack was withheld is acked here with the
+ * instant the verification settled on, and takes no content cut: the caller
+ * maps its content onto the acked instant itself. Where the ack already went
+ * out, a correction instead reports the new instant and the cut that keeps the
+ * member on the group timeline; a verification only confirms the ack sent.
+ * Called from the audio loop under g_audio_send_lock. */
 static void clock_verify_tick(void)
 {
     ap2_clock_verify_event_t ev;
-    switch (ap2cl_clock_verify_poll(g_ap2cl, &ev)) {
+    ap2_clock_verify_result_t result = ap2cl_clock_verify_poll(g_ap2cl, &ev);
+    if (result == AP2_CLOCK_VERIFY_IDLE) return;
+    switch (result) {
     case AP2_CLOCK_VERIFY_CORRECTED:
-        status_print("[STATUS] anchor_corrected requested_unix_ms=%" PRIu64
-                     " from_unix_ms=%" PRIu64 " at_unix_ms=%" PRIu64
-                     " content_cut_ms=%" PRIu64,
-                     ev.requested_unix_ms, ev.from_unix_ms, ev.at_unix_ms,
-                     ev.content_cut_ms);
+        if (!ev.start_ack) {
+            status_print("[STATUS] anchor_corrected requested_unix_ms=%" PRIu64
+                         " from_unix_ms=%" PRIu64 " at_unix_ms=%" PRIu64
+                         " content_cut_ms=%" PRIu64,
+                         ev.requested_unix_ms, ev.from_unix_ms, ev.at_unix_ms,
+                         ev.content_cut_ms);
+            g_content_cut_active = true;
+            g_content_cut_requested_ms = ev.content_cut_ms;
+            g_content_cut_dropped = 0;
+            g_content_cut_started_ntp = raopcl_get_ntp(NULL);
+        }
         break;
     case AP2_CLOCK_VERIFY_VERIFIED:
         status_print("[STATUS] clock_verified margin_ms=%" PRId64,
@@ -228,6 +293,10 @@ static void clock_verify_tick(void)
         break;
     default:
         break;
+    }
+    if (ev.start_ack) {
+        g_start_ack_at_ms = ev.at_unix_ms;
+        start_ack_flush();
     }
 }
 
@@ -462,9 +531,12 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             ? ap2_session_start(g_session, g_pend_start_unix_ms, &at_ms)
             : AP2_COMMIT_FAILED;
         if (started == AP2_COMMIT_OK) {
-            status_print("[STATUS] started requested_unix_ms=%" PRIu64
-                         " at_unix_ms=%" PRIu64,
-                         g_pend_start_unix_ms, at_ms);
+            /* A cold-clock join withholds its ack for the verification to
+             * answer with the instant the receiver can seat. The commit
+             * latched that decision, so read it rather than the pending flag:
+             * the verification can resolve — and emit — before this line. */
+            if (!g_start_ack_withheld)
+                status_started(g_pend_start_unix_ms, at_ms);
         } else {
             status_error("START failed");
         }
@@ -563,6 +635,11 @@ static ap2_commit_result_t session_commit(void *transport,
 {
     cli_config_t *cfg = transport;
     ap2_commit_result_t committed;
+    /* One ack per START: a previous join's withheld ack is answered with the
+     * instant that stood, before this commit replaces the timeline it
+     * described. */
+    start_ack_flush();
+    g_start_ack_withheld = false;
     /* The first START begins the session; a START after a FLUSH re-anchors the
      * flushed stream (no second receiver flush, no crypto/sequence reset). An
      * infeasible instant is corrected forward by the transport, which reports
@@ -582,6 +659,16 @@ static ap2_commit_result_t session_commit(void *transport,
             : ap2cl_resume(client, start_unix_ms, at_unix_ms);
     }
     if (committed != AP2_COMMIT_OK) return committed;
+
+    /* Latch a withheld ack here, inside the session engine's quiesce bracket:
+     * the audio loop is held off, so the verification cannot resolve between
+     * the commit arming it and the ack being owed. */
+    if (cfg->protocol != PROTO_RAOP && ap2cl_start_ack_deferred(g_ap2cl)) {
+        g_start_ack_withheld = true;
+        g_start_ack_pending = true;
+        g_start_ack_requested_ms = start_unix_ms;
+        g_start_ack_at_ms = at_unix_ms ? *at_unix_ms : start_unix_ms;
+    }
 
     /* Metadata-gated receivers must receive a placeholder before audio. */
     if (!g_first_start_done) send_initial_metadata(cfg);
@@ -1137,6 +1224,8 @@ static int run_airplay2(cli_config_t *cfg)
      * pipe thread anchors playback on the first START after connection setup. */
     int ap2_input_bpf = (cfg->bit_depth <= 16 ? 2 : 4) * cfg->channels;
     int ap2_alac_bpf = (cfg->bit_depth <= 16 ? 2 : 3) * cfg->channels;
+    unsigned ap2_input_byte_rate =
+        (unsigned)cfg->sample_rate * (unsigned)ap2_input_bpf;
     if (!start_stream_session(
             cfg, ap2_input_bpf, AP2_FRAMES_PER_CHUNK))
         return 1;
@@ -1176,6 +1265,19 @@ static int run_airplay2(cli_config_t *cfg)
             eof_reported = false;
             eof_time = 0;
         }
+
+        /* Receiver-clock verification of a cold-clock START, driven on every
+         * iteration whatever the playback status and whatever the input is
+         * doing: a join's ack is withheld until this resolves, so a pause, a
+         * park, or an input that ends before the anchor must not strand it.
+         * Once the verification can no longer answer — it resolved, or a
+         * commit, flush or park disarmed it — the withheld ack falls due here.
+         * The send lock is held because a correction rebases the anchor line
+         * the send path reads. */
+        pthread_mutex_lock(&g_audio_send_lock);
+        clock_verify_tick();
+        if (!ap2cl_clock_verify_armed(g_ap2cl)) start_ack_flush();
+        pthread_mutex_unlock(&g_audio_send_lock);
 
         /* Periodic status reporting (only while playing, so a pause does not keep
            emitting a "playing" status that would revive the sender's play state) */
@@ -1232,11 +1334,40 @@ static int run_airplay2(cli_config_t *cfg)
                 usleep(1000);
                 continue;
             }
-            /* Before the pacing gate: a distant anchor keeps the gate closed
-             * until anchor minus the pacing window, and the verification of
-             * a cold-clock START must keep advancing through exactly that
-             * quiet stretch. */
-            clock_verify_tick();
+            /* Corrected-join content debt: discard the queued input the
+             * correction advanced past, so the first retained sample is the
+             * one the group timeline schedules at the corrected instant.
+             * Serviced above the pacing gate — discarded bytes never reach
+             * the wire, so the gate has no business throttling them and the
+             * debt pays down across the whole quiet stretch the correction
+             * opens instead of the last window before the anchor. Nothing is
+             * sent until it is settled: every retained sample belongs after
+             * the corrected instant. */
+            uint32_t debt = ap2cl_content_skip_bytes(g_ap2cl);
+            if (debt) {
+                int dropped = ap2_session_discard(g_session, (int)debt, 250);
+                if (dropped == -2) {
+                    pthread_mutex_unlock(&g_audio_send_lock);
+                    break;
+                }
+                if (dropped > 0) {
+                    g_content_cut_dropped += (uint32_t)dropped;
+                    ap2cl_content_skip_consume(g_ap2cl, (uint32_t)dropped);
+                }
+                if (dropped == -1) {
+                    /* The input ended inside the cut: what is left of the debt
+                     * has no content to take, so the cut settles short here
+                     * rather than outliving the stream it belonged to. */
+                    LOG_INFO("End of AirPlay 2 input stream, draining buffer...");
+                    input_ended = true;
+                    eof_time = raopcl_get_ntp(NULL);
+                    ap2cl_content_skip_consume(g_ap2cl, debt);
+                    content_cut_report(ap2_input_byte_rate);
+                }
+                pthread_mutex_unlock(&g_audio_send_lock);
+                continue;
+            }
+            content_cut_report(ap2_input_byte_rate);
             if (!ap2cl_accept_frames(g_ap2cl)) {
                 pthread_mutex_unlock(&g_audio_send_lock);
                 usleep(1000);
@@ -1314,37 +1445,6 @@ static int run_airplay2(cli_config_t *cfg)
                     ap2cl_log_diagnostics(g_ap2cl);
                     starving = false;
                 }
-                /* Corrected-join content cut: drop the bytes the correction
-                 * advanced past, so the first retained sample is the one the
-                 * group timeline schedules at the corrected instant. Only
-                 * successful reads get here (a timeout returns 0 and takes
-                 * the starvation path above), and mid-stream those carry the
-                 * full request — so a read is either dropped whole, or holds
-                 * the cut boundary and its dropped span is refilled so the
-                 * sent chunk stays full with no silence inside the content.
-                 * At EOF the refill comes back short (or not at all) and the
-                 * remainder ships as the normal padded final chunk. */
-                uint32_t drop = ap2cl_content_skip_bytes(g_ap2cl);
-                if (drop && n > 0) {
-                    if ((uint32_t)n <= drop) {
-                        ap2cl_content_skip_consume(g_ap2cl, (uint32_t)n);
-                        pthread_mutex_unlock(&g_audio_send_lock);
-                        continue;
-                    }
-                    memmove(buf + pad_bytes, buf + pad_bytes + drop,
-                            (size_t)((uint32_t)n - drop));
-                    n -= (int)drop;
-                    int extra = ap2_session_read(
-                        g_session, buf + pad_bytes + n, (int)drop, 250);
-                    if (extra == -2) {
-                        /* Session ended mid-refill: match the main read
-                         * path and stop without sending. */
-                        pthread_mutex_unlock(&g_audio_send_lock);
-                        break;
-                    }
-                    if (extra > 0) n += extra;
-                    ap2cl_content_skip_consume(g_ap2cl, drop);
-                }
             }
             if (pad_bytes)
                 memset(buf, 0, (size_t)pad_bytes);
@@ -1404,6 +1504,9 @@ static int run_airplay2(cli_config_t *cfg)
         }
     }
 
+    /* The loop ends on teardown, and a join whose verification never resolved
+     * is still owed its one ack. */
+    start_ack_flush();
     request_command_stop();
     bool command_joined = join_command_thread();
     ap2_session_destroy(g_session);

@@ -257,7 +257,12 @@ wall clock), and the `[STATUS] started requested_unix_ms= at_unix_ms=` ack
 always reports the true scheduled instant — the caller compares the two, logs
 corrections, and re-aligns a group by re-STARTing every member at the largest
 reported instant. The minimum lead (250 ms; 200 ms on RAOP) covers only the
-commit round-trips since the connection and the feed are already up.
+commit round-trips since the connection and the feed are already up. One start
+acks late by design: a `START_JOIN=1` first START onto a cold receiver clock
+WITHHOLDS its ack until the clock verification below resolves, so the instant
+it reports is one the receiver can actually seat. Exactly one ack still leaves
+per START — every way the verification can end emits it, including the
+outcomes that leave the anchor exactly where it was committed.
 
 **Receiver clock readiness (clock-verified anchors).** A commanded start is
 only audible on time if the receiver's PTP servo can seat it: a third-party
@@ -281,20 +286,52 @@ granted the observed fast bound (third exchange + 250 ms). Enforcement:
   readiness logs `[STATUS] clock_verified margin_ms=`. One short of it is
   handled by START intent: a `START_JOIN=1` start (a late joiner that must
   land on the group's already-live timeline — the permanent-echo case) is
-  moved forward pre-send (a fresh announce over an idle pipeline, the clean
-  session-start shape) **with the queued content advanced by the same
-  amount** — every frame is still held by the pacing gate, so cutting the
-  correction off the head of the prime puts the first retained sample
-  exactly where the group timeline schedules it and the member joins in
-  sync immediately. The cut rides the report (`[STATUS] anchor_corrected
-  requested_unix_ms= from_unix_ms= at_unix_ms= content_cut_ms=`) and the
-  caller only re-bases its reported position by the cut — no re-join, no
-  other action. A group/solo ORIGIN start only logs the shortfall — its receivers
+  moved forward pre-send onto the readiness instant exactly — this correction
+  commits nothing back to the caller, so it carries none of the round-trip
+  slack the commit-path corrections do, and every millisecond of lead is
+  content the join would otherwise have to give up — as a fresh announce over
+  an idle pipeline, the clean session-start shape. Every frame is still held
+  by the pacing gate, so the move costs nothing already on the wire.
+
+  **Who absorbs the move depends on whether the ack has gone out**, and the
+  two are mutually exclusive by construction:
+
+  - **Ack withheld** (a join committed through the FIRST START, the cold-clock
+    case). No ack was sent, so nothing downstream is mapped yet: the
+    verification emits `[STATUS] started` itself, carrying the corrected
+    instant, and the caller maps its content straight onto it. **No content is
+    cut** — cutting on top of a mapping made against the same correction would
+    advance the content twice and put the joiner EARLY by exactly the cut.
+  - **Ack already out** (a join re-anchored through a warm `START` after a
+    `FLUSH`). The caller mapped its content to the acked instant, so the
+    correction is absorbed here instead: the report `[STATUS] anchor_corrected
+    requested_unix_ms= from_unix_ms= at_unix_ms= content_cut_ms=` rides it and
+    the caller only re-bases its reported position by the cut — no re-join, no
+    other action. **The queued content is advanced by the same amount**, so
+    the first retained sample lands exactly where the group timeline schedules
+    it and the member joins in sync immediately.
+
+  The cut is taken off the queued input **above** the pacing
+  gate — discarded bytes never reach the wire, so the whole quiet stretch the
+  correction opens drains them instead of only the last window before the
+  anchor — and nothing is sent until the debt is settled. What was ACTUALLY
+  taken is then reported on its own line, `[STATUS] content_cut requested_ms=
+  cut_ms= cut_bytes= drain_ms=`: the `anchor_corrected` figure is arithmetic
+  on two instants, computed before a byte is examined, so only this one can
+  confirm it. `cut_ms` falls short of `requested_ms` when the input ran out
+  inside the cut, or when a commit superseded the corrected timeline with the
+  debt still outstanding — which is logged loudly wherever it happens.
+  A group/solo ORIGIN start only logs the shortfall — its receivers
   self-seat a fresh session within ~20 ms, and moving one member of a group
   origin desyncs the group (ear-confirmed). Anchors without runway to act
-  (solo starts at the minimum lead) are never armed, and a window that
+  (solo starts at the minimum lead) are never armed — and never withhold an
+  ack, since nothing would be left to emit it — and a window that
   closes without a probe leaves the anchor standing, logged unverified —
-  the legacy behavior.
+  the legacy behavior. Those terminal outcomes still emit a withheld ack, at
+  the instant that stands: the window is bounded by the anchor itself (the
+  verification goes terminal once it can no longer act before it), so the
+  caller never waits on a timeout of its own. A commit, flush or park that
+  disarms the verification mid-flight releases the ack the same way.
 
 **Downstream render-latency is informational, not applied.** A receiver whose
 audible output sits behind an external pipeline reports that delay in its
@@ -336,9 +373,9 @@ capped to the receiver's buffer. Frame f is audible at its frame-clock
 position, so its deadline is f itself; a frame delivered more than the
 receiver's `latencyMax` early overflows the buffer and is dropped (Sonos:
 88200 frames = 2.0 s). Release therefore runs up to `window` ahead of the
-deadline — the device-reported window when known, else 77175 frames (1.75 s,
-inside every AirPlay receiver's standard 2 s) — which fills the receiver's
-buffer before a scheduled start no matter how far ahead T lies.
+deadline — the device-reported window less a 250 ms margin when known, else
+1.75 s (inside every AirPlay receiver's standard 2 s) — which fills the
+receiver's buffer before a scheduled start no matter how far ahead T lies.
 
 **Per-process timeline offsets**: streams in one group share T, and with
 identical RTP positions two sessions from one host are wire-identical twins

@@ -247,6 +247,60 @@ static void test_short_read_is_released_at_eof(void)
     status_state = NULL;
 }
 
+/* Discard pays down a corrected join's content cut: whole reads vanish, the
+ * byte after the cut is the first one delivered, a debt bigger than the queue
+ * is paid in instalments, and the input running out inside the cut ends it. */
+static void test_discard_drops_queued_input(void)
+{
+    static const uint8_t audio[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
+
+    feed(write_fd, audio, sizeof(audio));
+    assert(wait_for_count(&state.audio_status, 1, 1000));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
+
+    /* A debt covering less than the queue stops on its boundary: the next read
+     * starts at the byte the cut ended on, nothing in between is delivered. */
+    assert(ap2_session_discard(session, 2, 1000) == 2);
+    read_exact(session, audio + 2, sizeof(audio) - 2);
+
+    /* A debt covering the whole queue takes it whole, leaving nothing to read. */
+    feed(write_fd, audio, sizeof(audio));
+    uint8_t got[sizeof(audio)];
+    int taken = 0;
+    uint64_t deadline = ap2_io_monotonic_ms() + 2000;
+    while (taken < (int)sizeof(audio) && ap2_io_monotonic_ms() < deadline) {
+        int n = ap2_session_discard(session, (int)sizeof(audio) - taken, 200);
+        assert(n >= 0);
+        taken += n;
+    }
+    assert(taken == (int)sizeof(audio));
+    assert(ap2_session_read(session, got, sizeof(got), 50) == 0);
+
+    /* A debt outliving the queue takes what is there and carries the rest:
+     * the instalment is short, and the bytes fed afterwards pay the balance. */
+    feed(write_fd, audio, 2);
+    usleep(50000);
+    assert(ap2_session_discard(session, 4, 1000) == 2);
+    feed(write_fd, audio + 2, 2);
+    usleep(50000);
+    assert(ap2_session_discard(session, 2, 1000) == 2);
+    assert(ap2_session_discard(session, 4, 50) == 0);   /* nothing queued */
+
+    /* The input ending inside a debt ends the cut short. */
+    assert(close(write_fd) == 0);
+    assert(ap2_session_discard(session, 4, 1000) == -1);
+
+    /* An ended session is reported apart from a consumed input. */
+    ap2_session_end(session);
+    assert(ap2_session_discard(session, 4, 50) == -2);
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+}
+
 /* The headline test: FLUSH drains the ring AND any undelivered stdin bytes and
  * acks with [STATUS] flushed; the next START re-anchors and resumes cleanly from
  * only the post-flush audio. */
@@ -453,6 +507,7 @@ int main(void)
     test_flush_ack_carries_warm_head();
     test_ready_and_reads_wait_for_a_complete_packet();
     test_short_read_is_released_at_eof();
+    test_discard_drops_queued_input();
     test_flush_drains_and_reanchors();
     test_flush_while_idle_before_start();
     test_failed_flush_preserves_pending_audio();

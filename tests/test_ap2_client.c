@@ -50,8 +50,9 @@ void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
                                       uint64_t first_ms, uint64_t third_ms);
-bool ap2cl_test_clock_verify_armed(struct ap2cl_s *p);
 void ap2cl_test_bump_audio_sent(struct ap2cl_s *p);
+void ap2cl_test_set_dev_latency_max(struct ap2cl_s *p, uint32_t frames);
+uint64_t ap2cl_test_pacing_window_frames(struct ap2cl_s *p);
 
 typedef struct {
     int fd;
@@ -893,6 +894,70 @@ static void test_apple_model_resolution(void)
     puts("ap2_client apple model resolution tests passed");
 }
 
+/* The pacing window is a duration, so every term scales with the stream rate:
+ * the margin held back from the receiver's reported buffer, the default that
+ * stands in for a buffer it never reported, and the splice depth that caps
+ * both. Same frame counts at 44.1 kHz, ~8.8% more at 48 kHz. */
+static void test_pacing_window_rate_scaling(void)
+{
+    static const struct {
+        int rate;
+        uint64_t unreported;    /* no latencyMax echoed: the 1.75 s default */
+        uint32_t reported;      /* a 2.0 s receiver buffer, in frames */
+        uint64_t windowed;      /* that buffer less the 250 ms margin */
+        uint32_t under_margin;  /* a buffer no deeper than the margin */
+        uint32_t shallow;       /* an 800 ms buffer: under the splice depth */
+        uint64_t shallow_win;
+        uint64_t splice_depth;  /* 600 ms, the cap on the splice timeline */
+    } cases[] = {
+        {44100, 77175, 88200, 77175, 4410, 35280, 24255, 26460},
+        {48000, 84000, 96000, 84000, 4800, 38400, 26400, 28800},
+    };
+
+    ap2_device_info_t device = {
+        .name = "pacing test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ap2_audio_format_t format = {
+            .sample_rate = cases[i].rate,
+            .bit_depth = 16,
+            .channels = 2,
+        };
+        struct ap2cl_s *client = ap2cl_create(
+            &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+        assert(client);
+        ap2cl_force_native(client);
+
+        /* Receiver echoes no latencyMax (Sonos, and both Samsung sets in the
+         * late-join field logs): the assumed buffer less the margin. */
+        assert(ap2cl_test_pacing_window_frames(client) == cases[i].unreported);
+
+        /* A reported buffer: the margin held back scales with the rate too. */
+        ap2cl_test_set_dev_latency_max(client, cases[i].reported);
+        assert(ap2cl_test_pacing_window_frames(client) == cases[i].windowed);
+
+        /* A buffer inside the margin leaves nothing to hold back, so the
+         * default stands rather than underflowing the subtraction. */
+        ap2cl_test_set_dev_latency_max(client, cases[i].under_margin);
+        assert(ap2cl_test_pacing_window_frames(client) == cases[i].unreported);
+
+        /* On the splice timeline the shallow queue depth caps the window —
+         * unless the receiver reports a buffer shallower still, which then
+         * caps the room a corrected late join's content skip has to drain. */
+        ap2cl_test_set_splice(client, true);
+        ap2cl_test_set_dev_latency_max(client, cases[i].reported);
+        assert(ap2cl_test_pacing_window_frames(client) == cases[i].splice_depth);
+        ap2cl_test_set_dev_latency_max(client, cases[i].shallow);
+        assert(ap2cl_test_pacing_window_frames(client) == cases[i].shallow_win);
+
+        assert(ap2cl_destroy(client));
+    }
+    puts("ap2_client pacing window rate scaling tests passed");
+}
+
 /* A start committed before the receiver's first timing probe arms the
  * post-commit verification; the poll then verifies, corrects forward, or
  * closes the window, exactly once per commit. */
@@ -922,59 +987,116 @@ static void test_clock_verified_anchor(void)
     uint64_t at = 0;
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
     assert(at == start_ms);
-    assert(ap2cl_test_clock_verify_armed(client));
+    assert(ap2cl_clock_verify_armed(client));
 
     /* No probe yet and a wide-open window: nothing to report. */
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_IDLE);
-    assert(ap2cl_test_clock_verify_armed(client));
+    assert(ap2cl_clock_verify_armed(client));
 
     /* A streak whose lock window ends before the anchor verifies it. */
     ap2cl_test_inject_clock_exchange(client, 2, 100, 0);
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_VERIFIED);
     assert(ev.margin_ms > 2000 && ev.margin_ms < 3500);
-    assert(!ap2cl_test_clock_verify_armed(client));
+    assert(!ap2cl_clock_verify_armed(client));
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_IDLE);
 
     /* An origin start short of readiness is observed, never moved. */
     start_ms = test_now_unix_ms() + 1500;
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
-    assert(ap2cl_test_clock_verify_armed(client));
+    assert(ap2cl_clock_verify_armed(client));
     uint64_t origin_head = ap2cl_test_head_ts(client);
     ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_UNVERIFIED);
     assert(ap2cl_test_head_ts(client) == origin_head);
-    assert(!ap2cl_test_clock_verify_armed(client));
+    assert(!ap2cl_clock_verify_armed(client));
 
-    /* A join-marked start short of readiness moves the still-unsent line
-     * forward by the shortfall plus the retry slack (wire head following)
-     * and advances the queued content by exactly the correction, so the
-     * retained content still lands on the group timeline. */
+    /* A join-marked start short of readiness withholds its ack and moves the
+     * still-unsent line forward onto readiness exactly — no round-trip slack
+     * on top, since the caller commits nothing back — with the wire head
+     * following. The event carries the ack, so the caller maps its content
+     * onto the acked instant and NO cut is taken: doing both would advance the
+     * content twice. The 1.5 s anchor falls 800 ms short of the 2.3 s lock
+     * window the injected streak starts. */
     start_ms = test_now_unix_ms() + 1500;
     ap2cl_set_start_join(client, true);
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
-    assert(ap2cl_test_clock_verify_armed(client));
+    assert(at == start_ms);
+    assert(ap2cl_clock_verify_armed(client));
+    assert(ap2cl_start_ack_deferred(client));
     assert(ap2cl_content_skip_bytes(client) == 0);
     ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_CORRECTED);
+    assert(ev.start_ack);
     assert(ev.from_unix_ms == start_ms);
-    assert(ev.at_unix_ms > start_ms + 800);
-    assert(ev.at_unix_ms < start_ms + 2000);
-    assert(ev.content_cut_ms == ev.at_unix_ms - ev.from_unix_ms);
+    assert(ev.at_unix_ms >= start_ms + 800);
+    assert(ev.at_unix_ms < start_ms + 900);
+    assert(ev.content_cut_ms == 0);
+    assert(ap2cl_content_skip_bytes(client) == 0);
     uint64_t head_ms_at_rate =
         ap2cl_test_head_ts(client) * 1000ULL / format.sample_rate;
     assert(head_ms_at_rate + 5 > ev.at_unix_ms &&
            head_ms_at_rate < ev.at_unix_ms + 5);
+    /* Answered exactly once: the flag is consumed with the result, so a second
+     * poll can neither re-deliver it nor produce another event. */
+    assert(!ap2cl_start_ack_deferred(client));
+    assert(!ap2cl_clock_verify_armed(client));
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_IDLE);
+    assert(!ev.start_ack);
+
+    /* The fallback: a join re-anchored through resume acks at commit, so a
+     * later correction takes the cut instead — the caller already mapped its
+     * content to the instant it was acked. */
+    start_ms = test_now_unix_ms() + 1500;
+    ap2cl_set_start_join(client, true);
+    assert(ap2cl_resume(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_clock_verify_armed(client));
+    assert(!ap2cl_start_ack_deferred(client));
+    ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_CORRECTED);
+    assert(!ev.start_ack);
+    assert(ev.content_cut_ms == ev.at_unix_ms - ev.from_unix_ms);
     /* 16-bit stereo: 4 bytes per input frame. */
     assert(ap2cl_content_skip_bytes(client) ==
            ev.content_cut_ms * format.sample_rate / 1000 * 4);
     ap2cl_content_skip_consume(client, 128);
     assert(ap2cl_content_skip_bytes(client) ==
            ev.content_cut_ms * format.sample_rate / 1000 * 4 - 128);
-    assert(!ap2cl_test_clock_verify_armed(client));
 
     /* A new commit clears an undrained cut. */
     assert(ap2cl_start(client, 0, &at) == AP2_COMMIT_OK);
     assert(ap2cl_content_skip_bytes(client) == 0);
+
+    /* So does a flush, and every other reset of the corrected timeline. */
+    start_ms = test_now_unix_ms() + 1500;
+    ap2cl_set_start_join(client, true);
+    assert(ap2cl_resume(client, start_ms, &at) == AP2_COMMIT_OK);
+    ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_CORRECTED);
+    assert(ap2cl_content_skip_bytes(client) > 0);
+    assert(ap2cl_flush(client));
+    assert(ap2cl_content_skip_bytes(client) == 0);
+
+    /* A disarm before the verification resolves drops both flags together:
+     * that is how the audio loop knows the withheld ack will never be
+     * answered and must emit it with the instant that stands. */
+    start_ms = test_now_unix_ms() + 1500;
+    ap2cl_set_start_join(client, true);
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_clock_verify_armed(client));
+    assert(ap2cl_start_ack_deferred(client));
+    assert(ap2cl_flush(client));
+    assert(!ap2cl_clock_verify_armed(client));
+    assert(!ap2cl_start_ack_deferred(client));
+
+    /* An origin start never withholds its ack: it is acked at commit and the
+     * verification only observes. */
+    start_ms = test_now_unix_ms() + 1500;
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_clock_verify_armed(client));
+    assert(!ap2cl_start_ack_deferred(client));
+    ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_UNVERIFIED);
+    assert(!ev.start_ack);
 
     /* The Apple fast bound (third exchange + settle) verifies an anchor the
      * full lock window would have corrected. */
@@ -983,7 +1105,22 @@ static void test_clock_verified_anchor(void)
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
     ap2cl_test_inject_clock_exchange(client, 3, 400, 200);
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_VERIFIED);
-    assert(!ap2cl_test_clock_verify_armed(client));
+    assert(!ap2cl_clock_verify_armed(client));
+    ap2cl_test_set_apple_model(client, false);
+
+    /* A join whose anchor the receiver can already seat is acked at the
+     * instant it committed to — the ack is withheld for the answer, not for a
+     * correction. */
+    ap2cl_test_set_apple_model(client, true);
+    start_ms = test_now_unix_ms() + 1500;
+    ap2cl_set_start_join(client, true);
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_start_ack_deferred(client));
+    ap2cl_test_inject_clock_exchange(client, 3, 400, 200);
+    assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_VERIFIED);
+    assert(ev.start_ack);
+    assert(ev.at_unix_ms == start_ms);
+    assert(ap2cl_content_skip_bytes(client) == 0);
     ap2cl_test_set_apple_model(client, false);
 
     /* Audio already on the wire closes the window: without a probe the
@@ -992,29 +1129,38 @@ static void test_clock_verified_anchor(void)
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
     ap2cl_test_bump_audio_sent(client);
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_UNVERIFIED);
-    assert(!ap2cl_test_clock_verify_armed(client));
+    assert(!ap2cl_clock_verify_armed(client));
 
-    /* ...and even a join cannot move a line with audio already on it. */
+    /* ...and even a join cannot move a line with audio already on it. That
+     * terminal outcome still answers the withheld ack, with the instant that
+     * stands, so the caller is never left waiting on it. */
     start_ms = test_now_unix_ms() + 1500;
     ap2cl_set_start_join(client, true);
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_start_ack_deferred(client));
     uint64_t head_before = ap2cl_test_head_ts(client);
     ap2cl_test_bump_audio_sent(client);
     ap2cl_test_inject_clock_exchange(client, 1, 0, 0);
     assert(ap2cl_clock_verify_poll(client, &ev) == AP2_CLOCK_VERIFY_UNVERIFIED);
+    assert(ev.start_ack);
+    assert(ev.at_unix_ms == start_ms);
     assert(ap2cl_test_head_ts(client) == head_before);
-    assert(!ap2cl_test_clock_verify_armed(client));
+    assert(ap2cl_content_skip_bytes(client) == 0);
+    assert(!ap2cl_clock_verify_armed(client));
 
-    /* An anchor without room to act before the fill never arms. */
+    /* An anchor without room to act before the fill never arms — and a join
+     * that never arms never withholds its ack, or nothing would emit it. */
+    ap2cl_set_start_join(client, true);
     assert(ap2cl_start(client, 0, &at) == AP2_COMMIT_OK);
-    assert(!ap2cl_test_clock_verify_armed(client));
+    assert(!ap2cl_clock_verify_armed(client));
+    assert(!ap2cl_start_ack_deferred(client));
 
     /* A flush disarms a pending verification. */
     start_ms = test_now_unix_ms() + 5000;
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
-    assert(ap2cl_test_clock_verify_armed(client));
+    assert(ap2cl_clock_verify_armed(client));
     assert(ap2cl_flush(client));
-    assert(!ap2cl_test_clock_verify_armed(client));
+    assert(!ap2cl_clock_verify_armed(client));
 
     ap2cl_destroy(client);
     puts("ap2_client clock verified anchor tests passed");
@@ -1034,6 +1180,7 @@ int main(void)
     test_splice_pause_keeps_line_hot();
     test_feedback_miss_tolerated_then_recovered();
     test_apple_model_resolution();
+    test_pacing_window_rate_scaling();
     test_clock_verified_anchor();
 
     ap2_device_info_t device = {

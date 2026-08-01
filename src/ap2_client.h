@@ -243,6 +243,10 @@ typedef struct {
     int64_t margin_ms;             /* readiness margin before the anchor (verified) */
     uint64_t content_cut_ms;       /* content advanced past the correction so the
                                       join still lands on the group timeline */
+    bool start_ack;                /* this event carries the join's withheld
+                                      [STATUS] started (see
+                                      ap2cl_start_ack_deferred); then no content
+                                      was cut, the two being exclusive */
 } ap2_clock_verify_event_t;
 
 /*
@@ -257,6 +261,19 @@ typedef struct {
  */
 ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
                                                   ap2_clock_verify_event_t *ev);
+
+/* True while a cold-clock verification can still produce a result. It goes
+ * false on the resolving poll and on every disarm (commit, flush, park,
+ * teardown), which is how a caller holding a withheld ack knows the
+ * verification will never answer it and emits it itself. */
+bool ap2cl_clock_verify_armed(struct ap2cl_s *p);
+
+/* True when the commit just made withheld the join's [STATUS] started for its
+ * verification to answer: a cold-clock join committed through ap2cl_start can
+ * still have its anchor moved, and an ack carrying the moved instant lets the
+ * caller map its content straight onto it — which is why no content cut is
+ * taken on that path. Cleared by the resolving poll and by every disarm. */
+bool ap2cl_start_ack_deferred(struct ap2cl_s *p);
 
 /* Mark the next commanded start as a late join onto an already-live group
  * timeline: receiver clock readiness is then ENFORCED — a cold-clock anchor
