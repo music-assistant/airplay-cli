@@ -493,11 +493,16 @@ static void run_feedback_beats(struct ap2cl_s *client, int peer_fd, int beats,
     fflush(stderr);
     assert(dup2(fileno(captured), STDERR_FILENO) >= 0);
 
-    for (int beat = 0; beat < beats; beat++) assert(ap2cl_feedback(client));
+    /* Collect rather than assert: stderr belongs to the capture until it is
+     * restored, so an assertion failing here would swallow its own message. */
+    bool beats_ok = true;
+    for (int beat = 0; beat < beats; beat++)
+        if (!ap2cl_feedback(client)) beats_ok = false;
 
     fflush(stderr);
     assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
     assert(close(saved_stderr) == 0);
+    assert(beats_ok);
 
     rewind(captured);
     size_t read_len = fread(status_out, 1, status_size - 1, captured);
@@ -566,10 +571,31 @@ static void test_feedback_idle_streams_reported(void)
     assert(report);
     assert(!strstr(report + 1, "[STATUS] stream_dropped"));
 
-    /* The receiver rendering again closes the episode. */
+    /* A stream coming back closes the episode and says so. */
+    test_log_level = lINFO;
     run_feedback_beats(client, sockets[1], 1, FEEDBACK_ACTIVE,
                        sizeof(FEEDBACK_ACTIVE), status, sizeof(status));
     assert(ap2cl_test_feedback_idle_streams(client) == 0);
+    assert(strstr(status, "holds a stream again (streams=1)"));
+
+    /* The next episode re-arms on the same threshold. */
+    run_feedback_beats(client, sockets[1], 3, FEEDBACK_IDLE,
+                       sizeof(FEEDBACK_IDLE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 3);
+    assert(strstr(status, "[STATUS] stream_dropped streams=0 ticks=3 "
+                          "interval_ms=2000\n"));
+
+    /* Leaving the streaming state is not a recovery: a receiver holding
+     * nothing is the expected shape there, so the streak drops silently
+     * rather than claiming a stream came back. */
+    ap2cl_stop(client);
+    assert(ap2cl_state(client) != AP2_STREAMING);
+    run_feedback_beats(client, sockets[1], 1, FEEDBACK_IDLE,
+                       sizeof(FEEDBACK_IDLE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 0);
+    assert(!strstr(status, "holds a stream again"));
+    assert(!strstr(status, "stream_dropped"));
+    test_log_level = lSILENCE;
 
     ap2cl_test_detach_rtsp_socket(client);
     assert(close(sockets[0]) == 0);

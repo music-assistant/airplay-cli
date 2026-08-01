@@ -3701,7 +3701,11 @@ static void ap2_feedback_note_streams(struct ap2cl_s *p, const uint8_t *resp,
 
     LOG_DEBUG("[AP2] /feedback streams=%zu", streams);
     if (streams > 0 || p->state != AP2_STREAMING) {
-        if (p->feedback_idle_streams >= AP2_FEEDBACK_IDLE_STREAM_TICKS)
+        /* Only a stream coming back closes a reported episode; leaving the
+         * streaming state just drops the streak, since an idle receiver
+         * holding nothing is the expected shape there. */
+        if (streams > 0 &&
+            p->feedback_idle_streams >= AP2_FEEDBACK_IDLE_STREAM_TICKS)
             LOG_INFO("[AP2] receiver holds a stream again (streams=%zu)",
                      streams);
         p->feedback_idle_streams = 0;
