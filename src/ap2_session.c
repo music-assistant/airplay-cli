@@ -100,6 +100,16 @@ static size_t sring_pop(sring_t *r, uint8_t *buf, size_t want)
     return n;
 }
 
+/* Advance past queued bytes without copying them out (see
+ * ap2_session_discard). */
+static size_t sring_drop(sring_t *r, size_t want)
+{
+    size_t n = want < r->fill ? want : r->fill;
+    r->rd = (r->rd + n) % r->cap;
+    r->fill -= n;
+    return n;
+}
+
 static size_t sring_push(sring_t *r, const uint8_t *buf, size_t len)
 {
     size_t space = r->cap - r->fill;
@@ -457,6 +467,48 @@ int ap2_session_read(struct ap2_session_s *s, uint8_t *buf, int len,
             if (s->ring.fill >= (size_t)len ||
                 (s->ring.eof && s->ring.fill > 0)) {
                 size_t n = sring_pop(&s->ring, buf, (size_t)len);
+                pthread_cond_broadcast(&s->can_write);
+                pthread_mutex_unlock(&s->lock);
+                return (int)n;
+            }
+            if (s->ring.eof) {
+                pthread_mutex_unlock(&s->lock);
+                return -1;   /* input stream fully consumed */
+            }
+        }
+        uint64_t now = ap2_io_monotonic_ms();
+        if (now >= deadline) {
+            pthread_mutex_unlock(&s->lock);
+            return 0;
+        }
+        uint64_t wait_ms = deadline - now;
+        struct timespec ts;
+        clock_gettime(CLOCK_REALTIME, &ts);
+        ts.tv_sec += (time_t)(wait_ms / 1000);
+        ts.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+        if (ts.tv_nsec >= 1000000000L) {
+            ts.tv_sec += 1;
+            ts.tv_nsec -= 1000000000L;
+        }
+        pthread_cond_timedwait(&s->can_read, &s->lock, &ts);
+    }
+}
+
+int ap2_session_discard(struct ap2_session_s *s, int len, int timeout_ms)
+{
+    if (!s || len <= 0) return -2;
+    uint64_t deadline =
+        ap2_io_monotonic_ms() + (timeout_ms > 0 ? (uint64_t)timeout_ms : 0);
+
+    pthread_mutex_lock(&s->lock);
+    for (;;) {
+        if (s->state == AP2_SESSION_ENDED) {
+            pthread_mutex_unlock(&s->lock);
+            return -2;
+        }
+        if (s->state == AP2_SESSION_PLAYING) {
+            if (s->ring.fill > 0) {
+                size_t n = sring_drop(&s->ring, (size_t)len);
                 pthread_cond_broadcast(&s->can_write);
                 pthread_mutex_unlock(&s->lock);
                 return (int)n;

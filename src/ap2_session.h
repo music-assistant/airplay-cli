@@ -182,6 +182,19 @@ void ap2_session_end(struct ap2_session_s *s);
  * calls `poll` once per iteration so the engine can run the idle timeout. */
 int ap2_session_read(struct ap2_session_s *s, uint8_t *buf, int len,
                      int timeout_ms);
+/*
+ * Drop up to len bytes of queued input without delivering them. Unlike `read`
+ * this takes whatever the ring holds right now — the bytes are discarded, so
+ * waiting for a complete chunk would only stall the caller — and blocks only
+ * while the ring is empty. Returns the number of bytes dropped (0 when the
+ * timeout passes with nothing queued), -1 once the input is fully consumed,
+ * and -2 when the session ended or the arguments are invalid — the same
+ * overload `read` uses, so both are handled by one caller-side check.
+ *
+ * :param len: Upper bound on the bytes to drop.
+ * :param timeout_ms: How long to wait for input before returning 0.
+ */
+int ap2_session_discard(struct ap2_session_s *s, int len, int timeout_ms);
 void ap2_session_poll(struct ap2_session_s *s);
 
 ap2_session_state_t ap2_session_state(struct ap2_session_s *s);

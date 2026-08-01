@@ -103,6 +103,14 @@ extern log_level *loglevel;
 /* Receiver queue depth on the splice timeline (§ splice below): the
  * depth IS the audible latency of a warm splice, so it stays shallow. */
 #define AP2_SPLICE_PACING_MS         600
+/* Delivery pacing depth (§ pacing below). A frame handed over more than the
+ * receiver's buffer ahead of its deadline overflows that buffer and is
+ * dropped, so delivery runs at most the reported latencyMax less a margin
+ * ahead. Receivers that report no latencyMax get the standard AirPlay buffer
+ * as the assumed depth, leaving the same margin. Both are held in ms and
+ * scaled to the stream rate at use: the frame counts differ per rate. */
+#define AP2_PACING_MARGIN_MS         250
+#define AP2_PACING_DEFAULT_BUFFER_MS 2000
 /* Raw bytes kept from a failed exchange for the auth diagnostics dump: enough
  * for a full header block plus the start of a TLV/plist body. */
 #define AP2_DIAG_RESPONSE_MAX        1536
@@ -110,8 +118,8 @@ extern log_level *loglevel;
 /* Retransmit history. Receivers ask for lost audio on the RTP control port
  * (type 0x55 request / 0x56 response, marker bit set). A request is only worth
  * answering while the packet is still ahead of the receiver's play point, so
- * the ring only has to outlast the send window (77175 frames = 1.75 s): 512
- * packets is 4.1 s at 352 frames/packet, comfortably more. */
+ * the ring only has to outlast the send window (1.75 s at its default): 512
+ * packets is 4.1 s at 352 frames/packet and 44.1 kHz, comfortably more. */
 #define AP2_RTX_RING_SLOTS           512
 #define AP2_RTX_MAX_PKT              2048
 #define AP2_RTX_CTRL_POLL_MS         200
@@ -252,6 +260,10 @@ struct ap2cl_s {
     pthread_mutex_t clock_verify_lock;
     bool clock_verify_armed;
     bool clock_verify_enforce;     /* join start: correct, don't just observe */
+    bool start_ack_deferred;       /* the join's [STATUS] started is withheld
+                                      for this verification to answer, so the
+                                      correction owes no content cut (see
+                                      ap2cl_clock_verify_poll) */
     bool start_join_pending;       /* latched by ap2cl_set_start_join */
     bool apple_model;              /* model=/am= names an Apple receiver */
     uint64_t clock_verify_requested_unix_ms;
@@ -2696,6 +2708,10 @@ static void ap2_clock_verify_disarm(struct ap2cl_s *p)
 {
     pthread_mutex_lock(&p->clock_verify_lock);
     p->clock_verify_armed = false;
+    /* A withheld ack falls due the moment the verification can no longer
+     * answer it: the caller sees both flags drop together and emits it with
+     * the instant that stands. */
+    p->start_ack_deferred = false;
     pthread_mutex_unlock(&p->clock_verify_lock);
     atomic_store(&p->clock_verify_thread_stop, true);
 }
@@ -2801,6 +2817,24 @@ static void ap2_resolve_start(uint64_t start_unix_ms, uint64_t floor_ntp,
     if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(floor_ntp);
 }
 
+/* Drop a corrected join's content cut. A new commit, a park, or a teardown
+ * legitimately supersedes the corrected timeline, so the debt goes with it —
+ * but never silently: bytes still outstanding are content the audio loop
+ * retained past the correction, and on a timeline that still stands they
+ * render exactly that late. */
+static void ap2_content_skip_reset(struct ap2cl_s *p, const char *cause)
+{
+    if (p->content_skip_bytes) {
+        int input_bpf =
+            (p->format.bit_depth <= 16 ? 2 : 4) * p->format.channels;
+        uint64_t rate = (uint64_t)input_bpf * p->format.sample_rate;
+        LOG_WARN("[AP2] %s drops %u bytes (%" PRIu64 " ms) of an undrained "
+                 "corrected-join content cut", cause, p->content_skip_bytes,
+                 rate ? (uint64_t)p->content_skip_bytes * 1000ULL / rate : 0);
+    }
+    p->content_skip_bytes = 0;
+}
+
 ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
                                 uint64_t *at_unix_ms)
 {
@@ -2810,7 +2844,7 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
     p->start_join_pending = false;
     p->content_paused = false;
     p->content_stopped = false;
-    p->content_skip_bytes = 0;
+    ap2_content_skip_reset(p, "START");
     uint64_t ntp_start = 0;
     bool clock_cold = false;
     uint64_t floor_ntp =
@@ -2855,7 +2889,18 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
             atomic_store(&p->media_healthy, false);
             return AP2_COMMIT_FAILED;
         }
-        if (clock_cold) ap2_clock_verify_arm(p, start_unix_ms, at_local, join);
+        if (clock_cold) {
+            ap2_clock_verify_arm(p, start_unix_ms, at_local, join);
+            /* Withhold the join's ack for that verification to answer: this
+             * anchor can still move, and an ack carrying the moved instant
+             * lets the caller map its content straight onto it instead of
+             * mapping to a guess and being corrected afterwards. Only where
+             * the verification actually armed — nothing else would ever
+             * emit it. */
+            pthread_mutex_lock(&p->clock_verify_lock);
+            p->start_ack_deferred = join && p->clock_verify_armed;
+            pthread_mutex_unlock(&p->clock_verify_lock);
+        }
         return AP2_COMMIT_OK;
     }
     if (!p->raopcl) return AP2_COMMIT_FAILED;
@@ -2880,7 +2925,7 @@ void ap2cl_standby(struct ap2cl_s *p)
     ap2_clock_verify_disarm(p);
     p->content_paused = false;
     p->content_stopped = false;
-    p->content_skip_bytes = 0;
+    ap2_content_skip_reset(p, "standby");
     if (p->flow != FLOW_NATIVE_AP2) {
         if (p->raopcl) raop_session_standby(p->raopcl);
         p->state = AP2_CONNECTED;
@@ -2926,7 +2971,7 @@ bool ap2cl_flush(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return false;
     ap2_clock_verify_disarm(p);
-    p->content_skip_bytes = 0;
+    ap2_content_skip_reset(p, "FLUSH");
 
     if (p->flow != FLOW_NATIVE_AP2)
         return raop_session_flush(p->raopcl);
@@ -2980,7 +3025,7 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
     p->start_join_pending = false;
     p->content_paused = false;
     p->content_stopped = false;
-    p->content_skip_bytes = 0;
+    ap2_content_skip_reset(p, "resume");
 
     if (p->flow != FLOW_NATIVE_AP2) {
         ap2_commit_result_t r =
@@ -3117,8 +3162,14 @@ ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
 
 static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
 {
+    /* Frame counts, so every term is scaled to the stream rate: a receiver
+     * reports latencyMax in frames at the rate it is being fed. */
+    uint64_t margin = MS2TS(AP2_PACING_MARGIN_MS, p->format.sample_rate);
     uint64_t window =
-        p->dev_latency_max > 11025 ? p->dev_latency_max - 11025 : 77175;
+        p->dev_latency_max > margin
+            ? p->dev_latency_max - margin
+            : MS2TS(AP2_PACING_DEFAULT_BUFFER_MS - AP2_PACING_MARGIN_MS,
+                    p->format.sample_rate);
     /* The splice timeline keeps the receiver queue shallow: with warm
      * boundaries expressed as content splices on one immutable line, the
      * queue depth IS the audible latency of every seek/next. Apple receivers
@@ -3142,8 +3193,8 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
          * line starts one lead early), so f's deadline IS f. A frame delivered
          * more than the receiver's latencyMax before its deadline overflows
          * its buffer and is dropped (Sonos: 88200 = 2.0s) — release at most
-         * `window` ahead: the reported window when known, else 77175 (1.75s,
-         * inside every AirPlay receiver's standard 2s). Delivery therefore
+         * `window` ahead: the reported window when known, else 1.75s (inside
+         * every AirPlay receiver's standard 2s). Delivery therefore
          * runs up to ~window AHEAD of playback from the very first sample —
          * the receiver's buffer is filled before the scheduled start and the
          * start cannot underrun — while scheduled group starts stay safe no
@@ -3338,6 +3389,14 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
     }
 
     ap2_clock_verify_result_t result = AP2_CLOCK_VERIFY_IDLE;
+    /* Read once for the whole poll. A withheld ack and a content cut are two
+     * ways to answer the same correction and are mutually exclusive BY
+     * CONSTRUCTION here: this single flag either sends the correction out as
+     * the ack (the caller maps its content onto the acked instant itself) or
+     * takes the cut (the caller already mapped to the old instant). Doing both
+     * would advance the content twice and put the joiner early by exactly the
+     * cut. */
+    bool ack_deferred = p->start_ack_deferred;
     if (have) {
         uint64_t ready_ms = ap2_clock_ready_from(p, &ex, now_ms);
         ev->requested_unix_ms = p->clock_verify_requested_unix_ms;
@@ -3360,31 +3419,37 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
                      "origin anchor; anchor stands (observe only)",
                      ready_ms - anchor_ms);
         } else if (!sent) {
-            /* One lead of slack beyond readiness, mirroring every other
-             * forward correction: the instant must still be ahead once the
-             * caller's ack round-trips. */
-            ev->at_unix_ms = ready_ms + AP2_MIN_WARM_LEAD_MS;
+            /* Readiness itself, with no slack on top: unlike the forward
+             * corrections on the commit paths, this one asks nothing of the
+             * caller — it re-bases the reported position and commits nothing
+             * back — so there is no ack round-trip to stay ahead of, and every
+             * millisecond of lead here is content the join has to cut. */
+            ev->at_unix_ms = ready_ms;
             ap2_rebase_pending_anchor(p, ev->at_unix_ms);
-            /* Advance the queued content past the correction: the join's
-             * content was mapped to the original instant, so without the cut
-             * the member would render exactly that far behind the group for
-             * the whole session. Every frame is still unsent (the pacing
-             * gate holds them until anchor minus the window), and the
-             * carrier frame size mirrors the audio loop's input format. */
-            ev->content_cut_ms = ev->at_unix_ms - anchor_ms;
-            uint64_t cut_frames =
-                ev->content_cut_ms * p->format.sample_rate / 1000ULL;
-            int input_bpf =
-                (p->format.bit_depth <= 16 ? 2 : 4) * p->format.channels;
-            p->content_skip_bytes =
-                (uint32_t)(cut_frames * (uint64_t)input_bpf);
+            if (!ack_deferred) {
+                /* Advance the queued content past the correction: the ack has
+                 * already gone out on the original instant, so the caller
+                 * mapped its content there and without the cut the member
+                 * would render exactly that far behind the group for the whole
+                 * session. Every frame is still unsent (the pacing gate holds
+                 * them until anchor minus the window), and the carrier frame
+                 * size mirrors the audio loop's input format. */
+                ev->content_cut_ms = ev->at_unix_ms - anchor_ms;
+                uint64_t cut_frames =
+                    ev->content_cut_ms * p->format.sample_rate / 1000ULL;
+                int input_bpf =
+                    (p->format.bit_depth <= 16 ? 2 : 4) * p->format.channels;
+                p->content_skip_bytes =
+                    (uint32_t)(cut_frames * (uint64_t)input_bpf);
+            }
             result = AP2_CLOCK_VERIFY_CORRECTED;
             LOG_WARN("[AP2] anchor %" PRIu64 " ms precedes receiver clock "
                      "readiness by %" PRIu64 " ms; corrected forward to %"
-                     PRIu64 " and content advanced %" PRIu64 " ms to keep "
-                     "the join on the group timeline",
+                     PRIu64 " and %s to keep the join on the group timeline",
                      anchor_ms, ready_ms - anchor_ms, ev->at_unix_ms,
-                     ev->content_cut_ms);
+                     ack_deferred ? "acked there, the caller mapping its "
+                                    "content onto it"
+                                  : "content advanced by the same amount");
         } else {
             /* Readiness resolved late, after real frames went out: the line
              * cannot move without a stamp jump. The receiver will seat
@@ -3405,11 +3470,36 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
         LOG_WARN("[AP2] anchor window closed without a receiver clock probe; "
                  "anchor stands unverified");
     }
-    if (result != AP2_CLOCK_VERIFY_IDLE) p->clock_verify_armed = false;
+    if (result != AP2_CLOCK_VERIFY_IDLE) {
+        p->clock_verify_armed = false;
+        /* Every outcome answers the withheld ack — including the two that
+         * leave the anchor standing — and consuming the flag here, at the one
+         * point a result is produced, is what makes it exactly once. */
+        ev->start_ack = ack_deferred;
+        p->start_ack_deferred = false;
+    }
     pthread_mutex_unlock(&p->clock_verify_lock);
     if (result != AP2_CLOCK_VERIFY_IDLE)
         atomic_store(&p->clock_verify_thread_stop, true);
     return result;
+}
+
+bool ap2cl_clock_verify_armed(struct ap2cl_s *p)
+{
+    if (!p) return false;
+    pthread_mutex_lock(&p->clock_verify_lock);
+    bool armed = p->clock_verify_armed;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    return armed;
+}
+
+bool ap2cl_start_ack_deferred(struct ap2cl_s *p)
+{
+    if (!p) return false;
+    pthread_mutex_lock(&p->clock_verify_lock);
+    bool deferred = p->start_ack_deferred;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    return deferred;
 }
 
 void ap2cl_log_diagnostics(struct ap2cl_s *p)
@@ -3502,7 +3592,7 @@ void ap2cl_stop(struct ap2cl_s *p)
     ap2_clock_verify_disarm(p);
     p->content_paused = false;
     p->content_stopped = false;
-    p->content_skip_bytes = 0;
+    ap2_content_skip_reset(p, "stop");
     if (p->raopcl) raopcl_stop(p->raopcl);
     ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
     p->rt_anchor_valid = false;
@@ -4354,16 +4444,18 @@ void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
     pthread_mutex_unlock(&p->clock_verify_lock);
 }
 
-bool ap2cl_test_clock_verify_armed(struct ap2cl_s *p)
-{
-    pthread_mutex_lock(&p->clock_verify_lock);
-    bool armed = p->clock_verify_armed;
-    pthread_mutex_unlock(&p->clock_verify_lock);
-    return armed;
-}
-
 void ap2cl_test_bump_audio_sent(struct ap2cl_s *p)
 {
     p->audio_packets_sent++;
+}
+
+void ap2cl_test_set_dev_latency_max(struct ap2cl_s *p, uint32_t frames)
+{
+    p->dev_latency_max = frames;
+}
+
+uint64_t ap2cl_test_pacing_window_frames(struct ap2cl_s *p)
+{
+    return ap2_pacing_window_frames(p);
 }
 #endif

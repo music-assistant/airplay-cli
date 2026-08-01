@@ -200,7 +200,11 @@ stdin, the single persistent audio input for the whole process lifetime.
   `[STATUS] started requested_unix_ms=<ms> at_unix_ms=<ms>` always carries the
   true scheduled instant — the caller compares the two, logs any correction,
   and re-aligns a sync group by re-STARTing every member at the largest
-  reported instant.
+  reported instant. `START_JOIN=1` marks a late join onto an already-live group
+  timeline; on the first START to a receiver whose clock is still cold the ack
+  is withheld until that clock is measured (up to the anchor, never longer) so
+  it reports an instant the receiver can actually seat. Wait for the ack rather
+  than assuming it is immediate; exactly one arrives per START.
 - `ACTION=FLUSH` — in-place warm flush for seek/next: flush the receiver (RTSP
   FLUSH), discard the internal ring, and drain stdin to empty; after the receiver
   accepts the flush, acks with `[STATUS] flushed` and keeps buffering the next
