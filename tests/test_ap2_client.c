@@ -578,6 +578,16 @@ static void test_feedback_idle_streams_reported(void)
     assert(ap2cl_test_feedback_idle_streams(client) == 0);
     assert(strstr(status, "holds a stream again (streams=1)"));
 
+    /* A paused splice session stays AP2_STREAMING and feeds the wire silence;
+     * a receiver holding nothing through that is not a dropped stream. */
+    ap2cl_pause(client);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+    run_feedback_beats(client, sockets[1], 3, FEEDBACK_IDLE,
+                       sizeof(FEEDBACK_IDLE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 0);
+    assert(!strstr(status, "stream_dropped"));
+    ap2cl_play(client);
+
     /* The next episode re-arms on the same threshold. */
     run_feedback_beats(client, sockets[1], 3, FEEDBACK_IDLE,
                        sizeof(FEEDBACK_IDLE), status, sizeof(status));
