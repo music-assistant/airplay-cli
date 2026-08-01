@@ -1505,8 +1505,10 @@ static int run_airplay2(cli_config_t *cfg)
     }
 
     /* The loop ends on teardown, and a join whose verification never resolved
-     * is still owed its one ack. */
+     * is still owed its one ack. A cut caught mid-drain is settled short by
+     * the teardown, so it reports what it managed to take. */
     start_ack_flush();
+    content_cut_report(ap2_input_byte_rate);
     request_command_stop();
     bool command_joined = join_command_thread();
     ap2_session_destroy(g_session);

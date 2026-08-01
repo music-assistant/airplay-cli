@@ -188,7 +188,8 @@ int ap2_session_read(struct ap2_session_s *s, uint8_t *buf, int len,
  * waiting for a complete chunk would only stall the caller — and blocks only
  * while the ring is empty. Returns the number of bytes dropped (0 when the
  * timeout passes with nothing queued), -1 once the input is fully consumed,
- * and -2 when the session ended.
+ * and -2 when the session ended or the arguments are invalid — the same
+ * overload `read` uses, so both are handled by one caller-side check.
  *
  * :param len: Upper bound on the bytes to drop.
  * :param timeout_ms: How long to wait for input before returning 0.
