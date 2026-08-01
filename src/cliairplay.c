@@ -1316,11 +1316,14 @@ static int run_airplay2(cli_config_t *cfg)
                 }
                 /* Corrected-join content cut: drop the bytes the correction
                  * advanced past, so the first retained sample is the one the
-                 * group timeline schedules at the corrected instant. A
-                 * mid-stream read always returns the full request, so a read
-                 * is either dropped whole, or holds the cut boundary — the
-                 * dropped span is then refilled from the session so the sent
-                 * chunk stays full and no silence lands inside the content. */
+                 * group timeline schedules at the corrected instant. Only
+                 * successful reads get here (a timeout returns 0 and takes
+                 * the starvation path above), and mid-stream those carry the
+                 * full request — so a read is either dropped whole, or holds
+                 * the cut boundary and its dropped span is refilled so the
+                 * sent chunk stays full with no silence inside the content.
+                 * At EOF the refill comes back short (or not at all) and the
+                 * remainder ships as the normal padded final chunk. */
                 uint32_t drop = ap2cl_content_skip_bytes(g_ap2cl);
                 if (drop && n > 0) {
                     if ((uint32_t)n <= drop) {
@@ -1333,6 +1336,12 @@ static int run_airplay2(cli_config_t *cfg)
                     n -= (int)drop;
                     int extra = ap2_session_read(
                         g_session, buf + pad_bytes + n, (int)drop, 250);
+                    if (extra == -2) {
+                        /* Session ended mid-refill: match the main read
+                         * path and stop without sending. */
+                        pthread_mutex_unlock(&g_audio_send_lock);
+                        break;
+                    }
                     if (extra > 0) n += extra;
                     ap2cl_content_skip_consume(g_ap2cl, drop);
                 }
