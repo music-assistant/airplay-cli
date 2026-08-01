@@ -206,6 +206,56 @@ static void status_error(const char *msg)
     status_print("[ERROR] %s", msg);
 }
 
+/* Receiver-clock readiness, pushed from connect so the caller never has to
+ * guess a join headroom: a receiver begins probing our clock about a second
+ * after it connects, on its own schedule and with no anchor announced, and is
+ * seated roughly AP2_CLOCK_LOCK_MS after that — a property of the device, not
+ * of any fixed lead. The first line goes out unconditionally right after
+ * [STATUS] connected, whatever the state, so a caller can always tell the
+ * difference between "not ready yet" and "this binary will never tell me".
+ * After that only a MATERIAL change is reported — the state, or the projected
+ * instant the caller would plan against; the exchange count rides along as
+ * telemetry but never triggers a line on its own — rate-limited to one sample
+ * per AP2_CLOCK_VERIFY_POLL_MS, ending at the first state=ready. FLUSH and
+ * START re-arm it for the next cycle. */
+static bool g_clock_ready_reported = false;   /* emitted at least once this cycle */
+static bool g_clock_ready_done = false;       /* terminal state=ready reported */
+static uint64_t g_clock_ready_next_ntp = 0;
+static ap2_clock_state_t g_clock_ready_state = AP2_CLOCK_COLD;
+static uint64_t g_clock_ready_at_ms = 0;
+
+static void clock_ready_rearm(void)
+{
+    g_clock_ready_reported = false;
+    g_clock_ready_done = false;
+    g_clock_ready_next_ntp = 0;
+}
+
+static void clock_ready_tick(void)
+{
+    if (g_clock_ready_done) return;
+    uint64_t now = raopcl_get_ntp(NULL);
+    if (g_clock_ready_reported && now < g_clock_ready_next_ntp) return;
+    g_clock_ready_next_ntp = now + MS2NTP(AP2_CLOCK_VERIFY_POLL_MS);
+
+    ap2_clock_readiness_t r;
+    ap2cl_clock_readiness(g_ap2cl, &r);
+    if (g_clock_ready_reported && r.state == g_clock_ready_state &&
+        r.ready_at_unix_ms == g_clock_ready_at_ms)
+        return;
+    g_clock_ready_reported = true;
+    g_clock_ready_state = r.state;
+    g_clock_ready_at_ms = r.ready_at_unix_ms;
+    g_clock_ready_done = r.state == AP2_CLOCK_READY;
+    status_print("[STATUS] clock_ready mode=%s state=%s streak_ms=%" PRIu64
+                 " exchanges=%u ready_in_ms=%" PRIu64
+                 " ready_at_unix_ms=%" PRIu64,
+                 ap2cl_uses_ptp(g_ap2cl) ? "ptp" : "ntp",
+                 r.state == AP2_CLOCK_READY ? "ready"
+                     : r.state == AP2_CLOCK_PROBING ? "probing" : "cold",
+                 r.streak_ms, r.exchanges, r.ready_in_ms, r.ready_at_unix_ms);
+}
+
 /* The join's [STATUS] started, withheld at commit so the receiver-clock
  * verification can answer it with the instant the receiver can actually seat
  * (see ap2cl_start_ack_deferred). Exactly one ack leaves per START: the commit
@@ -640,6 +690,9 @@ static ap2_commit_result_t session_commit(void *transport,
      * described. */
     start_ack_flush();
     g_start_ack_withheld = false;
+    /* Report readiness afresh for the next cycle: this start consumed the
+     * reading the caller planned it against. */
+    clock_ready_rearm();
     /* The first START begins the session; a START after a FLUSH re-anchors the
      * flushed stream (no second receiver flush, no crypto/sequence reset). An
      * infeasible instant is corrected forward by the transport, which reports
@@ -691,6 +744,8 @@ static bool session_flush_op(void *transport)
     /* A failed RTSP round-trip can leave the receiver partially flushed.
      * Keep sends paused while the caller falls back to a cold restart. */
     if (g_status == STATUS_PLAYING) g_status = STATUS_PAUSED;
+    /* The next track's start plans against a fresh readiness reading. */
+    clock_ready_rearm();
     return flushed;
 }
 
@@ -950,6 +1005,11 @@ static int run_raop(cli_config_t *cfg)
         return 1;
     status_connected_legacy(inet_ntoa(player_addr), cfg->port,
                             (int)TS2MS(latency, raopcl_sample_rate(g_raopcl)));
+    /* Legacy RAOP has no PTP clock to measure, but the line still goes out so
+     * a caller that gates a join on it is answered rather than left waiting. */
+    pthread_mutex_lock(&g_audio_send_lock);
+    clock_ready_tick();
+    pthread_mutex_unlock(&g_audio_send_lock);
 
     /* Commanded PCM format:
      * For 16-bit: s16le (2 bytes per sample, 4 bytes per frame stereo)
@@ -1230,6 +1290,13 @@ static int run_airplay2(cli_config_t *cfg)
             cfg, ap2_input_bpf, AP2_FRAMES_PER_CHUNK))
         return 1;
     status_connected();
+    /* The caller gates its join on this line, so it goes out with the ack that
+     * the session is up — before any START, whatever the clock state. Under
+     * the send lock like every other reader of the latch: the command thread
+     * is live from here and re-arms it on FLUSH and START. */
+    pthread_mutex_lock(&g_audio_send_lock);
+    clock_ready_tick();
+    pthread_mutex_unlock(&g_audio_send_lock);
 
     uint64_t last = 0, frames = 0;
     uint64_t current_epoch = ap2_session_epoch(g_session);
@@ -1277,6 +1344,7 @@ static int run_airplay2(cli_config_t *cfg)
         pthread_mutex_lock(&g_audio_send_lock);
         clock_verify_tick();
         if (!ap2cl_clock_verify_armed(g_ap2cl)) start_ack_flush();
+        clock_ready_tick();
         pthread_mutex_unlock(&g_audio_send_lock);
 
         /* Periodic status reporting (only while playing, so a pause does not keep

@@ -70,6 +70,30 @@ group. A `START_UNIX_MS` of 0 or one the transport cannot honor is corrected
 forward to the earliest feasible instant (250 ms minimum lead, 200 ms on RAOP)
 and the `[STATUS] started` ack always reports the true scheduled instant.
 
+**Late joins: wait for the receiver's clock instead of guessing a headroom.**
+A receiver that has just connected cannot seat an anchor yet — it begins
+probing our PTP clock about a second after connect, on its own schedule, and
+its servo needs roughly 2.3 s more. That is a property of the device, so any
+fixed join headroom is either too short or needlessly slow. The binary reports
+what it measures, from connect:
+
+```
+[STATUS] clock_ready mode=<ptp|ntp> state=<cold|probing|ready> streak_ms=<u64> exchanges=<u32> ready_in_ms=<u64> ready_at_unix_ms=<u64>
+```
+
+The first line arrives right after `[STATUS] connected`, whatever the state, so
+a caller never blocks on a line that will not come; further lines follow only
+when the state or the projected instant changes, ending at the first
+`state=ready`. Plan a join anchor at or after `ready_at_unix_ms` (valid only
+when `state` is `probing` or `ready`). `mode=ntp` means readiness is not
+measurable for this session — legacy RAOP, or a PTP session that fell back to
+the NTP responder — so do not wait for it. `state=cold` can also persist
+indefinitely for a receiver past the timing engine's 8-peer limit, so keep a
+timeout. `FLUSH` and `START` re-arm the reporting for the next cycle.
+
+Starting before readiness is still supported and still corrected — see
+`START_JOIN=1` below.
+
 Delivery is not gated on the start time: frames are released up to the
 receiver's buffer window ahead of each frame's deadline (the device-reported
 `latencyMax`, or 1.75 s when the receiver does not report one), so receiver

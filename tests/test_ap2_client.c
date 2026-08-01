@@ -1166,6 +1166,88 @@ static void test_clock_verified_anchor(void)
     puts("ap2_client clock verified anchor tests passed");
 }
 
+/* Readiness reported from connect, so a caller can plan a join anchor the
+ * receiver can actually meet instead of guessing a headroom. */
+static void test_clock_readiness_report(void)
+{
+    ap2_device_info_t device = {
+        .name = "readiness test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=Era 100",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, true);
+    ap2_clock_readiness_t r;
+
+    /* NTP timing — including a PTP session that fell back on a 319/320 bind
+     * failure: readiness is not measurable, and the caller is told so rather
+     * than left waiting for a reading that will never come. */
+    ap2cl_test_set_use_ptp(client, false);
+    assert(!ap2cl_uses_ptp(client));
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    assert(r.streak_ms == 0 && r.exchanges == 0);
+    assert(r.ready_in_ms == 0 && r.ready_at_unix_ms == 0);
+
+    /* PTP with no probe recorded: a receiver that just connected, or one the
+     * engine has no peer slot left to serve. Cold, with nothing to plan
+     * against — the caller times out instead of waiting forever. */
+    ap2cl_test_set_use_ptp(client, true);
+    assert(ap2cl_uses_ptp(client));
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    assert(r.streak_ms == 0 && r.exchanges == 0);
+    assert(r.ready_in_ms == 0 && r.ready_at_unix_ms == 0);
+
+    /* A live streak projects readiness one lock window from its start, and
+     * carries the same two numbers the commit-time floor logs. */
+    uint64_t before = test_now_unix_ms();
+    ap2cl_test_inject_clock_exchange(client, 2, 100, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_PROBING);
+    assert(r.streak_ms == 100 && r.exchanges == 2);
+    assert(r.ready_in_ms > 2100 && r.ready_in_ms <= 2200);
+    assert(r.ready_at_unix_ms >= before + 2200);
+    assert(r.ready_at_unix_ms < before + 2300);
+
+    /* A streak whose projection has passed reports ready, with no wait left. */
+    ap2cl_test_inject_clock_exchange(client, 12, 3000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+    assert(r.ready_in_ms == 0);
+    assert(r.ready_at_unix_ms != 0);
+    assert(r.streak_ms == 3000 && r.exchanges == 12);
+
+    /* The Apple fast bound moves readiness in: the streak still probing on a
+     * generic receiver is already ready on an Apple one. */
+    ap2cl_test_inject_clock_exchange(client, 3, 400, 300);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_PROBING);
+    ap2cl_test_set_apple_model(client, true);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+    ap2cl_test_set_apple_model(client, false);
+
+    /* The projection is recomputed per call, never cached. */
+    uint64_t first_at = r.ready_at_unix_ms;
+    usleep(30000);
+    ap2cl_test_inject_clock_exchange(client, 4, 400, 300);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.ready_at_unix_ms > first_at);
+
+    ap2cl_destroy(client);
+    puts("ap2_client clock readiness report tests passed");
+}
+
 int main(void)
 {
     test_retransmit_responder();
@@ -1182,6 +1264,7 @@ int main(void)
     test_apple_model_resolution();
     test_pacing_window_rate_scaling();
     test_clock_verified_anchor();
+    test_clock_readiness_report();
 
     ap2_device_info_t device = {
         .name = "test",
