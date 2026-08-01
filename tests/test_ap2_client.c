@@ -1213,11 +1213,14 @@ static void test_clock_readiness_report(void)
     uint64_t before = test_now_unix_ms();
     ap2cl_test_inject_clock_exchange(client, 2, 100, 0);
     ap2cl_clock_readiness(client, &r);
+    uint64_t after = test_now_unix_ms();
     assert(r.state == AP2_CLOCK_PROBING);
     assert(r.streak_ms == 100 && r.exchanges == 2);
     assert(r.ready_in_ms > 2100 && r.ready_in_ms <= 2200);
+    /* The projection reads the clock once inside the call, so bracketing it by
+     * the call's own span pins it exactly however long the call takes. */
     assert(r.ready_at_unix_ms >= before + 2200);
-    assert(r.ready_at_unix_ms < before + 2300);
+    assert(r.ready_at_unix_ms <= after + 2200);
 
     /* A streak whose projection has passed reports ready, with no wait left. */
     ap2cl_test_inject_clock_exchange(client, 12, 3000, 0);
