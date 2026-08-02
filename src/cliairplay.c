@@ -379,9 +379,11 @@ static void clock_verify_tick(void)
 #define ERROR_CODE_AUTH_REQUIRED  "auth_required"
 #define ERROR_CODE_AUTH_FAILED    "auth_failed"
 #define ERROR_CODE_CONNECT_FAILED "connect_failed"
+#define ERROR_CODE_START_FAILED   "start_failed"
+#define ERROR_CODE_FLUSH_FAILED   "flush_failed"
 
 /*
- * Report a fatal failure as one machine-readable line followed by the
+ * Report a failure as one machine-readable line followed by the
  * human-readable one:
  *   [STATUS] error code=<slug> http=<int> detail="<text>"
  *   [ERROR] <msg>
@@ -403,6 +405,17 @@ static void status_error_ex(const char *code, int http, const char *detail,
     status_print("[STATUS] error code=%s http=%d detail=\"%s\"",
                  code, http, clean);
     status_error(msg);
+}
+
+/* Whether a transport command still has a session that could act on it. The
+ * pointer outlives the session it points at: DISCONNECT and the idle timeout
+ * mark it ENDED and only the teardown frees it, and every command entry point
+ * refuses an ended session. So the pointer alone would report a command the
+ * session refused where in truth there was no longer a session to refuse it.
+ * ap2_session_state() answers ENDED for NULL too. */
+static bool session_is_live(void)
+{
+    return ap2_session_state(g_session) != AP2_SESSION_ENDED;
 }
 
 static void remote_command_event(
@@ -613,13 +626,23 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             if (!g_start_ack_withheld)
                 status_started(g_pend_start_unix_ms, at_ms);
         } else {
-            status_error("START failed");
+            /* No instant was scheduled, so the caller must not map content
+             * onto one. Coded so it can abort its pending ack wait at once
+             * instead of waiting out the timeout that also means "old
+             * binary" — with the ack withheld, the wait is seconds long. */
+            status_error_ex(ERROR_CODE_START_FAILED, 0,
+                            session_is_live() ? "session did not schedule the start"
+                                              : "no live session to start",
+                            "START failed");
         }
         g_pend_start_unix_ms = 0;
         g_pend_start_join = false;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "FLUSH") == 0) {
         if (!g_session || !ap2_session_flush(g_session))
-            status_error("FLUSH failed");
+            status_error_ex(ERROR_CODE_FLUSH_FAILED, 0,
+                            session_is_live() ? "session rejected the flush"
+                                              : "no live session to flush",
+                            "FLUSH failed");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STANDBY") == 0) {
         if (g_session) ap2_session_standby(g_session);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "DISCONNECT") == 0) {
