@@ -3552,8 +3552,9 @@ bool ap2cl_uses_ptp(struct ap2cl_s *p)
 void ap2cl_clock_watch_restart(struct ap2cl_s *p)
 {
     if (!p) return;
+    uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
     pthread_mutex_lock(&p->clock_verify_lock);
-    p->clock_last_streak_unix_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    p->clock_last_streak_unix_ms = now_ms;
     pthread_mutex_unlock(&p->clock_verify_lock);
 }
 
