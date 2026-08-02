@@ -3549,6 +3549,14 @@ bool ap2cl_uses_ptp(struct ap2cl_s *p)
     return p && p->flow == FLOW_NATIVE_AP2 && p->use_ptp;
 }
 
+void ap2cl_clock_watch_restart(struct ap2cl_s *p)
+{
+    if (!p) return;
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_last_streak_unix_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    pthread_mutex_unlock(&p->clock_verify_lock);
+}
+
 void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
 {
     if (!out) return;
@@ -3573,9 +3581,10 @@ void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
      * connect while none ever has been: a snapshot goes empty on a single lost
      * Q round-trip as readily as on a receiver that stopped answering, so
      * measuring from connect alone would call a healthy session stalled on one
-     * dropped datagram. The poller refreshes the mark every round, so a blip
-     * can never reach the window while a real loss gets the same grace as a
-     * cold start. */
+     * dropped datagram. Under the shared daemon the poller refreshes the mark
+     * every round, so a blip can never reach the window while a real loss gets
+     * the same grace as a cold start; the in-process engine has no poller and
+     * relies on ap2cl_clock_watch_restart at each re-arm for the same grace. */
     uint64_t stall_from_ms =
         p->clock_last_streak_unix_ms > p->clock_connected_unix_ms
             ? p->clock_last_streak_unix_ms : p->clock_connected_unix_ms;

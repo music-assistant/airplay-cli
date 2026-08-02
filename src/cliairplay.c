@@ -230,6 +230,12 @@ static void clock_ready_rearm(void)
     g_clock_ready_reported = false;
     g_clock_ready_done = false;
     g_clock_ready_next_ntp = 0;
+    /* Reporting went terminal at the last ready and stopped asking, so under
+     * the in-process engine — which has no poller to follow the receiver
+     * meanwhile — the stall mark is as old as that quiet stretch. Restart the
+     * window here so the first reading after the re-arm measures the receiver,
+     * not the silence of nobody having looked. */
+    ap2cl_clock_watch_restart(g_ap2cl);
 }
 
 static const char *clock_state_name(ap2_clock_state_t state)
