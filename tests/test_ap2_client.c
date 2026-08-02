@@ -51,6 +51,10 @@ void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
                                       uint64_t first_ms, uint64_t third_ms);
+void ap2cl_test_clear_clock_exchange(struct ap2cl_s *p);
+void ap2cl_test_set_session_state(struct ap2cl_s *p, ap2_state_t state);
+void ap2cl_test_set_clock_marks(struct ap2cl_s *p, uint64_t connected_ms,
+                                uint64_t last_streak_ms);
 void ap2cl_test_bump_audio_sent(struct ap2cl_s *p);
 void ap2cl_test_set_dev_latency_max(struct ap2cl_s *p, uint32_t frames);
 uint64_t ap2cl_test_pacing_window_frames(struct ap2cl_s *p);
@@ -1424,6 +1428,7 @@ static void test_clock_readiness_report(void)
     assert(client);
     ap2cl_force_native(client);
     ap2cl_test_set_splice(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
     ap2_clock_readiness_t r;
 
     /* NTP timing — including a PTP session that fell back on a 319/320 bind
@@ -1489,6 +1494,118 @@ static void test_clock_readiness_report(void)
     puts("ap2_client clock readiness report tests passed");
 }
 
+/* A receiver that never probes is reported as such: a permanently dead
+ * receiver clock is otherwise indistinguishable from the cold state every
+ * healthy receiver passes through on its way to probing. */
+static void test_clock_stall_detection(void)
+{
+    ap2_device_info_t device = {
+        .name = "stall test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=Era 100",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, true);
+    ap2cl_test_set_use_ptp(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
+    ap2_clock_readiness_t r;
+
+    /* No session yet: nothing has started the window the stall is measured
+     * against, so there is nothing to be late for. */
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+
+    /* Inside the window: the receiver measured slowest took 1.078 s to its
+     * first probe, so a second in this is still the normal cold state. */
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 1000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    assert(r.streak_ms == 0 && r.exchanges == 0);
+    assert(r.ready_in_ms == 0 && r.ready_at_unix_ms == 0);
+
+    /* Past it with still no probe: the receiver never slaved to our clock. */
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+    assert(r.streak_ms == 0 && r.exchanges == 0);
+    assert(r.ready_in_ms == 0 && r.ready_at_unix_ms == 0);
+
+    /* An NTP-timed session has no streak to be missing, however long it has
+     * been up, so it stays cold rather than raising a false alarm. */
+    ap2cl_test_set_use_ptp(client, false);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    ap2cl_test_set_use_ptp(client, true);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+
+    /* Stalled is not terminal: a receiver that starts probing late is picked
+     * up on the next sample and runs on to ready as usual. */
+    ap2cl_test_inject_clock_exchange(client, 2, 100, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_PROBING);
+    assert(r.streak_ms == 100 && r.exchanges == 2);
+    assert(r.ready_in_ms > 2100 && r.ready_in_ms <= 2200);
+    ap2cl_test_inject_clock_exchange(client, 20, 3000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+    assert(r.ready_in_ms == 0);
+
+    /* One empty snapshot is a lost round-trip, not a receiver that went away:
+     * the window runs from the streak seen a poll ago, so a session a minute
+     * past connect still reports nothing to measure rather than a stall. */
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 60000, 0);
+    ap2cl_test_inject_clock_exchange(client, 40, 8000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+    ap2cl_test_clear_clock_exchange(client);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+
+    /* The mark is the poller's to keep, not the caller's: reporting goes
+     * terminal at the first ready, so a session can run for ten minutes with
+     * nothing sampling readiness at all. The reading that a flush re-arms then
+     * lands on a mark the poller refreshed a round ago, and a lost round-trip
+     * on that very cycle is still only a blip. */
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 600000,
+                               test_now_unix_ms() - 200);
+    ap2cl_test_clear_clock_exchange(client);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+
+    /* Only an absence lasting the whole window is the real thing, and it is
+     * measured from that last streak, not from the far older connect. */
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 600000,
+                               test_now_unix_ms() - 6000);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+
+    /* Once the session is down there is no receiver to answer for: the marks
+     * survive teardown, so a reading taken afterwards must not read as a stall. */
+    ap2cl_test_set_session_state(client, AP2_DOWN);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+
+    /* The snapshot survives teardown too, so the same has to hold with a streak
+     * still planted — a torn-down session must not answer with a live one. */
+    ap2cl_test_inject_clock_exchange(client, 40, 8000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    assert(r.exchanges == 0 && r.ready_at_unix_ms == 0);
+
+    ap2cl_destroy(client);
+    puts("ap2_client clock stall detection tests passed");
+}
+
 int main(void)
 {
     test_retransmit_responder();
@@ -1508,6 +1625,7 @@ int main(void)
     test_pacing_window_rate_scaling();
     test_clock_verified_anchor();
     test_clock_readiness_report();
+    test_clock_stall_detection();
 
     ap2_device_info_t device = {
         .name = "test",

@@ -217,7 +217,8 @@ static void status_error(const char *msg)
  * instant the caller would plan against; the exchange count rides along as
  * telemetry but never triggers a line on its own — rate-limited to one sample
  * per AP2_CLOCK_VERIFY_POLL_MS, ending at the first state=ready. FLUSH and
- * START re-arm it for the next cycle. */
+ * START re-arm it for the next cycle. state=stalled does NOT end it: a
+ * receiver that begins probing late still reports probing and then ready. */
 static bool g_clock_ready_reported = false;   /* emitted at least once this cycle */
 static bool g_clock_ready_done = false;       /* terminal state=ready reported */
 static uint64_t g_clock_ready_next_ntp = 0;
@@ -229,6 +230,16 @@ static void clock_ready_rearm(void)
     g_clock_ready_reported = false;
     g_clock_ready_done = false;
     g_clock_ready_next_ntp = 0;
+}
+
+static const char *clock_state_name(ap2_clock_state_t state)
+{
+    switch (state) {
+    case AP2_CLOCK_PROBING: return "probing";
+    case AP2_CLOCK_READY:   return "ready";
+    case AP2_CLOCK_STALLED: return "stalled";
+    default:                return "cold";
+    }
 }
 
 static void clock_ready_tick(void)
@@ -243,6 +254,10 @@ static void clock_ready_tick(void)
     if (g_clock_ready_reported && r.state == g_clock_ready_state &&
         r.ready_at_unix_ms == g_clock_ready_at_ms)
         return;
+    /* Read before the latch moves, so the diagnosis below is logged on the
+     * transition into the stall and not on every sample that stays in it. */
+    bool stalling = r.state == AP2_CLOCK_STALLED &&
+                    g_clock_ready_state != AP2_CLOCK_STALLED;
     g_clock_ready_reported = true;
     g_clock_ready_state = r.state;
     g_clock_ready_at_ms = r.ready_at_unix_ms;
@@ -251,9 +266,13 @@ static void clock_ready_tick(void)
                  " exchanges=%u ready_in_ms=%" PRIu64
                  " ready_at_unix_ms=%" PRIu64,
                  ap2cl_uses_ptp(g_ap2cl) ? "ptp" : "ntp",
-                 r.state == AP2_CLOCK_READY ? "ready"
-                     : r.state == AP2_CLOCK_PROBING ? "probing" : "cold",
+                 clock_state_name(r.state),
                  r.streak_ms, r.exchanges, r.ready_in_ms, r.ready_at_unix_ms);
+    if (stalling)
+        LOG_WARN("[AP2] the receiver has not answered our PTP clock: it is "
+                 "not slaved to us, can seat no render position and will play "
+                 "silence however cleanly the audio paces — check that the "
+                 "speaker can reach UDP 319/320 on this host");
 }
 
 /* The join's [STATUS] started, withheld at commit so the receiver-clock

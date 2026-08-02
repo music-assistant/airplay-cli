@@ -352,7 +352,7 @@ for callers that start before readiness anyway:
 binary reports what it measures instead of leaving the caller to guess:
 
 ```
-[STATUS] clock_ready mode=<ptp|ntp> state=<cold|probing|ready> streak_ms=<u64> exchanges=<u32> ready_in_ms=<u64> ready_at_unix_ms=<u64>
+[STATUS] clock_ready mode=<ptp|ntp> state=<cold|probing|ready|stalled> streak_ms=<u64> exchanges=<u32> ready_in_ms=<u64> ready_at_unix_ms=<u64>
 ```
 
 - `mode` is the **effective** timing, not the route intent: a PTP session that
@@ -366,6 +366,23 @@ binary reports what it measures instead of leaving the caller to guess:
 - `state=probing` — a live streak; `ready_at_unix_ms` is the projected
   readiness instant to plan the anchor against.
 - `state=ready` — the projection has passed.
+- `state=stalled` — 5 s with nothing to measure (`AP2_CLOCK_STALL_MS`, over four
+  times the 1.078 s first-probe latency measured above, so a merely slow
+  receiver cannot trip it), counted from the last streak actually seen and only
+  from connect while none ever has been. The receiver is not slaved to our
+  clock: it can seat no render position and renders **silence** however cleanly
+  the audio paces and however healthy the session looks — measured on a HomePod
+  pair that established, paced and answered every keepalive with a 200 without
+  one Delay_Req ever arriving. Measuring from the last streak rather than from
+  connect alone is what keeps a single lost `Q` round-trip — which empties the
+  snapshot exactly as a departed receiver does — from reading as a stall on a
+  healthy session, and gives a mid-session clock loss the same 5 s grace as a
+  cold start. That mark is stamped by the snapshot poller, on the same round it
+  refreshes the snapshot, precisely because the reporting below stops at the
+  first `state=ready`: for most of a session nothing else is watching, and a
+  mark left to age with the reporting would make the first reading after a
+  re-arm read stale. Only a PTP session can stall; `mode=ntp` stays cold.
+  `ready_in_ms`/`ready_at_unix_ms` are 0 and mean nothing, as while cold.
 - `streak_ms`/`exchanges` are the streak's first-probe age and probe count,
   the same two numbers the commit-time floor logs, so field reports compare
   directly.
@@ -376,7 +393,9 @@ unconditionally and whatever the state, so a caller can always distinguish
 material change is reported — the state, or the projected instant a caller
 would plan against; the exchange count rides along as telemetry but never
 triggers a line by itself — sampled at most every 250 ms, ending at the first
-`state=ready`. `FLUSH` and `START` re-arm it for the next cycle. The projection
+`state=ready`. `state=stalled` does NOT end it (a receiver that begins probing
+late still reports `probing` and then `ready`) but does log the diagnosis once,
+on the way in. `FLUSH` and `START` re-arm it for the next cycle. The projection
 is recomputed per emission and never cached. In shared-daemon mode the snapshot
 comes from the poller thread, started at connect, because the daemon's `Q`
 round-trip blocks and the audio loop must never make it inline; the in-process

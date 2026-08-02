@@ -271,6 +271,7 @@ typedef enum {
     AP2_CLOCK_COLD = 0,   /* no timing probe recorded yet */
     AP2_CLOCK_PROBING,    /* probing; readiness is projected, not reached */
     AP2_CLOCK_READY,      /* the projected readiness instant has passed */
+    AP2_CLOCK_STALLED,    /* still no probe long past when one was due */
 } ap2_clock_state_t;
 
 typedef struct {
@@ -291,7 +292,16 @@ bool ap2cl_uses_ptp(struct ap2cl_s *p);
  * can actually meet instead of guessing a headroom. A receiver begins probing
  * our clock about a second after it connects, on its own schedule and without
  * an anchor having been announced; readiness follows from the probe streak
- * (see ap2_clock_ready_from). Safe to call from the audio loop: it never
+ * (see ap2_clock_ready_from). A PTP session with nothing to measure for
+ * AP2_CLOCK_STALL_MS — counted from the last streak this call saw, or from
+ * connect while it has seen none — reports AP2_CLOCK_STALLED: that receiver is
+ * not slaved to our clock, so it can seat no render position and stays silent
+ * however cleanly the audio paces. That window is measured from a mark the
+ * snapshot poller keeps current for the whole session, so the verdict holds
+ * however rarely a caller samples — a caller that stops asking once it has
+ * what it needs cannot make a later reading read stale.
+ * Stalled is not terminal — a receiver that begins probing late reports
+ * probing and then ready as usual. Safe to call from the audio loop: it never
  * blocks on the network. Recompute per use — ready_at_unix_ms is a projection
  * against the wall clock and must not be cached.
  */

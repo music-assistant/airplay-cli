@@ -78,7 +78,7 @@ fixed join headroom is either too short or needlessly slow. The binary reports
 what it measures, from connect:
 
 ```
-[STATUS] clock_ready mode=<ptp|ntp> state=<cold|probing|ready> streak_ms=<u64> exchanges=<u32> ready_in_ms=<u64> ready_at_unix_ms=<u64>
+[STATUS] clock_ready mode=<ptp|ntp> state=<cold|probing|ready|stalled> streak_ms=<u64> exchanges=<u32> ready_in_ms=<u64> ready_at_unix_ms=<u64>
 ```
 
 The first line arrives right after `[STATUS] connected`, whatever the state, so
@@ -90,6 +90,15 @@ measurable for this session — legacy RAOP, or a PTP session that fell back to
 the NTP responder — so do not wait for it. `state=cold` can also persist
 indefinitely for a receiver past the timing engine's 8-peer limit, so keep a
 timeout. `FLUSH` and `START` re-arm the reporting for the next cycle.
+
+`state=stalled` means our clock has gone unanswered for 5 s — since the last
+probe if there ever was one, since connect if there was not. That is over four
+times the slowest first probe measured, so it is not a slow device and not a
+blip. The receiver is not slaved to us, so it can seat no render position and
+plays **silence** however healthy the session looks. Treat it as a failure to
+report rather than something to wait out; the usual cause is UDP 319/320 not
+reaching this host from the speaker. It is not final, though: a receiver that
+starts probing late, or picks up again, reports `probing` and then `ready`.
 
 Starting before readiness is still supported and still corrected — see
 `START_JOIN=1` below.
