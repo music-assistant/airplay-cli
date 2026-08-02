@@ -721,16 +721,17 @@ capture.
   each feedback POST. RAOP paths use libraop's keepalive (~20 s).
 - **Receiver stream list** — each `/feedback` response carries the receiver's
   own list of the streams it still holds for us,
-  `{"streams": [{"type": 96, "sr": 44100}]}`, logged at DEBUG every tick. An
-  empty list while the client is streaming means the receiver dropped the
-  stream under us and every packet is going nowhere; three consecutive empty
-  ticks (~6 s, past the transitions around SETUP/RECORD and a warm splice)
-  report it once per episode as `[STATUS] stream_dropped streams=0 ticks=<n>
-  interval_ms=<ms>`, and a stream coming back closes the episode. A receiver
-  that omits the key reports no stream status at all and is never faulted.
-  The list is what the receiver HOLDS, not what it renders: a Sonos Era 100
-  confirmed playing and a silent-class Samsung HW-LS60D answer with the same
-  single-entry body, so this detects a dropped stream, not a silent speaker.
+  `{"streams": [{"type": 96, "sr": 44100}]}`, logged at DEBUG every tick.
+  Diagnostic only — it carries no health verdict, because two independent
+  measurements (2026-08-02) show it cannot support one. Whether a receiver
+  fills the list in is vendor choice: a Sonos Era 100 and a Samsung HW-LS60D
+  report a single entry every tick, while an Apple TV 4K (tvOS 27) reports an
+  empty list throughout a perfectly healthy session (PTP clock ready over four
+  exchanges, no remote pause, audio flowing), so "empty" cannot mean "faulted".
+  And the list is what the receiver HOLDS, not what it renders: the
+  silent-class Samsung answers identically to the Sonos, so a live entry
+  cannot mean "audible" either. Channel health is judged by the keepalive
+  miss/`rtsp_dead`/`media_healthy` signals instead.
 - **RTSP serialization** — one mutex serializes the RTSP channel, so the
   keepalive thread and the streaming path can never interleave frames on the
   encrypted channel.

@@ -266,13 +266,6 @@ stdin, the single persistent audio input for the whole process lifetime.
 `[STATUS] eof` means the stdin input ended — the whole feed is done, not just
 one track.
 
-`[STATUS] stream_dropped streams=0 ticks=<n> interval_ms=<ms>` means the
-receiver has answered `<n>` consecutive keepalives reporting that it holds no
-stream for us while the session is streaming: it dropped the stream and the
-audio still being sent goes nowhere. It is reported once per episode (a
-returning stream closes it), and never for receivers that report no stream
-status at all.
-
 Some receivers (notably Sonos) do not emit audio until they have received
 metadata; the binary pushes an initial metadata set at the first commanded
 start, so audio starts regardless of whether the caller ever sends `SENDMETA`.
