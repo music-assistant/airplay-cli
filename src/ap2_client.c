@@ -3740,6 +3740,11 @@ void ap2cl_stop(struct ap2cl_s *p)
  * ready over four exchanges, no remote pause, audio flowing. A live entry
  * equally does not prove audio is audible: the Samsung answers like the
  * Sonos while its speaker stays silent.
+ *
+ * Three shapes therefore reach here and only the first logs a count: a body
+ * carrying the key (any length of list), a body without it, and no body at
+ * all. The last two are receivers that report no stream status, so silence
+ * in the log is expected of them rather than a missed tick.
  */
 static void ap2_feedback_log_streams(const uint8_t *resp, int resp_len)
 {

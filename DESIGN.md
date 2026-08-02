@@ -719,9 +719,11 @@ capture.
   sessions without it), independent of command-pipe metadata, artwork loading,
   and progress updates. The worker services encrypted reverse events after
   each feedback POST. RAOP paths use libraop's keepalive (~20 s).
-- **Receiver stream list** — each `/feedback` response carries the receiver's
+- **Receiver stream list** — a `/feedback` response may carry the receiver's
   own list of the streams it still holds for us,
-  `{"streams": [{"type": 96, "sr": 44100}]}`, logged at DEBUG every tick.
+  `{"streams": [{"type": 96, "sr": 44100}]}`, logged at DEBUG on each tick that
+  reports one. A receiver is free to omit the key (or answer with no body at
+  all), and then nothing is logged.
   Diagnostic only — it carries no health verdict, because two independent
   measurements (2026-08-02) show it cannot support one. Whether a receiver
   fills the list in is vendor choice: a Sonos Era 100 and a Samsung HW-LS60D
