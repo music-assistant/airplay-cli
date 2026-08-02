@@ -3700,7 +3700,12 @@ static void ap2_feedback_note_streams(struct ap2cl_s *p, const uint8_t *resp,
     }
 
     LOG_DEBUG("[AP2] /feedback streams=%zu", streams);
-    if (streams > 0 || p->state != AP2_STREAMING) {
+    /* Only while audio should actually be rendering: the splice timeline keeps
+     * a paused or parked session AP2_STREAMING and feeds the wire silence, and
+     * a receiver is free to hold nothing through that. */
+    bool rendering = p->state == AP2_STREAMING && !p->content_paused &&
+                     !p->content_stopped;
+    if (streams > 0 || !rendering) {
         /* Only a stream coming back closes a reported episode; leaving the
          * streaming state just drops the streak, since an idle receiver
          * holding nothing is the expected shape there. */
