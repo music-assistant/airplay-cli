@@ -166,9 +166,9 @@ status line, all headers and a bounded hex dump of the body
 (`ap2_io_format_response_dump()`), which is what tells whether a receiver's
 `401` carries a `WWW-Authenticate` challenge and what its TLV/plist body says.
 
-**Error contract.** Before the human-readable `[ERROR]` line, a fatal
-connect/auth failure emits exactly one machine-readable line on stderr that
-Music Assistant parses:
+**Error contract.** Before the human-readable `[ERROR]` line, a connect/auth
+failure or a rejected transport command emits exactly one machine-readable line
+on stderr that Music Assistant parses:
 
 ```
 [STATUS] error code=<slug> http=<int> detail="<single line>"
@@ -179,6 +179,14 @@ Music Assistant parses:
 | `auth_required` | a password is needed and none was supplied: reported before connecting when the TXT says so (and no credentials are stored), and on a `401`/`403` from a device we presented no password to |
 | `auth_failed` | the password we did present was rejected, on any exchange |
 | `connect_failed` | every other connect-path failure |
+| `start_failed` | `ACTION=START` scheduled no instant, so no `[STATUS] started` follows and no content may be mapped onto one |
+| `flush_failed` | `ACTION=FLUSH` was rejected, so no `[STATUS] flushed` follows |
+
+The connect/auth slugs are terminal — the process exits. `start_failed` and
+`flush_failed` are not: the connection survives and the caller decides whether
+to retry or fall back. Both exist so a caller can abort the pending ack wait
+immediately instead of waiting out a timeout that also means "a binary too old
+to ack at all"; a withheld join ack makes that wait seconds long.
 
 `http` is the most informative HTTP status seen, `0` when none applies (a
 TLV-level rejection is an HTTP 200). The detail is squeezed onto one line and
