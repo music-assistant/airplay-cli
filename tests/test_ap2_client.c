@@ -1418,6 +1418,7 @@ static void test_clock_readiness_report(void)
     assert(client);
     ap2cl_force_native(client);
     ap2cl_test_set_splice(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
     ap2_clock_readiness_t r;
 
     /* NTP timing — including a PTP session that fell back on a 319/320 bind
@@ -1578,11 +1579,18 @@ static void test_clock_stall_detection(void)
     ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_STALLED);
 
-    /* Once the session is down there is no receiver to be silent: the marks
-     * survive teardown, so a reading taken afterwards must not read as one. */
+    /* Once the session is down there is no receiver to answer for: the marks
+     * survive teardown, so a reading taken afterwards must not read as a stall. */
     ap2cl_test_set_session_state(client, AP2_DOWN);
     ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_COLD);
+
+    /* The snapshot survives teardown too, so the same has to hold with a streak
+     * still planted — a torn-down session must not answer with a live one. */
+    ap2cl_test_inject_clock_exchange(client, 40, 8000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    assert(r.exchanges == 0 && r.ready_at_unix_ms == 0);
 
     ap2cl_destroy(client);
     puts("ap2_client clock stall detection tests passed");

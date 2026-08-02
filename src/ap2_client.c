@@ -3565,6 +3565,11 @@ void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
     /* Without the PTP engine there is no probe streak to measure: NTP-timed
      * sessions (and the RAOP-compat flow) report cold and stay there. */
     if (!ap2cl_uses_ptp(p)) return;
+    /* Nothing measures a session that is down. Both the marks and the last
+     * snapshot outlive teardown, so a reading taken afterwards would otherwise
+     * answer for a receiver that is no longer connected — as a stall while the
+     * snapshot is empty, and as a live projection while it is not. */
+    if (p->state == AP2_DOWN) return;
 
     struct ap2_ptp_exchange ex;
     bool have = false;
@@ -3595,19 +3600,19 @@ void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
         /* Nothing to measure this long after the receiver was last heard from
          * means it is not slaved to our clock: it can seat no render position
          * and renders silence however cleanly the audio paces. Reported as its
-         * own state because a cold receiver looks the same on the way there.
-         * Only a live session can be judged silent: the marks outlive teardown,
-         * so a reading taken once the session is down measures nothing. */
-        if (p->state != AP2_DOWN && stall_from_ms &&
-            now_ms >= stall_from_ms + AP2_CLOCK_STALL_MS)
+         * own state because a cold receiver looks the same on the way there. */
+        if (stall_from_ms && now_ms >= stall_from_ms + AP2_CLOCK_STALL_MS)
             out->state = AP2_CLOCK_STALLED;
         return;
     }
-    /* Carry the mark for the in-process engine, which runs no poller to keep
-     * it current; in shared-daemon mode the poller has it already. */
-    pthread_mutex_lock(&p->clock_verify_lock);
-    p->clock_last_streak_unix_ms = now_ms;
-    pthread_mutex_unlock(&p->clock_verify_lock);
+    /* Carry the mark for the in-process engine, which runs no poller to keep it
+     * current. Shared-daemon mode leaves it to the poller, so the mark has one
+     * owner per mode and can never be advanced off a snapshot already stale. */
+    if (!ap2_ptp_shared_active(p->ptp)) {
+        pthread_mutex_lock(&p->clock_verify_lock);
+        p->clock_last_streak_unix_ms = now_ms;
+        pthread_mutex_unlock(&p->clock_verify_lock);
+    }
 
     uint64_t ready_ms = ap2_clock_ready_from(p, &ex, now_ms);
     out->streak_ms = ex.first_ms;
