@@ -513,6 +513,57 @@ static void run_feedback_beats(struct ap2cl_s *client, int peer_fd, int beats,
     assert(peer.ok);
 }
 
+/* Whether a receiver fills the stream list in at all is its own choice: an
+ * Apple TV 4K reports an empty list for a perfectly healthy session, so an
+ * empty list is only evidence once THIS receiver has been seen holding a
+ * stream. Without that, an Apple session would fault within three ticks. */
+static void test_feedback_idle_needs_a_seen_stream(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+
+    ap2_device_info_t device = {
+        .name = "never-reports test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_splice(client, true);
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+
+    char status[1024];
+    run_feedback_beats(client, sockets[1], 6, FEEDBACK_IDLE,
+                       sizeof(FEEDBACK_IDLE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 0);
+    assert(!strstr(status, "stream_dropped"));
+
+    /* Once it does hold one, a later drop is evidence again. */
+    run_feedback_beats(client, sockets[1], 1, FEEDBACK_ACTIVE,
+                       sizeof(FEEDBACK_ACTIVE), status, sizeof(status));
+    run_feedback_beats(client, sockets[1], 3, FEEDBACK_IDLE,
+                       sizeof(FEEDBACK_IDLE), status, sizeof(status));
+    assert(ap2cl_test_feedback_idle_streams(client) == 3);
+    assert(strstr(status, "[STATUS] stream_dropped streams=0 ticks=3 "
+                          "interval_ms=2000\n"));
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client feedback unreported-stream-list tests passed");
+}
+
 /* A receiver that keeps answering 200 while reporting an empty stream list has
  * dropped the stream we keep sending to. That is only a fault once it persists:
  * the list is briefly empty around setup and warm splices, so the report
@@ -1504,6 +1555,7 @@ int main(void)
     test_splice_pause_keeps_line_hot();
     test_feedback_miss_tolerated_then_recovered();
     test_feedback_idle_streams_reported();
+    test_feedback_idle_needs_a_seen_stream();
     test_apple_model_resolution();
     test_pacing_window_rate_scaling();
     test_clock_verified_anchor();

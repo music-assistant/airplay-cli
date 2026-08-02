@@ -707,11 +707,20 @@ capture.
   stream under us and every packet is going nowhere; three consecutive empty
   ticks (~6 s, past the transitions around SETUP/RECORD and a warm splice)
   report it once per episode as `[STATUS] stream_dropped streams=0 ticks=<n>
-  interval_ms=<ms>`, and a stream coming back closes the episode. A receiver
-  that omits the key reports no stream status at all and is never faulted.
-  The list is what the receiver HOLDS, not what it renders: a Sonos Era 100
-  confirmed playing and a silent-class Samsung HW-LS60D answer with the same
-  single-entry body, so this detects a dropped stream, not a silent speaker.
+  interval_ms=<ms>`, and a stream coming back closes the episode. Reporting is
+  suppressed while playback is paused or parked (the splice timeline keeps
+  those sessions `AP2_STREAMING` on a silence-fed wire, and a receiver may hold
+  nothing through them).
+  Whether a receiver fills the list in at all is its own choice, so the check
+  calibrates itself: an empty list is only evidence once **that** receiver has
+  been seen holding a stream, which also covers a receiver omitting the key
+  entirely. Measured 2026-08-02: a Sonos Era 100 and a Samsung HW-LS60D report
+  a single entry every tick, while an Apple TV 4K (tvOS 27) reports an empty
+  list for a perfectly healthy session — PTP clock ready over four exchanges,
+  no remote pause, audio flowing — so Apple hardware never trips it.
+  The list is also what the receiver HOLDS, not what it renders: the
+  silent-class Samsung answers identically to the Sonos, so this detects a
+  dropped stream, not a silent speaker.
 - **RTSP serialization** — one mutex serializes the RTSP channel, so the
   keepalive thread and the streaming path can never interleave frames on the
   encrypted channel.

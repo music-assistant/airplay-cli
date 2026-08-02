@@ -261,8 +261,10 @@ one track.
 receiver has answered `<n>` consecutive keepalives reporting that it holds no
 stream for us while the session is streaming: it dropped the stream and the
 audio still being sent goes nowhere. It is reported once per episode (a
-returning stream closes it), and never for receivers that report no stream
-status at all.
+returning stream closes it), never while playback is paused, and never for
+receivers that do not report stream status — a receiver only becomes eligible
+once it has been seen holding a stream, so hardware that never fills the list
+in (Apple TV, HomePod) is silently exempt rather than falsely flagged.
 
 Some receivers (notably Sonos) do not emit audio until they have received
 metadata; the binary pushes an initial metadata set at the first commanded

@@ -202,8 +202,11 @@ struct ap2cl_s {
     atomic_bool feedback_stop;
     bool feedback_thread_started;
     /* Consecutive /feedback bodies that listed no active stream while the
-     * client believed it was streaming. Only the feedback worker touches it. */
+     * client believed it was streaming, and whether this receiver has ever
+     * filled the list in (below, only then does an empty one mean anything).
+     * Only the feedback worker touches them. */
     unsigned feedback_idle_streams;
+    bool feedback_streams_seen;
     struct ap2_hap_ctx *hap;      /* HAP encryption context */
     struct ap2_ptp_ctx *ptp;      /* Timing */
     /* MRP now-playing over POST /command (path A, see DESIGN.md §8):
@@ -3682,11 +3685,18 @@ void ap2cl_stop(struct ap2cl_s *p)
  * the key report no stream status at all, which is never a fault: only a
  * present-but-empty list counts.
  *
- * The list is what the receiver HOLDS, not what it renders: measured
- * 2026-08-02, a Sonos Era 100 confirmed playing (its own UPnP transport
- * reported PLAYING) and a Samsung HW-LS60D both answered every tick with the
- * identical body {"streams": [{"type": 96, "sr": 44100}]}. So a live entry
- * does not prove audio is audible, and this is not a silence detector.
+ * Whether a receiver fills the list in at all is its own choice, so the signal
+ * calibrates itself against the receiver in front of it: an empty list only
+ * means something once THIS receiver has been seen holding a stream. Measured
+ * 2026-08-02 — a Sonos Era 100 and a Samsung HW-LS60D report
+ * {"streams": [{"type": 96, "sr": 44100}]} every tick, while an Apple TV 4K
+ * (tvOS 27) reports an empty list for a perfectly healthy session (PTP clock
+ * ready over four exchanges, no remote pause, audio flowing), so on Apple
+ * hardware the list never carries stream status and never reports.
+ *
+ * The list is also what the receiver HOLDS, not what it renders: the Samsung
+ * answers identically to the Sonos, so a live entry does not prove audio is
+ * audible and this is not a silence detector.
  */
 static void ap2_feedback_note_streams(struct ap2cl_s *p, const uint8_t *resp,
                                       int resp_len)
@@ -3700,6 +3710,7 @@ static void ap2_feedback_note_streams(struct ap2cl_s *p, const uint8_t *resp,
     }
 
     LOG_DEBUG("[AP2] /feedback streams=%zu", streams);
+    if (streams > 0) p->feedback_streams_seen = true;
     /* Only while audio should actually be rendering: the splice timeline keeps
      * a paused or parked session AP2_STREAMING and feeds the wire silence, and
      * a receiver is free to hold nothing through that. */
@@ -3716,6 +3727,9 @@ static void ap2_feedback_note_streams(struct ap2cl_s *p, const uint8_t *resp,
         p->feedback_idle_streams = 0;
         return;
     }
+    /* A receiver that has never filled the list in is not reporting stream
+     * status at all, the same as one that omits the key. */
+    if (!p->feedback_streams_seen) return;
     /* Report the fault once per episode; the recovery above closes it. */
     if (++p->feedback_idle_streams != AP2_FEEDBACK_IDLE_STREAM_TICKS) return;
     LOG_WARN("[AP2] Receiver holds no stream after %u feedback ticks while "
