@@ -251,8 +251,9 @@ typedef struct {
 
 /*
  * Advance the clock verification of a start that was committed before the
- * receiver's first timing probe (a rejoining receiver resumes its clock
- * exchange only after the START is acked). Armed automatically by such
+ * receiver's first timing probe (a freshly connected receiver takes about a
+ * second to start probing, so a prompt start commits ahead of it). Armed
+ * automatically by such
  * commits; the audio loop calls this every iteration under its send lock and
  * reports VERIFIED/CORRECTED events on the status channel. On a join-marked
  * start (ap2cl_set_start_join) a correction moves the still-unsent anchor
@@ -296,16 +297,25 @@ bool ap2cl_uses_ptp(struct ap2cl_s *p);
  * AP2_CLOCK_STALL_MS — counted from the last streak this call saw, or from
  * connect while it has seen none — reports AP2_CLOCK_STALLED: that receiver is
  * not slaved to our clock, so it can seat no render position and stays silent
- * however cleanly the audio paces. That window is measured from a mark the
- * snapshot poller keeps current for the whole session, so the verdict holds
- * however rarely a caller samples — a caller that stops asking once it has
- * what it needs cannot make a later reading read stale.
+ * however cleanly the audio paces. Under the shared daemon the snapshot poller
+ * keeps that mark current for the whole session; the in-process engine has no
+ * poller, so the mark only moves while a caller is asking. A caller that stops
+ * asking must therefore call ap2cl_clock_watch_restart before it resumes, or
+ * the first reading afterwards measures a window nobody was watching.
  * Stalled is not terminal — a receiver that begins probing late reports
  * probing and then ready as usual. Safe to call from the audio loop: it never
  * blocks on the network. Recompute per use — ready_at_unix_ms is a projection
  * against the wall clock and must not be cached.
  */
 void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out);
+/*
+ * Restart the stall window at now, so the receiver gets the full
+ * AP2_CLOCK_STALL_MS grace from the moment readiness reporting resumes.
+ * Call it wherever reporting re-arms after having gone terminal: the mark
+ * left behind is as old as the quiet stretch, and measuring a stall against
+ * it would condemn a healthy receiver on its first reading.
+ */
+void ap2cl_clock_watch_restart(struct ap2cl_s *p);
 
 /* True while a cold-clock verification can still produce a result. It goes
  * false on the resolving poll and on every disarm (commit, flush, park,

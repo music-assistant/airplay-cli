@@ -1392,11 +1392,9 @@ static void test_clock_stall_detection(void)
     ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_COLD);
 
-    /* The mark is the poller's to keep, not the caller's: reporting goes
-     * terminal at the first ready, so a session can run for ten minutes with
-     * nothing sampling readiness at all. The reading that a flush re-arms then
-     * lands on a mark the poller refreshed a round ago, and a lost round-trip
-     * on that very cycle is still only a blip. */
+    /* A mark kept current — by the shared daemon's poller, or by the re-arm
+     * restarting the window — makes a lost round-trip on that very cycle only
+     * a blip. */
     ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 600000,
                                test_now_unix_ms() - 200);
     ap2cl_test_clear_clock_exchange(client);
@@ -1409,6 +1407,14 @@ static void test_clock_stall_detection(void)
                                test_now_unix_ms() - 6000);
     ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_STALLED);
+
+    /* Restarting the watch is what earns a re-armed session the same grace as
+     * a cold one: without it the in-process engine, which has no poller, would
+     * measure the stall against a mark left behind while reporting was
+     * terminal and condemn a healthy receiver on the first reading. */
+    ap2cl_clock_watch_restart(client);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
 
     /* Once the session is down there is no receiver to answer for: the marks
      * survive teardown, so a reading taken afterwards must not read as a stall. */
