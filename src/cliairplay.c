@@ -407,6 +407,17 @@ static void status_error_ex(const char *code, int http, const char *detail,
     status_error(msg);
 }
 
+/* Whether a transport command still has a session that could act on it. The
+ * pointer outlives the session it points at: DISCONNECT and the idle timeout
+ * mark it ENDED and only the teardown frees it, and every command entry point
+ * refuses an ended session. So the pointer alone would report a command the
+ * session refused where in truth there was no longer a session to refuse it.
+ * ap2_session_state() answers ENDED for NULL too. */
+static bool session_is_live(void)
+{
+    return ap2_session_state(g_session) != AP2_SESSION_ENDED;
+}
+
 static void remote_command_event(
     ap2_remote_command_t command, void *userdata)
 {
@@ -620,8 +631,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
              * instead of waiting out the timeout that also means "old
              * binary" — with the ack withheld, the wait is seconds long. */
             status_error_ex(ERROR_CODE_START_FAILED, 0,
-                            g_session ? "session did not schedule the start"
-                                      : "no live session to start",
+                            session_is_live() ? "session did not schedule the start"
+                                              : "no live session to start",
                             "START failed");
         }
         g_pend_start_unix_ms = 0;
@@ -629,8 +640,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "FLUSH") == 0) {
         if (!g_session || !ap2_session_flush(g_session))
             status_error_ex(ERROR_CODE_FLUSH_FAILED, 0,
-                            g_session ? "session rejected the flush"
-                                      : "no live session to flush",
+                            session_is_live() ? "session rejected the flush"
+                                              : "no live session to flush",
                             "FLUSH failed");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STANDBY") == 0) {
         if (g_session) ap2_session_standby(g_session);
