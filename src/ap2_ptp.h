@@ -59,9 +59,6 @@ uint64_t ap2_ptp_local_to_device(struct ap2_ptp_ctx *ctx, uint64_t local_ntp);
  */
 void ap2_ptp_set_clock_id(struct ap2_ptp_ctx *ctx, uint64_t clock_id);
 
-/* The 64-bit PTP clock identity used by the engine (grandmasterIdentity). */
-uint64_t ap2_ptp_clock_id(struct ap2_ptp_ctx *ctx);
-
 /*
  * Set the timing peer IP list (typically [receiver_ip, our_ip]) learned from
  * SETPEERS / timingPeerInfo. Used for logging and, when unicast mirroring is
@@ -81,9 +78,6 @@ void ap2_ptp_set_peers(struct ap2_ptp_ctx *ctx, const char *const *ips, int coun
  */
 bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
                           const char *device_ip);
-
-/* True if the PTP grandmaster engine is running (vs the NTP responder). */
-bool ap2_ptp_engine_active(struct ap2_ptp_ctx *ctx);
 
 /*
  * Block for up to timeout_ms while the engine listens for peer Announce

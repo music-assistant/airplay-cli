@@ -1152,11 +1152,6 @@ void ap2_ptp_set_clock_id(struct ap2_ptp_ctx *ctx, uint64_t clock_id)
     ctx->clock_id_set = true;
 }
 
-uint64_t ap2_ptp_clock_id(struct ap2_ptp_ctx *ctx)
-{
-    return ctx ? ctx->clock_id : 0;
-}
-
 uint64_t ap2_ptp_now_ns(struct ap2_ptp_ctx *ctx)
 {
     (void)ctx;
@@ -1178,11 +1173,6 @@ void ap2_ptp_set_peers(struct ap2_ptp_ctx *ctx, const char *const *ips, int coun
         LOG_DEBUG("[PTP] peer[%d] = %s", i, ctx->peers[i]);
     ctx->peer_kick = ctx->npeers > 0;
     pthread_mutex_unlock(&ctx->lock);
-}
-
-bool ap2_ptp_engine_active(struct ap2_ptp_ctx *ctx)
-{
-    return ctx && ctx->engine_active;
 }
 
 bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
