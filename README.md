@@ -238,22 +238,28 @@ stdin, the single persistent audio input for the whole process lifetime.
   is withheld until that clock is measured (up to the anchor, never longer) so
   it reports an instant the receiver can actually seat. Wait for the ack rather
   than assuming it is immediate; exactly one arrives per START.
-- `ACTION=FLUSH` — in-place warm flush for seek/next: flush the receiver (RTSP
-  FLUSH), discard the internal ring, and drain stdin to empty; after the receiver
-  accepts the flush, acks with `[STATUS] flushed` and keeps buffering the next
-  track while sending nothing until the next `START` (idle-primed; the Apple
-  splice timeline sends keepalive silence instead). The one-shot
-  `[STATUS] audio buffered_ms=<ms>` line fires again when the next track's feed
-  has a complete packet buffered, or its final short packet reaches EOF.
-  On Apple receivers the native flow instead runs a splice timeline (no receiver
-  flush, one immutable anchor line; any discard, re-anchor or stamp jump makes
-  them emit a short noise burst): the queued audio — kept shallow, reported as
-  `warm_lead_ms` on the `[STATUS] latency` line — plays out and the next `START`
-  splices the new track at the commanded instant, filling the gap with encoded
-  silence so the bitstream stays contiguous.
-  The ack then reads `[STATUS] flushed head_unix_ms=<ms>` (the audible instant
-  of the frozen delivery head); the commanded start must land beyond every
-  member's head or that member splices at its own head instead.
+- `ACTION=FLUSH` — in-place warm flush for seek/next: it discards the internal
+  ring and drains stdin to empty, acks with `[STATUS] flushed`, and keeps
+  buffering the next track until the next `START`. The one-shot
+  `[STATUS] audio buffered_ms=<ms>` line
+  fires again when the next track's feed has a complete packet buffered, or its
+  final short packet reaches EOF.
+  Every native AirPlay 2 session runs a splice timeline: nothing is sent to the
+  receiver, its queued audio — kept shallow, reported as `warm_lead_ms` on the
+  `[STATUS] latency` line — simply plays out, and the next `START` splices the
+  new track at the commanded instant, filling the gap with encoded silence so
+  the bitstream stays contiguous on one immutable anchor line. Apple receivers
+  require it (any discard, re-anchor or stamp jump makes them emit a short
+  noise burst) and it measured clean on every other receiver class, so it is
+  the default for all of them. On a live splice timeline the ack carries
+  `head_unix_ms=<ms>`, the audible instant of the frozen delivery head: a
+  commanded start at or behind a member's head is
+  corrected forward to that head plus 250 ms, so anchor every warm START beyond
+  all members' heads and check `[STATUS] started at_unix_ms=` against what you
+  asked for.
+  The RAOP paths flush the receiver for real (RTSP FLUSH), go quiet until the
+  next `START`, and ack without the field — as does a flush that arrives before
+  the first `START`, when there is no head yet.
 - Session lifecycle: `ACTION=STANDBY` (silence the receiver, keep the connection
   warm), `ACTION=DISCONNECT` (end the session).
 - Transport: `ACTION=PLAY|PAUSE|STOP`.
@@ -264,10 +270,18 @@ stdin, the single persistent audio input for the whole process lifetime.
   `ACTION=SENDMETA` to push the set.
 
 `[STATUS] stopped` acknowledges `ACTION=STOP` once playback has been torn down.
-The process stays up, so a later `ACTION=START` can open a new session.
+`STOP` is terminal: the audio loop exits, the connection is torn down and the
+process exits 0, the same shape as `ACTION=DISCONNECT`. To keep a session
+reusable, use `ACTION=FLUSH` (warm seek/next) or `ACTION=STANDBY` (warm park) —
+both leave the process and the connection up for a later `ACTION=START`.
 
 `[STATUS] eof` means the stdin input ended — the whole feed is done, not just
 one track.
+
+Status lines are split across both streams: the lifecycle lines on stderr, and
+the one-shot setup lines (`route`, `capabilities`, `latency`) plus
+remote-control events on stdout — so a parser has to read both. `DESIGN.md` §12
+lists every line, the stream it uses, and when it fires.
 
 Some receivers (notably Sonos) do not emit audio until they have received
 metadata; the binary pushes an initial metadata set at the first commanded

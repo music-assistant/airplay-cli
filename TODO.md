@@ -12,4 +12,6 @@ Genuinely open work only. Completed work lives in git history.
       caller can pick the best format per device before the first stream —
       the CLI half of fully automatic 24-bit selection (no user toggle; the
       format tables are evidence, the Apple-model check covers understating
-      receivers).
+      receivers). The fetch and the format-table parse already run as part of
+      the normal connect; what is missing is the flag that stops there and
+      exits.

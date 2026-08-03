@@ -20,18 +20,24 @@
  * possible": the transport picks and the ack reports the pick.
  *
  *   START(start time)  -> first call: full session start; a call after a FLUSH
- *                         re-bases the frozen anchor and resumes from the ring
- *   FLUSH              -> stop sending, RTSP-FLUSH the receiver, discard the
+ *                         resumes from the ring at the commanded instant (the
+ *                         splice timeline pads silence up to it on its
+ *                         immutable anchor line; the other lanes re-base)
+ *   FLUSH              -> stop sending, take the transport's warm-boundary
+ *                         action (splice timeline: leave the receiver's queued
+ *                         audio playing and swap the content behind it; RAOP
+ *                         lanes: RTSP/libraop FLUSH it away), discard the
  *                         ring, drain the input to EAGAIN; stream goes
- *                         idle-primed (keeps buffering, sends nothing) until the
- *                         next START. Emits `[STATUS] flushed`.
+ *                         idle-primed (keeps buffering, sends nothing) until
+ *                         the next START. Emits `[STATUS] flushed`.
  *   STANDBY            -> stop playback, keep the connection warm
  *   END                -> real teardown (DISCONNECT / idle timeout)
  *
  * The input is never re-opened across a FLUSH: the caller (MA) restarts only
  * the per-seek transcoder feeding the same persistent fd, so sequence numbers
  * and audio nonces are never reset within the connection and crypto state stays
- * valid across the boundary. The media timeline re-bases per START.
+ * valid across the boundary. Each START places the media timeline at the
+ * commanded instant.
  *
  * Command pipe verbs (newline-terminated KEY=VALUE, existing verbs unchanged):
  *   START_UNIX_MS=<ms|0>      audible start instant; 0 = ASAP at the minimum
@@ -116,7 +122,7 @@ typedef enum {
  * Callbacks the session engine invokes from its own threads. All are required
  * except `warm_head_unix_ms`. `commit` performs the START transport work on a
  * LIVE connection: on the first start it begins the session; after a FLUSH it
- * re-bases the timeline. The commanded instant is honored exactly when
+ * resumes the timeline. The commanded instant is honored exactly when
  * feasible (padding silence or re-anchoring as the transport's lane
  * requires); an instant the transport cannot honor — behind its feasibility
  * floor — is CORRECTED FORWARD to the earliest feasible instant instead of
@@ -125,16 +131,18 @@ typedef enum {
  * verify the contract, re-align a group with a corrective START, and log the
  * mismatch. A `start_unix_ms` of 0 asks the transport to pick (earliest).
  * AP2_COMMIT_FAILED is terminal (the caller then ends the session so MA can
- * fall back cold). `flush` discards the receiver's buffered audio in place
- * (RTSP FLUSH / libraop flush), keeping the session and timeline continuity;
- * it returns false when the receiver did not accept the flush.
+ * fall back cold). `flush` performs the transport's warm-boundary action,
+ * keeping the session and timeline continuity: on the splice timeline nothing
+ * is sent — the receiver's queued audio plays out and the content is swapped
+ * behind it — while the RAOP lanes discard the buffered audio in place (RTSP
+ * FLUSH / libraop flush). It returns false when that action failed.
  * `warm_head_unix_ms` (optional) reports the audible instant of the delivery
  * head frozen by the flush (unix ms; 0 = no constraint); it rides the
  * `[STATUS] flushed` ack as the caller's anchor hint.
  */
 typedef struct {
     void (*quiesce)(void *transport);    /* pause audio sends across a command */
-    bool (*flush)(void *transport);      /* RTSP-flush receiver, keep session */
+    bool (*flush)(void *transport);      /* warm-boundary action, keep session */
     ap2_commit_result_t (*commit)(void *transport, uint64_t start_unix_ms,
                                   uint64_t *at_unix_ms);
     void (*resume)(void *transport);     /* resume sends after the command */

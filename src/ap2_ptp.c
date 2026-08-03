@@ -163,9 +163,10 @@ struct ap2_ptp_ctx {
     uint16_t signaling_seq;
     char *peers[PTP_MAX_PEERS];
     int npeers;
-    /* When true, timing messages are ALSO sent unicast to each peer. Multicast
-     * is the standard/default transport (this stays false); the peer list and
-     * this switch keep unicast one flip away for on-device experimentation. */
+    /* Timing messages go unicast to every timing peer; multicast is only the
+     * fallback while the peer list is still empty. Set true at create and never
+     * cleared — Apple receivers consume the session clock as unicast PTP and
+     * never join an open multicast election. */
     bool unicast_mirror;
 
     /* ---- BMCA / slave state (guarded by lock) ---- */

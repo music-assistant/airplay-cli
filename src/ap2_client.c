@@ -3103,8 +3103,9 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
          * group splices sample-aligned by construction. The feasibility
          * floor is the head itself: anything earlier would require
          * discarding queued audio (the noise trigger), so such a request is
-         * corrected FORWARD to the head and the ack carries the truth. A
-         * start of 0 splices at the head — the earliest possible point. */
+         * corrected FORWARD to head + AP2_MIN_WARM_LEAD_MS and the ack
+         * carries the truth. A start of 0 splices at the head — the earliest
+         * possible point. */
         uint64_t head_ntp = TS2NTP(p->head_ts, p->format.sample_rate);
         uint64_t requested =
             start_unix_ms ? ap2_unix_ms_to_ntp(start_unix_ms) : 0;
@@ -3244,9 +3245,10 @@ bool ap2cl_accept_frames(struct ap2cl_s *p)
          * Contract: frame f is AUDIBLE at its frame-clock position (the anchor
          * line starts one lead early), so f's deadline IS f. A frame delivered
          * more than the receiver's latencyMax before its deadline overflows
-         * its buffer and is dropped (Sonos: 88200 = 2.0s) — release at most
-         * `window` ahead: the reported window when known, else 1.75s (inside
-         * every AirPlay receiver's standard 2s). Delivery therefore
+         * its buffer and is dropped — release at most `window` ahead: the
+         * reported window when known, else 1.75s (inside every AirPlay
+         * receiver's standard 2s, the same assumption our own stream SETUP
+         * proposes as latencyMax=88200). Delivery therefore
          * runs up to ~window AHEAD of playback from the very first sample —
          * the receiver's buffer is filled before the scheduled start and the
          * start cannot underrun — while scheduled group starts stay safe no
@@ -4386,10 +4388,11 @@ int ap2cl_warm_lead_ms(struct ap2cl_s *p)
 /* Wall-clock instant (unix ms) at which the current delivery head becomes
  * audible on the splice timeline. The flush ack carries it so the caller can
  * anchor the warm START beyond EVERY member's queued audio: a commanded
- * instant at or behind a member's head splices at that member's own head
- * instead, silently breaking the shared instant (and the session's recorded
- * start time, which late joiners anchor against). 0 when the stream is not on
- * the splice timeline (no constraint). */
+ * instant at or behind a member's head is corrected forward to that head plus
+ * AP2_MIN_WARM_LEAD_MS, which breaks the shared instant (and the session's
+ * recorded start time, which late joiners anchor against) unless the caller
+ * re-aligns the group on the instant the started ack reports. 0 when the
+ * stream is not on the splice timeline (no constraint). */
 uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || !p->splice_timeline || !p->head_ts)
