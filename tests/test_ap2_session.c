@@ -167,6 +167,18 @@ static bool wait_for_count(atomic_int *counter, int want, int timeout_ms)
     return atomic_load(counter) >= want;
 }
 
+/* Block until the reader thread has seen the input close: a read reporting the
+ * stream fully consumed is the observable proof, and the orphan window is
+ * stamped from that same moment. */
+static bool wait_for_input_eof(struct ap2_session_s *session)
+{
+    uint64_t deadline = ap2_io_monotonic_ms() + 2000;
+    uint8_t byte;
+    while (ap2_io_monotonic_ms() < deadline)
+        if (ap2_session_read(session, &byte, 1, 100) == -1) return true;
+    return false;
+}
+
 static void test_start_streams_the_input(void)
 {
     static const uint8_t audio[] = {0x10, 0x20, 0x30, 0x40, 0x50, 0x60};
@@ -443,6 +455,71 @@ static void test_idle_timeout_ends_session(void)
     assert(close(write_fd) == 0);
 }
 
+/* A session played to EOF and then abandoned is the orphan the net exists for:
+ * it stays PLAYING (nothing moves it out), so the timeout has to arm on the
+ * closed input instead. A stream still being fed must not be touched. */
+static void test_idle_timeout_ends_an_abandoned_post_eof_session(void)
+{
+    static const uint8_t audio[] = {0x50, 0x51, 0x52, 0x53};
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 20, &write_fd);
+
+    feed(write_fd, audio, sizeof(audio));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
+    read_exact(session, audio, sizeof(audio));
+
+    /* Playing with the writer still open: the caller is feeding us, so a quiet
+     * stretch (a pause, a slow producer) is not an orphan. */
+    usleep(60000);
+    ap2_session_poll(session);
+    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
+    assert(atomic_load(&state.idle_timeouts) == 0);
+
+    assert(close(write_fd) == 0);
+    assert(wait_for_input_eof(session));
+    usleep(60000);
+    ap2_session_poll(session);
+    assert(ap2_session_state(session) == AP2_SESSION_ENDED);
+    assert(atomic_load(&state.idle_timeouts) == 1);
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+}
+
+/* A caller commanding a fresh START after the input closed is driving the
+ * session again, so the window re-opens from that START rather than expiring
+ * on the stamp the EOF left behind. */
+static void test_start_after_eof_reopens_the_idle_window(void)
+{
+    static const uint8_t audio[] = {0x60, 0x61};
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 20, &write_fd);
+
+    feed(write_fd, audio, sizeof(audio));
+    assert(ap2_session_start(session, 1700000000000ULL, NULL) == AP2_COMMIT_OK);
+    read_exact(session, audio, sizeof(audio));
+    assert(close(write_fd) == 0);
+    assert(wait_for_input_eof(session));
+
+    /* Well past the window the EOF opened, but the START pre-empts it. */
+    usleep(60000);
+    assert(ap2_session_start(session, 1700000005000ULL, NULL) == AP2_COMMIT_OK);
+    ap2_session_poll(session);
+    assert(ap2_session_state(session) == AP2_SESSION_PLAYING);
+    assert(atomic_load(&state.idle_timeouts) == 0);
+
+    /* Abandoned again: the re-opened window expires like any other. */
+    usleep(60000);
+    ap2_session_poll(session);
+    assert(ap2_session_state(session) == AP2_SESSION_ENDED);
+    assert(atomic_load(&state.idle_timeouts) == 1);
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+}
+
 /* The input pipe's writer stays open (as MA holds the CLI stdin open), so the
  * reader never sees EOF; destroy must still tear it down promptly. */
 static void test_destroy_is_prompt_with_open_writer(void)
@@ -513,6 +590,8 @@ int main(void)
     test_failed_flush_preserves_pending_audio();
     test_standby_then_resume();
     test_idle_timeout_ends_session();
+    test_idle_timeout_ends_an_abandoned_post_eof_session();
+    test_start_after_eof_reopens_the_idle_window();
     test_destroy_is_prompt_with_open_writer();
     puts("AP2 session flush-and-refill tests passed");
     return 0;

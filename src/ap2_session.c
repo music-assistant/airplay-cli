@@ -200,6 +200,13 @@ static void *reader_thread(void *arg)
             int read_errno = errno;
             pthread_mutex_lock(&s->lock);
             s->ring.eof = true;
+            /* Open the orphan window here. A closed input is the end of the
+             * whole feed (a warm seek/next is a FLUSH, which keeps the writer
+             * open), so what remains is a bounded playout — the ring, then the
+             * receiver's queue — and no later audio can arrive to disarm it.
+             * A caller that never comes back gets the same [STATUS]
+             * idle_timeout as one that never started; a START re-opens it. */
+            s->idle_since_ms = ap2_io_monotonic_ms();
             if (n == 0 && !s->audio_seen && s->ring.fill > 0) {
                 /* A final short input can still form one silence-padded packet. */
                 s->audio_seen = true;
@@ -358,6 +365,10 @@ ap2_commit_result_t ap2_session_start(struct ap2_session_s *s,
     }
     s->epoch++;
     s->state = AP2_SESSION_PLAYING;
+    /* The caller is driving the session, so the orphan window re-opens from
+     * here. It only bites after the input closed, where PLAYING alone no
+     * longer holds the timeout off. */
+    s->idle_since_ms = ap2_io_monotonic_ms();
     pthread_cond_broadcast(&s->can_read);
     pthread_cond_broadcast(&s->can_write);
     pthread_mutex_unlock(&s->lock);
@@ -540,7 +551,14 @@ void ap2_session_poll(struct ap2_session_s *s)
 {
     if (!s || s->idle_timeout_ms <= 0) return;
     pthread_mutex_lock(&s->lock);
-    bool idle = s->state == AP2_SESSION_IDLE || s->state == AP2_SESSION_STANDBY;
+    /* Idle is "nothing the caller commanded is still running": the pre-start
+     * and post-flush waits, a standby park, and a stream whose input closed.
+     * That last one still reads as PLAYING while the ring and the receiver's
+     * queue drain (bounded, and far inside any sane timeout), which is why the
+     * state alone cannot answer this. */
+    bool idle = s->state == AP2_SESSION_IDLE ||
+                s->state == AP2_SESSION_STANDBY ||
+                (s->state == AP2_SESSION_PLAYING && s->ring.eof);
     if (idle && ap2_io_monotonic_ms() - s->idle_since_ms >=
                     (uint64_t)s->idle_timeout_ms) {
         s->state = AP2_SESSION_ENDED;
