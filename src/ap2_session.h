@@ -20,7 +20,9 @@
  * possible": the transport picks and the ack reports the pick.
  *
  *   START(start time)  -> first call: full session start; a call after a FLUSH
- *                         re-bases the frozen anchor and resumes from the ring
+ *                         resumes from the ring at the commanded instant (the
+ *                         splice timeline pads silence up to it on its
+ *                         immutable anchor line; the other lanes re-base)
  *   FLUSH              -> stop sending, take the transport's warm-boundary
  *                         action (splice timeline: leave the receiver's queued
  *                         audio playing and swap the content behind it; RAOP
@@ -34,7 +36,8 @@
  * The input is never re-opened across a FLUSH: the caller (MA) restarts only
  * the per-seek transcoder feeding the same persistent fd, so sequence numbers
  * and audio nonces are never reset within the connection and crypto state stays
- * valid across the boundary. The media timeline re-bases per START.
+ * valid across the boundary. Each START places the media timeline at the
+ * commanded instant.
  *
  * Command pipe verbs (newline-terminated KEY=VALUE, existing verbs unchanged):
  *   START_UNIX_MS=<ms|0>      audible start instant; 0 = ASAP at the minimum
@@ -119,7 +122,7 @@ typedef enum {
  * Callbacks the session engine invokes from its own threads. All are required
  * except `warm_head_unix_ms`. `commit` performs the START transport work on a
  * LIVE connection: on the first start it begins the session; after a FLUSH it
- * re-bases the timeline. The commanded instant is honored exactly when
+ * resumes the timeline. The commanded instant is honored exactly when
  * feasible (padding silence or re-anchoring as the transport's lane
  * requires); an instant the transport cannot honor — behind its feasibility
  * floor — is CORRECTED FORWARD to the earliest feasible instant instead of

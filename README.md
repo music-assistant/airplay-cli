@@ -239,9 +239,9 @@ stdin, the single persistent audio input for the whole process lifetime.
   it reports an instant the receiver can actually seat. Wait for the ack rather
   than assuming it is immediate; exactly one arrives per START.
 - `ACTION=FLUSH` — in-place warm flush for seek/next: it discards the internal
-  ring and drains stdin to empty, acks with
-  `[STATUS] flushed head_unix_ms=<ms>`, and keeps buffering the next track
-  until the next `START`. The one-shot `[STATUS] audio buffered_ms=<ms>` line
+  ring and drains stdin to empty, acks with `[STATUS] flushed`, and keeps
+  buffering the next track until the next `START`. The one-shot
+  `[STATUS] audio buffered_ms=<ms>` line
   fires again when the next track's feed has a complete packet buffered, or its
   final short packet reaches EOF.
   Every native AirPlay 2 session runs a splice timeline: nothing is sent to the
@@ -251,13 +251,15 @@ stdin, the single persistent audio input for the whole process lifetime.
   the bitstream stays contiguous on one immutable anchor line. Apple receivers
   require it (any discard, re-anchor or stamp jump makes them emit a short
   noise burst) and it measured clean on every other receiver class, so it is
-  the default for all of them. `head_unix_ms=<ms>` is the audible instant of
-  the frozen delivery head: a commanded start at or behind a member's head is
+  the default for all of them. On a live splice timeline the ack carries
+  `head_unix_ms=<ms>`, the audible instant of the frozen delivery head: a
+  commanded start at or behind a member's head is
   corrected forward to that head plus 250 ms, so anchor every warm START beyond
   all members' heads and check `[STATUS] started at_unix_ms=` against what you
   asked for.
   The RAOP paths flush the receiver for real (RTSP FLUSH), go quiet until the
-  next `START`, and ack with a bare `[STATUS] flushed`.
+  next `START`, and ack without the field — as does a flush that arrives before
+  the first `START`, when there is no head yet.
 - Session lifecycle: `ACTION=STANDBY` (silence the receiver, keep the connection
   warm), `ACTION=DISCONNECT` (end the session).
 - Transport: `ACTION=PLAY|PAUSE|STOP`.
