@@ -139,7 +139,8 @@ enum mrp_ext_field {
  * MRP timestamps are doubles on this timebase. */
 #define MRP_APPLE_EPOCH_OFFSET 978307200.0
 
-/* Cadence of the defensive state re-push from ap2_mrp_tick (seconds). */
+/* Cadence of the defensive state re-push that ap2_mrp_prepare_state_push()
+ * arms for the /feedback keepalive worker (seconds, type-130 channel only). */
 #define MRP_STATE_REPUSH_S 15
 #define MRP_WRITE_TIMEOUT_MS 1000
 #define MRP_EVENT_LOG_TEXT_MAX 96

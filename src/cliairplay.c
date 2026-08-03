@@ -492,7 +492,7 @@ static void status_elapsed_legacy(uint64_t elapsed_ms, uint64_t frames, struct r
 /*
  * Truncate s32le samples to s24le (packed 3 bytes) for ALAC encoder.
  * Input: 4 bytes per sample (s32le), Output: 3 bytes per sample (s24le)
- * Takes the lower 3 bytes of each 32-bit LE sample (bytes 0,1,2 = bits 0-23).
+ * Takes the upper 3 bytes of each 32-bit LE sample (bytes 1,2,3 = bits 8-31).
  * Returns number of output bytes.
  */
 static int truncate_32to24(const uint8_t *in, int in_bytes, uint8_t *out)
@@ -1766,7 +1766,8 @@ static void print_usage(const char *name)
     printf("                             clamped into the device-reported window)\n");
     printf("  --dacp <id>                DACP ID\n");
     printf("  --activeremote <id>        Active Remote ID\n");
-    printf("  --cmdpipe <path>           Required named pipe for commands/audio staging\n");
+    printf("  --cmdpipe <path>           Required named pipe for commands and metadata\n");
+    printf("                             (audio is the process stdin, not this pipe)\n");
     printf("  --udn <name>               UDN name for mDNS\n");
     printf("  --samplerate <rate>        Sample rate (default: 44100)\n");
     printf("  --bitdepth <bits>          Bit depth: 16 or 24 (default: 16). 24-bit\n");

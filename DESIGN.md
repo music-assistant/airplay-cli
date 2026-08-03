@@ -204,8 +204,11 @@ authority. The engine (`ap2_ptp.c`) implements:
   accuracy 0x21 (100 ns), variance 0x436A, timeSource GPS (matching captured
   iOS senders). It must out-rank the receivers' own datasets (Sonos announces
   248/248/0xFE) or the session anchor is not honored.
-- **Two-step Sync/Follow_Up** every 125 ms and Announce every 1 s, multicast
-  (224.0.1.129) on UDP 319/320, plus **unicast** copies to each timing peer.
+- **Two-step Sync/Follow_Up** every 125 ms and Announce every 1 s, **unicast**
+  on UDP 319/320 to every timing peer — Apple receivers consume the session
+  clock as unicast PTP and never join an open multicast election. The multicast
+  group (224.0.1.129) is only the fallback while the peer list is still empty,
+  before SETPEERS fills it in.
 - **Unicast negotiation** — REQUEST_UNICAST_TRANSMISSION Signaling TLVs from
   receivers are answered with GRANT TLVs (Apple receivers request unicast
   Announce/Sync/Delay_Resp this way).
@@ -252,9 +255,13 @@ grandmaster — but MA spawns one cliairplay per device. The split
 exactly T on every streaming protocol.** Legacy RAOP, RAOP-compatible AirPlay 2,
 and native AirPlay 2 members are handed the same T, then align by construction.
 The first `ACTION=START` begins the session; a `START` after an `ACTION=FLUSH`
-re-anchors the same live stream (§10) by re-basing the frozen anchor line below,
-with no reconnect and no crypto/sequence reset. The first packet carries a fresh
-restart marker and sync announcement for the new timeline. The caller can gate
+re-anchors the same live stream (§10) with no reconnect and no crypto/sequence
+reset. On the splice timeline — the default for every native session — the
+frozen anchor line below is not re-based at all: it stays exactly where the
+first START put it, and the commanded instant is expressed as a pad of encoded
+silence up to it (§10). A lapsed line, a deny-listed receiver and the RAOP
+paths re-base instead, and their first packet carries a fresh restart marker
+and sync announcement for the new timeline. The caller can gate
 the command on the one-shot `[STATUS] audio buffered_ms=` line — emitted once a
 complete transport packet is buffered (or the final short packet reaches EOF),
 and re-armed by each FLUSH — so it commits a start only after the feed is ready.
@@ -447,11 +454,12 @@ identity — receivers slaved to that clock place the anchor precisely.
 **Pacing** (realtime): frames are released against the **anchor deadline**,
 capped to the receiver's buffer. Frame f is audible at its frame-clock
 position, so its deadline is f itself; a frame delivered more than the
-receiver's `latencyMax` early overflows the buffer and is dropped (Sonos:
-88200 frames = 2.0 s). Release therefore runs up to `window` ahead of the
-deadline — the device-reported window less a 250 ms margin when known, else
-1.75 s (inside every AirPlay receiver's standard 2 s) — which fills the
-receiver's buffer before a scheduled start no matter how far ahead T lies.
+receiver's `latencyMax` early overflows the buffer and is dropped. Release
+therefore runs up to `window` ahead of the deadline — the device-reported
+window less a 250 ms margin when known, else 1.75 s (inside every AirPlay
+receiver's standard 2 s, the same assumption our own stream SETUP proposes as
+`latencyMax` 88200 frames) — which fills the receiver's buffer before a
+scheduled start no matter how far ahead T lies.
 
 **Per-process timeline offsets**: streams in one group share T, and with
 identical RTP positions two sessions from one host are wire-identical twins
@@ -536,10 +544,12 @@ connect the sender emits the initial sequence from AirPlaySender's
 5. **`updateMRNowPlayingClient`** — the serialized `NowPlayingClient` external
    representation the receiver expects.
 
-Playback state is re-sent on every start/pause/resume/stop; now-playing on
-every metadata/progress/artwork change, plus a defensive re-push every ~15 s.
-Progress itself is never streamed — the receiver extrapolates position from
-`ElapsedTime` + `Timestamp` + `PlaybackRate`, so a steady state needs no push.
+Playback state is re-sent on every start/pause/resume/stop and now-playing on
+every metadata/progress/artwork change — all caller-driven; nothing on this
+path is pushed on a timer. Progress itself is never streamed — the receiver
+extrapolates position from `ElapsedTime` + `Timestamp` + `PlaybackRate`, so a
+steady state needs no push. The ~15 s defensive state re-push belongs to the
+type-130 channel below, which is off by default.
 
 **`updateMRNowPlayingInfo` envelope.** The `npi-text` / `mergePolicy` wrapper
 is mandatory; a bare or fabricated outer type string is rejected with HTTP 400:
@@ -682,9 +692,14 @@ enum** — the two enumerations disagree, so the wire values here
 **Type-130 remote-control channel — off by default.** A dedicated
 length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
 DataStream keys derived from the pair-verify shared secret) exists for *inbound*
-remote control (Siri-remote play/pause). It carries no now-playing state — the
-real sender pushes now-playing only over `/command` — and is off by default;
-`CLIAIRPLAY_MRP_TYPE130=1` enables the channel. `src/ap2_mrp.c` hand-rolls the
+remote control (Siri-remote play/pause). It is off by default because the real
+sender pushes now-playing over `/command`; `CLIAIRPLAY_MRP_TYPE130=1` enables
+it. Its outbound `SET_STATE` does carry a full now-playing picture —
+title/artist/album, duration, elapsed time, playback state and the artwork
+bytes — and while the channel is up and playback is PLAYING the feedback worker
+re-pushes it every 15 s (`MRP_STATE_REPUSH_S`) as a defensive refresh. That
+push is skipped while the channel is down, which is why the default path has no
+periodic state refresh. `src/ap2_mrp.c` hand-rolls the
 proto2 emitters, the `/command` builders, the bplist `params.data` wrapper, the
 DataStream key derivation and channel framing, and answers inbound `sync`
 frames with `rply`.
@@ -809,7 +824,7 @@ capture.
   pause parks members through standby), and the post-EOF drain/idle window
   each keep the wire fed with encoded silence, and a delivery stall
   longer than the pacing depth splice-pads the timeline forward (reported as
-  REANCHOR) instead of bursting the queued content on past timestamps when
+  REANCHOR, §12) instead of bursting the queued content on past timestamps when
   sending resumes. The 2026-07-31 fleet A/B validated the same mechanism on
   the third-party park (Sonos Era 100 pair and solo, Sonos Bookshelf, WiiM
   Pro, Edifier MS50A, Samsung HW-LS60D:
@@ -821,11 +836,18 @@ capture.
   member of a sync group, so a group splices sample-aligned); the pacing
   depth is kept shallow (600 ms) because the receiver's queued audio plays
   out before a splice is audible. A commanded instant at or behind a
-  member's head splices at that member's own head instead — silently
-  breaking the shared instant — so the flush ack carries the frozen head's
-  audible instant (`[STATUS] flushed head_unix_ms=<ms>`), the depth rides
-  `warm_lead_ms` on the `[STATUS] latency` line, and the caller anchors
-  every warm START beyond all members' heads (plus their sync adjustments).
+  member's head is corrected forward to that member's head plus the 250 ms
+  minimum warm lead, which breaks the shared instant unless the caller
+  re-aligns — so the flush ack carries the frozen head's audible instant
+  (`[STATUS] flushed head_unix_ms=<ms>`), the depth rides `warm_lead_ms` on
+  the `[STATUS] latency` line, and the caller anchors every warm START beyond
+  all members' heads (plus their sync adjustments). The correction is logged
+  at WARN and the corrected instant is what `[STATUS] started at_unix_ms=`
+  reports, so a caller detects it by comparing that against what it asked
+  for. It lands one lead beyond the head rather than at it because the
+  keepalive advances the head 1:1 with the wall clock: an ack naming the bare
+  head sends the corrective retry chasing a moving target (+212/+418/+15 ms
+  rounds, no convergence).
   A lapsed line (resume over a long-idle pipeline) re-anchors fresh — the
   clean session-start shape — and deny-listed receivers keep the classic
   warm path throughout.
@@ -835,8 +857,9 @@ capture.
   a nonzero process exit rather than a false EOF.
 - **EOF drain** — `[STATUS] eof` means the single stdin input ended (the whole
   feed, not one track). The receiver then drains at most `latency + 2 s`, and
-  the connection idles awaiting the next `START` or the orphan idle timeout /
-  `DISCONNECT`.
+  the connection idles awaiting the next `START` or `DISCONNECT`. The session
+  stays in its playing state across EOF, so the orphan timeout (§12) does not
+  cover this window — an abandoned post-EOF session is the caller's to end.
 - **Initial metadata** — pushed at the first START with a placeholder title if the
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
@@ -878,8 +901,9 @@ callers:
   must hold grandmaster for the session timeline (§4).
 - **Sonos household stream tracking cross-wires wire-identical sessions**
   from one host; per-process RTP timeline offsets are required (§6).
-- **Receiver buffer windows are ~2 s** (Sonos reports 88200 frames); the
-  SETUP echo of the window is optional, so pacing falls back to 1.75 s.
+- **Receiver buffer windows are ~2 s** — the AirPlay standard our own stream
+  SETUP proposes as `latencyMax` 88200 frames. The receiver's echo of the
+  window is optional (Sonos omits it), so pacing falls back to 1.75 s.
 - **Pairing posture differs by vendor**: Sonos/JBL/WiiM accept transient
   pairing (no PIN); Apple TV/HomePod require stored credentials from a PIN
   pair-setup (transient returns 200 + an in-band TLV error and silence).
@@ -891,3 +915,93 @@ callers:
   order but renders silence; moving RECORD immediately before the stream
   SETUP — the order Apple senders and owntone already use — fixes it, with
   no regression seen on Apple TV 4K or Sonos Era 100 (§3).
+
+## 12. Caller-facing output contract
+
+Everything the caller parses is one `[STATUS]` or `[EVENT]` line. **The
+contract spans both standard streams, and the split does not follow a semantic
+boundary — a parser has to read both.** stderr carries the runtime and
+lifecycle lines; stdout carries the one-shot setup lines and the remote-control
+events. The `[STATUS] mrp` family is itself split: `artwork=` on stderr,
+`path=` on stdout. stderr is unbuffered and every machine-readable stdout line
+is flushed as it is written, but the two are separate buffers, so their
+relative order is not guaranteed even when merged with `2>&1` — correlate by
+content, never by arrival order. Human-readable `LOG_*` output shares stderr,
+prefixed `[HH:MM:SS.mmm] <function>:<line>`; `--debug` changes only its
+verbosity, never its stream.
+
+| Line | Stream | Emitted |
+|---|---|---|
+| `[STATUS] route` | stdout | once, before any connect attempt |
+| `[STATUS] capabilities` | stdout | once after connect, AirPlay 2 route only |
+| `[STATUS] latency` | stdout | once after connect, AirPlay 2 route only |
+| `[STATUS] mrp path=channel` | stdout | once after connect, only when type-130 is enabled (§8) |
+| `[STATUS] mrp path=command` | stdout | on each change of the `/command` HTTP status |
+| `[EVENT] remote command=` | stdout | device-originated remote-control press |
+| `[STATUS] connected` | stderr | once, when the session is up |
+| `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |
+| `[STATUS] audio buffered_ms=` | stderr | once per start cycle, re-armed by FLUSH (§10) |
+| `[STATUS] started` | stderr | exactly one per `ACTION=START` (§6) |
+| `[STATUS] clock_verified` / `anchor_corrected` / `content_cut` | stderr | outcomes of a cold-commit clock verification (§6) |
+| `[STATUS] flushed` (optional `head_unix_ms=`) | stderr | one per accepted `ACTION=FLUSH` (§10) |
+| `[STATUS] REANCHOR` | stderr | the timeline was shifted to recover a gap |
+| `[STATUS] playing` / `paused` | stderr | `ACTION=PLAY` / `ACTION=PAUSE`, carrying `elapsed_ms=` |
+| `[STATUS] stopped` | stderr | `ACTION=STOP`; the process then exits 0 |
+| `[STATUS] mrp artwork=` | stderr | every artwork attempt (§8) |
+| `[STATUS] eof` | stderr | the stdin input ended |
+| `[STATUS] idle_timeout` | stderr | the orphan timer fired; the process then exits 0 |
+| `[STATUS] error code=` | stderr | immediately before the `[ERROR]` line (§3a) |
+
+The utility modes print `CREDENTIALS: <192 hex>` (`--pair-setup`) and
+`cliairplay <version> check` (`--check`) on stdout; the pair-setup PIN prompt
+goes to stderr precisely so the credentials line stays clean.
+
+**Route and capabilities.**
+
+```
+[STATUS] route protocol=<raop|airplay2> flow=<legacy|native|raop-compat> timing=<ptp|ntp> buffered=0
+[STATUS] capabilities requested=0x<hex> realtime_formats=0x<hex> realtime_known=<0|1> buffered_formats=0x<hex> buffered_known=<0|1>
+```
+
+`route` reports the resolved route (§2) before the first connect attempt, so it
+describes a session that then fails to connect just as well as one that
+succeeds, and its `timing=` is route intent rather than effective timing — a
+PTP session that falls back to the NTP responder still reports `timing=ptp`
+while `[STATUS] clock_ready` reports `mode=ntp`. `buffered=0` is a constant,
+kept so the line's shape does not change (§9). `capabilities` carries the
+selected `audioFormat` and the device's advertised format tables (§7); a
+`*_known=0` means the device published no such table, and `requested=0x0` on
+the RAOP-compat flow, which never reads `/info`. Both tables are evidence, not
+proof — hardware understates and overstates them (§11).
+
+**MediaRemote paths.** `[STATUS] mrp path=command status=<http>` is the
+`POST /command` status, edge-triggered: it prints only when the status changes
+to a new positive value, so a healthy session emits one `status=200` and
+nothing further. `[STATUS] mrp path=channel status=<0|1>` reports whether the
+type-130 channel came up and appears only when that channel is enabled at all
+(§8), so a stock session never sees it.
+
+**REANCHOR.**
+
+```
+[STATUS] REANCHOR shifted_frames=<u64> total_shifted_frames=<u64> sample_rate=<hz>
+```
+
+The timeline was padded forward to recover a gap: PCM starvation (the feed
+produced nothing within the read window) or a delivery stall (the head lapsed
+at or behind the wall clock through a process freeze or a network dropout).
+Both counts are in PCM frames — divide by `sample_rate` for seconds — where
+`shifted_frames` is this event alone and `total_shifted_frames` is **cumulative
+since the last START, not since process start**, because a commanded start
+zeroes the drift baseline on both sides. Native AirPlay 2 only, and only while
+streaming. Repeated recovery while a pad is still draining folds into the pad
+already queued, so one stall produces one line rather than a stream of them.
+
+**Orphan idle timeout.** A 120 s safety net ends a session nobody is driving.
+It arms when the session is created (so, at connect), on `ACTION=STANDBY`, and
+on each successful `ACTION=FLUSH` — a FLUSH whose transport leg fails does not
+re-arm it. Only a successful `START` disarms it. On expiry the binary emits
+`[STATUS] idle_timeout` and the process exits 0, with no `[ERROR]` and no
+`[STATUS] stopped`; a session that connects and never receives a `START` ends
+exactly this way. `ACTION=PAUSE` and EOF both leave the session in its playing
+state, so neither arms the timer.
