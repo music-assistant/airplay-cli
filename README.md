@@ -263,6 +263,9 @@ stdin, the single persistent audio input for the whole process lifetime.
   `ARTWORK=<local file path or http:// imageproxy URL>`, followed by
   `ACTION=SENDMETA` to push the set.
 
+`[STATUS] stopped` acknowledges `ACTION=STOP` once playback has been torn down.
+The process stays up, so a later `ACTION=START` can open a new session.
+
 `[STATUS] eof` means the stdin input ended — the whole feed is done, not just
 one track.
 

@@ -288,14 +288,13 @@ struct ap2cl_s {
                                            poller; takes over from the connect
                                            instant once it is set */
     /* Shared-daemon mode queries the streak over UDP (blocking); this poller
-     * keeps the snapshot fresh so the audio loop never blocks on it. */
+     * keeps the snapshot fresh so the audio loop never blocks on it. Readiness
+     * reporting (ap2cl_clock_readiness) reads the same snapshot, so the poller
+     * runs from connect and outlives every verification that uses it: only a
+     * reap (re-ensure or destroy) stops it. */
     pthread_t clock_verify_thread;
     bool clock_verify_thread_started;
     atomic_bool clock_verify_thread_stop;
-    atomic_bool clock_poll_wanted;  /* readiness reporting (ap2cl_clock_readiness)
-                                       also reads the snapshot, so in shared mode
-                                       the poller runs from connect and outlives
-                                       every verification that uses it */
     /* Retransmit history and the control-port reader that serves it. The ring
      * is written by the audio thread and read by the reader thread. */
     struct ap2_rtx_slot *rtx_ring;
@@ -2019,7 +2018,6 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * and stamp the instant its stall window runs from. The streak mark starts
      * clear: one left by an earlier session on this client describes a receiver
      * that is no longer the one being measured. */
-    atomic_store(&p->clock_poll_wanted, true);
     pthread_mutex_lock(&p->clock_verify_lock);
     p->clock_connected_unix_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
     p->clock_last_streak_unix_ms = 0;
@@ -2464,7 +2462,6 @@ struct ap2cl_s *ap2cl_create(
     pthread_mutex_init(&p->rtx_lock, NULL);
     pthread_mutex_init(&p->clock_verify_lock, NULL);
     atomic_init(&p->clock_verify_thread_stop, true);
-    atomic_init(&p->clock_poll_wanted, false);
     atomic_init(&p->rtx_stop, true);
     atomic_init(&p->rtx_requested, 0);
     atomic_init(&p->rtx_answered, 0);
@@ -2740,8 +2737,8 @@ static uint64_t ap2_clock_floor(struct ap2cl_s *p, uint64_t floor_ntp,
 }
 
 /* Stop the verification without an event (new commit, flush, teardown). The
- * poller is signalled here and joined by the next arm or the destroy, unless
- * readiness reporting still wants its snapshot. */
+ * poller is left running: readiness reporting keeps reading its snapshot, so
+ * it is stopped only by a reap (the next re-ensure, or the destroy). */
 static void ap2_clock_verify_disarm(struct ap2cl_s *p)
 {
     pthread_mutex_lock(&p->clock_verify_lock);
@@ -2751,8 +2748,6 @@ static void ap2_clock_verify_disarm(struct ap2cl_s *p)
      * the instant that stands. */
     p->start_ack_deferred = false;
     pthread_mutex_unlock(&p->clock_verify_lock);
-    if (!atomic_load(&p->clock_poll_wanted))
-        atomic_store(&p->clock_verify_thread_stop, true);
 }
 
 static void ap2_clock_verify_reap_poller(struct ap2cl_s *p)
@@ -2773,7 +2768,6 @@ static void *ap2_clock_verify_poller(void *arg)
         bool have = ap2_clock_query(p, &ex);
         uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
         pthread_mutex_lock(&p->clock_verify_lock);
-        bool armed = p->clock_verify_armed;
         p->clock_verify_have_exchange = have;
         if (have) {
             p->clock_verify_exchange = ex;
@@ -2784,7 +2778,6 @@ static void *ap2_clock_verify_poller(void *arg)
             p->clock_last_streak_unix_ms = now_ms;
         }
         pthread_mutex_unlock(&p->clock_verify_lock);
-        if (!armed && !atomic_load(&p->clock_poll_wanted)) break;
         for (int i = 0; i < AP2_CLOCK_VERIFY_POLL_MS / 50 &&
                         !atomic_load(&p->clock_verify_thread_stop); i++)
             usleep(50000);
@@ -3538,9 +3531,6 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
         p->start_ack_deferred = false;
     }
     pthread_mutex_unlock(&p->clock_verify_lock);
-    if (result != AP2_CLOCK_VERIFY_IDLE &&
-        !atomic_load(&p->clock_poll_wanted))
-        atomic_store(&p->clock_verify_thread_stop, true);
     return result;
 }
 
