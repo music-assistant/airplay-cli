@@ -694,7 +694,8 @@ length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
 DataStream keys derived from the pair-verify shared secret) exists for *inbound*
 remote control (Siri-remote play/pause). It is off by default because the real
 sender pushes now-playing over `/command`; `CLIAIRPLAY_MRP_TYPE130=1` enables
-it. Its outbound `SET_STATE` does carry a full now-playing picture —
+it. Its value is parsed the same way as `CLIAIRPLAY_MRP`, so `0`/`false`/`off`
+keep it off. Its outbound `SET_STATE` does carry a full now-playing picture —
 title/artist/album, duration, elapsed time, playback state and the artwork
 bytes — and while the channel is up and playback is PLAYING the feedback worker
 re-pushes it every 15 s (`MRP_STATE_REPUSH_S`) as a defensive refresh. That

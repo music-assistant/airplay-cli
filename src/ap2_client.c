@@ -375,6 +375,29 @@ static void ap2_remote_command_received(
         p->remote_command_cb(command, p->remote_command_userdata);
 }
 
+/* ---- Environment toggles ---- */
+
+/* Read a diagnostic on/off toggle: `0`, `false` and `off` disable it, any
+ * other value enables it, and an unset variable leaves the compiled-in
+ * default in place. */
+static bool ap2_env_enabled(const char *name, bool unset_default)
+{
+    const char *setting = getenv(name);
+    if (!setting) return unset_default;
+    if (!strcmp(setting, "0") || !strcmp(setting, "false") ||
+        !strcmp(setting, "off"))
+        return false;
+    return true;
+}
+
+/* Single answer for the opt-in type-130 channel: the setup site and the
+ * [STATUS] reporter must agree, or the status line reports on a channel that
+ * was never set up. */
+static bool ap2_mrp_type130_enabled(void)
+{
+    return ap2_env_enabled("CLIAIRPLAY_MRP_TYPE130", false);
+}
+
 /* ---- Native AP2 failure reporting ---- */
 
 /* True for the statuses a receiver uses to refuse an unauthenticated or
@@ -1997,7 +2020,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * default; now-playing rides /command (ap2cl_mrp_register + ap2cl_mrp_push).
      * Set CLIAIRPLAY_MRP_TYPE130=1 to re-enable the channel (future remote-
      * control RX). Best-effort; audio is up regardless. */
-    if (getenv("CLIAIRPLAY_MRP_TYPE130"))
+    if (ap2_mrp_type130_enabled())
         ap2_native_setup_mrp(p);
 
     /* Create ALAC encoder */
@@ -3940,10 +3963,7 @@ static void ap2_mrp_ready(struct ap2cl_s *p)
     if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
         p->sock_fd < 0 || p->events_sock < 0 || !p->session_uuid[0])
         return;
-    const char *setting = getenv("CLIAIRPLAY_MRP");
-    if (setting && (!strcmp(setting, "0") || !strcmp(setting, "false") ||
-                    !strcmp(setting, "off")))
-        return;
+    if (!ap2_env_enabled("CLIAIRPLAY_MRP", true)) return;
     p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
                             p->dacp_id, p->device.name,
                             p->session_uuid, p->group_uuid,
@@ -4167,10 +4187,10 @@ int ap2cl_mrp_push_progress(struct ap2cl_s *p)
 int ap2cl_mrp_channel_status(struct ap2cl_s *p)
 {
     if (!p || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return -1;
-    /* The type-130 channel is opt-in (see ap2_native_connect §6d); when it is
+    /* The type-130 channel is opt-in (see ap2_native_connect §6b); when it is
      * not attempted, report "not applicable" so the [STATUS] path=channel line
      * is suppressed and only path=command (the active now-playing path) shows. */
-    if (!getenv("CLIAIRPLAY_MRP_TYPE130")) return -1;
+    if (!ap2_mrp_type130_enabled()) return -1;
     pthread_mutex_lock(&p->mrp_lock);
     int status = (p->mrp && ap2_mrp_is_connected(p->mrp)) ? 1 : 0;
     pthread_mutex_unlock(&p->mrp_lock);
@@ -4588,6 +4608,16 @@ void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple)
 bool ap2cl_test_apple_model_default(const char *txt, const char *am)
 {
     return ap2_apple_model(txt, am);
+}
+
+bool ap2cl_test_env_enabled(const char *name, bool unset_default)
+{
+    return ap2_env_enabled(name, unset_default);
+}
+
+bool ap2cl_test_mrp_type130_enabled(void)
+{
+    return ap2_mrp_type130_enabled();
 }
 
 /* Plant a probe-streak snapshot where the shared-daemon poller would put

@@ -48,6 +48,8 @@ unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p);
 void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
+bool ap2cl_test_env_enabled(const char *name, bool unset_default);
+bool ap2cl_test_mrp_type130_enabled(void);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
                                       uint64_t first_ms, uint64_t third_ms);
 void ap2cl_test_clear_clock_exchange(struct ap2cl_s *p);
@@ -480,6 +482,39 @@ static void test_route_with_password(void)
         false, false);
     assert(legacy.use_raop);
     puts("ap2_client route password selection tests passed");
+}
+
+/* Both MediaRemote toggles parse their value, so the spellings a user reaches
+ * for to switch something off do that from either default — the /command path
+ * that ships on, and the type-130 channel that ships off. */
+static void test_env_toggle_parsing(void)
+{
+    static const char *const off[] = { "0", "false", "off" };
+    static const char *const on[] = { "1", "yes", "" };
+
+    /* Unset keeps each toggle's own default: /command on, type-130 off. */
+    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130") == 0);
+    assert(ap2cl_test_env_enabled("CLIAIRPLAY_MRP", true));
+    assert(!ap2cl_test_mrp_type130_enabled());
+
+    for (size_t i = 0; i < sizeof(off) / sizeof(off[0]); i++) {
+        assert(setenv("CLIAIRPLAY_MRP", off[i], 1) == 0);
+        assert(setenv("CLIAIRPLAY_MRP_TYPE130", off[i], 1) == 0);
+        assert(!ap2cl_test_env_enabled("CLIAIRPLAY_MRP", true));
+        assert(!ap2cl_test_mrp_type130_enabled());
+    }
+    /* The documented CLIAIRPLAY_MRP_TYPE130=1 spelling enables (DESIGN.md §8),
+     * and no other value is read as off. */
+    for (size_t i = 0; i < sizeof(on) / sizeof(on[0]); i++) {
+        assert(setenv("CLIAIRPLAY_MRP", on[i], 1) == 0);
+        assert(setenv("CLIAIRPLAY_MRP_TYPE130", on[i], 1) == 0);
+        assert(ap2cl_test_env_enabled("CLIAIRPLAY_MRP", true));
+        assert(ap2cl_test_mrp_type130_enabled());
+    }
+    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP_TYPE130") == 0);
+    puts("ap2_client env toggle parsing tests passed");
 }
 
 /* The splice timeline is the default for every native session; the deny-list
@@ -1442,6 +1477,7 @@ int main(void)
     test_feedback_stream_counts();
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
+    test_env_toggle_parsing();
     test_splice_default_resolution();
     test_splice_timeline_warm_path();
     test_splice_delivery_gap_recovery();
