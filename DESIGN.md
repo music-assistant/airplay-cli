@@ -858,9 +858,9 @@ capture.
   a nonzero process exit rather than a false EOF.
 - **EOF drain** — `[STATUS] eof` means the single stdin input ended (the whole
   feed, not one track). The receiver then drains at most `latency + 2 s`, and
-  the connection idles awaiting the next `START` or `DISCONNECT`. The session
-  stays in its playing state across EOF, so the orphan timeout (§12) does not
-  cover this window — an abandoned post-EOF session is the caller's to end.
+  the connection idles awaiting the next `START`, the orphan idle timeout, or
+  `DISCONNECT`. The session stays in its playing state across EOF, so the
+  timeout arms on the input closing rather than on that state (§12).
 - **Initial metadata** — pushed at the first START with a placeholder title if the
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
@@ -999,10 +999,22 @@ streaming. Repeated recovery while a pad is still draining folds into the pad
 already queued, so one stall produces one line rather than a stream of them.
 
 **Orphan idle timeout.** A 120 s safety net ends a session nobody is driving.
-It arms when the session is created (so, at connect), on `ACTION=STANDBY`, and
-on each successful `ACTION=FLUSH` — a FLUSH whose transport leg fails does not
-re-arm it. Only a successful `START` disarms it. On expiry the binary emits
-`[STATUS] idle_timeout` and the process exits 0, with no `[ERROR]` and no
-`[STATUS] stopped`; a session that connects and never receives a `START` ends
-exactly this way. `ACTION=PAUSE` and EOF both leave the session in its playing
-state, so neither arms the timer.
+It arms when the session is created (so, at connect), on `ACTION=STANDBY`, on
+each successful `ACTION=FLUSH` — a FLUSH whose transport leg fails does not
+re-arm it — and when the input closes. Only a successful `START` disarms it,
+and a `START` after the input closed re-opens the window rather than disarming
+it for good, so a caller that keeps commanding is never cut off. On expiry the
+binary emits `[STATUS] idle_timeout` and the process exits 0, with no
+`[ERROR]` and no `[STATUS] stopped`; a session that connects and never
+receives a `START` ends exactly this way, and so does one played to EOF and
+then abandoned.
+
+The EOF arming is keyed on the input CLOSING, not on the drain finishing or
+the ring emptying. A closed stdin is the end of the whole feed — a warm
+seek/next is a `FLUSH`, which keeps the writer open — so no later audio can
+reach the session and what remains is a bounded playout of the ring and the
+receiver's queue. Keying it on the close also covers a session that was paused
+when the input closed, where the audio loop never reads and so never observes
+the ring run dry. `ACTION=PAUSE` on its own does not arm the timer: a paused
+session is still being driven and routine pauses outlast 120 s, while a caller
+that dies while paused closes its end of stdin and arrives as the EOF case.

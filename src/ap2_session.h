@@ -158,8 +158,12 @@ typedef struct {
  * :param ops: transport quiesce/flush/commit/resume/stop + status callbacks.
  * :param byte_rate: PCM byte rate of the input format (ring sizing/timing).
  * :param ready_bytes: buffered PCM required before the one-shot audio status.
- * :param idle_timeout_ms: end the session after this long idle (no playing
- *                         stream), an orphan safety net; 0 disables it.
+ * :param idle_timeout_ms: end the session after this long without the caller
+ *                         driving it — the pre-start and post-flush idle
+ *                         waits, a standby park, and a stream whose input has
+ *                         closed (no further audio can reach it, so the
+ *                         post-EOF drain and wait are covered too). An orphan
+ *                         safety net; 0 disables it.
  * :param input_fd: PCM input descriptor (normally the process stdin). The
  *                  engine duplicates it, drives it non-blocking, and reads it
  *                  for the whole session; the caller keeps ownership of its own
