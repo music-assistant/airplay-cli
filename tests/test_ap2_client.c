@@ -955,6 +955,10 @@ static void test_retransmit_responder(void)
         if (!memcmp(resp + 4, pkt_b, sizeof(pkt_b))) seen_b = true;
     }
     assert(seen_a && seen_b);
+    /* The responder counts a resend only once the datagram is away, so the
+     * second packet can reach us here before the counter catches up. */
+    for (int i = 0; i < 30 && ap2cl_test_rtx_answered(client) < 2; i++)
+        usleep(50000);
     assert(ap2cl_test_rtx_answered(client) == 2);
 
     /* A packet that has already aged out is counted, not answered. */
@@ -1519,7 +1523,10 @@ int main(void)
     ap2cl_test_lock_mrp(client);
     pthread_t thread;
     assert(pthread_create(&thread, NULL, run_health_check, &check) == 0);
-    usleep(50000);
+    /* Completing while the MRP lock is held is the property under test, so
+     * wait for the snapshot instead of assuming a fixed span was enough. */
+    for (int i = 0; i < 30 && !atomic_load(&check.done); i++)
+        usleep(50000);
     assert(atomic_load(&check.done));
     assert(check.healthy);
     ap2cl_test_unlock_mrp(client);
