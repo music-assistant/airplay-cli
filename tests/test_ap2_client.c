@@ -59,6 +59,7 @@ void ap2cl_test_set_clock_marks(struct ap2cl_s *p, uint64_t connected_ms,
 void ap2cl_test_bump_audio_sent(struct ap2cl_s *p);
 void ap2cl_test_set_dev_latency_max(struct ap2cl_s *p, uint32_t frames);
 uint64_t ap2cl_test_pacing_window_frames(struct ap2cl_s *p);
+ap2_connect_error_t ap2cl_test_auth_error_kind(struct ap2cl_s *p);
 
 typedef struct {
     int fd;
@@ -482,6 +483,67 @@ static void test_route_with_password(void)
         false, false);
     assert(legacy.use_raop);
     puts("ap2_client route password selection tests passed");
+}
+
+/* A 401/403 is classified from what we actually presented, because the two
+ * verdicts send the caller to different remedies: AUTH_REQUIRED becomes MA's
+ * "password required" prompt, AUTH_FAILED tells the user to fix the secret.
+ * Stored HAP credentials count as a presented secret — a receiver that rotated
+ * them (tvOS re-pairing) rejects pair-verify, and prompting for a password the
+ * device never had leaves the user with nothing to enter. */
+static void test_auth_error_kind(void)
+{
+    ap2_device_info_t device = {
+        .name = "auth kind test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    /* Only credentials of the exact HAP length are stored by ap2cl_create. */
+    char creds[193];
+    memset(creds, 'a', sizeof(creds) - 1);
+    creds[sizeof(creds) - 1] = '\0';
+
+    struct ap2cl_s *bare = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(bare);
+    assert(ap2cl_test_auth_error_kind(bare) == AP2_CONNECT_ERROR_AUTH_REQUIRED);
+    assert(ap2cl_destroy(bare));
+
+    /* An empty password is no password: it is stored but can never be
+     * presented, so the "supply one" verdict still stands. */
+    struct ap2cl_s *empty = ap2cl_create(
+        &device, &format, NULL, "", NULL, NULL, 2000, 100);
+    assert(empty);
+    assert(ap2cl_test_auth_error_kind(empty) == AP2_CONNECT_ERROR_AUTH_REQUIRED);
+    assert(ap2cl_destroy(empty));
+
+    struct ap2cl_s *with_password = ap2cl_create(
+        &device, &format, NULL, "device-password", NULL, NULL, 2000, 100);
+    assert(with_password);
+    assert(ap2cl_test_auth_error_kind(with_password) ==
+           AP2_CONNECT_ERROR_AUTH_FAILED);
+    assert(ap2cl_destroy(with_password));
+
+    /* Credentials present, no password: revoked pairing, not a missing one. */
+    struct ap2cl_s *with_creds = ap2cl_create(
+        &device, &format, creds, NULL, NULL, NULL, 2000, 100);
+    assert(with_creds);
+    assert(ap2cl_test_auth_error_kind(with_creds) ==
+           AP2_CONNECT_ERROR_AUTH_FAILED);
+    assert(ap2cl_destroy(with_creds));
+
+    struct ap2cl_s *both = ap2cl_create(
+        &device, &format, creds, "device-password", NULL, NULL, 2000, 100);
+    assert(both);
+    assert(ap2cl_test_auth_error_kind(both) == AP2_CONNECT_ERROR_AUTH_FAILED);
+    assert(ap2cl_destroy(both));
+
+    puts("ap2_client auth error classification tests passed");
 }
 
 /* Both MediaRemote toggles parse their value, so the spellings a user reaches
@@ -1477,6 +1539,7 @@ int main(void)
     test_retransmit_responder();
     test_route_with_password();
     test_route_explicit_airplay2();
+    test_auth_error_kind();
     test_info_format_tables();
     test_feedback_stream_counts();
     test_native_flush_resume_reuses_rtsp_session();

@@ -36,6 +36,7 @@
 #include "cross_log.h"
 #include "ap2_client.h"
 #include "ap2_session.h"
+#include "ap2_io.h"
 #include "ap2_ptp.h"
 #include "ap2_hap.h"
 #include "raop_session.h"
@@ -149,29 +150,15 @@ static struct debug_s {
 
 /* ---- Normalized status output ---- */
 
-/* One line, one write. Three threads emit these (the audio loop, the command
- * pipe, the session reader) and the human-readable LOG_* output shares the
- * stream, so formatting the body and the newline as two writes lets another
- * thread land between them and corrupt a line the caller then drops. The
- * relied-on guarantee is POSIX pipe atomicity: concurrent writes of at most
- * PIPE_BUF bytes are not interleaved, and PIPE_BUF is at least 512 everywhere
- * (exactly 512 on macOS), so the buffer is sized to emit at most 511 bytes.
- * That is well past the longest line we produce (a `mrp artwork=` report, ~200
- * chars); a line that would still overflow is clamped rather than split. The
- * flush is a no-op while stderr stays unbuffered (set at startup) and is kept
- * so a future buffering change cannot silently delay status lines. */
+/* One line, one write — see ap2_io_status_line() for the atomicity the emitters
+ * here rely on. The implementation lives in ap2_io.c so the AP2 client's own
+ * status lines go out through the same single write. */
 static void status_print(const char *fmt, ...)
 {
-    char line[512];
     va_list args;
     va_start(args, fmt);
-    int written = vsnprintf(line, sizeof(line) - 1, fmt, args);
+    ap2_io_status_vline(fmt, args);
     va_end(args);
-    size_t len = written < 0 ? 0 : (size_t)written;
-    if (len > sizeof(line) - 2) len = sizeof(line) - 2;
-    line[len++] = '\n';
-    fwrite(line, 1, len, stderr);
-    fflush(stderr);
 }
 
 /* Status messages parsed by Music Assistant's _stderr_reader() */
@@ -901,7 +888,16 @@ static void *cmdpipe_reader_thread(void *arg)
 
     while (g_running) {
         struct pollfd pfds = {.fd = g_cmdpipe_fd, .events = POLLIN};
-        int n = poll(&pfds, 1, 1000);
+        /* The timeout bounds teardown, not command latency: an arriving command
+         * wakes the poll at once, but STOP, DISCONNECT and the idle timeout all
+         * tear down through join_command_thread(), which cannot return before
+         * this wait expires. By then the client is AP2_DOWN, so the audio loop's
+         * silence keepalive has already stopped and nothing feeds the wire until
+         * TEARDOWN goes out — a receiver whose queue underruns while its session
+         * is still armed pops audibly. 100 ms keeps that gap far inside the
+         * 600 ms queue depth. The wait's only other job is pacing libraop's 20 s
+         * RAOP keepalive below, which ten wakeups a second serve as well as one. */
+        int n = poll(&pfds, 1, 100);
         if (!g_running) break;
 
         uint64_t now = raopcl_get_ntp(NULL);

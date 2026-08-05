@@ -459,9 +459,9 @@ void ap2cl_set_remote_command_callback(
  */
 void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint32_t *dev_max);
 
-/* Device-reported arrival->render latency in ms (0 when unreported). Members
- * reporting it are scheduled earlier by this amount so their acoustic output
- * aligns with the group. */
+/* Device-reported arrival->render latency in ms (0 when unreported). Reported
+ * for diagnostics on the [STATUS] latency line and never applied to a schedule:
+ * receivers already self-compensate their own render latency. */
 int ap2cl_render_latency_ms(struct ap2cl_s *p);
 
 /* Frames between the delivery head and the audible position (elapsed

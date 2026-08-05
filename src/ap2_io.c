@@ -15,6 +15,25 @@
 #include <strings.h>
 #include <time.h>
 
+void ap2_io_status_vline(const char *fmt, va_list args)
+{
+    char line[512];
+    int written = vsnprintf(line, sizeof(line) - 1, fmt, args);
+    size_t len = written < 0 ? 0 : (size_t)written;
+    if (len > sizeof(line) - 2) len = sizeof(line) - 2;
+    line[len++] = '\n';
+    fwrite(line, 1, len, stderr);
+    fflush(stderr);
+}
+
+void ap2_io_status_line(const char *fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    ap2_io_status_vline(fmt, args);
+    va_end(args);
+}
+
 uint64_t ap2_io_monotonic_ms(void)
 {
     struct timespec ts;
