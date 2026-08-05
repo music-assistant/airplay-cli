@@ -100,6 +100,7 @@ typedef struct {
     bool force_native;      /* force native AP2 flow (transient pairing) */
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
+    bool no_ptp;            /* force NTP timing even when SupportsPTP is advertised */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
 
     /* Audio format */
@@ -1874,6 +1875,8 @@ static void print_usage(const char *name)
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
     printf("                             SupportsPTP feature bit)\n");
+    printf("  --no-ptp                   Force NTP timing even when the device\n");
+    printf("                             advertises SupportsPTP (wins over --ptp)\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
     printf("                             read the elected clock from shared memory and do\n");
     printf("                             not bind 319/320 when a daemon is present; else\n");
@@ -1948,6 +1951,7 @@ int main(int argc, char *argv[])
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
+        {"no-ptp",       no_argument,       0, 1014},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
         {"check",        no_argument,       0, 1002},
@@ -1998,6 +2002,7 @@ int main(int argc, char *argv[])
         case 1007: cfg.force_native = true; break;
         case 1008: cfg.publish_ip = optarg; break;
         case 1009: cfg.ptp = true; break;
+        case 1014: cfg.no_ptp = true; break;
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
@@ -2081,9 +2086,14 @@ int main(int argc, char *argv[])
      * cfg.route carries the AirPlay 2 sub-decisions applied in run_airplay2(). */
     bool have_creds = cfg.auth && strlen(cfg.auth) == 192;
     bool have_password = cfg.password && *cfg.password;
+    /* --no-ptp wins over --ptp and the SupportsPTP auto-detect: some receivers
+     * advertise PTP but never render a PTP-timed stream (old LinkPlay platform
+     * firmware), and the caller knows better than the TXT records. */
+    bool ptp_forced = cfg.ptp || cfg.no_ptp;
+    bool ptp_enabled = cfg.ptp && !cfg.no_ptp;
     cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
                                   have_password, cfg.bit_depth, cfg.force_native,
-                                  cfg.ptp, cfg.ptp);
+                                  ptp_forced, ptp_enabled);
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
              cfg.route.reason,
