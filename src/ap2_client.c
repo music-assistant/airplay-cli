@@ -163,7 +163,7 @@ struct ap2cl_s {
     ap2_device_info_t device;
     ap2_audio_format_t format;
     ap2_state_t state;
-    int latency_ms;
+    int lead_ms;
     uint32_t dev_latency_min;      /* receiver-reported buffering window (frames) */
     uint32_t dev_latency_max;
     int dev_render_ms;             /* receiver-reported arrival->render latency (ms) */
@@ -1960,18 +1960,18 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         if (ap2_bplist_find_uint(resp, (size_t)resp_len, "latencyMax", &v) && v > 0)
             p->dev_latency_max = (uint32_t)v;
         if (p->dev_latency_min || p->dev_latency_max) {
-            int lat_frames = MS2TS(p->latency_ms, p->format.sample_rate);
+            int lat_frames = MS2TS(p->lead_ms, p->format.sample_rate);
             int min_f = p->dev_latency_min ? (int)p->dev_latency_min : 0;
             int max_f = p->dev_latency_max ? (int)p->dev_latency_max : lat_frames;
             int clamped = lat_frames < min_f ? min_f : (lat_frames > max_f ? max_f : lat_frames);
             int clamped_ms = clamped * 1000 / p->format.sample_rate;
-            if (clamped_ms != p->latency_ms) {
+            if (clamped_ms != p->lead_ms) {
                 LOG_INFO("[AP2] Device latency window %d..%d frames: adjusting lead "
-                         "%dms -> %dms", min_f, max_f, p->latency_ms, clamped_ms);
-                p->latency_ms = clamped_ms;
+                         "%dms -> %dms", min_f, max_f, p->lead_ms, clamped_ms);
+                p->lead_ms = clamped_ms;
             }
             LOG_INFO("[AP2] Device latency: min=%u max=%u frames, effective lead %dms",
-                     p->dev_latency_min, p->dev_latency_max, p->latency_ms);
+                     p->dev_latency_min, p->dev_latency_max, p->lead_ms);
         }
 
         if (remote_data > 0) {
@@ -2103,7 +2103,7 @@ static ap2_send_result_t ap2_send_sync_packet(struct ap2cl_s *p, bool first)
     pkt[2] = 0x00;
     pkt[3] = 0x07;
 
-    uint32_t latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
+    uint32_t latency_frames = MS2TS(p->lead_ms, p->format.sample_rate);
     uint32_t ts_latency = p->rtp_timestamp >= latency_frames
                           ? p->rtp_timestamp - latency_frames : 0;
     uint32_t ts_be = htonl(ts_latency);
@@ -2166,7 +2166,7 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
      * schedules playback as "frame_1 - 11035 plays at the packet timestamp"
      * and derives its buffer latency from frame_2 - frame_1 (Apple senders:
      * 77175). The mapping is FROZEN at stream start — playback of the first
-     * frame begins latency_ms after the anchor point — and every periodic
+     * frame begins lead_ms after the anchor point — and every periodic
      * packet extrapolates along that same line, so all time-announces agree. */
     uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
     if (!p->rt_anchor_valid) {
@@ -2182,7 +2182,7 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->latency_ms * 1000000ULL;
+            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->lead_ms * 1000000ULL;
             p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
                               + atomic_load(&p->rtp_offset);
         } else {
@@ -2196,17 +2196,17 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
          * bring its output path up. */
         int64_t audible_in_ms =
             ((int64_t)(p->rt_anchor_wall0 - wall) / 1000000LL)
-            + (int64_t)p->latency_ms;
+            + (int64_t)p->lead_ms;
         LOG_INFO("[AP2] anchor frozen: wall0=%" PRIu64 "ns pos0=%u "
-                 "latency_ms=%u start_ntp=%" PRIu64 " audible_in_ms=%" PRId64,
-                 p->rt_anchor_wall0, p->rt_anchor_pos0, p->latency_ms,
+                 "lead_ms=%u start_ntp=%" PRIu64 " audible_in_ms=%" PRId64,
+                 p->rt_anchor_wall0, p->rt_anchor_pos0, p->lead_ms,
                  p->start_ntp, audible_in_ms);
     }
     int64_t wall_delta_ns = wall >= p->rt_anchor_wall0
                                 ? (int64_t)(wall - p->rt_anchor_wall0)
                                 : -(int64_t)(p->rt_anchor_wall0 - wall);
     int64_t elapsed_ns = wall_delta_ns
-                       - (int64_t)p->latency_ms * 1000000LL;
+                       - (int64_t)p->lead_ms * 1000000LL;
     uint32_t play_pos = p->rt_anchor_pos0
                       + (uint32_t)((elapsed_ns * p->format.sample_rate) / 1000000000LL);
     uint32_t frame_1 = play_pos + 11035;
@@ -2434,7 +2434,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
     if (!hostent) return false;
     memcpy(&player_addr.s_addr, hostent->h_addr_list[0], hostent->h_length);
 
-    int latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
+    int latency_frames = MS2TS(p->lead_ms, p->format.sample_rate);
     bool mfi_auth = p->am && strcasestr(p->am, "airport");
 
     p->raopcl = raopcl_create(
@@ -2474,7 +2474,7 @@ struct ap2cl_s *ap2cl_create(
     ap2_device_info_t *device, ap2_audio_format_t *format,
     const char *auth, const char *password,
     const char *dacp_id, const char *active_remote,
-    int latency_ms, int volume)
+    int lead_ms, int volume)
 {
     struct ap2cl_s *p = calloc(1, sizeof(struct ap2cl_s));
     if (!p) return NULL;
@@ -2482,7 +2482,7 @@ struct ap2cl_s *ap2cl_create(
     p->device = *device;
     p->format = *format;
     p->state = AP2_DOWN;
-    p->latency_ms = latency_ms;
+    p->lead_ms = lead_ms;
     p->volume = volume;
     p->sock_fd = -1;
     p->data_sock = -1;
@@ -3336,7 +3336,7 @@ static bool ap2_splice_pad_to_lead(struct ap2cl_s *p, uint64_t now_ts,
                                    uint64_t lapse_ts, const char *cause)
 {
     uint64_t window = ap2_pacing_window_frames(p);
-    uint64_t latency = MS2TS(p->latency_ms, p->format.sample_rate);
+    uint64_t latency = MS2TS(p->lead_ms, p->format.sample_rate);
     uint64_t recovery_lead = latency < window ? latency : window;
     uint64_t effective_head = p->head_ts + p->splice_pad_frames;
     if (effective_head > lapse_ts) return false;
@@ -3363,7 +3363,7 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
     uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
     uint64_t floor = MS2TS(250, p->format.sample_rate);
     uint64_t window = ap2_pacing_window_frames(p);
-    uint64_t latency = MS2TS(p->latency_ms, p->format.sample_rate);
+    uint64_t latency = MS2TS(p->lead_ms, p->format.sample_rate);
     uint64_t recovery_lead = latency < window ? latency : window;
 
     if (p->splice_timeline) {
@@ -4404,7 +4404,7 @@ void ap2cl_format_capabilities(struct ap2cl_s *p,
 
 void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint32_t *dev_max)
 {
-    if (lead_ms) *lead_ms = p ? p->latency_ms : 0;
+    if (lead_ms) *lead_ms = p ? p->lead_ms : 0;
     if (dev_min) *dev_min = p ? p->dev_latency_min : 0;
     if (dev_max) *dev_max = p ? p->dev_latency_max : 0;
 }
@@ -4417,7 +4417,7 @@ uint32_t ap2cl_audible_lag_frames(struct ap2cl_s *p)
     if (!p) return 0;
     if (p->flow == FLOW_NATIVE_AP2 && p->splice_timeline)
         return (uint32_t)ap2_pacing_window_frames(p);
-    return (uint32_t)MS2TS(p->latency_ms, p->format.sample_rate);
+    return (uint32_t)MS2TS(p->lead_ms, p->format.sample_rate);
 }
 
 /* Minimum lead (ms) a warm commanded START needs for the new content to begin
