@@ -110,7 +110,7 @@ extern log_level *loglevel;
 #define AP2_CLOCK_VERIFY_MIN_WINDOW_MS(p) (ap2_splice_depth_ms(p) + 500)
 /* Receiver queue depth on the splice timeline (§ splice below): the
  * depth IS the audible latency of a warm splice, so it stays shallow.
- * ap2_splice_depth_ms() applies the caller's --splice-depth-ms override:
+ * ap2_splice_depth_ms() applies the caller's --buffer-depth-ms override:
  * LinkPlay receivers acting as native multiroom master starve the AirPlay
  * renderer below ~1 s of queued audio, so their caller asks for more. */
 #define AP2_SPLICE_PACING_MS         600

@@ -1880,7 +1880,7 @@ static void print_usage(const char *name)
     printf("                             SupportsPTP feature bit)\n");
     printf("  --no-ptp                   Force NTP timing even when the device\n");
     printf("                             advertises SupportsPTP (wins over --ptp)\n");
-    printf("  --splice-depth-ms <ms>     Receiver queue depth on the splice timeline\n");
+    printf("  --buffer-depth-ms <ms>     Receiver queue depth on the splice timeline\n");
     printf("                             (default 600; deeper feeds multiroom masters,\n");
     printf("                             at the cost of seek responsiveness)\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
@@ -1958,7 +1958,7 @@ int main(int argc, char *argv[])
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
         {"no-ptp",       no_argument,       0, 1014},
-        {"splice-depth-ms", required_argument, 0, 1015},
+        {"buffer-depth-ms", required_argument, 0, 1015},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
         {"check",        no_argument,       0, 1002},
