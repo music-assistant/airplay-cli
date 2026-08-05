@@ -2089,9 +2089,11 @@ int main(int argc, char *argv[])
     /* --no-ptp wins over --ptp and the SupportsPTP auto-detect: some receivers
      * advertise PTP but never render a PTP-timed stream (old LinkPlay platform
      * firmware), and the caller knows better than the TXT records. */
+    bool ptp_forced = cfg.ptp || cfg.no_ptp;
+    bool ptp_enabled = cfg.ptp && !cfg.no_ptp;
     cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
                                   have_password, cfg.bit_depth, cfg.force_native,
-                                  cfg.ptp || cfg.no_ptp, cfg.ptp && !cfg.no_ptp);
+                                  ptp_forced, ptp_enabled);
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
              cfg.route.reason,

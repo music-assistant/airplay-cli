@@ -111,8 +111,10 @@ uint64_t ap2_txt_flags(const char *txt);
  * :param bit_depth: requested output bit depth (informational; hi-res rides
  *                   the realtime stream).
  * :param force_native: --ap2-native was given (forces the native AP2 flow).
- * :param ptp_forced: --ptp was given (overrides the SupportsPTP auto-detect).
- * :param ptp_enabled: the value passed to --ptp.
+ * :param ptp_forced: --ptp or --no-ptp was given (overrides the SupportsPTP
+ *                    auto-detect).
+ * :param ptp_enabled: the forced timing when ptp_forced: true for --ptp,
+ *                     false for --no-ptp (which wins when both are given).
  */
 ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char *pw,
                               bool have_credentials, bool have_password,
