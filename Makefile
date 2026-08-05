@@ -228,12 +228,23 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 		/tmp/cliairplay-test-unused 127.0.0.1 - 2>&1 || true)"; \
 		printf '%s\n' "$$argv_audio" | \
 		grep -q "Streaming audio must be provided on stdin, not argv"
+# Both greps are chained with && on purpose: a recipe line reports only its
+# last command's status, so separating them with ; would leave the coded-line
+# assertion unenforced.
 	@auth_required="$$($(EXECUTABLE) --protocol raop --pw true \
 		127.0.0.1 2>&1 || true)"; \
 		printf '%s\n' "$$auth_required" | \
-		grep -q '^\[STATUS\] error code=auth_required http=0 detail="[^"]*"$$'; \
+		grep -q '^\[STATUS\] error code=auth_required http=0 detail="[^"]*"$$' && \
 		printf '%s\n' "$$auth_required" | \
 		grep -q "Password required but not supplied"
+# A connect-path setup failure must carry its code too: without one the caller
+# has nothing to fail fast on and waits out its connect timeout instead.
+	@setup_failed="$$($(EXECUTABLE) --protocol raop --cmdpipe \
+		/nonexistent-cliairplay-test-dir/pipe 127.0.0.1 2>&1 || true)"; \
+		printf '%s\n' "$$setup_failed" | \
+		grep -q '^\[STATUS\] error code=connect_failed http=0 detail="[^"]*"$$' && \
+		printf '%s\n' "$$setup_failed" | \
+		grep -q "Failed to create command pipe"
 
 $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 		src/raop_session.h Makefile

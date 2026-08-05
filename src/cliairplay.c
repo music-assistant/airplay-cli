@@ -149,14 +149,27 @@ static struct debug_s {
 
 /* ---- Normalized status output ---- */
 
+/* One line, one write. Three threads emit these (the audio loop, the command
+ * pipe, the session reader) and the human-readable LOG_* output shares the
+ * stream, so formatting the body and the newline as two writes lets another
+ * thread land between them and corrupt a line the caller then drops. The
+ * relied-on guarantee is POSIX pipe atomicity: concurrent writes of at most
+ * PIPE_BUF bytes are not interleaved, and PIPE_BUF is at least 512 everywhere
+ * (exactly 512 on macOS), so the buffer is sized to emit at most 511 bytes.
+ * That is well past the longest line we produce (a `mrp artwork=` report, ~200
+ * chars); a line that would still overflow is clamped rather than split. */
 static void status_print(const char *fmt, ...)
 {
+    char line[512];
     va_list args;
     va_start(args, fmt);
-    vfprintf(stderr, fmt, args);
-    fprintf(stderr, "\n");
-    fflush(stderr);
+    int written = vsnprintf(line, sizeof(line) - 1, fmt, args);
     va_end(args);
+    size_t len = written < 0 ? 0 : (size_t)written;
+    if (len > sizeof(line) - 2) len = sizeof(line) - 2;
+    line[len++] = '\n';
+    fwrite(line, 1, len, stderr);
+    fflush(stderr);
 }
 
 /* Status messages parsed by Music Assistant's _stderr_reader() */
@@ -206,6 +219,14 @@ static void status_error(const char *msg)
     status_print("[ERROR] %s", msg);
 }
 
+/* How far the projected readiness instant must move to count as material. The
+ * projection is arithmetic on two live readings, so it jitters even while the
+ * receiver behaves: the shared-daemon snapshot freezes between poller rounds
+ * while now advances, and the in-process engine mixes two clocks each truncated
+ * to milliseconds. Comparing exactly reports that jitter as news every sample;
+ * nothing a caller plans against moves by this little. */
+#define CLOCK_READY_JITTER_MS 50
+
 /* Receiver-clock readiness, pushed from connect so the caller never has to
  * guess a join headroom: a receiver begins probing our clock about a second
  * after it connects, on its own schedule and with no anchor announced, and is
@@ -214,11 +235,13 @@ static void status_error(const char *msg)
  * [STATUS] connected, whatever the state, so a caller can always tell the
  * difference between "not ready yet" and "this binary will never tell me".
  * After that only a MATERIAL change is reported — the state, or the projected
- * instant the caller would plan against; the exchange count rides along as
- * telemetry but never triggers a line on its own — rate-limited to one sample
- * per AP2_CLOCK_VERIFY_POLL_MS, ending at the first state=ready. FLUSH and
- * START re-arm it for the next cycle. state=stalled does NOT end it: a
- * receiver that begins probing late still reports probing and then ready. */
+ * instant the caller would plan against moving further than
+ * CLOCK_READY_JITTER_MS from the one last reported; the exchange count rides
+ * along as telemetry but never triggers a line on its own — rate-limited to one
+ * sample per AP2_CLOCK_VERIFY_POLL_MS, ending at the first state=ready. FLUSH
+ * and START re-arm it for the next cycle, comparison baseline included.
+ * state=stalled does NOT end it: a receiver that begins probing late still
+ * reports probing and then ready. */
 static bool g_clock_ready_reported = false;   /* emitted at least once this cycle */
 static bool g_clock_ready_done = false;       /* terminal state=ready reported */
 static uint64_t g_clock_ready_next_ntp = 0;
@@ -230,6 +253,12 @@ static void clock_ready_rearm(void)
     g_clock_ready_reported = false;
     g_clock_ready_done = false;
     g_clock_ready_next_ntp = 0;
+    /* The comparison baseline goes with them. A cycle judged against the
+     * previous one's reading gets its own first transition wrong: a session
+     * already stalled when it is re-armed reads stalled->stalled, so it repeats
+     * the state without the diagnosis that explains what a stall means. */
+    g_clock_ready_state = AP2_CLOCK_COLD;
+    g_clock_ready_at_ms = 0;
     /* Reporting went terminal at the last ready and stopped asking, so under
      * the in-process engine — which has no poller to follow the receiver
      * meanwhile — the stall mark is as old as that quiet stretch. Restart the
@@ -257,8 +286,18 @@ static void clock_ready_tick(void)
 
     ap2_clock_readiness_t r;
     ap2cl_clock_readiness(g_ap2cl, &r);
+    /* Material change only: the state, or a projected instant that moved
+     * further than the reading's own jitter. Measured against what was last
+     * reported rather than against the last sample, so a slow drift still
+     * surfaces once it has grown past the tolerance. The terminal state=ready
+     * is out of the tolerance's reach either way — it is a state change, and
+     * once reported the latch below ends the reporting above — and the line is
+     * always formatted from this reading, never from the latched values. */
+    uint64_t moved = r.ready_at_unix_ms > g_clock_ready_at_ms
+        ? r.ready_at_unix_ms - g_clock_ready_at_ms
+        : g_clock_ready_at_ms - r.ready_at_unix_ms;
     if (g_clock_ready_reported && r.state == g_clock_ready_state &&
-        r.ready_at_unix_ms == g_clock_ready_at_ms)
+        moved <= CLOCK_READY_JITTER_MS)
         return;
     /* Read before the latch moves, so the diagnosis below is logged on the
      * transition into the stall and not on every sample that stays in it. */
@@ -381,6 +420,10 @@ static void clock_verify_tick(void)
 #define ERROR_CODE_CONNECT_FAILED "connect_failed"
 #define ERROR_CODE_START_FAILED   "start_failed"
 #define ERROR_CODE_FLUSH_FAILED   "flush_failed"
+#define ERROR_CODE_STANDBY_FAILED "standby_failed"
+#define ERROR_CODE_PLAY_FAILED    "play_failed"
+#define ERROR_CODE_PAUSE_FAILED   "pause_failed"
+#define ERROR_CODE_STOP_FAILED    "stop_failed"
 
 /*
  * Report a failure as one machine-readable line followed by the
@@ -644,7 +687,11 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                                               : "no live session to flush",
                             "FLUSH failed");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STANDBY") == 0) {
-        if (g_session) ap2_session_standby(g_session);
+        if (!g_session || !ap2_session_standby(g_session))
+            status_error_ex(ERROR_CODE_STANDBY_FAILED, 0,
+                            session_is_live() ? "session rejected the standby"
+                                              : "no live session to stand by",
+                            "STANDBY failed");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "DISCONNECT") == 0) {
         if (g_session) ap2_session_end(g_session);
         g_status = STATUS_STOPPED;
@@ -654,7 +701,9 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             if (g_status == STATUS_PLAYING) {
                 if (cfg->protocol == PROTO_RAOP && g_raopcl) {
                     if (!raop_session_pause(g_raopcl))
-                        status_error("RAOP pause failed");
+                        status_error_ex(ERROR_CODE_PAUSE_FAILED, 0,
+                                        "the RAOP transport rejected the pause",
+                                        "RAOP pause failed");
                 } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
                     ap2cl_pause(g_ap2cl);
                 }
@@ -668,12 +717,20 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         bool play_ok = true;
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
             if (!raop_session_resume(g_raopcl)) {
-                status_error("RAOP play failed");
+                status_error_ex(ERROR_CODE_PLAY_FAILED, 0,
+                                "the RAOP transport rejected the resume",
+                                "RAOP play failed");
                 play_ok = false;
             }
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_play(g_ap2cl);
         } else {
+            /* No client for the resolved protocol: the command reached nothing,
+             * and the status stays where it was. Coded so the caller does not
+             * read the silence as a resume it can start counting from. */
+            status_error_ex(ERROR_CODE_PLAY_FAILED, 0,
+                            "no transport client to resume",
+                            "PLAY failed");
             play_ok = false;
         }
         /* No status emission here: reporting elapsed_ms=0 would snap the
@@ -688,6 +745,14 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             raopcl_stop(g_raopcl);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_stop(g_ap2cl);
+        } else {
+            /* Neither transport call reports a result, so the one failure that
+             * can be seen here is having no client to make the call on. The
+             * stopped line still goes out below: the caller treats STOP as
+             * terminal and tears the process down either way. */
+            status_error_ex(ERROR_CODE_STOP_FAILED, 0,
+                            "no transport client to stop",
+                            "STOP failed");
         }
         status_print("[STATUS] stopped");
         pthread_mutex_unlock(&g_audio_send_lock);
@@ -802,7 +867,9 @@ static void session_stop_op(void *transport)
     cli_config_t *cfg = transport;
     if (cfg->protocol == PROTO_RAOP) {
         if (g_raopcl && !raop_session_standby(g_raopcl))
-            status_error("RAOP standby failed");
+            status_error_ex(ERROR_CODE_STANDBY_FAILED, 0,
+                            "the RAOP transport rejected the standby",
+                            "RAOP standby failed");
     } else if (g_ap2cl) {
         ap2cl_standby(g_ap2cl);
     }
@@ -910,14 +977,18 @@ static bool start_command_thread(cli_config_t *cfg)
     if (g_cmdpipe_fd == -1) {
         LOG_ERROR("Failed to open command pipe: %s (errno=%d)",
                   cfg->cmdpipe, errno);
-        status_error("Failed to open command pipe");
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        "cannot open the command pipe",
+                        "Failed to open command pipe");
         return false;
     }
     int result = pthread_create(
         &g_cmdpipe_thread, NULL, cmdpipe_reader_thread, cfg);
     if (result != 0) {
         LOG_ERROR("Failed to start command pipe thread: %s", strerror(result));
-        status_error("Failed to start command pipe thread");
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        "cannot start the command pipe thread",
+                        "Failed to start command pipe thread");
         close(g_cmdpipe_fd);
         g_cmdpipe_fd = -1;
         return false;
@@ -944,7 +1015,9 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf,
         (unsigned)frames_per_chunk * (unsigned)input_bpf,
         SESSION_IDLE_TIMEOUT_MS, STDIN_FILENO);
     if (!g_session) {
-        status_error("Cannot create session engine");
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        "cannot create the session engine",
+                        "Cannot create session engine");
         return false;
     }
     g_status = STATUS_PAUSED;
@@ -2054,7 +2127,9 @@ int main(int argc, char *argv[])
     struct stat st;
     if (stat(cfg.cmdpipe, &st) != 0) {
         if (mkfifo(cfg.cmdpipe, 0666) != 0) {
-            status_error("Failed to create command pipe");
+            status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                            "cannot create the command pipe",
+                            "Failed to create command pipe");
             return 1;
         }
     }
