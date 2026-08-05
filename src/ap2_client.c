@@ -107,9 +107,12 @@ extern log_level *loglevel;
 /* Verification needs room to act before the initial fill starts releasing
  * real frames at anchor - pacing depth: anchors closer than the depth plus
  * one poll round plus slack can never be corrected, so they are not armed. */
-#define AP2_CLOCK_VERIFY_MIN_WINDOW_MS (AP2_SPLICE_PACING_MS + 500)
+#define AP2_CLOCK_VERIFY_MIN_WINDOW_MS(p) (ap2_splice_depth_ms(p) + 500)
 /* Receiver queue depth on the splice timeline (§ splice below): the
- * depth IS the audible latency of a warm splice, so it stays shallow. */
+ * depth IS the audible latency of a warm splice, so it stays shallow.
+ * ap2_splice_depth_ms() applies the caller's override (ap2cl_set_splice_depth_ms):
+ * LinkPlay receivers acting as native multiroom master starve the AirPlay
+ * renderer below ~1 s of queued audio, so their caller asks for more. */
 #define AP2_SPLICE_PACING_MS         600
 /* Delivery pacing depth (§ pacing below). A frame handed over more than the
  * receiver's buffer ahead of its deadline overflows that buffer and is
@@ -160,7 +163,7 @@ struct ap2cl_s {
     ap2_device_info_t device;
     ap2_audio_format_t format;
     ap2_state_t state;
-    int latency_ms;
+    int lead_ms;
     uint32_t dev_latency_min;      /* receiver-reported buffering window (frames) */
     uint32_t dev_latency_max;
     int dev_render_ms;             /* receiver-reported arrival->render latency (ms) */
@@ -243,6 +246,8 @@ struct ap2cl_s {
                                      anchor line — the native default; false
                                      only for deny-listed receivers (see the
                                      splice comments at flush/resume/standby) */
+    int splice_depth_ms;          /* >0: caller override of the
+                                     AP2_SPLICE_PACING_MS queue depth */
     uint32_t splice_pad_frames;   /* silence frames still to send before the
                                      next real sample so it lands exactly on
                                      the commanded splice instant */
@@ -1955,18 +1960,18 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         if (ap2_bplist_find_uint(resp, (size_t)resp_len, "latencyMax", &v) && v > 0)
             p->dev_latency_max = (uint32_t)v;
         if (p->dev_latency_min || p->dev_latency_max) {
-            int lat_frames = MS2TS(p->latency_ms, p->format.sample_rate);
+            int lat_frames = MS2TS(p->lead_ms, p->format.sample_rate);
             int min_f = p->dev_latency_min ? (int)p->dev_latency_min : 0;
             int max_f = p->dev_latency_max ? (int)p->dev_latency_max : lat_frames;
             int clamped = lat_frames < min_f ? min_f : (lat_frames > max_f ? max_f : lat_frames);
             int clamped_ms = clamped * 1000 / p->format.sample_rate;
-            if (clamped_ms != p->latency_ms) {
+            if (clamped_ms != p->lead_ms) {
                 LOG_INFO("[AP2] Device latency window %d..%d frames: adjusting lead "
-                         "%dms -> %dms", min_f, max_f, p->latency_ms, clamped_ms);
-                p->latency_ms = clamped_ms;
+                         "%dms -> %dms", min_f, max_f, p->lead_ms, clamped_ms);
+                p->lead_ms = clamped_ms;
             }
             LOG_INFO("[AP2] Device latency: min=%u max=%u frames, effective lead %dms",
-                     p->dev_latency_min, p->dev_latency_max, p->latency_ms);
+                     p->dev_latency_min, p->dev_latency_max, p->lead_ms);
         }
 
         if (remote_data > 0) {
@@ -2098,7 +2103,7 @@ static ap2_send_result_t ap2_send_sync_packet(struct ap2cl_s *p, bool first)
     pkt[2] = 0x00;
     pkt[3] = 0x07;
 
-    uint32_t latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
+    uint32_t latency_frames = MS2TS(p->lead_ms, p->format.sample_rate);
     uint32_t ts_latency = p->rtp_timestamp >= latency_frames
                           ? p->rtp_timestamp - latency_frames : 0;
     uint32_t ts_be = htonl(ts_latency);
@@ -2161,7 +2166,7 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
      * schedules playback as "frame_1 - 11035 plays at the packet timestamp"
      * and derives its buffer latency from frame_2 - frame_1 (Apple senders:
      * 77175). The mapping is FROZEN at stream start — playback of the first
-     * frame begins latency_ms after the anchor point — and every periodic
+     * frame begins lead_ms after the anchor point — and every periodic
      * packet extrapolates along that same line, so all time-announces agree. */
     uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
     if (!p->rt_anchor_valid) {
@@ -2177,7 +2182,7 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->latency_ms * 1000000ULL;
+            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->lead_ms * 1000000ULL;
             p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
                               + atomic_load(&p->rtp_offset);
         } else {
@@ -2191,17 +2196,17 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
          * bring its output path up. */
         int64_t audible_in_ms =
             ((int64_t)(p->rt_anchor_wall0 - wall) / 1000000LL)
-            + (int64_t)p->latency_ms;
+            + (int64_t)p->lead_ms;
         LOG_INFO("[AP2] anchor frozen: wall0=%" PRIu64 "ns pos0=%u "
-                 "latency_ms=%u start_ntp=%" PRIu64 " audible_in_ms=%" PRId64,
-                 p->rt_anchor_wall0, p->rt_anchor_pos0, p->latency_ms,
+                 "lead_ms=%u start_ntp=%" PRIu64 " audible_in_ms=%" PRId64,
+                 p->rt_anchor_wall0, p->rt_anchor_pos0, p->lead_ms,
                  p->start_ntp, audible_in_ms);
     }
     int64_t wall_delta_ns = wall >= p->rt_anchor_wall0
                                 ? (int64_t)(wall - p->rt_anchor_wall0)
                                 : -(int64_t)(p->rt_anchor_wall0 - wall);
     int64_t elapsed_ns = wall_delta_ns
-                       - (int64_t)p->latency_ms * 1000000LL;
+                       - (int64_t)p->lead_ms * 1000000LL;
     uint32_t play_pos = p->rt_anchor_pos0
                       + (uint32_t)((elapsed_ns * p->format.sample_rate) / 1000000000LL);
     uint32_t frame_1 = play_pos + 11035;
@@ -2429,7 +2434,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
     if (!hostent) return false;
     memcpy(&player_addr.s_addr, hostent->h_addr_list[0], hostent->h_length);
 
-    int latency_frames = MS2TS(p->latency_ms, p->format.sample_rate);
+    int latency_frames = MS2TS(p->lead_ms, p->format.sample_rate);
     bool mfi_auth = p->am && strcasestr(p->am, "airport");
 
     p->raopcl = raopcl_create(
@@ -2469,7 +2474,7 @@ struct ap2cl_s *ap2cl_create(
     ap2_device_info_t *device, ap2_audio_format_t *format,
     const char *auth, const char *password,
     const char *dacp_id, const char *active_remote,
-    int latency_ms, int volume)
+    int lead_ms, int volume)
 {
     struct ap2cl_s *p = calloc(1, sizeof(struct ap2cl_s));
     if (!p) return NULL;
@@ -2477,7 +2482,7 @@ struct ap2cl_s *ap2cl_create(
     p->device = *device;
     p->format = *format;
     p->state = AP2_DOWN;
-    p->latency_ms = latency_ms;
+    p->lead_ms = lead_ms;
     p->volume = volume;
     p->sock_fd = -1;
     p->data_sock = -1;
@@ -2590,6 +2595,35 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
     p->publish_ip = strdup(ip);
 }
 
+/* Effective splice queue depth: the compiled default unless the caller
+ * supplied --buffer-depth-ms. Every consumer of the depth (pacing, warm
+ * lead, clock-verification windows, connect log) reads it from here so an
+ * override moves them all coherently. */
+static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
+{
+    uint32_t depth = p->splice_depth_ms > 0 ? (uint32_t)p->splice_depth_ms
+                                            : AP2_SPLICE_PACING_MS;
+    /* Same cap as the pacing window - the receiver's reported buffer minus
+     * the delivery margin, or the assumed standard window when unreported -
+     * so every consumer (pacing, warm lead, verification windows, the
+     * connect log) sees one effective depth. */
+    uint32_t cap_ms = AP2_PACING_DEFAULT_BUFFER_MS - AP2_PACING_MARGIN_MS;
+    if (p->format.sample_rate > 0) {
+        uint64_t margin = MS2TS(AP2_PACING_MARGIN_MS, p->format.sample_rate);
+        if (p->dev_latency_max > margin)
+            cap_ms = (uint32_t)((p->dev_latency_max - margin) * 1000ULL /
+                                (uint32_t)p->format.sample_rate);
+    }
+    return depth < cap_ms ? depth : cap_ms;
+}
+
+void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms)
+{
+    if (!p || ms <= 0) return;
+    p->splice_depth_ms = ms;
+    LOG_INFO("[AP2] splice queue depth override: %d ms", ms);
+}
+
 void ap2cl_set_ptp(struct ap2cl_s *p, bool enable)
 {
     if (!p) return;
@@ -2642,7 +2676,7 @@ bool ap2cl_connect(struct ap2cl_s *p)
         p->apple_model = ap2_apple_model(p->device.txt_records, p->am);
         if (p->splice_timeline) {
             LOG_INFO("[AP2] splice timeline (discard-free warm path, "
-                     "%d ms queue depth)", AP2_SPLICE_PACING_MS);
+                     "%u ms queue depth)", ap2_splice_depth_ms(p));
         } else {
             LOG_INFO("[AP2] deny-listed receiver: classic flush + re-anchor "
                      "warm path");
@@ -2846,7 +2880,7 @@ static void ap2_clock_verify_arm(struct ap2cl_s *p, uint64_t requested_unix_ms,
 {
     if (!p->splice_timeline || !p->use_ptp) return;
     uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
-    if (at_unix_ms < now_ms + AP2_CLOCK_VERIFY_MIN_WINDOW_MS) return;
+    if (at_unix_ms < now_ms + AP2_CLOCK_VERIFY_MIN_WINDOW_MS(p)) return;
     pthread_mutex_lock(&p->clock_verify_lock);
     p->clock_verify_armed = true;
     p->clock_verify_enforce = enforce;
@@ -3256,7 +3290,7 @@ static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
      * are the LAN-local targets owntone has fed at realtime pacing for years,
      * so the reduced dropout headroom is field-proven there. */
     if (p->splice_timeline) {
-        uint64_t depth = (uint64_t)MS2TS(AP2_SPLICE_PACING_MS,
+        uint64_t depth = (uint64_t)MS2TS(ap2_splice_depth_ms(p),
                                          p->format.sample_rate);
         return depth < window ? depth : window;
     }
@@ -3314,7 +3348,7 @@ static bool ap2_splice_pad_to_lead(struct ap2cl_s *p, uint64_t now_ts,
                                    uint64_t lapse_ts, const char *cause)
 {
     uint64_t window = ap2_pacing_window_frames(p);
-    uint64_t latency = MS2TS(p->latency_ms, p->format.sample_rate);
+    uint64_t latency = MS2TS(p->lead_ms, p->format.sample_rate);
     uint64_t recovery_lead = latency < window ? latency : window;
     uint64_t effective_head = p->head_ts + p->splice_pad_frames;
     if (effective_head > lapse_ts) return false;
@@ -3341,7 +3375,7 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
     uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
     uint64_t floor = MS2TS(250, p->format.sample_rate);
     uint64_t window = ap2_pacing_window_frames(p);
-    uint64_t latency = MS2TS(p->latency_ms, p->format.sample_rate);
+    uint64_t latency = MS2TS(p->lead_ms, p->format.sample_rate);
     uint64_t recovery_lead = latency < window ? latency : window;
 
     if (p->splice_timeline) {
@@ -3541,7 +3575,7 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
                      "seat", ready_ms - anchor_ms);
         }
     } else if (sent || now_ms + AP2_CLOCK_VERIFY_POLL_MS >=
-                           anchor_ms - AP2_SPLICE_PACING_MS) {
+                           anchor_ms - ap2_splice_depth_ms(p)) {
         ev->requested_unix_ms = p->clock_verify_requested_unix_ms;
         ev->from_unix_ms = anchor_ms;
         ev->at_unix_ms = anchor_ms;
@@ -4382,7 +4416,7 @@ void ap2cl_format_capabilities(struct ap2cl_s *p,
 
 void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint32_t *dev_max)
 {
-    if (lead_ms) *lead_ms = p ? p->latency_ms : 0;
+    if (lead_ms) *lead_ms = p ? p->lead_ms : 0;
     if (dev_min) *dev_min = p ? p->dev_latency_min : 0;
     if (dev_max) *dev_max = p ? p->dev_latency_max : 0;
 }
@@ -4395,7 +4429,7 @@ uint32_t ap2cl_audible_lag_frames(struct ap2cl_s *p)
     if (!p) return 0;
     if (p->flow == FLOW_NATIVE_AP2 && p->splice_timeline)
         return (uint32_t)ap2_pacing_window_frames(p);
-    return (uint32_t)MS2TS(p->latency_ms, p->format.sample_rate);
+    return (uint32_t)MS2TS(p->lead_ms, p->format.sample_rate);
 }
 
 /* Minimum lead (ms) a warm commanded START needs for the new content to begin
@@ -4404,7 +4438,7 @@ uint32_t ap2cl_audible_lag_frames(struct ap2cl_s *p)
  * anchor beyond it. 0 = no constraint (stock flush+re-anchor path). */
 int ap2cl_warm_lead_ms(struct ap2cl_s *p)
 {
-    return p && p->splice_timeline ? AP2_SPLICE_PACING_MS : 0;
+    return p && p->splice_timeline ? (int)ap2_splice_depth_ms(p) : 0;
 }
 
 /* Wall-clock instant (unix ms) at which the current delivery head becomes

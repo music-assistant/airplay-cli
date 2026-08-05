@@ -111,10 +111,8 @@ uint64_t ap2_txt_flags(const char *txt);
  * :param bit_depth: requested output bit depth (informational; hi-res rides
  *                   the realtime stream).
  * :param force_native: --ap2-native was given (forces the native AP2 flow).
- * :param ptp_forced: --ptp or --no-ptp was given (overrides the SupportsPTP
- *                    auto-detect).
- * :param ptp_enabled: the forced timing when ptp_forced: true for --ptp,
- *                     false for --no-ptp (which wins when both are given).
+ * :param ptp_forced: --ptp was given (overrides the SupportsPTP auto-detect).
+ * :param ptp_enabled: the value passed to --ptp.
  */
 ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char *pw,
                               bool have_credentials, bool have_password,
@@ -150,7 +148,7 @@ ap2_connect_error_t ap2cl_connect_error(struct ap2cl_s *p, int *http_status,
  * :param password: Device password, or NULL.
  * :param dacp_id: DACP identifier for remote control.
  * :param active_remote: Active-Remote identifier.
- * :param latency_ms: Output buffer duration in milliseconds.
+ * :param lead_ms: Anchor-to-render lead in milliseconds.
  * :param volume: Initial volume (0-100), or -1 for no initial set.
  */
 struct ap2cl_s *ap2cl_create(
@@ -160,7 +158,7 @@ struct ap2cl_s *ap2cl_create(
     const char *password,
     const char *dacp_id,
     const char *active_remote,
-    int latency_ms,
+    int lead_ms,
     int volume
 );
 
@@ -426,6 +424,16 @@ void ap2cl_force_native(struct ap2cl_s *p);
  * ap2cl_connect(). When PTP is selected but 319/320 cannot be bound, the client
  * falls back to NTP timing. */
 void ap2cl_set_ptp(struct ap2cl_s *p, bool enable);
+
+/*
+ * Override the splice-timeline receiver queue depth (default 600 ms). The
+ * depth is the audible latency of every warm seek/next, but receivers that
+ * feed a native multiroom pipeline (LinkPlay masters) starve below ~1 s of
+ * queued audio and render silence, so their caller asks for more. Values
+ * <= 0 are ignored; the effective depth stays capped by the receiver's
+ * reported (or assumed) buffer window.
+ */
+void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms);
 
 /* Prefer a shared PTP daemon clock (multi-room) for the native AP2 flow. When
  * enabled and a live `cliairplay --ptp-daemon` is present on this host, the

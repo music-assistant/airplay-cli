@@ -72,7 +72,7 @@ typedef struct {
     char *host;
     int port;
     int volume;
-    int latency_ms;
+    int lead_ms;            /* anchor->render lead (fixed 2000 ms; no external knob) */
     int debug_level;
     char *dacp_id;
     char *active_remote;
@@ -100,7 +100,7 @@ typedef struct {
     bool force_native;      /* force native AP2 flow (transient pairing) */
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
-    bool no_ptp;            /* force NTP timing even when SupportsPTP is advertised */
+    int splice_depth_ms;    /* >0: override the splice receiver-queue depth */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
 
     /* Audio format */
@@ -508,9 +508,9 @@ static void mrp_artwork_reject_local(const char *reason)
 
 /* Also emit the older human-readable status line; the [STATUS] lines from
  * status_connected/status_playing are what the MA provider parses. */
-static void status_connected_legacy(const char *host, int port, int latency_ms)
+static void status_connected_legacy(const char *host, int port, int lead_ms)
 {
-    LOG_INFO("connected to %s on port %d, player latency is %d ms", host, port, latency_ms);
+    LOG_INFO("connected to %s on port %d, player latency is %d ms", host, port, lead_ms);
     status_connected();
 }
 
@@ -1071,7 +1071,7 @@ static int run_raop(cli_config_t *cfg)
      * that was not supplied is rejected before any connect attempt (main). */
     char *password = (cfg->password && *cfg->password) ? cfg->password : NULL;
 
-    int latency = MS2TS(cfg->latency_ms, cfg->sample_rate);
+    int latency = MS2TS(cfg->lead_ms, cfg->sample_rate);
 
     /* Codec selection: default to compressed ALAC, which virtually every RAOP
      * receiver advertises and which saves LAN bandwidth. Fall back to uncompressed
@@ -1307,7 +1307,7 @@ static int run_airplay2(cli_config_t *cfg)
 
     struct ap2cl_s *client = ap2cl_create(
         &device, &format, cfg->auth, cfg->password,
-        cfg->dacp_id, cfg->active_remote, cfg->latency_ms, cfg->volume);
+        cfg->dacp_id, cfg->active_remote, cfg->lead_ms, cfg->volume);
     if (!client) {
         status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
                         "cannot create the AirPlay 2 client",
@@ -1325,6 +1325,8 @@ static int run_airplay2(cli_config_t *cfg)
     if (cfg->publish_ip)
         ap2cl_set_publish_ip(client, cfg->publish_ip);
     ap2cl_set_ptp(client, cfg->route.ptp);
+    if (cfg->splice_depth_ms > 0)
+        ap2cl_set_splice_depth_ms(client, cfg->splice_depth_ms);
     ap2cl_set_ptp_shared(client, cfg->ptp_shared);
     ap2cl_set_remote_command_callback(
         client, remote_command_event, NULL);
@@ -1489,7 +1491,7 @@ static int run_airplay2(cli_config_t *cfg)
              * burst on Apple receivers), while a later teardown with silence
              * still queued is clean. */
             bool drained = !ap2cl_is_playing(g_ap2cl) ||
-                           now - eof_time > MS2NTP(cfg->latency_ms + 2000);
+                           now - eof_time > MS2NTP(cfg->lead_ms + 2000);
             if (drained && !eof_reported) {
                 eof_reported = true;
                 status_eof();
@@ -1834,8 +1836,9 @@ static void print_usage(const char *name)
     printf("Common options:\n");
     printf("  --port <port>              Device port (default: 5000)\n");
     printf("  --volume <0-100>           Initial volume level\n");
-    printf("  --latency <ms>             Playback lead / buffer in ms (default: 2000,\n");
-    printf("                             clamped into the device-reported window)\n");
+    printf("  --latency <ms>             Receiver buffer depth in ms (native AirPlay 2\n");
+    printf("                             only; default 600; deeper feeds devices whose\n");
+    printf("                             pipeline starves, at the cost of seek response)\n");
     printf("  --dacp <id>                DACP ID\n");
     printf("  --activeremote <id>        Active Remote ID\n");
     printf("  --cmdpipe <path>           Required named pipe for commands and metadata\n");
@@ -1875,8 +1878,6 @@ static void print_usage(const char *name)
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
     printf("                             SupportsPTP feature bit)\n");
-    printf("  --no-ptp                   Force NTP timing even when the device\n");
-    printf("                             advertises SupportsPTP (wins over --ptp)\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
     printf("                             read the elected clock from shared memory and do\n");
     printf("                             not bind 319/320 when a daemon is present; else\n");
@@ -1902,7 +1903,7 @@ int main(int argc, char *argv[])
         .proto_pref = AP2_PROTO_AUTO,
         .port = 5000,
         .volume = 0,
-        .latency_ms = 2000,
+        .lead_ms = 2000,
         .debug_level = 3,
         .dacp_id = "1A2B3D4EA1B2C3D4",
         .active_remote = "ap5918800d",
@@ -1951,7 +1952,6 @@ int main(int argc, char *argv[])
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
-        {"no-ptp",       no_argument,       0, 1014},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
         {"check",        no_argument,       0, 1002},
@@ -1975,7 +1975,7 @@ int main(int argc, char *argv[])
             break;
         case 'p': cfg.port = atoi(optarg); break;
         case 'v': cfg.volume = atoi(optarg); break;
-        case 'l': cfg.latency_ms = atoi(optarg); break;
+        case 'l': cfg.splice_depth_ms = atoi(optarg); break;
         case 'D': cfg.dacp_id = optarg; break;
         case 'R': cfg.active_remote = optarg; break;
         case 'C': cfg.cmdpipe = optarg; break;
@@ -2002,7 +2002,6 @@ int main(int argc, char *argv[])
         case 1007: cfg.force_native = true; break;
         case 1008: cfg.publish_ip = optarg; break;
         case 1009: cfg.ptp = true; break;
-        case 1014: cfg.no_ptp = true; break;
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
@@ -2086,14 +2085,9 @@ int main(int argc, char *argv[])
      * cfg.route carries the AirPlay 2 sub-decisions applied in run_airplay2(). */
     bool have_creds = cfg.auth && strlen(cfg.auth) == 192;
     bool have_password = cfg.password && *cfg.password;
-    /* --no-ptp wins over --ptp and the SupportsPTP auto-detect: some receivers
-     * advertise PTP but never render a PTP-timed stream (old LinkPlay platform
-     * firmware), and the caller knows better than the TXT records. */
-    bool ptp_forced = cfg.ptp || cfg.no_ptp;
-    bool ptp_enabled = cfg.ptp && !cfg.no_ptp;
     cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
                                   have_password, cfg.bit_depth, cfg.force_native,
-                                  ptp_forced, ptp_enabled);
+                                  cfg.ptp, cfg.ptp);
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
              cfg.route.reason,
