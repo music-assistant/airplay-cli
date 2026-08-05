@@ -1836,9 +1836,9 @@ static void print_usage(const char *name)
     printf("Common options:\n");
     printf("  --port <port>              Device port (default: 5000)\n");
     printf("  --volume <0-100>           Initial volume level\n");
-    printf("  --latency <ms>             Receiver buffer depth in ms (default 600;\n");
-    printf("                             deeper feeds devices whose pipeline starves,\n");
-    printf("                             at the cost of seek responsiveness)\n");
+    printf("  --latency <ms>             Receiver buffer depth in ms (native AirPlay 2\n");
+    printf("                             only; default 600; deeper feeds devices whose\n");
+    printf("                             pipeline starves, at the cost of seek response)\n");
     printf("  --dacp <id>                DACP ID\n");
     printf("  --activeremote <id>        Active Remote ID\n");
     printf("  --cmdpipe <path>           Required named pipe for commands and metadata\n");

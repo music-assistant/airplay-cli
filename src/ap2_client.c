@@ -110,7 +110,7 @@ extern log_level *loglevel;
 #define AP2_CLOCK_VERIFY_MIN_WINDOW_MS(p) (ap2_splice_depth_ms(p) + 500)
 /* Receiver queue depth on the splice timeline (§ splice below): the
  * depth IS the audible latency of a warm splice, so it stays shallow.
- * ap2_splice_depth_ms() applies the caller's --buffer-depth-ms override:
+ * ap2_splice_depth_ms() applies the caller's override (ap2cl_set_splice_depth_ms):
  * LinkPlay receivers acting as native multiroom master starve the AirPlay
  * renderer below ~1 s of queued audio, so their caller asks for more. */
 #define AP2_SPLICE_PACING_MS         600
@@ -246,7 +246,7 @@ struct ap2cl_s {
                                      anchor line — the native default; false
                                      only for deny-listed receivers (see the
                                      splice comments at flush/resume/standby) */
-    int splice_depth_ms;          /* >0: --buffer-depth-ms override of the
+    int splice_depth_ms;          /* >0: caller override of the
                                      AP2_SPLICE_PACING_MS queue depth */
     uint32_t splice_pad_frames;   /* silence frames still to send before the
                                      next real sample so it lands exactly on
@@ -2601,8 +2601,20 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
  * override moves them all coherently. */
 static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
 {
-    return p->splice_depth_ms > 0 ? (uint32_t)p->splice_depth_ms
-                                  : AP2_SPLICE_PACING_MS;
+    uint32_t depth = p->splice_depth_ms > 0 ? (uint32_t)p->splice_depth_ms
+                                            : AP2_SPLICE_PACING_MS;
+    /* Same cap as the pacing window - the receiver's reported buffer minus
+     * the delivery margin, or the assumed standard window when unreported -
+     * so every consumer (pacing, warm lead, verification windows, the
+     * connect log) sees one effective depth. */
+    uint32_t cap_ms = AP2_PACING_DEFAULT_BUFFER_MS - AP2_PACING_MARGIN_MS;
+    if (p->format.sample_rate > 0) {
+        uint64_t margin = MS2TS(AP2_PACING_MARGIN_MS, p->format.sample_rate);
+        if (p->dev_latency_max > margin)
+            cap_ms = (uint32_t)((p->dev_latency_max - margin) * 1000ULL /
+                                (uint32_t)p->format.sample_rate);
+    }
+    return depth < cap_ms ? depth : cap_ms;
 }
 
 void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms)
