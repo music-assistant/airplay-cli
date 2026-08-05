@@ -15,6 +15,12 @@
 #include <strings.h>
 #include <time.h>
 
+/* One buffer, one stdio call. POSIX requires stdio functions to lock the
+ * FILE for the whole call, so this fwrite cannot interleave with another
+ * thread's fprintf to the same stream - that lock, not the write itself, is
+ * the serialization every emitter in this process shares (nothing writes the
+ * fd raw). Staying under 512 bytes additionally keeps the line inside
+ * PIPE_BUF, the backstop if such a writer ever appears. */
 void ap2_io_status_vline(const char *fmt, va_list args)
 {
     char line[512];

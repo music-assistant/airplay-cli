@@ -504,7 +504,7 @@ static void test_auth_error_kind(void)
         .channels = 2,
     };
     /* Only credentials of the exact HAP length are stored by ap2cl_create. */
-    char creds[193];
+    char creds[192 + 1]; /* 192-hex HAP credential + NUL */
     memset(creds, 'a', sizeof(creds) - 1);
     creds[sizeof(creds) - 1] = '\0';
 
