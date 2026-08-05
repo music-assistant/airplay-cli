@@ -107,9 +107,12 @@ extern log_level *loglevel;
 /* Verification needs room to act before the initial fill starts releasing
  * real frames at anchor - pacing depth: anchors closer than the depth plus
  * one poll round plus slack can never be corrected, so they are not armed. */
-#define AP2_CLOCK_VERIFY_MIN_WINDOW_MS (AP2_SPLICE_PACING_MS + 500)
+#define AP2_CLOCK_VERIFY_MIN_WINDOW_MS(p) (ap2_splice_depth_ms(p) + 500)
 /* Receiver queue depth on the splice timeline (§ splice below): the
- * depth IS the audible latency of a warm splice, so it stays shallow. */
+ * depth IS the audible latency of a warm splice, so it stays shallow.
+ * ap2_splice_depth_ms() applies the caller's --splice-depth-ms override:
+ * LinkPlay receivers acting as native multiroom master starve the AirPlay
+ * renderer below ~1 s of queued audio, so their caller asks for more. */
 #define AP2_SPLICE_PACING_MS         600
 /* Delivery pacing depth (§ pacing below). A frame handed over more than the
  * receiver's buffer ahead of its deadline overflows that buffer and is
@@ -243,6 +246,8 @@ struct ap2cl_s {
                                      anchor line — the native default; false
                                      only for deny-listed receivers (see the
                                      splice comments at flush/resume/standby) */
+    int splice_depth_ms;          /* >0: --splice-depth-ms override of the
+                                     AP2_SPLICE_PACING_MS queue depth */
     uint32_t splice_pad_frames;   /* silence frames still to send before the
                                      next real sample so it lands exactly on
                                      the commanded splice instant */
@@ -2590,6 +2595,23 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
     p->publish_ip = strdup(ip);
 }
 
+/* Effective splice queue depth: the compiled default unless the caller
+ * supplied --splice-depth-ms. Every consumer of the depth (pacing, warm
+ * lead, clock-verification windows, connect log) reads it from here so an
+ * override moves them all coherently. */
+static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
+{
+    return p->splice_depth_ms > 0 ? (uint32_t)p->splice_depth_ms
+                                  : AP2_SPLICE_PACING_MS;
+}
+
+void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms)
+{
+    if (!p || ms <= 0) return;
+    p->splice_depth_ms = ms;
+    LOG_INFO("[AP2] splice queue depth override: %d ms", ms);
+}
+
 void ap2cl_set_ptp(struct ap2cl_s *p, bool enable)
 {
     if (!p) return;
@@ -2642,7 +2664,7 @@ bool ap2cl_connect(struct ap2cl_s *p)
         p->apple_model = ap2_apple_model(p->device.txt_records, p->am);
         if (p->splice_timeline) {
             LOG_INFO("[AP2] splice timeline (discard-free warm path, "
-                     "%d ms queue depth)", AP2_SPLICE_PACING_MS);
+                     "%u ms queue depth)", ap2_splice_depth_ms(p));
         } else {
             LOG_INFO("[AP2] deny-listed receiver: classic flush + re-anchor "
                      "warm path");
@@ -2846,7 +2868,7 @@ static void ap2_clock_verify_arm(struct ap2cl_s *p, uint64_t requested_unix_ms,
 {
     if (!p->splice_timeline || !p->use_ptp) return;
     uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
-    if (at_unix_ms < now_ms + AP2_CLOCK_VERIFY_MIN_WINDOW_MS) return;
+    if (at_unix_ms < now_ms + AP2_CLOCK_VERIFY_MIN_WINDOW_MS(p)) return;
     pthread_mutex_lock(&p->clock_verify_lock);
     p->clock_verify_armed = true;
     p->clock_verify_enforce = enforce;
@@ -3256,7 +3278,7 @@ static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
      * are the LAN-local targets owntone has fed at realtime pacing for years,
      * so the reduced dropout headroom is field-proven there. */
     if (p->splice_timeline) {
-        uint64_t depth = (uint64_t)MS2TS(AP2_SPLICE_PACING_MS,
+        uint64_t depth = (uint64_t)MS2TS(ap2_splice_depth_ms(p),
                                          p->format.sample_rate);
         return depth < window ? depth : window;
     }
@@ -3541,7 +3563,7 @@ ap2_clock_verify_result_t ap2cl_clock_verify_poll(struct ap2cl_s *p,
                      "seat", ready_ms - anchor_ms);
         }
     } else if (sent || now_ms + AP2_CLOCK_VERIFY_POLL_MS >=
-                           anchor_ms - AP2_SPLICE_PACING_MS) {
+                           anchor_ms - ap2_splice_depth_ms(p)) {
         ev->requested_unix_ms = p->clock_verify_requested_unix_ms;
         ev->from_unix_ms = anchor_ms;
         ev->at_unix_ms = anchor_ms;
@@ -4404,7 +4426,7 @@ uint32_t ap2cl_audible_lag_frames(struct ap2cl_s *p)
  * anchor beyond it. 0 = no constraint (stock flush+re-anchor path). */
 int ap2cl_warm_lead_ms(struct ap2cl_s *p)
 {
-    return p && p->splice_timeline ? AP2_SPLICE_PACING_MS : 0;
+    return p && p->splice_timeline ? (int)ap2_splice_depth_ms(p) : 0;
 }
 
 /* Wall-clock instant (unix ms) at which the current delivery head becomes

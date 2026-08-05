@@ -427,6 +427,16 @@ void ap2cl_force_native(struct ap2cl_s *p);
  * falls back to NTP timing. */
 void ap2cl_set_ptp(struct ap2cl_s *p, bool enable);
 
+/*
+ * Override the splice-timeline receiver queue depth (default 600 ms). The
+ * depth is the audible latency of every warm seek/next, but receivers that
+ * feed a native multiroom pipeline (LinkPlay masters) starve below ~1 s of
+ * queued audio and render silence, so their caller asks for more. Values
+ * <= 0 are ignored; the effective depth stays capped by the receiver's
+ * reported (or assumed) buffer window.
+ */
+void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms);
+
 /* Prefer a shared PTP daemon clock (multi-room) for the native AP2 flow. When
  * enabled and a live `cliairplay --ptp-daemon` is present on this host, the
  * client reads the elected clock from shared memory and does NOT bind UDP

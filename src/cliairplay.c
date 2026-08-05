@@ -101,6 +101,7 @@ typedef struct {
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
     bool no_ptp;            /* force NTP timing even when SupportsPTP is advertised */
+    int splice_depth_ms;    /* >0: override the splice receiver-queue depth */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
 
     /* Audio format */
@@ -1325,6 +1326,8 @@ static int run_airplay2(cli_config_t *cfg)
     if (cfg->publish_ip)
         ap2cl_set_publish_ip(client, cfg->publish_ip);
     ap2cl_set_ptp(client, cfg->route.ptp);
+    if (cfg->splice_depth_ms > 0)
+        ap2cl_set_splice_depth_ms(client, cfg->splice_depth_ms);
     ap2cl_set_ptp_shared(client, cfg->ptp_shared);
     ap2cl_set_remote_command_callback(
         client, remote_command_event, NULL);
@@ -1877,6 +1880,9 @@ static void print_usage(const char *name)
     printf("                             SupportsPTP feature bit)\n");
     printf("  --no-ptp                   Force NTP timing even when the device\n");
     printf("                             advertises SupportsPTP (wins over --ptp)\n");
+    printf("  --splice-depth-ms <ms>     Receiver queue depth on the splice timeline\n");
+    printf("                             (default 600; deeper feeds multiroom masters,\n");
+    printf("                             at the cost of seek responsiveness)\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
     printf("                             read the elected clock from shared memory and do\n");
     printf("                             not bind 319/320 when a daemon is present; else\n");
@@ -1952,6 +1958,7 @@ int main(int argc, char *argv[])
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
         {"no-ptp",       no_argument,       0, 1014},
+        {"splice-depth-ms", required_argument, 0, 1015},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
         {"check",        no_argument,       0, 1002},
@@ -2003,6 +2010,7 @@ int main(int argc, char *argv[])
         case 1008: cfg.publish_ip = optarg; break;
         case 1009: cfg.ptp = true; break;
         case 1014: cfg.no_ptp = true; break;
+        case 1015: cfg.splice_depth_ms = atoi(optarg); break;
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
