@@ -407,12 +407,16 @@ static bool ap2_status_is_auth(int status)
     return status == 401 || status == 403;
 }
 
-/* An auth-shaped rejection means "supply a password" when we presented none,
- * and "this password is wrong" when we did. */
+/* An auth-shaped rejection means "supply a secret" only when we presented none
+ * at all; whatever we did present was rejected. Stored HAP credentials count as
+ * a presented secret: a receiver that has rotated them (tvOS re-pairing) answers
+ * pair-verify with 401/403, and the remedy is to pair again — reporting
+ * AUTH_REQUIRED there would point the user at a password the device never had. */
 static ap2_connect_error_t ap2_auth_error_kind(struct ap2cl_s *p)
 {
-    return (p->password && *p->password) ? AP2_CONNECT_ERROR_AUTH_FAILED
-                                         : AP2_CONNECT_ERROR_AUTH_REQUIRED;
+    bool presented_secret = (p->password && *p->password) || p->auth_credentials;
+    return presented_secret ? AP2_CONNECT_ERROR_AUTH_FAILED
+                            : AP2_CONNECT_ERROR_AUTH_REQUIRED;
 }
 
 static void ap2_set_connect_error(struct ap2cl_s *p, ap2_connect_error_t kind,
@@ -3323,10 +3327,9 @@ static bool ap2_splice_pad_to_lead(struct ap2cl_s *p, uint64_t now_ts,
     LOG_WARN("[AP2] Splice-padded after %s: shifted_frames="
              "%" PRIu64 " lead_frames=%" PRIu64 " count=%" PRIu64,
              cause, pad, recovery_lead, p->timeline_reanchors);
-    fprintf(stderr, "[STATUS] REANCHOR shifted_frames=%" PRIu64
-            " total_shifted_frames=%" PRIu64 " sample_rate=%d\n",
-            pad, p->reanchor_shifted_frames, p->format.sample_rate);
-    fflush(stderr);
+    ap2_io_status_line("[STATUS] REANCHOR shifted_frames=%" PRIu64
+                       " total_shifted_frames=%" PRIu64 " sample_rate=%d",
+                       pad, p->reanchor_shifted_frames, p->format.sample_rate);
     return true;
 }
 
@@ -3378,11 +3381,10 @@ bool ap2cl_recover_input_gap(struct ap2cl_s *p)
     /* Machine-readable counterpart of the LOG_WARN above, on the same stderr
      * channel as the binary's other [STATUS] lines, so Music Assistant can
      * track re-anchor drift without scraping the human-readable log. */
-    fprintf(stderr, "[STATUS] REANCHOR shifted_frames=%" PRIu64
-            " total_shifted_frames=%" PRIu64 " sample_rate=%d\n",
-            recovery.shifted_frames, p->reanchor_shifted_frames,
-            p->format.sample_rate);
-    fflush(stderr);
+    ap2_io_status_line("[STATUS] REANCHOR shifted_frames=%" PRIu64
+                       " total_shifted_frames=%" PRIu64 " sample_rate=%d",
+                       recovery.shifted_frames, p->reanchor_shifted_frames,
+                       p->format.sample_rate);
     return true;
 }
 
@@ -4676,5 +4678,10 @@ void ap2cl_test_set_dev_latency_max(struct ap2cl_s *p, uint32_t frames)
 uint64_t ap2cl_test_pacing_window_frames(struct ap2cl_s *p)
 {
     return ap2_pacing_window_frames(p);
+}
+
+ap2_connect_error_t ap2cl_test_auth_error_kind(struct ap2cl_s *p)
+{
+    return ap2_auth_error_kind(p);
 }
 #endif
