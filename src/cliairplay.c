@@ -2094,9 +2094,9 @@ int main(int argc, char *argv[])
      * cfg.route carries the AirPlay 2 sub-decisions applied in run_airplay2(). */
     bool have_creds = cfg.auth && strlen(cfg.auth) == 192;
     bool have_password = cfg.password && *cfg.password;
-    /* --no-ptp wins over --ptp and the SupportsPTP auto-detect: some receivers
-     * advertise PTP but never render a PTP-timed stream (old LinkPlay platform
-     * firmware), and the caller knows better than the TXT records. */
+    /* --no-ptp wins over --ptp and the SupportsPTP auto-detect. Diagnostic
+     * escape hatch only: no device is routed here by default (receivers that
+     * looked PTP-broken turned out to need a deeper splice queue instead). */
     bool ptp_forced = cfg.ptp || cfg.no_ptp;
     bool ptp_enabled = cfg.ptp && !cfg.no_ptp;
     cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
