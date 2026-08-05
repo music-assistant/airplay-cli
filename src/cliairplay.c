@@ -157,7 +157,9 @@ static struct debug_s {
  * PIPE_BUF bytes are not interleaved, and PIPE_BUF is at least 512 everywhere
  * (exactly 512 on macOS), so the buffer is sized to emit at most 511 bytes.
  * That is well past the longest line we produce (a `mrp artwork=` report, ~200
- * chars); a line that would still overflow is clamped rather than split. */
+ * chars); a line that would still overflow is clamped rather than split. The
+ * flush is a no-op while stderr stays unbuffered (set at startup) and is kept
+ * so a future buffering change cannot silently delay status lines. */
 static void status_print(const char *fmt, ...)
 {
     char line[512];
