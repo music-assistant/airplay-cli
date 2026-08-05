@@ -246,7 +246,7 @@ struct ap2cl_s {
                                      anchor line — the native default; false
                                      only for deny-listed receivers (see the
                                      splice comments at flush/resume/standby) */
-    int splice_depth_ms;          /* >0: --splice-depth-ms override of the
+    int splice_depth_ms;          /* >0: --buffer-depth-ms override of the
                                      AP2_SPLICE_PACING_MS queue depth */
     uint32_t splice_pad_frames;   /* silence frames still to send before the
                                      next real sample so it lands exactly on
@@ -2596,7 +2596,7 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
 }
 
 /* Effective splice queue depth: the compiled default unless the caller
- * supplied --splice-depth-ms. Every consumer of the depth (pacing, warm
+ * supplied --buffer-depth-ms. Every consumer of the depth (pacing, warm
  * lead, clock-verification windows, connect log) reads it from here so an
  * override moves them all coherently. */
 static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
