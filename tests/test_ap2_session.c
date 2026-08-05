@@ -436,6 +436,29 @@ static void test_standby_then_resume(void)
     assert(close(write_fd) == 0);
 }
 
+/* The refusal behind [STATUS] error code=standby_failed. An ended session (and
+ * a session that is gone entirely) must answer false rather than report a park
+ * that never happened, and must not reach the transport on the way. */
+static void test_standby_is_refused_on_an_ended_session(void)
+{
+    test_state_t state;
+    int write_fd;
+    struct ap2_session_s *session = create_session(&state, 0, &write_fd);
+
+    assert(ap2_session_standby(session));
+    assert(atomic_load(&state.stops) == 1);
+
+    ap2_session_end(session);
+    assert(ap2_session_state(session) == AP2_SESSION_ENDED);
+    assert(!ap2_session_standby(session));
+    assert(atomic_load(&state.stops) == 1);
+    assert(!ap2_session_standby(NULL));
+
+    ap2_session_destroy(session);
+    status_state = NULL;
+    assert(close(write_fd) == 0);
+}
+
 static void test_idle_timeout_ends_session(void)
 {
     test_state_t state;
@@ -589,6 +612,7 @@ int main(void)
     test_flush_while_idle_before_start();
     test_failed_flush_preserves_pending_audio();
     test_standby_then_resume();
+    test_standby_is_refused_on_an_ended_session();
     test_idle_timeout_ends_session();
     test_idle_timeout_ends_an_abandoned_post_eof_session();
     test_start_after_eof_reopens_the_idle_window();

@@ -178,15 +178,21 @@ on stderr that Music Assistant parses:
 |---|---|
 | `auth_required` | a password is needed and none was supplied: reported before connecting when the TXT says so (and no credentials are stored), and on a `401`/`403` from a device we presented no password to |
 | `auth_failed` | the password we did present was rejected, on any exchange |
-| `connect_failed` | every other connect-path failure |
+| `connect_failed` | every other connect-path failure, including the local session-engine and command-pipe setup that runs before `[STATUS] connected` |
 | `start_failed` | `ACTION=START` scheduled no instant, so no `[STATUS] started` follows and no content may be mapped onto one |
 | `flush_failed` | `ACTION=FLUSH` was rejected, so no `[STATUS] flushed` follows |
+| `standby_failed` | `ACTION=STANDBY` was rejected, or there was no live session to park |
+| `play_failed` | `ACTION=PLAY` was rejected by the transport, or the resolved protocol had no client to resume; the status stays where it was either way |
+| `pause_failed` | `ACTION=PAUSE` was rejected by the transport; `[STATUS] paused` still follows, because sends stop regardless |
+| `stop_failed` | `ACTION=STOP` found no client to stop; `[STATUS] stopped` still follows, because the caller treats STOP as terminal |
 
-The connect/auth slugs are terminal — the process exits. `start_failed` and
-`flush_failed` are not: the connection survives and the caller decides whether
-to retry or fall back. Both exist so a caller can abort the pending ack wait
-immediately instead of waiting out a timeout that also means "a binary too old
-to ack at all"; a withheld join ack makes that wait seconds long.
+The connect/auth slugs are terminal — the process exits. The command slugs are
+not: the connection survives and the caller decides whether to retry or fall
+back. `start_failed` and `flush_failed` exist so a caller can abort the pending
+ack wait immediately instead of waiting out a timeout that also means "a binary
+too old to ack at all"; a withheld join ack makes that wait seconds long. The
+rest answer commands that have no ack of their own to withhold, so without them
+a command that reached nothing is indistinguishable from one that worked.
 
 `http` is the most informative HTTP status seen, `0` when none applies (a
 TLV-level rejection is an HTTP 200). The detail is squeezed onto one line and
@@ -391,12 +397,16 @@ binary reports what it measures instead of leaving the caller to guess:
   one Delay_Req ever arriving. Measuring from the last streak rather than from
   connect alone is what keeps a single lost `Q` round-trip — which empties the
   snapshot exactly as a departed receiver does — from reading as a stall on a
-  healthy session, and gives a mid-session clock loss the same 5 s grace as a
-  cold start. That mark is stamped by the snapshot poller, on the same round it
-  refreshes the snapshot, precisely because the reporting below stops at the
-  first `state=ready`: for most of a session nothing else is watching, and a
-  mark left to age with the reporting would make the first reading after a
-  re-arm read stale. Only a PTP session can stall; `mode=ntp` stays cold.
+  healthy session. What it does not do is make a mid-session clock loss
+  reportable as it happens: nothing samples readiness between the first
+  `state=ready` and the next `FLUSH` or `START`, and that re-arm restarts the
+  window, so a receiver that went quiet mid-stream surfaces as stalled only once
+  the new cycle has run its own 5 s without a streak. That mark is stamped by
+  the snapshot poller, on the same round it refreshes the snapshot, precisely
+  because the reporting stops there: for most of a session nothing else is
+  watching, and a mark left to age with the reporting would make the first
+  reading after a re-arm read stale. Only a PTP session can stall; `mode=ntp`
+  stays cold.
   `ready_in_ms`/`ready_at_unix_ms` are 0 and mean nothing, as while cold.
 - `streak_ms`/`exchanges` are the streak's first-probe age and probe count,
   the same two numbers the commit-time floor logs, so field reports compare
@@ -406,12 +416,20 @@ The first line is emitted immediately after `[STATUS] connected`,
 unconditionally and whatever the state, so a caller can always distinguish
 "not ready yet" from "this binary will never tell me". After that only a
 material change is reported — the state, or the projected instant a caller
-would plan against; the exchange count rides along as telemetry but never
-triggers a line by itself — sampled at most every 250 ms, ending at the first
-`state=ready`. `state=stalled` does NOT end it (a receiver that begins probing
-late still reports `probing` and then `ready`) but does log the diagnosis once,
-on the way in. `FLUSH` and `START` re-arm it for the next cycle. The projection
-is recomputed per emission and never cached. In shared-daemon mode the snapshot
+would plan against moving more than 50 ms from the one last reported; the
+exchange count rides along as telemetry but never triggers a line by itself —
+sampled at most every 250 ms, ending at the first `state=ready`. The 50 ms is
+the projection's own jitter: it is arithmetic on two live readings, so it
+wobbles by a millisecond or two in-process (two clocks each truncated to
+milliseconds) and drifts with the snapshot's age under the shared daemon, and
+comparing exactly would report that wobble as news every sample. Measuring
+against the last line sent rather than the last sample keeps a slow drift from
+hiding under the tolerance forever. `state=stalled` does NOT end the reporting
+(a receiver that begins probing late still reports `probing` and then `ready`)
+but does log the diagnosis once, on the way in. `FLUSH` and `START` re-arm it
+for the next cycle, comparison baseline included, so the first line of a cycle
+is judged against nothing the previous one left behind. The projection is
+recomputed per emission and never cached. In shared-daemon mode the snapshot
 comes from the poller thread, started at connect, because the daemon's `Q`
 round-trip blocks and the audio loop must never make it inline; the in-process
 engine is queried directly under its own lock.
@@ -1007,7 +1025,9 @@ it for good, so a caller that keeps commanding is never cut off. On expiry the
 binary emits `[STATUS] idle_timeout` and the process exits 0, with no
 `[ERROR]` and no `[STATUS] stopped`; a session that connects and never
 receives a `START` ends exactly this way, and so does one played to EOF and
-then abandoned.
+then abandoned. In that second case the line reaches nobody but a human reading
+the raw log: Music Assistant's reader treats `[STATUS] eof` as terminal and has
+stopped parsing long before the timeout fires.
 
 The EOF arming is keyed on the input CLOSING, not on the drain finishing or
 the ring emptying. A closed stdin is the end of the whole feed — a warm
