@@ -212,6 +212,23 @@ static uint8_t *tlv_concat(const uint8_t *data, int data_len,
     return result;
 }
 
+/* Human-readable annotation for a HAP TLV error code (HomeKit kTLVError).
+ * Callers keep the raw tag in their log line; this only adds the meaning. */
+static const char *tlv_error_desc(uint8_t code)
+{
+    switch (code) {
+    case 0x01: return " (unknown error)";
+    case 0x02: return " (authentication failed - wrong PIN or key mismatch)";
+    case 0x03: return " (backoff - the device refuses new pairing attempts "
+                      "for a while; reboot it and try once)";
+    case 0x04: return " (max peers - the device cannot store more pairings)";
+    case 0x05: return " (max tries - too many failed attempts; reboot the device)";
+    case 0x06: return " (pairing method unavailable)";
+    case 0x07: return " (busy - another pairing attempt is in progress)";
+    default:   return "";
+    }
+}
+
 /* ---- Crypto helpers ---- */
 
 static bool hkdf_sha512(const uint8_t *secret, int secret_len,
@@ -978,7 +995,8 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd,
         int err_len;
         const uint8_t *err = tlv_find(body, body_len, TLV_ERROR, &err_len);
         if (err && err_len > 0 && *err != 0) {
-            LOG_WARN("[HAP] M4 error tag: %d (may be non-fatal)", *err);
+            LOG_WARN("[HAP] M4 error tag: %d%s (may be non-fatal)", *err,
+                     tlv_error_desc(*err));
         }
         if (state_val && *state_val != 0x04) {
             LOG_ERROR("[HAP] Pair-verify M4 unexpected state: %d", *state_val);
@@ -1065,7 +1083,8 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd,
     const uint8_t *state_val = tlv_find(body, body_len, TLV_STATE, &state_len);
     const uint8_t *err = tlv_find(body, body_len, TLV_ERROR, &err_len);
     if (err && err_len > 0) {
-        LOG_ERROR("[HAP] Pair-setup M2 error tag: %d", *err);
+        LOG_ERROR("[HAP] Pair-setup M2 error tag: %d%s", *err,
+                  tlv_error_desc(*err));
         hap_set_error(err_out, AP2_HAP_ERR_AUTH, 0, *err);
         return false;
     }
@@ -1128,7 +1147,7 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd,
     err = tlv_find(body, body_len, TLV_ERROR, &err_len);
     if (err && err_len > 0) {
         LOG_ERROR("[HAP] Pair-setup M4 error tag: %d%s", *err,
-                  *err == 0x02 ? " (authentication failed)" : "");
+                  tlv_error_desc(*err));
         hap_set_error(err_out, AP2_HAP_ERR_AUTH, 0, *err);
         goto fail;
     }
@@ -1234,7 +1253,7 @@ bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
     const uint8_t *err = tlv_find(body, body_len, TLV_ERROR, &err_len);
     if (err && err_len > 0) {
         LOG_ERROR("[HAP] Pair-setup M2 error tag: %d%s", *err,
-                  *err == 0x06 ? " (device busy / too many pairings?)" : "");
+                  tlv_error_desc(*err));
         return false;
     }
     const uint8_t *salt = tlv_find(body, body_len, TLV_SALT, &salt_len);
@@ -1247,6 +1266,10 @@ bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
     }
     uint8_t salt_buf[16];
     memcpy(salt_buf, salt, sizeof(salt_buf));
+
+    /* Support triage marker: M2 success proves the device accepted the pairing
+     * attempt, so a missing on-screen PIN from here on is a device-side issue. */
+    LOG_INFO("[HAP] Pair-setup M2 OK - waiting for the PIN entry");
 
     /* The device is showing its PIN now — ask the caller for it. */
     const char *pin = pin_cb(pin_arg);
@@ -1287,7 +1310,7 @@ bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
     err = tlv_find(body, body_len, TLV_ERROR, &err_len);
     if (err && err_len > 0) {
         LOG_ERROR("[HAP] Pair-setup M4 error tag: %d%s", *err,
-                  *err == 0x02 ? " (wrong PIN?)" : "");
+                  tlv_error_desc(*err));
         goto fail;
     }
     {
@@ -1385,7 +1408,8 @@ bool ap2_hap_pair_setup_pin(struct ap2_hap_ctx *ctx, int sock_fd,
         state_val = tlv_find(body, body_len, TLV_STATE, &state_len);
         err = tlv_find(body, body_len, TLV_ERROR, &err_len);
         if (err && err_len > 0) {
-            LOG_ERROR("[HAP] Pair-setup M6 error tag: %d", *err);
+            LOG_ERROR("[HAP] Pair-setup M6 error tag: %d%s", *err,
+                      tlv_error_desc(*err));
             goto fail;
         }
         int enc_len = 0;
