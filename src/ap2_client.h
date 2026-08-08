@@ -371,14 +371,16 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
  * its now-playing item on it, so later tag refinements for the same item
  * update in place instead of presenting as a new track. Byte-identical
  * artwork keeps its ArtworkIdentifier across a track change; NULL artwork
- * drops retained MRP artwork when the track changed. mrp_info and mrp_push
- * receive the request-scoped artwork verdict and push statuses.
+ * drops retained MRP artwork when the track changed. track_changed_out
+ * (optional) receives whether the item identity changed; mrp_info and
+ * mrp_push receive the request-scoped artwork verdict and push statuses.
  */
 bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                            const char *artist, const char *album,
                            int duration, const char *item_id,
                            const char *content_type, const uint8_t *art_data,
-                           int art_len, ap2_mrp_artwork_info_t *mrp_info,
+                           int art_len, bool *track_changed_out,
+                           ap2_mrp_artwork_info_t *mrp_info,
                            ap2_mrp_push_result_t *mrp_push);
 
 /* ap2cl_set_metadata_ex without artwork or result reporting. */

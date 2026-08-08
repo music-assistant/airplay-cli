@@ -930,7 +930,7 @@ static bool find_artwork_identifier(const uint8_t *data, size_t len,
     return false;
 }
 
-#define COMMAND_PEER_MAX_REQUESTS 16
+#define COMMAND_PEER_MAX_REQUESTS 24
 #define COMMAND_PEER_BODY_MAX 8192
 
 typedef struct {
@@ -954,6 +954,11 @@ static void *run_command_peer(void *arg)
 {
     command_peer_t *peer = arg;
     peer->ok = true;
+    /* A client that regresses into sending fewer requests must fail the
+     * suite, not hang it in read()/pthread_join. */
+    struct timeval rcv_timeout = { .tv_sec = 5, .tv_usec = 0 };
+    setsockopt(peer->fd, SOL_SOCKET, SO_RCVTIMEO, &rcv_timeout,
+               sizeof(rcv_timeout));
     for (int i = 0; i < peer->expected_requests; i++) {
         uint8_t buffer[COMMAND_PEER_BODY_MAX + 2048];
         size_t fill = 0;
@@ -1038,7 +1043,7 @@ static void test_mrp_bundle_and_pause_publish(void)
     command_peer_t *peer = calloc(1, sizeof(*peer));
     assert(peer);
     peer->fd = sockets[1];
-    peer->expected_requests = 15;
+    peer->expected_requests = 17;
     pthread_t peer_thread;
     assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
 
@@ -1077,9 +1082,12 @@ static void test_mrp_bundle_and_pause_publish(void)
      * (requests 1-7). */
     ap2_mrp_artwork_info_t info;
     ap2_mrp_push_result_t push;
+    bool track_changed = false;
     assert(ap2cl_set_metadata_ex(client, "Track One", "Artist", "Album", 180,
                                  "item-1", "image/jpeg", k_baseline_jpeg,
-                                 (int)sizeof(k_baseline_jpeg), &info, &push));
+                                 (int)sizeof(k_baseline_jpeg), &track_changed,
+                                 &info, &push));
+    assert(track_changed);
     assert(info.result == AP2_MRP_ARTWORK_ACCEPTED);
     assert(push.overall_status == 200 && push.nowplaying_status == 200);
 
@@ -1103,21 +1111,27 @@ static void test_mrp_bundle_and_pause_publish(void)
                                      (size_t)paused_progress_len));
     free(paused_progress);
 
-    /* Resume: timeline push then playback state (requests 10-11), and stop:
-     * playback state only (request 12). */
+    /* Resume: timeline push then playback state (requests 10-11). A REDUNDANT
+     * play (state already Playing) must still post the forced state re-assert
+     * after its timeline push (requests 12-13) — the chained send dedupes on
+     * an unchanged state, so only the kept force reaches the wire. Then stop:
+     * playback state only (request 14). */
+    ap2cl_play(client);
     ap2cl_play(client);
     ap2cl_stop(client);
 
-    /* Next track with byte-identical artwork: one more bundle (13-15). */
+    /* Next track with byte-identical artwork: one more bundle (15-17). */
     assert(ap2cl_set_metadata_ex(client, "Track Two", "Artist", "Album", 200,
                                  "item-2", "image/jpeg", k_baseline_jpeg,
-                                 (int)sizeof(k_baseline_jpeg), &info, &push));
+                                 (int)sizeof(k_baseline_jpeg), &track_changed,
+                                 &info, &push));
+    assert(track_changed);
     assert(info.result == AP2_MRP_ARTWORK_UNCHANGED);
     assert(push.overall_status == 200 && push.nowplaying_status == 200);
 
     assert(pthread_join(peer_thread, NULL) == 0);
     assert(peer->ok);
-    assert(peer->request_count == 15);
+    assert(peer->request_count == 17);
 
     /* Bundle 1: DMAP metadata + artwork ride SET_PARAMETER first. */
     assert(strcmp(peer->requests[0].method, "SET_PARAMETER") == 0);
@@ -1160,30 +1174,38 @@ static void test_mrp_bundle_and_pause_publish(void)
                                       (size_t)peer->requests[9].body_len));
     assert(request_has(&peer->requests[10], "updateMRPlaybackState"));
 
+    /* Redundant play: timeline update, then the FORCED state re-assert the
+     * caller asked for — the chained send dedupes on the unchanged state, so
+     * without the kept force nothing would reach the wire. */
+    assert(request_has(&peer->requests[11], "updateMRNowPlayingInfo"));
+    assert(!request_has(&peer->requests[11], "replace"));
+    assert(request_has(&peer->requests[12], "updateMRPlaybackState"));
+    assert(!request_has(&peer->requests[12], "updateMRNowPlayingInfo"));
+
     /* Stop: state only, no now-playing body at teardown. */
-    assert(request_has(&peer->requests[11], "updateMRPlaybackState"));
-    assert(!request_has(&peer->requests[11], "updateMRNowPlayingInfo"));
+    assert(request_has(&peer->requests[13], "updateMRPlaybackState"));
+    assert(!request_has(&peer->requests[13], "updateMRNowPlayingInfo"));
 
     /* Bundle 2: the DMAP copy is re-sent for the new track even though the
      * bytes are identical, while the MRP push keeps the ArtworkIdentifier
      * (an identifier flip alone re-renders the receiver's UI) under a fresh
      * item UniqueIdentifier. */
-    assert(strcmp(peer->requests[12].method, "SET_PARAMETER") == 0);
-    assert(request_has(&peer->requests[12], "mlit"));
-    assert(strcmp(peer->requests[13].method, "SET_PARAMETER") == 0);
-    assert(bytes_contain(peer->requests[13].body,
-                         (size_t)peer->requests[13].body_len,
+    assert(strcmp(peer->requests[14].method, "SET_PARAMETER") == 0);
+    assert(request_has(&peer->requests[14], "mlit"));
+    assert(strcmp(peer->requests[15].method, "SET_PARAMETER") == 0);
+    assert(bytes_contain(peer->requests[15].body,
+                         (size_t)peer->requests[15].body_len,
                          k_baseline_jpeg, sizeof(k_baseline_jpeg)));
-    assert(request_has(&peer->requests[14], "updateMRNowPlayingInfo"));
-    assert(request_has(&peer->requests[14],
+    assert(request_has(&peer->requests[16], "updateMRNowPlayingInfo"));
+    assert(request_has(&peer->requests[16],
                        "kMRMediaRemoteNowPlayingInfoArtworkData"));
     char id_first[17];
     char id_second[17];
     assert(find_artwork_identifier(peer->requests[3].body,
                                    (size_t)peer->requests[3].body_len,
                                    id_first));
-    assert(find_artwork_identifier(peer->requests[14].body,
-                                   (size_t)peer->requests[14].body_len,
+    assert(find_artwork_identifier(peer->requests[16].body,
+                                   (size_t)peer->requests[16].body_len,
                                    id_second));
     assert(strcmp(id_first, id_second) == 0);
     uint64_t uid_first = 0;
@@ -1192,18 +1214,18 @@ static void test_mrp_bundle_and_pause_publish(void)
         peer->requests[3].body, (size_t)peer->requests[3].body_len,
         "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_first));
     assert(ap2_bplist_find_uint(
-        peer->requests[14].body, (size_t)peer->requests[14].body_len,
+        peer->requests[16].body, (size_t)peer->requests[16].body_len,
         "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_second));
     assert(uid_first != 0 && uid_second != 0 && uid_first != uid_second);
 
-    /* Exactly four now-playing posts in total: one per bundle, one per
-     * pause/resume transition — nothing doubled. */
+    /* Exactly five now-playing posts in total: one per bundle, one per
+     * pause/resume/redundant-play transition — nothing doubled. */
     int nowplaying_posts = 0;
     for (int i = 0; i < peer->request_count; i++) {
         if (request_has(&peer->requests[i], "updateMRNowPlayingInfo"))
             nowplaying_posts++;
     }
-    assert(nowplaying_posts == 4);
+    assert(nowplaying_posts == 5);
 
     ap2cl_test_detach_rtsp_socket(client);
     assert(close(sockets[0]) == 0);

@@ -629,19 +629,24 @@ static void send_track_metadata(const cli_config_t *cfg, const char *title)
     } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
         ap2_mrp_artwork_info_t mrp_info;
         ap2_mrp_push_result_t push;
+        bool track_changed = false;
         ap2cl_set_metadata_ex(g_ap2cl, title, metadata_str(g_metadata.artist),
                               metadata_str(g_metadata.album),
                               g_metadata.duration,
                               metadata_str(g_metadata.item_id),
                               image ? content_type : NULL, image,
-                              (int)image_size, &mrp_info, &push);
-        if (artwork_failed && push.overall_status >= 0) {
-            /* The bundle push above already went out without artwork, so no
-             * separate clear+push follows; its status doubles as the clear
-             * status the artwork=rejected contract reports. */
+                              (int)image_size, &track_changed, &mrp_info,
+                              &push);
+        if (artwork_failed && track_changed && push.overall_status >= 0) {
+            /* The track changed, so the retained art was dropped and the
+             * bundle push above already went out without artwork: no
+             * separate clear+push follows, and its status doubles as the
+             * clear status the artwork=rejected contract reports. A load
+             * failure on the SAME item keeps the retained art (the warning
+             * above is the only report), so claiming a clear would lie. */
             status_print("[STATUS] mrp artwork=rejected reason=invalid_artwork "
                          "clear_status=%d", push.nowplaying_status);
-        } else {
+        } else if (!artwork_failed) {
             mrp_artwork_status_report(&mrp_info, push.nowplaying_status);
         }
         mrp_status_report(push.overall_status);

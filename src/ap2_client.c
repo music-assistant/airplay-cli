@@ -4113,14 +4113,21 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
      * (pause) or extrapolating across the paused span (resume). The timeline
      * push carries the elapsed just frozen/resumed by set_playing above with
      * a fresh timestamp, before the state post — info-then-state, the Apple
-     * sender order. A successful push already chains updateMRPlaybackState,
-     * so dropping force lets the explicit send below dedupe instead of
-     * posting the same state twice; any failure keeps the forced explicit
-     * send as the fallback. Teardown (STOPPED) stays state-only. */
-    if (state != AP2_MRP_PLAYBACK_STOPPED &&
-        ap2_mrp_status_ok(
-            ap2cl_mrp_push_progress_serialized(p).overall_status))
-        force = false;
+     * sender order. On a real transition a successful push already chains
+     * updateMRPlaybackState, so dropping force lets the explicit send below
+     * dedupe instead of posting the same state twice. A redundant publish
+     * (state already current) keeps force: the chained send dedupes there,
+     * and the forced explicit post is the caller's re-assert toward a
+     * receiver whose state may have drifted. Any push failure keeps the
+     * forced explicit send as the fallback. Teardown (STOPPED) stays
+     * state-only. */
+    if (state != AP2_MRP_PLAYBACK_STOPPED) {
+        bool state_was_current = p->mrp_last_playback_state == state;
+        if (ap2_mrp_status_ok(
+                ap2cl_mrp_push_progress_serialized(p).overall_status) &&
+            !state_was_current)
+            force = false;
+    }
     ap2_mrp_send_playback_state(p, state, force);
     pthread_mutex_unlock(&p->mrp_publish_lock);
 }
@@ -4294,6 +4301,7 @@ int ap2cl_mrp_register(struct ap2cl_s *p)
 static bool ap2_send_dmap_artwork(struct ap2cl_s *p, const char *content_type,
                                   int size, const char *data)
 {
+    if (!content_type || !*content_type || !data || size <= 0) return false;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         char rtpinfo[48];
         snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
@@ -4316,11 +4324,13 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                            const char *artist, const char *album,
                            int duration, const char *item_id,
                            const char *content_type, const uint8_t *art_data,
-                           int art_len, ap2_mrp_artwork_info_t *mrp_info,
+                           int art_len, bool *track_changed_out,
+                           ap2_mrp_artwork_info_t *mrp_info,
                            ap2_mrp_push_result_t *mrp_push)
 {
     ap2_mrp_artwork_info_t local_info;
     if (!mrp_info) mrp_info = &local_info;
+    if (track_changed_out) *track_changed_out = false;
     if (mrp_push) *mrp_push = ap2_mrp_push_result_empty();
     memset(mrp_info, 0, sizeof(*mrp_info));
     mrp_info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
@@ -4337,6 +4347,7 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                           item_id, content_type, art_data, art_len,
                           &track_changed, mrp_info);
     pthread_mutex_unlock(&p->mrp_lock);
+    if (track_changed_out) *track_changed_out = track_changed;
 
     bool dmap_ok;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
@@ -4371,7 +4382,7 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
                         const char *album, int duration, const char *item_id)
 {
     return ap2cl_set_metadata_ex(p, title, artist, album, duration, item_id,
-                                 NULL, NULL, 0, NULL, NULL);
+                                 NULL, NULL, 0, NULL, NULL, NULL);
 }
 
 bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
@@ -4592,7 +4603,9 @@ bool ap2cl_is_playing(struct ap2cl_s *p)
  * client takes ownership (ap2cl_destroy frees it). */
 void ap2cl_test_set_mrp(struct ap2cl_s *p, struct ap2_mrp_ctx *m)
 {
+    pthread_mutex_lock(&p->mrp_lock);
     p->mrp = m;
+    pthread_mutex_unlock(&p->mrp_lock);
 }
 
 void ap2cl_test_lock_mrp(struct ap2cl_s *p)

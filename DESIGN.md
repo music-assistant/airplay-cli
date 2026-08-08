@@ -573,8 +573,11 @@ order: a bare state flip leaves the receiver showing the last literal
 `ElapsedTime` it was sent (usually the track start) on pause, and
 extrapolating across the paused wall-time span on resume. The frozen/resumed
 elapsed with a fresh `Timestamp` pins both transitions; teardown (stop) stays
-state-only. The ~15 s defensive state re-push belongs to the type-130 channel
-below, which is off by default.
+state-only. A receiver demoted to full replace pushes (update-policy
+rejection, below) gets the artwork-bearing replace shape at pause/resume too:
+the correct frozen elapsed is judged worth the re-render on such receivers,
+none of which have been observed in practice. The ~15 s defensive state
+re-push belongs to the type-130 channel below, which is off by default.
 
 **`updateMRNowPlayingInfo` envelope.** The `npi-text` / `mergePolicy` wrapper
 is mandatory; a bare or fabricated outer type string is rejected with HTTP 400:
