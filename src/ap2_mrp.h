@@ -149,14 +149,39 @@ bool ap2_mrp_start(struct ap2_mrp_ctx *m);
 void ap2_mrp_stop(struct ap2_mrp_ctx *m);
 
 /*
- * Set the now-playing track metadata. Values are copied; NULL is treated as
- * empty. Takes effect on the next feedback-worker state push.
+ * Set the now-playing track metadata and artwork in one state change.
  *
- * The now-playing item identity (UniqueIdentifier and retained artwork) is
- * keyed on item_id when both the stored and incoming ids are non-empty:
- * title/artist/album changes under the same item_id are tag refinements that
- * update the existing item in place. Without ids, identity falls back to the
- * title/artist/album tuple.
+ * The now-playing item identity (UniqueIdentifier) is keyed on item_id when
+ * both the stored and incoming ids are non-empty: title/artist/album changes
+ * under the same item_id are tag refinements that update the existing item in
+ * place. Without ids, identity falls back to the title/artist/album tuple.
+ * A track change resets elapsed to zero.
+ *
+ * Artwork resolves against the retained image (ap2_mrp_set_artwork rules):
+ * identical bytes keep the current ArtworkIdentifier even across a track
+ * change (an identifier flip alone re-renders the receiver's Now Playing UI),
+ * new bytes stage under a fresh identifier, a rejected image clears staging,
+ * and no artwork drops the retained image only when the track changed.
+ *
+ * :param duration_ms: track duration in milliseconds (0 = unknown/live).
+ * :param item_id: sender's stable per-track identity ("" or NULL = none).
+ * :param mime: artwork MIME type; must be "image/jpeg".
+ * :param art: artwork bytes (copied); NULL/empty = no artwork for this track.
+ * :param art_len: artwork byte count.
+ * :param track_changed_out: optional; receives whether the item identity changed.
+ * :param info: optional artwork probe result and best-effort telemetry.
+ */
+bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
+                       const char *artist, const char *album,
+                       int duration_ms, const char *item_id,
+                       const char *mime, const uint8_t *art, int art_len,
+                       bool *track_changed_out, ap2_mrp_artwork_info_t *info);
+
+/*
+ * Set the now-playing track metadata without artwork: ap2_mrp_set_track with
+ * no image, so a track change drops the retained artwork. Values are copied;
+ * NULL is treated as empty. Takes effect on the next feedback-worker state
+ * push.
  *
  * :param duration_ms: track duration in milliseconds (0 = unknown/live).
  * :param item_id: sender's stable per-track identity ("" or NULL = none).

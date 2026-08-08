@@ -425,6 +425,172 @@ static bool test_nowplaying_command_payload(void)
     return true;
 }
 
+/* Locate the ArtworkIdentifier value in a serialized now-playing command: the
+ * identifier is the only 16-character ASCII string object in that payload
+ * (marker 0x5F, int-count 0x10 0x10, then 16 lowercase-hex characters). */
+static bool find_artwork_identifier(const uint8_t *data, size_t len,
+                                    char out[17])
+{
+    for (size_t i = 0; i + 19 <= len; i++) {
+        if (data[i] != 0x5F || data[i + 1] != 0x10 || data[i + 2] != 0x10)
+            continue;
+        bool hex = true;
+        for (size_t j = 0; j < 16 && hex; j++) {
+            uint8_t c = data[i + 3 + j];
+            hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }
+        if (!hex) continue;
+        memcpy(out, data + i + 3, 16);
+        out[16] = '\0';
+        return true;
+    }
+    return false;
+}
+
+static bool test_set_track_bundle(void)
+{
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "Test sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL);
+    CHECK(mrp != NULL);
+
+    /* First track with artwork: identity and image land in one state change. */
+    ap2_mrp_artwork_info_t info;
+    bool track_changed = false;
+    CHECK(ap2_mrp_set_track(mrp, "Track One", "Artist", "Album", 180000,
+                            "item-1", "image/jpeg", k_baseline_jpeg,
+                            (int)sizeof(k_baseline_jpeg), &track_changed,
+                            &info));
+    CHECK(track_changed);
+    CHECK(info.result == AP2_MRP_ARTWORK_ACCEPTED);
+    uint8_t *first = NULL;
+    int first_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &first, &first_len));
+    uint64_t uid_first = 0;
+    CHECK(ap2_bplist_find_uint(
+        first, (size_t)first_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_first));
+    CHECK(uid_first != 0);
+    char id_first[17];
+    CHECK(find_artwork_identifier(first, (size_t)first_len, id_first));
+    free(first);
+
+    /* Redundant bundle for the same item: uid stable, image a reported no-op
+     * that keeps the identifier. */
+    CHECK(ap2_mrp_set_track(mrp, "Track One", "Artist", "Album", 180000,
+                            "item-1", "image/jpeg", k_baseline_jpeg,
+                            (int)sizeof(k_baseline_jpeg), &track_changed,
+                            &info));
+    CHECK(!track_changed);
+    CHECK(info.result == AP2_MRP_ARTWORK_UNCHANGED);
+    uint8_t *again = NULL;
+    int again_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &again, &again_len));
+    uint64_t uid_again = 0;
+    CHECK(ap2_bplist_find_uint(
+        again, (size_t)again_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_again));
+    CHECK(uid_again == uid_first);
+    char id_again[17];
+    CHECK(find_artwork_identifier(again, (size_t)again_len, id_again));
+    CHECK(strcmp(id_again, id_first) == 0);
+    free(again);
+
+    /* Track change with byte-identical artwork (one album): fresh uid, but
+     * the ArtworkIdentifier survives — an identifier flip alone makes the
+     * receiver invalidate and re-render the art it is already showing. */
+    CHECK(ap2_mrp_set_track(mrp, "Track Two", "Artist", "Album", 200000,
+                            "item-2", "image/jpeg", k_baseline_jpeg,
+                            (int)sizeof(k_baseline_jpeg), &track_changed,
+                            &info));
+    CHECK(track_changed);
+    CHECK(info.result == AP2_MRP_ARTWORK_UNCHANGED);
+    uint8_t *second = NULL;
+    int second_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &second, &second_len));
+    uint64_t uid_second = 0;
+    CHECK(ap2_bplist_find_uint(
+        second, (size_t)second_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_second));
+    CHECK(uid_second != uid_first);
+    char id_second[17];
+    CHECK(find_artwork_identifier(second, (size_t)second_len, id_second));
+    CHECK(strcmp(id_second, id_first) == 0);
+    CHECK(bytes_contain(second, (size_t)second_len,
+                        k_baseline_jpeg, sizeof(k_baseline_jpeg)));
+    free(second);
+
+    /* Track change with different artwork bytes: a new identifier. */
+    uint8_t *other = make_padded_jpeg(44032);
+    CHECK(other != NULL);
+    CHECK(ap2_mrp_set_track(mrp, "Track Three", "Artist", "Album", 210000,
+                            "item-3", "image/jpeg", other, 44032,
+                            &track_changed, &info));
+    CHECK(track_changed);
+    CHECK(info.result == AP2_MRP_ARTWORK_ACCEPTED);
+    uint8_t *third = NULL;
+    int third_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &third, &third_len));
+    char id_third[17];
+    CHECK(find_artwork_identifier(third, (size_t)third_len, id_third));
+    CHECK(strcmp(id_third, id_first) != 0);
+    free(third);
+
+    /* No artwork in the bundle for the same item (tag refinement): the
+     * retained image and identifier stay. */
+    CHECK(ap2_mrp_set_track(mrp, "Track Three (remastered)", "Artist", "Album",
+                            210000, "item-3", NULL, NULL, 0, &track_changed,
+                            &info));
+    CHECK(!track_changed);
+    CHECK(info.result == AP2_MRP_ARTWORK_NOT_APPLICABLE);
+    uint8_t *refined = NULL;
+    int refined_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &refined, &refined_len));
+    char id_refined[17];
+    CHECK(find_artwork_identifier(refined, (size_t)refined_len, id_refined));
+    CHECK(strcmp(id_refined, id_third) == 0);
+    free(refined);
+
+    /* A probe-rejected image clears staging like set_artwork always does. */
+    CHECK(ap2_mrp_set_track(mrp, "Track Three (remastered)", "Artist", "Album",
+                            210000, "item-3", "image/jpeg", k_baseline_jpeg,
+                            (int)sizeof(k_baseline_jpeg) - 1, &track_changed,
+                            &info));
+    CHECK(!track_changed);
+    CHECK(info.result == AP2_MRP_ARTWORK_INVALID_JPEG_ENVELOPE);
+    uint8_t *rejected = NULL;
+    int rejected_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &rejected, &rejected_len));
+    CHECK(!bytes_contain_string(
+        rejected, (size_t)rejected_len,
+        "kMRMediaRemoteNowPlayingInfoArtworkIdentifier"));
+    free(rejected);
+
+    /* No artwork in the bundle at a track change: the old track's image (a
+     * fresh re-stage here) must not ride the new item. */
+    CHECK(ap2_mrp_set_track(mrp, "Track Three (remastered)", "Artist", "Album",
+                            210000, "item-3", "image/jpeg", other, 44032,
+                            &track_changed, &info));
+    CHECK(info.result == AP2_MRP_ARTWORK_ACCEPTED);
+    CHECK(ap2_mrp_set_track(mrp, "Track Four", "Artist", "Album", 220000,
+                            "item-4", NULL, NULL, 0, &track_changed, &info));
+    CHECK(track_changed);
+    CHECK(info.result == AP2_MRP_ARTWORK_NOT_APPLICABLE);
+    uint8_t *bare = NULL;
+    int bare_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &bare, &bare_len));
+    CHECK(!bytes_contain_string(
+        bare, (size_t)bare_len,
+        "kMRMediaRemoteNowPlayingInfoArtworkIdentifier"));
+    free(bare);
+    free(other);
+
+    ap2_mrp_destroy(mrp);
+    puts("MRP set_track bundle tests passed");
+    return true;
+}
+
 typedef struct {
     ap2_mrp_serial_t serial;
     atomic_int active;
@@ -497,6 +663,7 @@ int main(int argc, char **argv)
         !test_mrp_probe_boundary() ||
         !test_decoder_valid_profile_fixtures() ||
         !test_nowplaying_command_payload() ||
+        !test_set_track_bundle() ||
         !test_push_result_scope())
         return 1;
     for (int i = 1; i < argc; i++) {

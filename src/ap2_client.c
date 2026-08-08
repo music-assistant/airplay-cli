@@ -365,6 +365,8 @@ static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
 static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                                      ap2_mrp_playback_state_t state,
                                      bool force);
+static ap2_mrp_push_result_t ap2cl_mrp_push_progress_serialized(
+    struct ap2cl_s *p);
 static bool ap2_set_nonblocking(int fd, const char *name);
 static void ap2_raop_session_cleanup(struct ap2cl_s *p);
 static void ap2_clock_verify_disarm(struct ap2cl_s *p);
@@ -4105,6 +4107,27 @@ static void ap2_mrp_publish_playback(struct ap2cl_s *p,
                 p->mrp, state == AP2_MRP_PLAYBACK_PLAYING);
     }
     pthread_mutex_unlock(&p->mrp_lock);
+    /* Pause/resume must carry the transition's timeline: the receiver
+     * extrapolates position from ElapsedTime + Timestamp + PlaybackRate, so a
+     * bare state flip leaves it showing the last literal elapsed it received
+     * (pause) or extrapolating across the paused span (resume). The timeline
+     * push carries the elapsed just frozen/resumed by set_playing above with
+     * a fresh timestamp, before the state post — info-then-state, the Apple
+     * sender order. On a real transition a successful push already chains
+     * updateMRPlaybackState, so dropping force lets the explicit send below
+     * dedupe instead of posting the same state twice. A redundant publish
+     * (state already current) keeps force: the chained send dedupes there,
+     * and the forced explicit post is the caller's re-assert toward a
+     * receiver whose state may have drifted. Any push failure keeps the
+     * forced explicit send as the fallback. Teardown (STOPPED) stays
+     * state-only. */
+    if (state != AP2_MRP_PLAYBACK_STOPPED) {
+        bool state_was_current = p->mrp_last_playback_state == state;
+        if (ap2_mrp_status_ok(
+                ap2cl_mrp_push_progress_serialized(p).overall_status) &&
+            !state_was_current)
+            force = false;
+    }
     ap2_mrp_send_playback_state(p, state, force);
     pthread_mutex_unlock(&p->mrp_publish_lock);
 }
@@ -4191,11 +4214,12 @@ int ap2cl_mrp_push(struct ap2cl_s *p)
     return ap2cl_mrp_push_ex(p).overall_status;
 }
 
-int ap2cl_mrp_push_progress(struct ap2cl_s *p)
+/* Timeline (mergePolicy "update") push for callers already holding
+ * mrp_publish_lock: seek progress and the pause/resume transitions. */
+static ap2_mrp_push_result_t ap2cl_mrp_push_progress_serialized(
+    struct ap2cl_s *p)
 {
     ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
-    if (!p) return result.overall_status;
-    pthread_mutex_lock(&p->mrp_publish_lock);
     if (!p->mrp_progress_push_full) {
         result = ap2cl_mrp_push_serialized_with(
             p, ap2_mrp_build_nowplaying_progress_command);
@@ -4212,6 +4236,15 @@ int ap2cl_mrp_push_progress(struct ap2cl_s *p)
     }
     if (p->mrp_progress_push_full)
         result = ap2cl_mrp_push_serialized(p);
+    return result;
+}
+
+int ap2cl_mrp_push_progress(struct ap2cl_s *p)
+{
+    ap2_mrp_push_result_t result = ap2_mrp_push_result_empty();
+    if (!p) return result.overall_status;
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    result = ap2cl_mrp_push_progress_serialized(p);
     pthread_mutex_unlock(&p->mrp_publish_lock);
     return result.overall_status;
 }
@@ -4262,24 +4295,94 @@ int ap2cl_mrp_register(struct ap2cl_s *p)
     return status;
 }
 
-bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
-                        const char *album, int duration, const char *item_id)
+/* Artwork on the DMAP/SET_PARAMETER path for receivers such as Sonos, which
+ * consume only it; pair-verified Apple sessions mirror validated artwork over
+ * MRP separately. */
+static bool ap2_send_dmap_artwork(struct ap2cl_s *p, const char *content_type,
+                                  int size, const char *data)
 {
+    if (!content_type || !*content_type || !data || size <= 0) return false;
+    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
+        char rtpinfo[48];
+        snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
+        uint8_t *resp = NULL; int resp_len = 0;
+        int status = ap2_rtsp_send_ex(p, "SET_PARAMETER", p->session_url,
+                                      (const uint8_t *)data, size, content_type,
+                                      rtpinfo, &resp, &resp_len);
+        free(resp);
+        LOG_INFO("[AP2] native artwork SET_PARAMETER -> status %d (%d bytes, %s)",
+                 status, size, content_type);
+        return status >= 200 && status < 300;
+    }
+    if (p->raopcl)
+        return raopcl_set_artwork(
+            p->raopcl, (char *)content_type, size, (char *)data);
+    return false;
+}
+
+bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
+                           const char *artist, const char *album,
+                           int duration, const char *item_id,
+                           const char *content_type, const uint8_t *art_data,
+                           int art_len, bool *track_changed_out,
+                           ap2_mrp_artwork_info_t *mrp_info,
+                           ap2_mrp_push_result_t *mrp_push)
+{
+    ap2_mrp_artwork_info_t local_info;
+    if (!mrp_info) mrp_info = &local_info;
+    if (track_changed_out) *track_changed_out = false;
+    if (mrp_push) *mrp_push = ap2_mrp_push_result_empty();
+    memset(mrp_info, 0, sizeof(*mrp_info));
+    mrp_info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
+    mrp_info->bytes = art_len > 0 ? (size_t)art_len : 0;
     if (!p) return false;
+    bool have_art = art_data && art_len > 0;
     pthread_mutex_lock(&p->mrp_publish_lock);
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
+    bool have_mrp = p->mrp != NULL;
+    bool track_changed = false;
     if (p->mrp)
-        ap2_mrp_set_metadata(p->mrp, title, artist, album, duration * 1000,
-                             item_id);
+        ap2_mrp_set_track(p->mrp, title, artist, album, duration * 1000,
+                          item_id, content_type, art_data, art_len,
+                          &track_changed, mrp_info);
     pthread_mutex_unlock(&p->mrp_lock);
-    pthread_mutex_unlock(&p->mrp_publish_lock);
+    if (track_changed_out) *track_changed_out = track_changed;
+
+    bool dmap_ok;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
-        return ap2_native_send_metadata(p, title, artist, album);
-    if (p->raopcl)
-        return raopcl_set_daap(p->raopcl, 4, "minm", 's', title,
-                                "asar", 's', artist, "asal", 's', album, "astn", 'i', 1);
-    return false;
+        dmap_ok = ap2_native_send_metadata(p, title, artist, album);
+    else if (p->raopcl)
+        dmap_ok = raopcl_set_daap(p->raopcl, 4, "minm", 's', title,
+                                  "asar", 's', artist, "asal", 's', album,
+                                  "astn", 'i', 1);
+    else
+        dmap_ok = false;
+    /* DMAP re-sends the art on any identity change, byte-identical or not:
+     * Sonos-class receivers key it to the track they were just told about.
+     * Only a same-item redundant image (MRP verdict "unchanged") is skipped,
+     * matching ap2cl_set_artwork; MRP-rejected bytes still go out on DMAP. */
+    if (have_art && (!have_mrp || track_changed ||
+                     mrp_info->result != AP2_MRP_ARTWORK_UNCHANGED))
+        ap2_send_dmap_artwork(p, content_type, art_len,
+                              (const char *)art_data);
+    if (have_mrp) {
+        /* One full replace push carries item + timeline + artwork together —
+         * the real Apple sender shape. Splitting it (a replace without art,
+         * then a second replace with it) makes tvOS tear down and rebuild
+         * its Now Playing view on every track change. */
+        ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
+        if (mrp_push) *mrp_push = result;
+    }
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+    return dmap_ok;
+}
+
+bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
+                        const char *album, int duration, const char *item_id)
+{
+    return ap2cl_set_metadata_ex(p, title, artist, album, duration, item_id,
+                                 NULL, NULL, 0, NULL, NULL, NULL);
 }
 
 bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
@@ -4308,24 +4411,7 @@ bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,
         pthread_mutex_unlock(&p->mrp_publish_lock);
         return true;
     }
-    bool dmap_ok = false;
-    if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
-        /* Preserve the DMAP/SET_PARAMETER path for receivers such as Sonos;
-         * pair-verified Apple sessions mirror validated artwork over MRP. */
-        char rtpinfo[48];
-        snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
-        uint8_t *resp = NULL; int resp_len = 0;
-        int status = ap2_rtsp_send_ex(p, "SET_PARAMETER", p->session_url,
-                                      (const uint8_t *)data, size, content_type,
-                                      rtpinfo, &resp, &resp_len);
-        free(resp);
-        LOG_INFO("[AP2] native artwork SET_PARAMETER -> status %d (%d bytes, %s)",
-                 status, size, content_type);
-        dmap_ok = status >= 200 && status < 300;
-    } else if (p->raopcl) {
-        dmap_ok = raopcl_set_artwork(
-            p->raopcl, (char *)content_type, size, (char *)data);
-    }
+    bool dmap_ok = ap2_send_dmap_artwork(p, content_type, size, data);
     if (have_mrp) {
         ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
         if (mrp_push) *mrp_push = result;
@@ -4362,9 +4448,12 @@ bool ap2cl_set_progress(struct ap2cl_s *p, int elapsed_s, int duration_s)
     pthread_mutex_lock(&p->mrp_lock);
     ap2_mrp_ready(p);
     bool have_mrp = p->mrp != NULL;
+    /* The content flags, not the wire state, decide the published rate: a
+     * splice pause keeps the client AP2_STREAMING with content_paused set. */
     if (p->mrp)
         ap2_mrp_set_progress(p->mrp, elapsed_s * 1000, duration_s * 1000,
-                             p->state == AP2_STREAMING);
+                             ap2_mrp_current_playback_state(p) ==
+                                 AP2_MRP_PLAYBACK_PLAYING);
     pthread_mutex_unlock(&p->mrp_lock);
     pthread_mutex_unlock(&p->mrp_publish_lock);
     if (have_mrp) {
@@ -4509,6 +4598,16 @@ bool ap2cl_is_playing(struct ap2cl_s *p)
 }
 
 #ifdef AP2_TESTING
+/* Hand the client a ready MRP context without a paired session, so a test can
+ * drive the /command now-playing path against a scripted RTSP peer. The
+ * client takes ownership (ap2cl_destroy frees it). */
+void ap2cl_test_set_mrp(struct ap2cl_s *p, struct ap2_mrp_ctx *m)
+{
+    pthread_mutex_lock(&p->mrp_lock);
+    p->mrp = m;
+    pthread_mutex_unlock(&p->mrp_lock);
+}
+
 void ap2cl_test_lock_mrp(struct ap2cl_s *p)
 {
     pthread_mutex_lock(&p->mrp_lock);

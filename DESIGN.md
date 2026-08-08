@@ -566,8 +566,18 @@ Playback state is re-sent on every start/pause/resume/stop and now-playing on
 every metadata/progress/artwork change — all caller-driven; nothing on this
 path is pushed on a timer. Progress itself is never streamed — the receiver
 extrapolates position from `ElapsedTime` + `Timestamp` + `PlaybackRate`, so a
-steady state needs no push. The ~15 s defensive state re-push belongs to the
-type-130 channel below, which is off by default.
+steady state needs no push. That same extrapolation is why pause and resume
+each push a timeline update (the `mergePolicy: "update"` shape below) before
+their `updateMRPlaybackState`, matching the Apple sender's info-then-state
+order: a bare state flip leaves the receiver showing the last literal
+`ElapsedTime` it was sent (usually the track start) on pause, and
+extrapolating across the paused wall-time span on resume. The frozen/resumed
+elapsed with a fresh `Timestamp` pins both transitions; teardown (stop) stays
+state-only. A receiver demoted to full replace pushes (update-policy
+rejection, below) gets the artwork-bearing replace shape at pause/resume too:
+the correct frozen elapsed is judged worth the re-render on such receivers,
+none of which have been observed in practice. The ~15 s defensive state
+re-push belongs to the type-130 channel below, which is off by default.
 
 **`updateMRNowPlayingInfo` envelope.** The `npi-text` / `mergePolicy` wrapper
 is mandatory; a bare or fabricated outer type string is rejected with HTTP 400:
@@ -619,23 +629,39 @@ rare by design (track/artwork change, play/pause), so per-push bytes cost a
 few tens of KB on the control channel at human-action frequency, and a
 receiver that dropped its art self-heals on the next push.
 
-Pure timeline corrections (seek) use `mergePolicy: "update"` instead,
-carrying only the timeline fields and no artwork keys: a bytes-carrying
-replace push makes tvOS visibly re-decode and re-set the cover on every seek.
-Measured on the same hardware, the update push returns 200, the new elapsed
-lands as an in-place content-item update (no `SET_STATE` re-render), and
-`artworkAvailable` stays true. A receiver that rejects the policy with an
-HTTP error automatically gets full replace pushes for the rest of the session
-(`ap2cl_mrp_push_progress`).
+Pure timeline corrections — seek, and the pause/resume pushes above — use
+`mergePolicy: "update"` instead, carrying only the timeline fields and no
+artwork keys: a bytes-carrying replace push makes tvOS visibly re-decode and
+re-set the cover on every seek. Measured on the same hardware, the update push
+returns 200, the new elapsed lands as an in-place content-item update (no
+`SET_STATE` re-render), and `artworkAvailable` stays true. A receiver that
+rejects the policy with an HTTP error automatically gets full replace pushes
+for the rest of the session (`ap2cl_mrp_push_progress`).
 
-Identity churn is equally destructive and equally guarded: `set_metadata`
-mints a fresh `UniqueIdentifier` only when title/artist/album actually change
-(a redundant re-send under a fresh uid reads as a new item and orphans
-delivered artwork), a track change drops the previous track's staged art so it
-cannot ride the new item, and re-staging byte-identical artwork is a reported
-no-op (`unchanged`) that keeps the current `ArtworkIdentifier` — an identifier
-flip alone makes the receiver invalidate and re-resolve what it is already
-showing, which re-renders its Now Playing UI.
+Identity churn is equally destructive and equally guarded: `set_track` mints
+a fresh `UniqueIdentifier` only when the item identity (item id, else the
+title/artist/album tuple) actually changes — a redundant re-send under a
+fresh uid reads as a new item and orphans delivered artwork — and a track
+change without new artwork drops the previous track's staged art so it cannot
+ride the new item. Byte-identical artwork is a reported no-op (`unchanged`)
+that keeps the current `ArtworkIdentifier`, including across a track change
+(one album's cover survives its track boundaries): an identifier flip alone
+makes the receiver invalidate and re-resolve what it is already showing,
+which re-renders its Now Playing UI.
+
+A track change is therefore pushed as one transaction. The `ARTWORKFILE`
+pipe key stages an artwork path and `ACTION=SENDMETA` consumes it one-shot,
+applying metadata and artwork to MRP state in a single change
+(`ap2_mrp_set_track`) and emitting a single replace push that carries item,
+duration, elapsed, rate and artwork together — the shape a real Apple sender
+emits at a track change. The earlier split sequence (a replace without art,
+a timeline correction, then a second replace re-minting the artwork
+identifier for byte-identical art) rewrote the receiver's now-playing state
+three times within ~100 ms of every track change; observed on tvOS, that
+burst left the Now Playing view degraded (progress bar gone, artwork not
+re-rendered) until the app was re-entered. The DMAP `SET_PARAMETER` copy is
+still re-sent on every identity change, byte-identical or not, since
+Sonos-class receivers consume only that path.
 
 The complete registration/now-playing/extended-state sequence is serialized;
 its return value carries request-scoped overall and `updateMRNowPlayingInfo`
@@ -896,7 +922,9 @@ capture.
   needed. `ARTWORK` accepts local files and MA's local HTTP imageproxy URLs;
   imageproxy requests are normalized to supported `size=512&fmt=jpeg` values,
   and fetches have a 5-second overall deadline so metadata I/O cannot starve
-  the feedback/event keepalive loop.
+  the feedback/event keepalive loop. `ARTWORKFILE` stages the same inputs
+  without pushing; the next `SENDMETA` consumes the staged path — success or
+  failure — and pushes metadata and artwork as one bundle (§8).
 
 ## 11. Device-behavior findings
 

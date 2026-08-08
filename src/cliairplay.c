@@ -560,6 +560,7 @@ static struct {
     char *artist;
     char *album;
     char *item_id;  /* sender's stable per-track identity (ITEMID key) */
+    char *artwork_file; /* staged path (ARTWORKFILE key); SENDMETA consumes it */
     int duration;
     int progress;
 } g_metadata;
@@ -579,6 +580,82 @@ static const char *metadata_str(const char *value)
     return value ? value : "";
 }
 
+/* One-shot claim of the staged ARTWORKFILE path: SENDMETA consumes it whether
+ * the load succeeds or fails, so a later SENDMETA without a fresh file can
+ * never re-push a stale one. NULL when nothing (or an empty value) is staged;
+ * caller frees. */
+static char *metadata_take_artwork_file(void)
+{
+    char *path = g_metadata.artwork_file;
+    g_metadata.artwork_file = NULL;
+    if (path && !*path) {
+        free(path);
+        path = NULL;
+    }
+    return path;
+}
+
+/* Push the current metadata — and any staged artwork file — as one track
+ * bundle. On AP2 this reaches the receiver as a single now-playing replace
+ * push carrying item + timeline + artwork (the real Apple sender shape);
+ * split pushes make tvOS re-render its Now Playing UI on every track change. */
+static void send_track_metadata(const cli_config_t *cfg, const char *title)
+{
+    char *artwork_file = metadata_take_artwork_file();
+    uint8_t *image = NULL;
+    size_t image_size = 0;
+    char content_type[32];
+    bool artwork_failed = false;
+    if (artwork_file) {
+        char error[160];
+        if (artwork_load(artwork_file, &image, &image_size, content_type,
+                         error, sizeof(error))) {
+            LOG_INFO("Loaded artwork (%zu bytes, %s)", image_size, content_type);
+        } else {
+            /* The bundle continues without artwork: on the MRP path a track
+             * change then drops the previous track's art rather than keep it
+             * riding; a RAOP receiver keeps whatever art it last received. */
+            LOG_WARN("Cannot load artwork: %s", error);
+            artwork_failed = true;
+        }
+    }
+    if (cfg->protocol == PROTO_RAOP && g_raopcl) {
+        raopcl_set_daap(g_raopcl, 4, "minm", 's', title,
+                        "asar", 's', metadata_str(g_metadata.artist),
+                        "asal", 's', metadata_str(g_metadata.album),
+                        "astn", 'i', 1);
+        if (image)
+            raopcl_set_artwork(g_raopcl, content_type, (int)image_size,
+                               (char *)image);
+    } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+        ap2_mrp_artwork_info_t mrp_info;
+        ap2_mrp_push_result_t push;
+        bool track_changed = false;
+        ap2cl_set_metadata_ex(g_ap2cl, title, metadata_str(g_metadata.artist),
+                              metadata_str(g_metadata.album),
+                              g_metadata.duration,
+                              metadata_str(g_metadata.item_id),
+                              image ? content_type : NULL, image,
+                              (int)image_size, &track_changed, &mrp_info,
+                              &push);
+        if (artwork_failed && track_changed && push.overall_status >= 0) {
+            /* The track changed, so the retained art was dropped and the
+             * bundle push above already went out without artwork: no
+             * separate clear+push follows, and its status doubles as the
+             * clear status the artwork=rejected contract reports. A load
+             * failure on the SAME item keeps the retained art (the warning
+             * above is the only report), so claiming a clear would lie. */
+            status_print("[STATUS] mrp artwork=rejected reason=invalid_artwork "
+                         "clear_status=%d", push.nowplaying_status);
+        } else if (!artwork_failed) {
+            mrp_artwork_status_report(&mrp_info, push.nowplaying_status);
+        }
+        mrp_status_report(push.overall_status);
+    }
+    free(image);
+    free(artwork_file);
+}
+
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
     if (strcmp(key, "TITLE") == 0) {
@@ -589,6 +666,10 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         metadata_set(&g_metadata.album, value);
     } else if (strcmp(key, "ITEMID") == 0) {
         metadata_set(&g_metadata.item_id, value);
+    } else if (strcmp(key, "ARTWORKFILE") == 0) {
+        /* Stage-only, like TITLE: the next SENDMETA loads the file and pushes
+         * it bundled with the metadata. An empty value clears the staging. */
+        metadata_set(&g_metadata.artwork_file, value);
     } else if (strcmp(key, "DURATION") == 0) {
         g_metadata.duration = atoi(value);
     } else if (strcmp(key, "PROGRESS") == 0) {
@@ -747,18 +828,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         status_print("[STATUS] stopped");
         pthread_mutex_unlock(&g_audio_send_lock);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "SENDMETA") == 0) {
-        if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-            raopcl_set_daap(g_raopcl, 4, "minm", 's', metadata_str(g_metadata.title),
-                            "asar", 's', metadata_str(g_metadata.artist),
-                            "asal", 's', metadata_str(g_metadata.album),
-                            "astn", 'i', 1);
-        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-            ap2cl_set_metadata(g_ap2cl, metadata_str(g_metadata.title),
-                               metadata_str(g_metadata.artist),
-                               metadata_str(g_metadata.album), g_metadata.duration,
-                               metadata_str(g_metadata.item_id));
-            mrp_status_report(ap2cl_mrp_push(g_ap2cl));
-        }
+        send_track_metadata(cfg, metadata_str(g_metadata.title));
     }
 }
 
@@ -768,16 +838,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
 static void send_initial_metadata(const cli_config_t *cfg)
 {
     const char *title = (g_metadata.title && *g_metadata.title) ? g_metadata.title : "cliairplay";
-    if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-        raopcl_set_daap(g_raopcl, 4, "minm", 's', title,
-                        "asar", 's', metadata_str(g_metadata.artist),
-                        "asal", 's', metadata_str(g_metadata.album), "astn", 'i', 1);
-    } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
-        ap2cl_set_metadata(g_ap2cl, title, metadata_str(g_metadata.artist),
-                           metadata_str(g_metadata.album), g_metadata.duration,
-                           metadata_str(g_metadata.item_id));
-        mrp_status_report(ap2cl_mrp_push(g_ap2cl));
-    }
+    send_track_metadata(cfg, title);
 }
 
 /* ---- Session engine transport callbacks ---- */

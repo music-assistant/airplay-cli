@@ -266,8 +266,11 @@ stdin, the single persistent audio input for the whole process lifetime.
 - `VOLUME=<0-100>`.
 - Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
   `ITEMID=<stable per-track id>`,
-  `ARTWORK=<local file path or http:// imageproxy URL>`, followed by
-  `ACTION=SENDMETA` to push the set.
+  `ARTWORKFILE=<local file path or http:// imageproxy URL>` (staged; an empty
+  value clears the staging), followed by `ACTION=SENDMETA` to push the set —
+  metadata and the staged artwork as one bundle; the staged path is consumed
+  by that push. `ARTWORK=<local file path or http:// imageproxy URL>` pushes
+  artwork on its own, outside a track change.
 
 `[STATUS] stopped` acknowledges `ACTION=STOP` once playback has been torn down.
 `STOP` is terminal: the audio loop exits, the connection is torn down and the
@@ -292,10 +295,11 @@ MediaRemote `POST /command`, including explicit play/pause/stop state. Set
 `ITEMID` keys the now-playing item identity: metadata re-sent under the same
 id updates the item in place (a tag refinement never presents as a new
 track), while a new id is a track change that starts at 0:00; without ids,
-identity falls back to the title/artist/album tuple. Byte-identical
-`ARTWORK=` re-sends are ignored, and a `PROGRESS=` correction rides a lean
-merge update on MediaRemote sessions, so a seek never redraws the receiver's
-now-playing screen.
+identity falls back to the title/artist/album tuple. Byte-identical artwork
+keeps its identity even across a track change, redundant `ARTWORK=` re-sends
+are ignored, and a `PROGRESS=` correction — like the pause/resume timeline —
+rides a lean merge update on MediaRemote sessions, so neither a seek nor a
+track change on one album redraws the receiver's now-playing screen.
 Metadata strings are encoded as Unicode binary-plist strings; artwork is
 signature-checked and capped at 5 MiB. MA imageproxy URLs are normalized to a
 supported `size=512&fmt=jpeg` request.
