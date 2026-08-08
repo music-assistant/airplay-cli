@@ -612,8 +612,9 @@ static void send_track_metadata(const cli_config_t *cfg, const char *title)
                          error, sizeof(error))) {
             LOG_INFO("Loaded artwork (%zu bytes, %s)", image_size, content_type);
         } else {
-            /* The bundle continues without artwork: a track change must drop
-             * the previous track's art rather than keep it riding. */
+            /* The bundle continues without artwork: on the MRP path a track
+             * change then drops the previous track's art rather than keep it
+             * riding; a RAOP receiver keeps whatever art it last received. */
             LOG_WARN("Cannot load artwork: %s", error);
             artwork_failed = true;
         }
