@@ -1726,7 +1726,9 @@ static const char *pair_setup_pin_prompt(void *arg)
 {
     static char pin[32];
     (void)arg;
-    fprintf(stderr, "Enter the PIN shown on the device: ");
+    /* Newline-terminated: line-based stderr consumers would otherwise read the
+     * prompt glued to the front of whatever the pairing logs next. */
+    fprintf(stderr, "Enter the PIN shown on the device:\n");
     fflush(stderr);
     if (!fgets(pin, sizeof(pin), stdin)) return NULL;
     pin[strcspn(pin, "\r\n")] = '\0';
