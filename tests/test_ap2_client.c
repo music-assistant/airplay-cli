@@ -20,11 +20,14 @@
 #include "ap2_io.h"
 #include "cross_log.h"
 
+#include "mrp_jpeg_fixture.h"
+
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
 log_level util_loglevel = lSILENCE;
 log_level raop_loglevel = lSILENCE;
 
+void ap2cl_test_set_mrp(struct ap2cl_s *p, struct ap2_mrp_ctx *m);
 void ap2cl_test_lock_mrp(struct ap2cl_s *p);
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
@@ -879,6 +882,337 @@ static void test_splice_pause_keeps_line_hot(void)
     puts("ap2_client splice pause keepalive tests passed");
 }
 
+static bool bytes_contain(const uint8_t *data, size_t data_len,
+                          const void *needle, size_t needle_len)
+{
+    if (!data || !needle || needle_len == 0 || needle_len > data_len)
+        return false;
+    for (size_t i = 0; i <= data_len - needle_len; i++) {
+        if (memcmp(data + i, needle, needle_len) == 0) return true;
+    }
+    return false;
+}
+
+static bool bytes_contain_string(const uint8_t *data, size_t data_len,
+                                 const char *needle)
+{
+    return bytes_contain(data, data_len, needle, strlen(needle));
+}
+
+/* Whether a serialized bplist carries a real with value 0.0 (marker 0x23 and
+ * eight zero bytes). The 32-byte trailer is excluded: a small top-object
+ * reference there is the one place the pattern could occur by coincidence. */
+static bool bplist_contains_zero_real(const uint8_t *data, size_t len)
+{
+    static const uint8_t zero_real[9] = {0x23, 0, 0, 0, 0, 0, 0, 0, 0};
+    if (len <= 32) return false;
+    return bytes_contain(data, len - 32, zero_real, sizeof(zero_real));
+}
+
+/* Locate the ArtworkIdentifier value in a now-playing body: the only
+ * 16-character ASCII string object (marker 0x5F 0x10 0x10, 16 hex chars). */
+static bool find_artwork_identifier(const uint8_t *data, size_t len,
+                                    char out[17])
+{
+    for (size_t i = 0; i + 19 <= len; i++) {
+        if (data[i] != 0x5F || data[i + 1] != 0x10 || data[i + 2] != 0x10)
+            continue;
+        bool hex = true;
+        for (size_t j = 0; j < 16 && hex; j++) {
+            uint8_t c = data[i + 3 + j];
+            hex = (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f');
+        }
+        if (!hex) continue;
+        memcpy(out, data + i + 3, 16);
+        out[16] = '\0';
+        return true;
+    }
+    return false;
+}
+
+#define COMMAND_PEER_MAX_REQUESTS 16
+#define COMMAND_PEER_BODY_MAX 8192
+
+typedef struct {
+    char method[16];
+    char uri[64];
+    uint8_t body[COMMAND_PEER_BODY_MAX];
+    int body_len;
+} command_peer_request_t;
+
+typedef struct {
+    int fd;
+    int expected_requests;
+    int request_count;
+    command_peer_request_t requests[COMMAND_PEER_MAX_REQUESTS];
+    bool ok;
+} command_peer_t;
+
+/* Receiver end for the MediaRemote publication tests: answer every RTSP
+ * request with 200 while capturing method, URI and body for inspection. */
+static void *run_command_peer(void *arg)
+{
+    command_peer_t *peer = arg;
+    peer->ok = true;
+    for (int i = 0; i < peer->expected_requests; i++) {
+        uint8_t buffer[COMMAND_PEER_BODY_MAX + 2048];
+        size_t fill = 0;
+        char *body_start = NULL;
+        while (!body_start) {
+            if (fill >= sizeof(buffer) - 1) {
+                peer->ok = false;
+                return NULL;
+            }
+            ssize_t n = read(peer->fd, buffer + fill,
+                             sizeof(buffer) - 1 - fill);
+            if (n <= 0) {
+                peer->ok = false;
+                return NULL;
+            }
+            fill += (size_t)n;
+            buffer[fill] = '\0';
+            body_start = strstr((char *)buffer, "\r\n\r\n");
+        }
+        body_start += 4;
+        size_t header_len = (size_t)((uint8_t *)body_start - buffer);
+        int cseq = 0;
+        long content_length = 0;
+        char *cseq_header = strstr((char *)buffer, "\r\nCSeq: ");
+        char *length_header = strstr((char *)buffer, "\r\nContent-Length: ");
+        if (!cseq_header || sscanf(cseq_header, "\r\nCSeq: %d", &cseq) != 1) {
+            peer->ok = false;
+            return NULL;
+        }
+        if (length_header)
+            content_length = strtol(length_header + 18, NULL, 10);
+        if (content_length < 0 || content_length > COMMAND_PEER_BODY_MAX ||
+            header_len + (size_t)content_length > sizeof(buffer) - 1) {
+            peer->ok = false;
+            return NULL;
+        }
+        while (fill < header_len + (size_t)content_length) {
+            ssize_t n = read(peer->fd, buffer + fill,
+                             header_len + (size_t)content_length - fill);
+            if (n <= 0) {
+                peer->ok = false;
+                return NULL;
+            }
+            fill += (size_t)n;
+        }
+        command_peer_request_t *req = &peer->requests[peer->request_count];
+        if (sscanf((char *)buffer, "%15s %63s", req->method, req->uri) != 2) {
+            peer->ok = false;
+            return NULL;
+        }
+        memcpy(req->body, buffer + header_len, (size_t)content_length);
+        req->body_len = (int)content_length;
+        peer->request_count++;
+        char response[96];
+        int response_len = snprintf(
+            response, sizeof(response),
+            "RTSP/1.0 200 OK\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n", cseq);
+        if (write(peer->fd, response, (size_t)response_len) != response_len) {
+            peer->ok = false;
+            return NULL;
+        }
+    }
+    return NULL;
+}
+
+static bool request_has(const command_peer_request_t *req, const char *needle)
+{
+    return bytes_contain_string(req->body, (size_t)req->body_len, needle);
+}
+
+/* MediaRemote publication over a scripted RTSP peer: the track bundle reaches
+ * the receiver as ONE now-playing replace push carrying the artwork; pause
+ * and resume each push a timeline (mergePolicy update) body BEFORE their
+ * updateMRPlaybackState with no duplicate state post; stop stays state-only;
+ * a progress set while content-paused reports rate 0; and a track change with
+ * byte-identical artwork keeps the ArtworkIdentifier while still re-sending
+ * the DMAP copy for receivers that consume only that path. */
+static void test_mrp_bundle_and_pause_publish(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    peer->expected_requests = 15;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "mrp bundle test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_splice(client, true);
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
+    ap2cl_test_set_first_packet(client, false);
+    ap2cl_test_set_anchor_valid(client, true);
+
+    /* The test bypasses pairing, so hand the client a ready MRP context; the
+     * client owns it from here (ap2cl_destroy frees it). */
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "bundle sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL);
+    assert(mrp);
+    ap2cl_test_set_mrp(client, mrp);
+
+    /* Track bundle: DMAP metadata, DMAP artwork, then registration and ONE
+     * now-playing replace push chained with the extended registration
+     * (requests 1-7). */
+    ap2_mrp_artwork_info_t info;
+    ap2_mrp_push_result_t push;
+    assert(ap2cl_set_metadata_ex(client, "Track One", "Artist", "Album", 180,
+                                 "item-1", "image/jpeg", k_baseline_jpeg,
+                                 (int)sizeof(k_baseline_jpeg), &info, &push));
+    assert(info.result == AP2_MRP_ARTWORK_ACCEPTED);
+    assert(push.overall_status == 200 && push.nowplaying_status == 200);
+
+    /* A progress set while playing stages state without wire traffic. */
+    assert(ap2cl_set_progress(client, 42, 180));
+
+    /* Splice pause: timeline push then playback state (requests 8-9). */
+    ap2cl_pause(client);
+
+    /* A progress set while content-paused must report rate 0: the splice
+     * pause keeps the client AP2_STREAMING, so the content flags own the
+     * published rate. */
+    assert(ap2cl_set_progress(client, 42, 180));
+    uint8_t *paused_progress = NULL;
+    int paused_progress_len = 0;
+    ap2cl_test_lock_mrp(client);
+    assert(ap2_mrp_build_nowplaying_progress_command(
+        mrp, &paused_progress, &paused_progress_len));
+    ap2cl_test_unlock_mrp(client);
+    assert(bplist_contains_zero_real(paused_progress,
+                                     (size_t)paused_progress_len));
+    free(paused_progress);
+
+    /* Resume: timeline push then playback state (requests 10-11), and stop:
+     * playback state only (request 12). */
+    ap2cl_play(client);
+    ap2cl_stop(client);
+
+    /* Next track with byte-identical artwork: one more bundle (13-15). */
+    assert(ap2cl_set_metadata_ex(client, "Track Two", "Artist", "Album", 200,
+                                 "item-2", "image/jpeg", k_baseline_jpeg,
+                                 (int)sizeof(k_baseline_jpeg), &info, &push));
+    assert(info.result == AP2_MRP_ARTWORK_UNCHANGED);
+    assert(push.overall_status == 200 && push.nowplaying_status == 200);
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok);
+    assert(peer->request_count == 15);
+
+    /* Bundle 1: DMAP metadata + artwork ride SET_PARAMETER first. */
+    assert(strcmp(peer->requests[0].method, "SET_PARAMETER") == 0);
+    assert(request_has(&peer->requests[0], "mlit"));
+    assert(strcmp(peer->requests[1].method, "SET_PARAMETER") == 0);
+    assert(bytes_contain(peer->requests[1].body,
+                         (size_t)peer->requests[1].body_len,
+                         k_baseline_jpeg, sizeof(k_baseline_jpeg)));
+    /* Registration, then the single replace push carrying the artwork. */
+    assert(strcmp(peer->requests[2].method, "POST") == 0);
+    assert(strcmp(peer->requests[2].uri, "/command") == 0);
+    assert(request_has(&peer->requests[3], "updateMRNowPlayingInfo"));
+    assert(request_has(&peer->requests[3], "replace"));
+    assert(request_has(&peer->requests[3],
+                       "kMRMediaRemoteNowPlayingInfoArtworkData"));
+    assert(bytes_contain(peer->requests[3].body,
+                         (size_t)peer->requests[3].body_len,
+                         k_baseline_jpeg, sizeof(k_baseline_jpeg)));
+    assert(request_has(&peer->requests[4], "updateMRSupportedCommands"));
+    assert(request_has(&peer->requests[5], "updateMRPlaybackState"));
+    assert(request_has(&peer->requests[6], "updateMRNowPlayingClient"));
+
+    /* Pause: a lean timeline body (no replace, no artwork keys, rate 0)
+     * BEFORE updateMRPlaybackState, and exactly one state post. */
+    assert(request_has(&peer->requests[7], "updateMRNowPlayingInfo"));
+    assert(!request_has(&peer->requests[7], "replace"));
+    assert(!request_has(&peer->requests[7],
+                        "kMRMediaRemoteNowPlayingInfoArtwork"));
+    assert(request_has(&peer->requests[7],
+                       "kMRMediaRemoteNowPlayingInfoElapsedTime"));
+    assert(bplist_contains_zero_real(peer->requests[7].body,
+                                     (size_t)peer->requests[7].body_len));
+    assert(request_has(&peer->requests[8], "updateMRPlaybackState"));
+    assert(!request_has(&peer->requests[8], "updateMRNowPlayingInfo"));
+
+    /* Resume: the same shape at rate 1 (elapsed is 42.x, so no zero real). */
+    assert(request_has(&peer->requests[9], "updateMRNowPlayingInfo"));
+    assert(!request_has(&peer->requests[9], "replace"));
+    assert(!bplist_contains_zero_real(peer->requests[9].body,
+                                      (size_t)peer->requests[9].body_len));
+    assert(request_has(&peer->requests[10], "updateMRPlaybackState"));
+
+    /* Stop: state only, no now-playing body at teardown. */
+    assert(request_has(&peer->requests[11], "updateMRPlaybackState"));
+    assert(!request_has(&peer->requests[11], "updateMRNowPlayingInfo"));
+
+    /* Bundle 2: the DMAP copy is re-sent for the new track even though the
+     * bytes are identical, while the MRP push keeps the ArtworkIdentifier
+     * (an identifier flip alone re-renders the receiver's UI) under a fresh
+     * item UniqueIdentifier. */
+    assert(strcmp(peer->requests[12].method, "SET_PARAMETER") == 0);
+    assert(request_has(&peer->requests[12], "mlit"));
+    assert(strcmp(peer->requests[13].method, "SET_PARAMETER") == 0);
+    assert(bytes_contain(peer->requests[13].body,
+                         (size_t)peer->requests[13].body_len,
+                         k_baseline_jpeg, sizeof(k_baseline_jpeg)));
+    assert(request_has(&peer->requests[14], "updateMRNowPlayingInfo"));
+    assert(request_has(&peer->requests[14],
+                       "kMRMediaRemoteNowPlayingInfoArtworkData"));
+    char id_first[17];
+    char id_second[17];
+    assert(find_artwork_identifier(peer->requests[3].body,
+                                   (size_t)peer->requests[3].body_len,
+                                   id_first));
+    assert(find_artwork_identifier(peer->requests[14].body,
+                                   (size_t)peer->requests[14].body_len,
+                                   id_second));
+    assert(strcmp(id_first, id_second) == 0);
+    uint64_t uid_first = 0;
+    uint64_t uid_second = 0;
+    assert(ap2_bplist_find_uint(
+        peer->requests[3].body, (size_t)peer->requests[3].body_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_first));
+    assert(ap2_bplist_find_uint(
+        peer->requests[14].body, (size_t)peer->requests[14].body_len,
+        "kMRMediaRemoteNowPlayingInfoUniqueIdentifier", &uid_second));
+    assert(uid_first != 0 && uid_second != 0 && uid_first != uid_second);
+
+    /* Exactly four now-playing posts in total: one per bundle, one per
+     * pause/resume transition — nothing doubled. */
+    int nowplaying_posts = 0;
+    for (int i = 0; i < peer->request_count; i++) {
+        if (request_has(&peer->requests[i], "updateMRNowPlayingInfo"))
+            nowplaying_posts++;
+    }
+    assert(nowplaying_posts == 4);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    puts("ap2_client MRP bundle and pause publication tests passed");
+}
+
 /* An explicit --protocol airplay2 reaches the native flow on exactly the same
  * terms as auto, so an AirPlay-2-only receiver (no _raop service to fall back
  * on) is not routed into a RAOP-compatible flow it cannot answer. Only a real
@@ -1549,6 +1883,7 @@ int main(void)
     test_splice_timeline_warm_path();
     test_splice_delivery_gap_recovery();
     test_splice_pause_keeps_line_hot();
+    test_mrp_bundle_and_pause_publish();
     test_feedback_miss_tolerated_then_recovered();
     test_apple_model_resolution();
     test_pacing_window_rate_scaling();

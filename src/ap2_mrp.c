@@ -1581,11 +1581,19 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m)
     m->event_plain_len = 0;
 }
 
-bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
-                          const char *artist, const char *album,
-                          int duration_ms, const char *item_id)
+bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
+                       const char *artist, const char *album,
+                       int duration_ms, const char *item_id,
+                       const char *mime, const uint8_t *art, int art_len,
+                       bool *track_changed_out, ap2_mrp_artwork_info_t *info)
 {
-    if (!m) return false;
+    ap2_mrp_artwork_info_t local_info;
+    if (!info) info = &local_info;
+    if (track_changed_out) *track_changed_out = false;
+    if (!m) {
+        mrp_artwork_info_init(info, art_len > 0 ? (size_t)art_len : 0);
+        return false;
+    }
     /* The UniqueIdentifier must stay stable across a track's pushes: the
      * receiver keys its now-playing item on it, so a fresh uid on a redundant
      * re-send (registration burst, warm seek, progress correction) reads as a
@@ -1618,9 +1626,6 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
         RAND_bytes((uint8_t *)&uid, sizeof(uid));
         m->np_uid = uid & 0x7FFFFFFFFFFFFFFFULL;
         if (track_changed) {
-            /* The old track's staged artwork must not ride the new item; the
-             * caller stages the new track's art (or none) right after this. */
-            mrp_reset_artwork(m);
             /* A new item starts at zero. Keeping the previous track's elapsed
              * would push the new title at the old position; the sender's
              * settled correction follows only when it starts elsewhere. */
@@ -1628,9 +1633,33 @@ bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
             m->elapsed_set_at = mrp_cf_now();
         }
     }
+    if (art && art_len > 0) {
+        /* The staged artwork survives the identity change long enough for
+         * set_artwork's identical-bytes comparison: the same cover riding a
+         * new track (one album) keeps its ArtworkIdentifier, because an
+         * identifier flip alone makes the receiver invalidate and re-render
+         * the art it is already showing. A rejected image clears staging the
+         * way set_artwork always does. */
+        ap2_mrp_set_artwork(m, mime, art, art_len, info);
+    } else {
+        mrp_artwork_info_init(info, 0);
+        info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
+        /* The old track's staged artwork must not ride the new item; the same
+         * item without a new image keeps what it has (tag refinement). */
+        if (track_changed) mrp_reset_artwork(m);
+    }
     m->state_generation++;
     m->state_dirty = true;
+    if (track_changed_out) *track_changed_out = track_changed;
     return true;
+}
+
+bool ap2_mrp_set_metadata(struct ap2_mrp_ctx *m, const char *title,
+                          const char *artist, const char *album,
+                          int duration_ms, const char *item_id)
+{
+    return ap2_mrp_set_track(m, title, artist, album, duration_ms, item_id,
+                             NULL, NULL, 0, NULL, NULL);
 }
 
 bool ap2_mrp_set_artwork(struct ap2_mrp_ctx *m, const char *mime,

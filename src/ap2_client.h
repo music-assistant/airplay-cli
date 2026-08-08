@@ -362,10 +362,26 @@ bool ap2cl_feedback(struct ap2cl_s *p);
 /* Set volume (0-100). */
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
 
-/* Set metadata (DAAP format). item_id is the sender's stable per-track
- * identity ("" = none): MediaRemote keys its now-playing item on it, so
- * later tag refinements for the same item update in place instead of
- * presenting as a new track. */
+/*
+ * Set the track metadata and artwork as one bundle: DMAP metadata (and, when
+ * artwork is given, DMAP artwork) on the transport in use, plus exactly one
+ * serialized MediaRemote replace push carrying item, timeline and artwork
+ * together — the shape a real Apple sender emits at a track change. item_id
+ * is the sender's stable per-track identity ("" = none): MediaRemote keys
+ * its now-playing item on it, so later tag refinements for the same item
+ * update in place instead of presenting as a new track. Byte-identical
+ * artwork keeps its ArtworkIdentifier across a track change; NULL artwork
+ * drops retained MRP artwork when the track changed. mrp_info and mrp_push
+ * receive the request-scoped artwork verdict and push statuses.
+ */
+bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
+                           const char *artist, const char *album,
+                           int duration, const char *item_id,
+                           const char *content_type, const uint8_t *art_data,
+                           int art_len, ap2_mrp_artwork_info_t *mrp_info,
+                           ap2_mrp_push_result_t *mrp_push);
+
+/* ap2cl_set_metadata_ex without artwork or result reporting. */
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,
                         const char *album, int duration, const char *item_id);
 
