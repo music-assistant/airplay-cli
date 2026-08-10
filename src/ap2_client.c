@@ -68,6 +68,14 @@ extern log_level *loglevel;
 #define AP2_RTSP_FEEDBACK_TIMEOUT_MS 2000
 #define AP2_RTSP_METADATA_TIMEOUT_MS 5000
 #define AP2_RTSP_ARTWORK_TIMEOUT_MS  15000
+/* Budget for the farewell TEARDOWN written on a channel that is being
+ * abandoned. It has to land while the receiver still has queued audio to play
+ * out — a teardown with audio still queued is clean, an underrun on an armed
+ * session pops — so it stays well inside the queue the sender paces to
+ * (AP2_SPLICE_PACING_MS, only ever raised per device). A frame this small
+ * normally leaves in microseconds; the budget is what a receiver that has
+ * stopped reading altogether costs, and nothing waits on the answer. */
+#define AP2_RTSP_FAREWELL_TIMEOUT_MS 250
 #define AP2_FEEDBACK_INTERVAL_MS     2000
 /* A single missed keepalive beat must not kill an otherwise healthy session:
  * receivers ride out multi-second local network blackouts (wifi roams, DFS
@@ -500,9 +508,124 @@ static void ap2_report_failed_exchange(struct ap2cl_s *p, const char *label,
 
 /* ---- Native AP2 RTSP I/O ---- */
 
+/* Put one RTSP request on the wire, HAP-framed while the channel is encrypted.
+ * A failure leaves errno set and names the phase it died in, so the caller can
+ * report it and decide whether it kills the channel. Only a "write" failure can
+ * have left part of the request behind, which desynchronizes the receiver's
+ * frame stream. */
+static bool ap2_rtsp_write_request(struct ap2cl_s *p, const char *method,
+                                   const char *uri, const uint8_t *body,
+                                   int body_len, const char *ct,
+                                   const char *extra_hdr, int cseq,
+                                   uint64_t started_ms, uint64_t deadline_ms,
+                                   const char **phase)
+{
+    char hdr[1024];
+    int hdr_len = snprintf(hdr, sizeof(hdr),
+        "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: AirPlay/670.6.2\r\n"
+        "DACP-ID: %s\r\nActive-Remote: %s\r\n%s%s%s%s"
+        "Content-Length: %d\r\n\r\n",
+        method, uri, cseq,
+        p->dacp_id ? p->dacp_id : "0",
+        p->active_remote ? p->active_remote : "0",
+        ct ? "Content-Type: " : "", ct ? ct : "", ct ? "\r\n" : "",
+        extra_hdr ? extra_hdr : "",
+        body_len);
+    if (hdr_len <= 0 || hdr_len >= (int)sizeof(hdr)) {
+        errno = EMSGSIZE;
+        *phase = "construct";
+        return false;
+    }
+
+    uint8_t *msg = NULL;
+    int msg_len = 0;
+
+    if (p->hap) {
+        /* Encrypt RTSP via HAP framing */
+        int raw_len = hdr_len + body_len;
+        uint8_t *raw = malloc(raw_len);
+        if (!raw) {
+            errno = ENOMEM;
+            *phase = "allocate";
+            return false;
+        }
+        memcpy(raw, hdr, hdr_len);
+        if (body && body_len > 0) memcpy(raw + hdr_len, body, body_len);
+        msg_len = ap2_hap_encrypt(p->hap, raw, raw_len, &msg);
+        free(raw);
+        if (msg_len <= 0) {
+            free(msg);
+            errno = EPROTO;
+            *phase = "encrypt";
+            return false;
+        }
+    } else {
+        msg_len = hdr_len + body_len;
+        msg = malloc(msg_len);
+        if (!msg) {
+            errno = ENOMEM;
+            *phase = "allocate";
+            return false;
+        }
+        memcpy(msg, hdr, hdr_len);
+        if (body && body_len > 0) memcpy(msg + hdr_len, body, body_len);
+    }
+
+    LOG_DEBUG("[AP2] RTSP TX cseq=%d %s %s body=%d wire=%d timeout=%dms",
+              cseq, method, uri, body_len, msg_len,
+              (int)(deadline_ms - started_ms));
+    bool sent = ap2_io_write_all_deadline(p->sock_fd, msg, msg_len,
+                                          deadline_ms);
+    /* Keep the failed write's errno: the caller reports it, and free() is not
+     * guaranteed to preserve it. */
+    int write_errno = errno;
+    free(msg);
+    errno = write_errno;
+    if (!sent) *phase = "write";
+    return sent;
+}
+
+/* Say goodbye on a control channel that is about to be abandoned.
+ *
+ * A receiver whose sender disappears keeps the session armed: it plays out what
+ * is queued and then pops audibly on the starved queue, over and over, until
+ * something else displaces it. The TEARDOWN in ap2cl_disconnect() cannot get
+ * there any more — the regular send path is fail-closed once the channel is
+ * dead, and the socket is shut down right after this — so it goes out from
+ * here, while the socket is still open and the receiver still has audio queued
+ * (a teardown with audio still queued is clean).
+ *
+ * The response is deliberately not read: nothing depends on it, and the read
+ * direction is exactly what just proved unreliable. Writing is safe regardless,
+ * because the two directions carry their own keys and counters and the write
+ * nonce only ever advances. */
+static void ap2_rtsp_farewell_teardown(struct ap2cl_s *p)
+{
+    if (!p->rtsp_established || p->sock_fd < 0 || !*p->session_url) return;
+    uint64_t started_ms = ap2_io_monotonic_ms();
+    const char *phase = NULL;
+    if (ap2_rtsp_write_request(p, "TEARDOWN", p->session_url, NULL, 0, NULL,
+                               NULL, p->cseq++, started_ms,
+                               started_ms + AP2_RTSP_FAREWELL_TIMEOUT_MS,
+                               &phase)) {
+        LOG_INFO("[AP2] Wrote a farewell TEARDOWN for %s so the receiver can "
+                 "drop the session instead of popping on its starved queue",
+                 p->session_url);
+        return;
+    }
+    int write_errno = errno;
+    LOG_WARN("[AP2] Farewell TEARDOWN for %s failed during %s: %s; the "
+             "receiver may hold the session until something displaces it",
+             p->session_url, phase, strerror(write_errno));
+}
+
+/* Give up on the channel, unless the failure is a tolerated keepalive miss.
+ * request_intact says whether the failed request went out in full, which is
+ * what decides if a farewell TEARDOWN can still be appended to the channel:
+ * appending to a half-written frame only desynchronizes the receiver. */
 static void ap2_mark_rtsp_dead(struct ap2cl_s *p, const char *method,
                                const char *uri, const char *phase,
-                               uint64_t elapsed_ms)
+                               uint64_t elapsed_ms, bool request_intact)
 {
     int saved_errno = errno;
     unsigned prior_misses = atomic_load(&p->feedback_failures);
@@ -524,6 +647,13 @@ static void ap2_mark_rtsp_dead(struct ap2cl_s *p, const char *method,
         LOG_ERROR("[AP2] RTSP channel failed during %s %s %s after %" PRIu64
                   "ms: %s; terminating native session",
                   method, uri, phase, elapsed_ms, strerror(saved_errno));
+        /* Only worth trying when the receiver simply stopped answering: a peer
+         * that reset or closed the connection is already gone, and a request
+         * that died mid-write left a partial frame no further write can follow.
+         * The farewell cannot recurse into here: it writes through the helper,
+         * which reports failures back instead of killing the channel. */
+        if (request_intact && saved_errno == ETIMEDOUT)
+            ap2_rtsp_farewell_teardown(p);
         shutdown(p->sock_fd, SHUT_RDWR);
     }
     errno = saved_errno;
@@ -561,69 +691,15 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
     }
     if (request_started) *request_started = true;
     int cseq = p->cseq++;
-    char hdr[1024];
-    int hdr_len = snprintf(hdr, sizeof(hdr),
-        "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: AirPlay/670.6.2\r\n"
-        "DACP-ID: %s\r\nActive-Remote: %s\r\n%s%s%s%s"
-        "Content-Length: %d\r\n\r\n",
-        method, uri, cseq,
-        p->dacp_id ? p->dacp_id : "0",
-        p->active_remote ? p->active_remote : "0",
-        ct ? "Content-Type: " : "", ct ? ct : "", ct ? "\r\n" : "",
-        extra_hdr ? extra_hdr : "",
-        body_len);
-    if (hdr_len <= 0 || hdr_len >= (int)sizeof(hdr)) {
-        errno = EMSGSIZE;
-        ap2_mark_rtsp_dead(p, method, uri, "construct", 0);
+    const char *write_phase = NULL;
+    if (!ap2_rtsp_write_request(p, method, uri, body, body_len, ct, extra_hdr,
+                                cseq, started_ms, deadline_ms, &write_phase)) {
+        ap2_mark_rtsp_dead(p, method, uri, write_phase,
+                           ap2_io_monotonic_ms() - started_ms, false);
+        *resp_body = NULL;
+        *resp_len = 0;
         return 0;
     }
-
-    uint8_t *msg = NULL;
-    int msg_len = 0;
-
-    if (p->hap) {
-        /* Encrypt RTSP via HAP framing */
-        int raw_len = hdr_len + body_len;
-        uint8_t *raw = malloc(raw_len);
-        if (!raw) {
-            errno = ENOMEM;
-            ap2_mark_rtsp_dead(p, method, uri, "allocate", 0);
-            return 0;
-        }
-        memcpy(raw, hdr, hdr_len);
-        if (body && body_len > 0) memcpy(raw + hdr_len, body, body_len);
-        msg_len = ap2_hap_encrypt(p->hap, raw, raw_len, &msg);
-        free(raw);
-        if (msg_len <= 0) {
-            free(msg);
-            errno = EPROTO;
-            ap2_mark_rtsp_dead(p, method, uri, "encrypt", 0);
-            return 0;
-        }
-    } else {
-        msg_len = hdr_len + body_len;
-        msg = malloc(msg_len);
-        if (!msg) {
-            errno = ENOMEM;
-            ap2_mark_rtsp_dead(p, method, uri, "allocate", 0);
-            return 0;
-        }
-        memcpy(msg, hdr, hdr_len);
-        if (body && body_len > 0) memcpy(msg + hdr_len, body, body_len);
-    }
-
-    LOG_DEBUG("[AP2] RTSP TX cseq=%d %s %s body=%d wire=%d timeout=%dms",
-              cseq, method, uri, body_len, msg_len,
-              (int)(deadline_ms - started_ms));
-    if (!ap2_io_write_all_deadline(p->sock_fd, msg, msg_len, deadline_ms)) {
-        /* mark first: it keys off errno from the failed write, which a
-         * free() in between is not guaranteed to preserve */
-        ap2_mark_rtsp_dead(p, method, uri, "write",
-                           ap2_io_monotonic_ms() - started_ms);
-        free(msg);
-        return 0;
-    }
-    free(msg);
 
     /* Read encrypted response.
      * HAP framing: [2-byte LE length][encrypted chunk + 16-byte tag]
@@ -676,7 +752,7 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
         }
         if (total >= (int)sizeof(buf)) errno = EMSGSIZE;
         ap2_mark_rtsp_dead(p, method, uri, "read",
-                           ap2_io_monotonic_ms() - started_ms);
+                           ap2_io_monotonic_ms() - started_ms, true);
         if (!atomic_load(&p->rtsp_dead) && total > 0) {
             memcpy(p->rtsp_carry, buf, (size_t)total);
             p->rtsp_carry_len = total;
@@ -743,7 +819,7 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
 
     if (total >= (int)sizeof(buf)) errno = EMSGSIZE;
     ap2_mark_rtsp_dead(p, method, uri, "read",
-                       ap2_io_monotonic_ms() - started_ms);
+                       ap2_io_monotonic_ms() - started_ms, true);
     if (!atomic_load(&p->rtsp_dead) && total > 0) {
         memcpy(p->rtsp_carry, buf, (size_t)total);
         p->rtsp_carry_len = total;
@@ -4625,6 +4701,14 @@ void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd)
     p->rtsp_carry_len = 0;
     atomic_store(&p->rtsp_dead, false);
     snprintf(p->session_url, sizeof(p->session_url), "rtsp://test/session");
+}
+
+/* Leave the miss budget with one beat left, so the next failed beat is the one
+ * that spends it whatever the budget is set to. */
+void ap2cl_test_prime_feedback_misses(struct ap2cl_s *p)
+{
+    atomic_store(&p->feedback_failures,
+                 AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES - 1);
 }
 
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p)

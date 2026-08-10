@@ -824,6 +824,19 @@ capture.
   CSeq, and bytes of a response that was mid-flight at an abandoned deadline
   carry over into the next exchange to keep the byte stream and the HAP
   read-nonce sequence intact. A succeeded beat resets the miss count.
+- **Farewell teardown** — giving up on the channel writes one last `TEARDOWN`
+  before the socket is shut down, because the regular teardown at disconnect
+  cannot pass the fail-closed send gate any more. Without it the receiver keeps
+  the session armed and pops audibly on its starved queue, over and over, until
+  another session displaces it. It is written only when the failed request went
+  out in full and simply was not answered, so the goodbye appends at a frame
+  boundary: a peer that reset or closed the connection is already gone, and a
+  request that died mid-write left a partial frame no further write can follow.
+  Its 250 ms budget keeps it inside the queue the sender paces to, so it lands
+  while audio is still queued — the clean case. The response is never read;
+  nothing depends on it, and only the write nonce advances, so none is reused.
+  Best-effort by nature: a receiver wedged badly enough to miss three
+  keepalives may never read it, and the socket shutdown follows immediately.
 - **Reverse event channel** — pair-verified sessions derive independent
   `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS

@@ -31,6 +31,7 @@ void ap2cl_test_set_mrp(struct ap2cl_s *p, struct ap2_mrp_ctx *m);
 void ap2cl_test_lock_mrp(struct ap2cl_s *p);
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
+void ap2cl_test_prime_feedback_misses(struct ap2cl_s *p);
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
 bool ap2cl_test_first_packet(struct ap2cl_s *p);
 void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet);
@@ -302,6 +303,73 @@ static void test_feedback_miss_tolerated_then_recovered(void)
     assert(close(sockets[1]) == 0);
     assert(ap2cl_destroy(client));
     puts("ap2_client feedback miss tolerance test passed");
+}
+
+static void *run_farewell_teardown_peer(void *arg)
+{
+    feedback_peer_t *peer = arg;
+    peer->ok = false;
+    /* Swallow the beat that spends the budget. */
+    int missed_cseq = 0;
+    if (!read_rtsp_request_cseq(peer->fd, "POST /feedback ", &missed_cseq))
+        return NULL;
+    /* The goodbye has to arrive on the channel the sender is abandoning, as
+     * the next request in that channel's sequence. */
+    int teardown_cseq = 0;
+    if (!read_rtsp_request_cseq(peer->fd, "TEARDOWN rtsp://test/session ",
+                                &teardown_cseq) ||
+        teardown_cseq != missed_cseq + 1)
+        return NULL;
+    peer->ok = true;
+    return NULL;
+}
+
+/* Spending the miss budget kills the channel, and the receiver must still be
+ * told: without the farewell TEARDOWN it holds the session armed and pops
+ * audibly on the starved queue until something else displaces it.
+ *
+ * The budget is primed rather than spent beat by beat, so the test costs one
+ * feedback timeout instead of the whole ladder and does not mirror the budget
+ * constant — a raised budget would otherwise leave the peer waiting for a
+ * goodbye the sender never sends, hanging the suite instead of failing it. */
+static void test_dead_channel_writes_farewell_teardown(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    feedback_peer_t peer = {
+        .fd = sockets[1],
+    };
+    pthread_t peer_thread;
+    assert(pthread_create(
+               &peer_thread, NULL, run_farewell_teardown_peer, &peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "farewell test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_prime_feedback_misses(client);
+
+    assert(!ap2cl_feedback(client));
+    assert(!ap2cl_control_healthy(client));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client farewell teardown test passed");
 }
 
 typedef struct {
@@ -1907,6 +1975,7 @@ int main(void)
     test_splice_pause_keeps_line_hot();
     test_mrp_bundle_and_pause_publish();
     test_feedback_miss_tolerated_then_recovered();
+    test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();
     test_pacing_window_rate_scaling();
     test_clock_verified_anchor();
