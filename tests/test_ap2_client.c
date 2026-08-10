@@ -31,6 +31,7 @@ void ap2cl_test_set_mrp(struct ap2cl_s *p, struct ap2_mrp_ctx *m);
 void ap2cl_test_lock_mrp(struct ap2cl_s *p);
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
+void ap2cl_test_prime_feedback_misses(struct ap2cl_s *p);
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
 bool ap2cl_test_first_packet(struct ap2cl_s *p);
 void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet);
@@ -304,23 +305,20 @@ static void test_feedback_miss_tolerated_then_recovered(void)
     puts("ap2_client feedback miss tolerance test passed");
 }
 
-/* Mirrors AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES in ap2_client.c. */
-#define TEST_FEEDBACK_MISS_BUDGET 3
-
 static void *run_farewell_teardown_peer(void *arg)
 {
     feedback_peer_t *peer = arg;
     peer->ok = false;
-    /* Swallow every beat of the budget so the sender gives up on the channel. */
-    for (int beat = 0; beat < TEST_FEEDBACK_MISS_BUDGET; beat++) {
-        int cseq = 0;
-        if (!read_rtsp_request_cseq(peer->fd, "POST /feedback ", &cseq))
-            return NULL;
-    }
-    /* The goodbye has to arrive on the channel the sender is abandoning. */
+    /* Swallow the beat that spends the budget. */
+    int missed_cseq = 0;
+    if (!read_rtsp_request_cseq(peer->fd, "POST /feedback ", &missed_cseq))
+        return NULL;
+    /* The goodbye has to arrive on the channel the sender is abandoning, as
+     * the next request in that channel's sequence. */
     int teardown_cseq = 0;
     if (!read_rtsp_request_cseq(peer->fd, "TEARDOWN rtsp://test/session ",
-                                &teardown_cseq))
+                                &teardown_cseq) ||
+        teardown_cseq != missed_cseq + 1)
         return NULL;
     peer->ok = true;
     return NULL;
@@ -328,7 +326,12 @@ static void *run_farewell_teardown_peer(void *arg)
 
 /* Spending the miss budget kills the channel, and the receiver must still be
  * told: without the farewell TEARDOWN it holds the session armed and pops
- * audibly on the starved queue until something else displaces it. */
+ * audibly on the starved queue until something else displaces it.
+ *
+ * The budget is primed rather than spent beat by beat, so the test costs one
+ * feedback timeout instead of the whole ladder and does not mirror the budget
+ * constant — a raised budget would otherwise leave the peer waiting for a
+ * goodbye the sender never sends, hanging the suite instead of failing it. */
 static void test_dead_channel_writes_farewell_teardown(void)
 {
     int sockets[2];
@@ -355,13 +358,10 @@ static void test_dead_channel_writes_farewell_teardown(void)
     assert(client);
     ap2cl_force_native(client);
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_prime_feedback_misses(client);
 
-    for (int beat = 1; beat <= TEST_FEEDBACK_MISS_BUDGET; beat++) {
-        assert(!ap2cl_feedback(client));
-        /* Only the budget's last beat gives up on the channel. */
-        assert(ap2cl_control_healthy(client) ==
-               (beat < TEST_FEEDBACK_MISS_BUDGET));
-    }
+    assert(!ap2cl_feedback(client));
+    assert(!ap2cl_control_healthy(client));
 
     assert(pthread_join(peer_thread, NULL) == 0);
     assert(peer.ok);

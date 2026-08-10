@@ -71,9 +71,10 @@ extern log_level *loglevel;
 /* Budget for the farewell TEARDOWN written on a channel that is being
  * abandoned. It has to land while the receiver still has queued audio to play
  * out — a teardown with audio still queued is clean, an underrun on an armed
- * session pops — so it stays well inside the 600 ms queue depth. Nothing waits
- * on it, and the channel is going away either way, so a receiver that has
- * stopped reading costs only this. */
+ * session pops — so it stays well inside the queue the sender paces to
+ * (AP2_SPLICE_PACING_MS, only ever raised per device). A frame this small
+ * normally leaves in microseconds; the budget is what a receiver that has
+ * stopped reading altogether costs, and nothing waits on the answer. */
 #define AP2_RTSP_FAREWELL_TIMEOUT_MS 250
 #define AP2_FEEDBACK_INTERVAL_MS     2000
 /* A single missed keepalive beat must not kill an otherwise healthy session:
@@ -607,8 +608,8 @@ static void ap2_rtsp_farewell_teardown(struct ap2cl_s *p)
                                NULL, p->cseq++, started_ms,
                                started_ms + AP2_RTSP_FAREWELL_TIMEOUT_MS,
                                &phase)) {
-        LOG_INFO("[AP2] Wrote a farewell TEARDOWN for %s so the receiver drops "
-                 "the session instead of popping on its starved queue",
+        LOG_INFO("[AP2] Wrote a farewell TEARDOWN for %s so the receiver can "
+                 "drop the session instead of popping on its starved queue",
                  p->session_url);
         return;
     }
@@ -618,9 +619,10 @@ static void ap2_rtsp_farewell_teardown(struct ap2cl_s *p)
              p->session_url, phase, strerror(write_errno));
 }
 
-/* :param request_intact: Whether the request this failure belongs to reached
- *     the receiver whole, which decides if a farewell TEARDOWN can still be
- *     appended to the channel. */
+/* Give up on the channel, unless the failure is a tolerated keepalive miss.
+ * request_intact says whether the failed request went out in full, which is
+ * what decides if a farewell TEARDOWN can still be appended to the channel:
+ * appending to a half-written frame only desynchronizes the receiver. */
 static void ap2_mark_rtsp_dead(struct ap2cl_s *p, const char *method,
                                const char *uri, const char *phase,
                                uint64_t elapsed_ms, bool request_intact)
@@ -648,7 +650,8 @@ static void ap2_mark_rtsp_dead(struct ap2cl_s *p, const char *method,
         /* Only worth trying when the receiver simply stopped answering: a peer
          * that reset or closed the connection is already gone, and a request
          * that died mid-write left a partial frame no further write can follow.
-         * rtsp_dead is set by now, so the farewell cannot recurse into here. */
+         * The farewell cannot recurse into here: it writes through the helper,
+         * which reports failures back instead of killing the channel. */
         if (request_intact && saved_errno == ETIMEDOUT)
             ap2_rtsp_farewell_teardown(p);
         shutdown(p->sock_fd, SHUT_RDWR);
@@ -4698,6 +4701,14 @@ void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd)
     p->rtsp_carry_len = 0;
     atomic_store(&p->rtsp_dead, false);
     snprintf(p->session_url, sizeof(p->session_url), "rtsp://test/session");
+}
+
+/* Leave the miss budget with one beat left, so the next failed beat is the one
+ * that spends it whatever the budget is set to. */
+void ap2cl_test_prime_feedback_misses(struct ap2cl_s *p)
+{
+    atomic_store(&p->feedback_failures,
+                 AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES - 1);
 }
 
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p)
