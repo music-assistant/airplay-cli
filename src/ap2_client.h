@@ -507,6 +507,11 @@ int ap2cl_warm_lead_ms(struct ap2cl_s *p);
  * every member's queued audio. 0 = no constraint (not on the splice path). */
 uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p);
 
+/* Audible instant (unix ms) of the next frame the audio loop will send, on
+ * every flow (announcement mapping). 0 = head unknown: no timeline anchored
+ * yet, or no chunk sent since the last re-anchor. */
+uint64_t ap2cl_head_audible_unix_ms(struct ap2cl_s *p);
+
 /* Silence frames still owed to the wire before the next real sample (splice
  * timeline): the audio loop prepends them as ordinary encoded chunks so the
  * bitstream stays contiguous, and consumes the pad as it sends. */

@@ -193,6 +193,11 @@ struct ap2cl_s {
 
     /* RAOP-compat flow: libraop client */
     struct raopcl_s *raopcl;
+    /* Last sent chunk's playtime and frame count: the delivery-head
+     * projection for ap2cl_head_audible_unix_ms. Zeroed on every raopcl
+     * re-anchor (0 = head unknown until the next chunk is sent). */
+    uint64_t raop_last_playtime;
+    uint32_t raop_last_chunk_frames;
 
     /* Native AP2 flow */
     int sock_fd;                  /* TCP connection */
@@ -2599,8 +2604,17 @@ struct ap2cl_s *ap2cl_create(
     return p;
 }
 
+/* The RAOP-compat timeline re-anchored (start/flush/pause/resume/stop): the
+ * delivery-head projection from the last sent chunk no longer holds. */
+static void ap2_raop_head_reset(struct ap2cl_s *p)
+{
+    p->raop_last_playtime = 0;
+    p->raop_last_chunk_frames = 0;
+}
+
 static void ap2_raop_session_cleanup(struct ap2cl_s *p)
 {
+    ap2_raop_head_reset(p);
     if (p->raopcl) {
         raopcl_destroy(p->raopcl);
         p->raopcl = NULL;
@@ -3095,6 +3109,7 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
         return AP2_COMMIT_OK;
     }
     if (!p->raopcl) return AP2_COMMIT_FAILED;
+    ap2_raop_head_reset(p);
     int latency = raopcl_latency(p->raopcl);
     raopcl_start_at(p->raopcl, ntp_start - TS2NTP(latency, p->format.sample_rate));
     p->state = AP2_STREAMING;
@@ -3118,6 +3133,7 @@ void ap2cl_standby(struct ap2cl_s *p)
     p->content_stopped = false;
     ap2_content_skip_reset(p, "standby");
     if (p->flow != FLOW_NATIVE_AP2) {
+        ap2_raop_head_reset(p);
         if (p->raopcl) raop_session_standby(p->raopcl);
         p->state = AP2_CONNECTED;
         return;
@@ -3164,8 +3180,10 @@ bool ap2cl_flush(struct ap2cl_s *p)
     ap2_clock_verify_disarm(p);
     ap2_content_skip_reset(p, "FLUSH");
 
-    if (p->flow != FLOW_NATIVE_AP2)
+    if (p->flow != FLOW_NATIVE_AP2) {
+        ap2_raop_head_reset(p);
         return raop_session_flush(p->raopcl);
+    }
 
     if (atomic_load(&p->rtsp_dead)) return false;
     if (p->splice_timeline) {
@@ -3219,6 +3237,7 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
     ap2_content_skip_reset(p, "resume");
 
     if (p->flow != FLOW_NATIVE_AP2) {
+        ap2_raop_head_reset(p);
         ap2_commit_result_t r =
             raop_session_start_at(p->raopcl, start_unix_ms, at_unix_ms);
         if (r == AP2_COMMIT_OK) p->state = AP2_STREAMING;
@@ -3347,9 +3366,11 @@ ap2_send_result_t ap2cl_send_chunk(struct ap2cl_s *p, uint8_t *sample,
     }
     if (!p->raopcl) return AP2_SEND_FATAL;
     uint64_t playtime;
-    return raopcl_send_chunk(p->raopcl, sample, frames, &playtime)
-               ? AP2_SEND_SENT
-               : AP2_SEND_FATAL;
+    if (!raopcl_send_chunk(p->raopcl, sample, frames, &playtime))
+        return AP2_SEND_FATAL;
+    p->raop_last_playtime = playtime;
+    p->raop_last_chunk_frames = (uint32_t)frames;
+    return AP2_SEND_SENT;
 }
 
 static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
@@ -3790,7 +3811,11 @@ void ap2cl_pause(struct ap2cl_s *p)
 {
     if (!p) return;
     p->content_stopped = false;
-    if (p->raopcl) { raopcl_pause(p->raopcl); raopcl_flush(p->raopcl); }
+    if (p->raopcl) {
+        ap2_raop_head_reset(p);
+        raopcl_pause(p->raopcl);
+        raopcl_flush(p->raopcl);
+    }
     if (p->splice_timeline) {
         /* Splice pause stops the CONTENT, never the wire: an Apple receiver
          * whose queue underruns while the session stays armed emits a noise
@@ -3817,6 +3842,7 @@ void ap2cl_play(struct ap2cl_s *p)
     p->content_paused = false;
     p->content_stopped = false;
     if (p->raopcl) {
+        ap2_raop_head_reset(p);
         int lat = raopcl_latency(p->raopcl);
         uint64_t now = raopcl_get_ntp(NULL);
         raopcl_start_at(p->raopcl, now + MS2NTP(200) - TS2NTP(lat, raopcl_sample_rate(p->raopcl)));
@@ -3860,7 +3886,10 @@ void ap2cl_stop(struct ap2cl_s *p)
     p->content_paused = false;
     p->content_stopped = false;
     ap2_content_skip_reset(p, "stop");
-    if (p->raopcl) raopcl_stop(p->raopcl);
+    if (p->raopcl) {
+        ap2_raop_head_reset(p);
+        raopcl_stop(p->raopcl);
+    }
     ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
     p->rt_anchor_valid = false;
     p->state = AP2_DOWN;
@@ -4621,6 +4650,25 @@ uint64_t ap2cl_splice_head_unix_ms(struct ap2cl_s *p)
     /* head_ts lives in the frame-clock domain of the unix-epoch NTP wall
      * clock, so its audible instant is the direct inverse mapping. */
     return ap2_ntp_to_unix_ms(TS2NTP(p->head_ts, p->format.sample_rate));
+}
+
+/* Audible wall-clock instant (unix ms) of the next frame the audio loop will
+ * send, whatever the flow. Native sessions — splice or not — anchor every
+ * frame audible at its frame-clock position (see ap2cl_accept_frames), so the
+ * delivery head maps directly; the RAOP-compat flow projects it from the last
+ * sent chunk's playtime plus that chunk's duration (RAOP timestamps are
+ * contiguous between re-anchors). 0 while the head is unknown: no timeline
+ * anchored yet, or no chunk sent since the last re-anchor. */
+uint64_t ap2cl_head_audible_unix_ms(struct ap2cl_s *p)
+{
+    if (!p) return 0;
+    if (p->flow == FLOW_NATIVE_AP2) {
+        if (!p->head_ts) return 0;
+        return ap2_ntp_to_unix_ms(TS2NTP(p->head_ts, p->format.sample_rate));
+    }
+    return raop_session_next_head_unix_ms(p->raop_last_playtime,
+                                          p->raop_last_chunk_frames,
+                                          (uint32_t)p->format.sample_rate);
 }
 
 /* Silence frames the audio loop still owes the wire before the next real

@@ -126,3 +126,11 @@ bool raop_session_resume(struct raopcl_s *client)
         TS2NTP(raopcl_latency(client), raopcl_sample_rate(client));
     return raopcl_start_at(client, audible_ntp - latency_ntp);
 }
+
+uint64_t raop_session_next_head_unix_ms(uint64_t playtime_ntp,
+                                        uint32_t chunk_frames,
+                                        uint32_t sample_rate)
+{
+    if (!playtime_ntp) return 0;
+    return ntp_to_unix_ms(playtime_ntp + TS2NTP(chunk_frames, sample_rate));
+}

@@ -185,6 +185,7 @@ on stderr that Music Assistant parses:
 | `play_failed` | `ACTION=PLAY` was rejected by the transport, or the resolved protocol had no client to resume; the status stays where it was either way |
 | `pause_failed` | `ACTION=PAUSE` was rejected by the transport; `[STATUS] paused` still follows, because sends stop regardless |
 | `stop_failed` | `ACTION=STOP` found no client to stop; `[STATUS] stopped` still follows, because the caller treats STOP as terminal |
+| `announce_failed` | `ACTION=ANNOUNCE` armed nothing (no playing session, or an unusable clip file), so no announce status lines follow (§6a) |
 
 The connect/auth slugs are terminal — the process exits. The command slugs are
 not: the connection survives and the caller decides whether to retry or fall
@@ -494,6 +495,46 @@ lead and the raw window are surfaced on stdout
 so the caller plans group starts from device reality. The SETUP echo of the
 window is receiver-optional (Sonos omits it — then the 1.75 s default
 applies); parsing `audioLatencies` from GET /info is an open item.
+
+## 6a. Announcements (ANNOUNCE)
+
+A short clip (doorbell, TTS) is mixed **inside the binary** over the music at
+the frame-pull point, with the music ducked under it, so the group timeline is
+untouched — announcement frames are ordinary content frames on the existing
+anchor, the duck is gapless, and elapsed reporting never notices. The caller
+pre-renders the clip to **exactly the session's stdin PCM format** (raw,
+headerless) into a local file and commands:
+
+```
+ANNOUNCE_FILE=/tmp/<player>-announce.pcm
+ANNOUNCE_AT_UNIX_MS=<T>       # unix epoch ms; 0 = earliest feasible
+ANNOUNCE_DUCK_DB=-12          # music gain during the clip (dB, <= 0; <= -60 mutes)
+ACTION=ANNOUNCE
+```
+
+**Mapping contract.** T maps onto the flow's audible timeline the same way a
+START does: when the chunk being assembled covers T, mixing begins at the
+exact frame offset within it; a T of 0 or one already behind the earliest
+unsent frame starts at that frame instead. The clip is never entered mid-way —
+it always plays from its first byte at the (possibly corrected) instant, and
+`[STATUS] announce_started at_unix_ms= duration_ms=` reports the true audible
+instant of its first sample once that sample is committed into an outgoing
+chunk. The music gain ramps 1.0 → duck over 200 ms from the clip's first
+sample, holds for the clip, and ramps back over 200 ms after its last sample;
+`[STATUS] announce_done` follows once that tail is mixed out. Mixing happens
+on the finalized PCM chunk right before encoding, so splice pad silence under
+a starving feed is simply part of the bed, and on the splice timeline a clip
+outlives its input: the post-EOF silence keepalive keeps carrying it.
+
+**Cancellation.** Anything that invalidates the timeline the clip was mapped
+onto cancels it with `[STATUS] announce_done cancelled=1`: FLUSH, a new START,
+PAUSE, STANDBY, STOP and teardown, plus end-of-input on the paths that have no
+silence keepalive to carry the clip (legacy RAOP, deny-listed receivers). A
+new ANNOUNCE while one is active replaces it the same way — the recovery path
+for a clip left armed by a caller restart. Arming requires an anchored,
+playing session and a readable, non-empty clip file; anything else is one
+non-terminal `announce_failed` error (§3a) and the caller falls back to its
+generic interrupt-and-restore flow.
 
 ## 7. Audio wire formats
 
@@ -1008,6 +1049,8 @@ verbosity, never its stream.
 | `[STATUS] playing` / `paused` | stderr | `ACTION=PLAY` / `ACTION=PAUSE`, carrying `elapsed_ms=` |
 | `[STATUS] stopped` | stderr | `ACTION=STOP`; the process then exits 0 |
 | `[STATUS] mrp artwork=` | stderr | every artwork attempt (§8) |
+| `[STATUS] announce_started at_unix_ms= duration_ms=` | stderr | once per armed clip: its first sample was committed, at the reported audible instant (§6a) |
+| `[STATUS] announce_done` (optional `cancelled=1`) | stderr | the clip and its tail ramp finished — or were cancelled (§6a) |
 | `[STATUS] eof` | stderr | the stdin input ended |
 | `[STATUS] idle_timeout` | stderr | the orphan timer fired; the process then exits 0 |
 | `[STATUS] error code=` | stderr | immediately before the `[ERROR]` line (§3a) |
