@@ -14,6 +14,7 @@
 #include <stdio.h>
 #include <signal.h>
 #include <fcntl.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <stdarg.h>
@@ -819,7 +820,13 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
     } else if (strcmp(key, "ANNOUNCE_AT_UNIX_MS") == 0) {
         g_pend_announce_at_ms = strtoull(value, NULL, 10);
     } else if (strcmp(key, "ANNOUNCE_DUCK_DB") == 0) {
-        g_pend_announce_duck_db = atof(value);
+        /* A NaN would sail through every gain comparison into the Q15 math;
+         * an unparseable or non-finite value falls back to the default duck. */
+        char *end = NULL;
+        double duck_db = strtod(value, &end);
+        g_pend_announce_duck_db = (end != value && isfinite(duck_db))
+                                      ? duck_db
+                                      : ANNOUNCE_DEFAULT_DUCK_DB;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "ANNOUNCE") == 0) {
         handle_announce(cfg);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "START") == 0) {

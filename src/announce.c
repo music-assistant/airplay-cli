@@ -163,8 +163,10 @@ void announce_mix_chunk(announce_t *a, uint8_t *buf, int frames,
 
 int32_t announce_gain_q15_from_db(double duck_db)
 {
+    /* NaN fails every comparison below and would reach the pow/lround with
+     * an unspecified result; treat it as "no duck". */
+    if (isnan(duck_db) || duck_db >= 0.0) return Q15_UNITY;
     if (duck_db <= ANNOUNCE_MUTE_DB) return 0;
-    if (duck_db >= 0.0) return Q15_UNITY;
     return (int32_t)lround(pow(10.0, duck_db / 20.0) * Q15_UNITY);
 }
 

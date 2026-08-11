@@ -52,6 +52,12 @@ static void fill_s32(int32_t *buf, int frames, int channels, int32_t v)
     for (int i = 0; i < frames * channels; i++) buf[i] = v;
 }
 
+static void test_gain_nan(void)
+{
+    /* a NaN duck must degrade to "no duck", never reach the pow/lround */
+    assert(announce_gain_q15_from_db((double)NAN) == 32768);
+}
+
 static void test_gain_from_db(void)
 {
     assert(announce_gain_q15_from_db(0.0) == Q15);
@@ -393,6 +399,7 @@ int main(void)
              tmp && *tmp ? tmp : "/tmp", (int)getpid());
 
     test_gain_from_db();
+    test_gain_nan();
     test_envelope_shape();
     test_s16_mix_and_mapping();
     test_s16_saturation();
