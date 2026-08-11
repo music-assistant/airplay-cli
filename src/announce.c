@@ -115,8 +115,12 @@ void announce_mix_chunk(announce_t *a, uint8_t *buf, int frames,
          * first frame — the earliest unsent one — and the reported instant is
          * the corrected truth. The clip always plays from byte 0. */
         if (a->at_unix_ms > head_unix_ms) {
-            uint64_t off =
-                (a->at_unix_ms - head_unix_ms) * a->sample_rate / 1000;
+            uint64_t delta_ms = a->at_unix_ms - head_unix_ms;
+            /* An instant so far out that the frame math would wrap can only
+             * be a corrupt command; keep the clip waiting instead of starting
+             * it on a wrapped offset. */
+            if (delta_ms > UINT64_MAX / a->sample_rate) return;
+            uint64_t off = delta_ms * a->sample_rate / 1000;
             if (off >= (uint64_t)frames) return;   /* not reached yet */
             offset = (int)off;
         }

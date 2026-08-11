@@ -274,6 +274,16 @@ static void test_at_clamp(void)
     assert(!r.started);
     for (int i = 0; i < 10 * 2; i++) assert(buf[i] == 100);
     announce_cancel(&a);
+
+    /* an instant so far out the frame math would wrap keeps the clip
+     * waiting instead of starting it on a wrapped offset */
+    write_clip_s16(500, 5, 2);
+    assert(announce_arm(&a, clip_path, UINT64_MAX - 1, 0.0, err, sizeof(err)));
+    fill_s16(buf, 10, 2, 100);
+    announce_mix_chunk(&a, (uint8_t *)buf, 10, 1000000, &r);
+    assert(!r.started);
+    for (int i = 0; i < 10 * 2; i++) assert(buf[i] == 100);
+    announce_cancel(&a);
 }
 
 /* started and done can land in one call when clip + tail fit one chunk. */
