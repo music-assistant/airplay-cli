@@ -47,7 +47,10 @@ bool announce_arm(announce_t *a, const char *path, uint64_t at_unix_ms,
      * is only the leak guard for a caller that did not. */
     if (a->active) announce_cancel(a);
 
-    int fd = open(path, O_RDONLY);
+    /* O_NONBLOCK so a FIFO with no writer cannot block the open (and with it
+     * the caller's audio lock) before the regular-file check below rejects
+     * it; reads from the regular files this accepts are unaffected. */
+    int fd = open(path, O_RDONLY | O_NONBLOCK);
     if (fd < 0) {
         snprintf(error, error_len, "cannot open the announcement clip: %s",
                  strerror(errno));
