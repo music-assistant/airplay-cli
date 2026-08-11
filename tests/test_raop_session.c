@@ -184,6 +184,17 @@ int main(void)
     assert(raop_session_start_at(&client, resume_ms, NULL) != AP2_COMMIT_OK);
     assert(start_calls == 0);
 
+    /* The delivery-head projection: a sent chunk's playtime plus its duration
+     * is the audible instant of the chunk that follows it. 352 frames is
+     * 7.98 ms at 44100 Hz and 7.33 ms at 48000 Hz, so a playtime on an exact
+     * second projects 7 whole ms forward at either rate. No playtime yet (0)
+     * means the head is unknown. */
+    assert(raop_session_next_head_unix_ms(0, 352, 44100) == 0);
+    assert(raop_session_next_head_unix_ms(unix_ms_to_ntp(now_ms), 352, 44100) ==
+           now_ms + 7);
+    assert(raop_session_next_head_unix_ms(unix_ms_to_ntp(now_ms), 352, 48000) ==
+           now_ms + 7);
+
     client.state = RAOP_DOWN;
     assert(raop_session_commit(&client, future_ms, NULL) != AP2_COMMIT_OK);
     assert(!raop_session_standby(&client));

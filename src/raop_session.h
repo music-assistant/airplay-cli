@@ -44,4 +44,13 @@ bool raop_session_pause(struct raopcl_s *client);
 /* Resume a paused stream without discarding libraop's retained backlog. */
 bool raop_session_resume(struct raopcl_s *client);
 
+/* Audible instant (unix ms) of the chunk that follows one sent with
+ * raopcl_send_chunk, from that send's playtime and frame count. RAOP
+ * timestamps are contiguous between re-anchors, so the projection tracks the
+ * delivery head exactly. 0 while playtime_ntp is 0 (no chunk sent since the
+ * last re-anchor: head unknown). */
+uint64_t raop_session_next_head_unix_ms(uint64_t playtime_ntp,
+                                        uint32_t chunk_frames,
+                                        uint32_t sample_rate);
+
 #endif /* RAOP_SESSION_H */

@@ -113,7 +113,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
-	cliairplay.c raop_session.c artwork.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -165,6 +165,7 @@ RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_latency=ap2_test_raopcl_latency \
 	-Draopcl_sample_rate=ap2_test_raopcl_sample_rate
 RAOP_SESSION_TEST = build/tests/test_raop_session
+ANNOUNCE_TEST = build/tests/test_announce
 
 all: directory $(EXECUTABLE)
 
@@ -211,7 +212,7 @@ clean:
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 		$(SESSION_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
-		$(RAOP_SESSION_TEST)
+		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
@@ -220,6 +221,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
+	$(ANNOUNCE_TEST)
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
 		127.0.0.1 2>&1 || true)"; \
@@ -251,6 +253,11 @@ $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_raop_session.c \
 		src/raop_session.c $(EXTRA_LDFLAGS) -o $@
+
+$(ANNOUNCE_TEST): tests/test_announce.c src/announce.c src/announce.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_announce.c src/announce.c \
+		$(EXTRA_LDFLAGS) -lm -o $@
 
 $(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
 		src/ap2_io.c src/ap2_io.h Makefile

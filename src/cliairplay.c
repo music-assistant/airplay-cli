@@ -41,6 +41,7 @@
 #include "ap2_hap.h"
 #include "raop_session.h"
 #include "artwork.h"
+#include "announce.h"
 
 #define VERSION "0.4.0"
 /* Overridden at build time from the git tag for tagged releases (see Makefile). */
@@ -414,6 +415,7 @@ static void clock_verify_tick(void)
 #define ERROR_CODE_PLAY_FAILED    "play_failed"
 #define ERROR_CODE_PAUSE_FAILED   "pause_failed"
 #define ERROR_CODE_STOP_FAILED    "stop_failed"
+#define ERROR_CODE_ANNOUNCE_FAILED "announce_failed"
 
 /*
  * Report a failure as one machine-readable line followed by the
@@ -449,6 +451,54 @@ static void status_error_ex(const char *code, int http, const char *detail,
 static bool session_is_live(void)
 {
     return ap2_session_state(g_session) != AP2_SESSION_ENDED;
+}
+
+/* ---- Announcement mixing (ACTION=ANNOUNCE) ---- */
+
+/* All announce state is owned by g_audio_send_lock: armed on the cmdpipe
+ * thread, mixed at the audio loops' send points, cancelled by whichever side
+ * invalidates the timeline the clip was mapped onto (see announce_abort call
+ * sites). The staged command values follow the START_UNIX_MS pattern. */
+static announce_t g_announce;
+#define ANNOUNCE_DEFAULT_DUCK_DB (-12.0)
+static char *g_pend_announce_file = NULL;
+static uint64_t g_pend_announce_at_ms = 0;
+static double g_pend_announce_duck_db = ANNOUNCE_DEFAULT_DUCK_DB;
+
+/* Cancel an active clip and report it. Caller holds g_audio_send_lock. */
+static void announce_abort(void)
+{
+    if (announce_cancel(&g_announce))
+        status_print("[STATUS] announce_done cancelled=1");
+}
+
+/* Mix an active clip into the finalized PCM chunk about to be sent and report
+ * the lifecycle lines. head_unix_ms is the audible instant of the chunk's
+ * first frame. Caller holds g_audio_send_lock. */
+static void announce_service(uint8_t *buf, int frames, uint64_t head_unix_ms)
+{
+    if (!announce_active(&g_announce)) return;
+    announce_mix_result_t r;
+    announce_mix_chunk(&g_announce, buf, frames, head_unix_ms, &r);
+    if (r.started)
+        status_print("[STATUS] announce_started at_unix_ms=%" PRIu64
+                     " duration_ms=%" PRIu64, r.at_unix_ms, r.duration_ms);
+    if (r.done)
+        status_print("[STATUS] announce_done");
+}
+
+/* Delivery-head projection for the legacy RAOP path: the last sent chunk's
+ * playtime and frame count give the next chunk's audible instant (see
+ * raop_session_next_head_unix_ms). Owned by g_audio_send_lock. */
+static uint64_t g_raop_last_playtime = 0;
+static uint32_t g_raop_last_chunk_frames = 0;
+
+/* The RAOP timeline re-anchored (start/flush/pause/resume/stop): the head is
+ * unknown until the next chunk is sent. Caller holds g_audio_send_lock. */
+static void raop_head_reset(void)
+{
+    g_raop_last_playtime = 0;
+    g_raop_last_chunk_frames = 0;
 }
 
 static void remote_command_event(
@@ -656,6 +706,47 @@ static void send_track_metadata(const cli_config_t *cfg, const char *title)
     free(artwork_file);
 }
 
+/* ACTION=ANNOUNCE: arm the staged clip for mixing at the commanded instant.
+ * Arming needs an anchored, playing timeline to map the clip onto; a clip
+ * already active is replaced, with its cancellation reported first (the
+ * recovery path for a stale clip after a caller restart). */
+static void handle_announce(const cli_config_t *cfg)
+{
+    char *path = g_pend_announce_file;
+    uint64_t at_ms = g_pend_announce_at_ms;
+    double duck_db = g_pend_announce_duck_db;
+    g_pend_announce_file = NULL;
+    g_pend_announce_at_ms = 0;
+    g_pend_announce_duck_db = ANNOUNCE_DEFAULT_DUCK_DB;
+
+    bool have_client = cfg->protocol == PROTO_RAOP ? g_raopcl != NULL
+                                                   : g_ap2cl != NULL;
+    char detail[192];
+    bool armed = false;
+    const char *reject = NULL;
+    pthread_mutex_lock(&g_audio_send_lock);
+    if (!session_is_live() || !have_client) {
+        reject = "no live session to announce into";
+    } else if (!g_first_start_done || g_status != STATUS_PLAYING) {
+        reject = "session is not playing";
+    } else if (!path || !*path) {
+        reject = "no announcement file staged";
+    } else {
+        announce_abort();
+        armed = announce_arm(&g_announce, path, at_ms, duck_db,
+                             detail, sizeof(detail));
+        if (!armed) reject = detail;
+    }
+    pthread_mutex_unlock(&g_audio_send_lock);
+    if (!armed)
+        status_error_ex(ERROR_CODE_ANNOUNCE_FAILED, 0, reject,
+                        "ANNOUNCE failed");
+    else
+        LOG_INFO("Announcement armed: %s at_unix_ms=%" PRIu64 " duck_db=%.1f",
+                 path, at_ms, duck_db);
+    free(path);
+}
+
 static void handle_command(const char *key, const char *value, cli_config_t *cfg)
 {
     if (strcmp(key, "TITLE") == 0) {
@@ -723,6 +814,14 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         g_pend_start_unix_ms = strtoull(value, NULL, 10);
     } else if (strcmp(key, "START_JOIN") == 0) {
         g_pend_start_join = atoi(value) != 0;
+    } else if (strcmp(key, "ANNOUNCE_FILE") == 0) {
+        metadata_set(&g_pend_announce_file, value);
+    } else if (strcmp(key, "ANNOUNCE_AT_UNIX_MS") == 0) {
+        g_pend_announce_at_ms = strtoull(value, NULL, 10);
+    } else if (strcmp(key, "ANNOUNCE_DUCK_DB") == 0) {
+        g_pend_announce_duck_db = atof(value);
+    } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "ANNOUNCE") == 0) {
+        handle_announce(cfg);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "START") == 0) {
         /* The verified start contract: the ack always reports the true
          * scheduled instant, so the caller compares it with the request,
@@ -770,7 +869,10 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         if (g_status == STATUS_PLAYING) {
             pthread_mutex_lock(&g_audio_send_lock);
             if (g_status == STATUS_PLAYING) {
+                /* A pause freezes the content the clip rode on. */
+                announce_abort();
                 if (cfg->protocol == PROTO_RAOP && g_raopcl) {
+                    raop_head_reset();
                     if (!raop_session_pause(g_raopcl))
                         status_error_ex(ERROR_CODE_PAUSE_FAILED, 0,
                                         "the RAOP transport rejected the pause",
@@ -787,6 +889,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         pthread_mutex_lock(&g_audio_send_lock);
         bool play_ok = true;
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
+            raop_head_reset();
             if (!raop_session_resume(g_raopcl)) {
                 status_error_ex(ERROR_CODE_PLAY_FAILED, 0,
                                 "the RAOP transport rejected the resume",
@@ -811,8 +914,10 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         pthread_mutex_unlock(&g_audio_send_lock);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STOP") == 0) {
         pthread_mutex_lock(&g_audio_send_lock);
+        announce_abort();
         g_status = STATUS_STOPPED;
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
+            raop_head_reset();
             raopcl_stop(g_raopcl);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_stop(g_ap2cl);
@@ -849,6 +954,8 @@ static ap2_commit_result_t session_commit(void *transport,
 {
     cli_config_t *cfg = transport;
     ap2_commit_result_t committed;
+    /* A START re-anchors the timeline an active clip was mapped onto. */
+    announce_abort();
     /* One ack per START: a previous join's withheld ack is answered with the
      * instant that stood, before this commit replaces the timeline it
      * described. */
@@ -864,6 +971,7 @@ static ap2_commit_result_t session_commit(void *transport,
     if (cfg->protocol == PROTO_RAOP) {
         struct raopcl_s *client = g_raopcl;
         if (!client) return AP2_COMMIT_FAILED;
+        raop_head_reset();
         committed = !g_first_start_done
             ? raop_session_commit(client, start_unix_ms, at_unix_ms)
             : raop_session_start_at(client, start_unix_ms, at_unix_ms);
@@ -900,7 +1008,10 @@ static bool session_flush_op(void *transport)
 {
     cli_config_t *cfg = transport;
     bool flushed = false;
+    /* The flush discards the timeline an active clip was mapped onto. */
+    announce_abort();
     if (cfg->protocol == PROTO_RAOP) {
+        raop_head_reset();
         flushed = g_raopcl && raop_session_flush(g_raopcl);
     } else if (g_ap2cl) {
         flushed = ap2cl_flush(g_ap2cl);
@@ -916,7 +1027,10 @@ static bool session_flush_op(void *transport)
 static void session_stop_op(void *transport)
 {
     cli_config_t *cfg = transport;
+    /* A standby park stops the content an active clip rode on. */
+    announce_abort();
     if (cfg->protocol == PROTO_RAOP) {
+        raop_head_reset();
         if (g_raopcl && !raop_session_standby(g_raopcl))
             status_error_ex(ERROR_CODE_STANDBY_FAILED, 0,
                             "the RAOP transport rejected the standby",
@@ -1060,6 +1174,10 @@ static bool start_command_thread(cli_config_t *cfg)
 static bool start_stream_session(cli_config_t *cfg, int input_bpf,
                                  int frames_per_chunk)
 {
+    /* Before the command thread exists: ACTION=ANNOUNCE arms into this. */
+    announce_init(&g_announce, (unsigned)cfg->sample_rate,
+                  (unsigned)cfg->channels,
+                  (unsigned)(input_bpf / cfg->channels));
     ap2_session_ops_t ops = {
         .quiesce = session_quiesce,
         .flush = session_flush_op,
@@ -1252,6 +1370,11 @@ static int run_raop(cli_config_t *cfg)
         }
 
         if (input_ended) {
+            /* The legacy path has no silence keepalive to carry a clip past
+             * the input, so an armed announcement ends here. */
+            pthread_mutex_lock(&g_audio_send_lock);
+            announce_abort();
+            pthread_mutex_unlock(&g_audio_send_lock);
             bool drained = !raopcl_is_playing(g_raopcl) ||
                            now - eof_time > MS2NTP(
                                TS2MS(raopcl_latency(g_raopcl),
@@ -1302,6 +1425,11 @@ static int run_raop(cli_config_t *cfg)
                 buf, n, DEFAULT_FRAMES_PER_CHUNK * input_bpf, input_bpf);
 
             int audio_frames = n / input_bpf;
+            announce_service(buf, audio_frames,
+                             raop_session_next_head_unix_ms(
+                                 g_raop_last_playtime,
+                                 g_raop_last_chunk_frames,
+                                 (uint32_t)cfg->sample_rate));
             uint8_t *send_buf = buf;
             /* For 24-bit: truncate s32le input to s24le (packed 3 bytes) for ALAC encoder */
             if (alac_buf && cfg->bit_depth > 16) {
@@ -1316,6 +1444,8 @@ static int run_raop(cli_config_t *cfg)
                 pthread_mutex_unlock(&g_audio_send_lock);
                 break;
             }
+            g_raop_last_playtime = playtime;
+            g_raop_last_chunk_frames = (uint32_t)audio_frames;
             frames += audio_frames;
             pthread_mutex_unlock(&g_audio_send_lock);
         } else {
@@ -1323,6 +1453,10 @@ static int run_raop(cli_config_t *cfg)
         }
     }
 
+    /* Teardown ends an armed clip with its cancellation reported. */
+    pthread_mutex_lock(&g_audio_send_lock);
+    announce_abort();
+    pthread_mutex_unlock(&g_audio_send_lock);
     request_command_stop();
     bool command_joined = join_command_thread();
     ap2_session_destroy(g_session);
@@ -1342,6 +1476,11 @@ static bool ap2_send_silence_chunk(const cli_config_t *cfg, uint8_t *buf,
                                    uint8_t *alac_buf, int input_bpf)
 {
     memset(buf, 0, (size_t)AP2_FRAMES_PER_CHUNK * input_bpf);
+    /* The input_ended drain keeps an active clip playing over the silence
+     * bed; the paused/standby call site can never carry one (those actions
+     * cancel it). */
+    announce_service(buf, AP2_FRAMES_PER_CHUNK,
+                     ap2cl_head_audible_unix_ms(g_ap2cl));
     uint8_t *send = buf;
     if (alac_buf && cfg->bit_depth > 16) {
         truncate_32to24(buf, AP2_FRAMES_PER_CHUNK * input_bpf, alac_buf);
@@ -1572,6 +1711,11 @@ static int run_airplay2(cli_config_t *cfg)
                 pthread_mutex_unlock(&g_audio_send_lock);
                 usleep(1000);
             } else {
+                /* No silence keepalive on this path to carry a clip past the
+                 * input, so an armed announcement ends here. */
+                pthread_mutex_lock(&g_audio_send_lock);
+                announce_abort();
+                pthread_mutex_unlock(&g_audio_send_lock);
                 usleep(drained ? 50000 : 10000);
             }
             continue;
@@ -1704,6 +1848,9 @@ static int run_airplay2(cli_config_t *cfg)
                 ap2_input_bpf);
 
             int af = n / ap2_input_bpf;
+            /* Any splice pad silence at the head of the chunk is mixed over
+             * uniformly — the desired silence bed during starvation. */
+            announce_service(buf, af, ap2cl_head_audible_unix_ms(g_ap2cl));
             uint8_t *send = buf;
             if (ap2_alac_buf && cfg->bit_depth > 16) {
                 truncate_32to24(buf, n, ap2_alac_buf);
@@ -1757,7 +1904,11 @@ static int run_airplay2(cli_config_t *cfg)
 
     /* The loop ends on teardown, and a join whose verification never resolved
      * is still owed its one ack. A cut caught mid-drain is settled short by
-     * the teardown, so it reports what it managed to take. */
+     * the teardown, so it reports what it managed to take. An armed clip ends
+     * with its cancellation reported. */
+    pthread_mutex_lock(&g_audio_send_lock);
+    announce_abort();
+    pthread_mutex_unlock(&g_audio_send_lock);
     start_ack_flush();
     content_cut_report(ap2_input_byte_rate);
     request_command_stop();
@@ -2220,6 +2371,8 @@ int main(int argc, char *argv[])
     free(g_metadata.artist);
     free(g_metadata.album);
     g_metadata.title = g_metadata.artist = g_metadata.album = NULL;
+    free(g_pend_announce_file);
+    g_pend_announce_file = NULL;
     netsock_close();
     cross_ssl_free();
 
