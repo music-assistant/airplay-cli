@@ -66,7 +66,8 @@ typedef struct {
     bool done;               /* clip and tail ramp fully mixed; state idle */
 } announce_mix_result_t;
 
-/* Bind the module to the session's PCM format. Resets any armed state. */
+/* Bind the module to the session's PCM format, before any clip is armed.
+ * Call on an idle instance only: a live clip's file descriptor would leak. */
 void announce_init(announce_t *a, unsigned sample_rate, unsigned channels,
                    unsigned bytes_per_sample);
 

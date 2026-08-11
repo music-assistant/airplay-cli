@@ -43,6 +43,11 @@ bool announce_arm(announce_t *a, const char *path, uint64_t at_unix_ms,
         snprintf(error, error_len, "announce module not initialised");
         return false;
     }
+    if (a->bytes_per_sample != 2 && a->bytes_per_sample != 4) {
+        snprintf(error, error_len, "unsupported PCM sample size (%u bytes)",
+                 a->bytes_per_sample);
+        return false;
+    }
     /* The caller reports an active clip's cancellation before re-arming; this
      * is only the leak guard for a caller that did not. */
     if (a->active) announce_cancel(a);

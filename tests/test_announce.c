@@ -375,6 +375,13 @@ static void test_file_validation(void)
                          err, sizeof(err)));
     assert(!announce_active(&a));
 
+    /* only s16le and the s32le carrier are mixable sample sizes */
+    announce_t bad;
+    announce_init(&bad, 1000, 2, 3);
+    write_clip("abcdef", 6);
+    assert(!announce_arm(&bad, clip_path, 0, 0.0, err, sizeof(err)));
+    assert(!announce_active(&bad));
+
     write_clip("", 0);
     assert(!announce_arm(&a, clip_path, 0, 0.0, err, sizeof(err)));
 
