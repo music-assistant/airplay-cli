@@ -1546,6 +1546,46 @@ static void test_pacing_window_rate_scaling(void)
     puts("ap2_client pacing window rate scaling tests passed");
 }
 
+/* An explicit depth override outranks the buffer the receiver never reported,
+ * but never the one it did: a starving renderer can be given the headroom it
+ * needs, while a device that named its limit still bounds the delivery. */
+static void test_splice_depth_override_vs_reported_buffer(void)
+{
+    ap2_device_info_t device = {
+        .name = "depth override test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {.sample_rate = 44100, .bit_depth = 16, .channels = 2};
+
+    struct ap2cl_s *client =
+        ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, true);
+
+    /* Nothing reported: 3000 ms clears the 1.75 s assumed window untouched. */
+    ap2cl_set_splice_depth_ms(client, 3000);
+    assert(ap2cl_test_pacing_window_frames(client) == 132300);
+
+    /* A reported 2.0 s buffer clamps the same override to that buffer less
+     * the 250 ms margin. */
+    ap2cl_test_set_dev_latency_max(client, 88200);
+    assert(ap2cl_test_pacing_window_frames(client) == 77175);
+
+    /* Without an override the assumed window still caps the compiled default. */
+    struct ap2cl_s *plain =
+        ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(plain);
+    ap2cl_force_native(plain);
+    ap2cl_test_set_splice(plain, true);
+    assert(ap2cl_test_pacing_window_frames(plain) == 26460);
+
+    assert(ap2cl_destroy(plain));
+    assert(ap2cl_destroy(client));
+    puts("ap2_client splice depth override tests passed");
+}
+
 /* A start committed before the receiver's first timing probe arms the
  * post-commit verification; the poll then verifies, corrects forward, or
  * closes the window, exactly once per commit. */
@@ -1978,6 +2018,7 @@ int main(void)
     test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();
     test_pacing_window_rate_scaling();
+    test_splice_depth_override_vs_reported_buffer();
     test_clock_verified_anchor();
     test_clock_readiness_report();
     test_clock_stall_detection();

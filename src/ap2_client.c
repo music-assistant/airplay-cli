@@ -2696,17 +2696,25 @@ static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
     uint32_t depth = p->splice_depth_ms > 0 ? (uint32_t)p->splice_depth_ms
                                             : AP2_SPLICE_PACING_MS;
     /* Same cap as the pacing window - the receiver's reported buffer minus
-     * the delivery margin, or the assumed standard window when unreported -
-     * so every consumer (pacing, warm lead, verification windows, the
-     * connect log) sees one effective depth. */
-    uint32_t cap_ms = AP2_PACING_DEFAULT_BUFFER_MS - AP2_PACING_MARGIN_MS;
+     * the delivery margin - so every consumer (pacing, warm lead,
+     * verification windows, the connect log) sees one effective depth. A
+     * reported window is authoritative: the device named its limit and
+     * overflowing it drops frames. */
     if (p->format.sample_rate > 0) {
         uint64_t margin = MS2TS(AP2_PACING_MARGIN_MS, p->format.sample_rate);
-        if (p->dev_latency_max > margin)
-            cap_ms = (uint32_t)((p->dev_latency_max - margin) * 1000ULL /
-                                (uint32_t)p->format.sample_rate);
+        if (p->dev_latency_max > margin) {
+            uint32_t cap_ms = (uint32_t)((p->dev_latency_max - margin) * 1000ULL /
+                                         (uint32_t)p->format.sample_rate);
+            return depth < cap_ms ? depth : cap_ms;
+        }
     }
-    return depth < cap_ms ? depth : cap_ms;
+    /* Nothing reported: the standard window is only an assumption, so it caps
+     * the compiled default but not an explicit override - a caller naming a
+     * depth knows the device better than a stand-in value does. Receivers
+     * whose renderer starves below their real buffer need that headroom. */
+    if (p->splice_depth_ms > 0) return depth;
+    uint32_t assumed_ms = AP2_PACING_DEFAULT_BUFFER_MS - AP2_PACING_MARGIN_MS;
+    return depth < assumed_ms ? depth : assumed_ms;
 }
 
 void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms)
@@ -3378,11 +3386,11 @@ static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
     /* Frame counts, so every term is scaled to the stream rate: a receiver
      * reports latencyMax in frames at the rate it is being fed. */
     uint64_t margin = MS2TS(AP2_PACING_MARGIN_MS, p->format.sample_rate);
+    bool reported = p->dev_latency_max > margin;
     uint64_t window =
-        p->dev_latency_max > margin
-            ? p->dev_latency_max - margin
-            : MS2TS(AP2_PACING_DEFAULT_BUFFER_MS - AP2_PACING_MARGIN_MS,
-                    p->format.sample_rate);
+        reported ? p->dev_latency_max - margin
+                 : MS2TS(AP2_PACING_DEFAULT_BUFFER_MS - AP2_PACING_MARGIN_MS,
+                         p->format.sample_rate);
     /* The splice timeline keeps the receiver queue shallow: with warm
      * boundaries expressed as content splices on one immutable line, the
      * queue depth IS the audible latency of every seek/next. Apple receivers
@@ -3391,6 +3399,12 @@ static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
     if (p->splice_timeline) {
         uint64_t depth = (uint64_t)MS2TS(ap2_splice_depth_ms(p),
                                          p->format.sample_rate);
+        /* A reported window is authoritative and clamps the depth. Unreported,
+         * the standard buffer is only a stand-in, so an explicit override
+         * outranks it: a renderer that starves below its real buffer needs
+         * that headroom, and the caller naming a depth knows the device
+         * better than a default can. */
+        if (!reported && p->splice_depth_ms > 0) return depth;
         return depth < window ? depth : window;
     }
     return window;
