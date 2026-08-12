@@ -1548,41 +1548,59 @@ static void test_pacing_window_rate_scaling(void)
 
 /* An explicit depth override outranks the buffer the receiver never reported,
  * but never the one it did: a starving renderer can be given the headroom it
- * needs, while a device that named its limit still bounds the delivery. */
+ * needs, while a device that named its limit still bounds the delivery. The
+ * depth drives ms-domain consumers (warm lead, clock-verification windows)
+ * as well as the frame-domain pacing window, so both are pinned. */
 static void test_splice_depth_override_vs_reported_buffer(void)
 {
+    static const struct {
+        int rate;
+        uint64_t override_unreported; /* a 3000 ms override, no window echoed */
+        uint32_t reported;            /* a 2.0 s receiver buffer, in frames */
+        uint64_t override_reported;   /* that buffer less the 250 ms margin */
+        uint32_t under_margin;        /* a buffer no deeper than the margin */
+    } cases[] = {
+        {44100, 132300, 88200, 77175, 4410},
+        {48000, 144000, 96000, 84000, 4800},
+    };
+
     ap2_device_info_t device = {
         .name = "depth override test",
         .address = "127.0.0.1",
         .port = 7000,
     };
-    ap2_audio_format_t format = {.sample_rate = 44100, .bit_depth = 16, .channels = 2};
 
-    struct ap2cl_s *client =
-        ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
-    assert(client);
-    ap2cl_force_native(client);
-    ap2cl_test_set_splice(client, true);
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        ap2_audio_format_t format = {
+            .sample_rate = cases[i].rate,
+            .bit_depth = 16,
+            .channels = 2,
+        };
+        struct ap2cl_s *client =
+            ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+        assert(client);
+        ap2cl_force_native(client);
+        ap2cl_test_set_splice(client, true);
 
-    /* Nothing reported: 3000 ms clears the 1.75 s assumed window untouched. */
-    ap2cl_set_splice_depth_ms(client, 3000);
-    assert(ap2cl_test_pacing_window_frames(client) == 132300);
+        /* Nothing reported: a 3000 ms override clears the 1.75 s assumed
+         * window untouched, in both the frame and the ms domain. */
+        ap2cl_set_splice_depth_ms(client, 3000);
+        assert(ap2cl_test_pacing_window_frames(client) == cases[i].override_unreported);
+        assert(ap2cl_warm_lead_ms(client) == 3000);
 
-    /* A reported 2.0 s buffer clamps the same override to that buffer less
-     * the 250 ms margin. */
-    ap2cl_test_set_dev_latency_max(client, 88200);
-    assert(ap2cl_test_pacing_window_frames(client) == 77175);
+        /* A reported 2.0 s buffer clamps the same override to that buffer
+         * less the 250 ms margin. */
+        ap2cl_test_set_dev_latency_max(client, cases[i].reported);
+        assert(ap2cl_test_pacing_window_frames(client) == cases[i].override_reported);
+        assert(ap2cl_warm_lead_ms(client) == 1750);
 
-    /* Without an override the assumed window still caps the compiled default. */
-    struct ap2cl_s *plain =
-        ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
-    assert(plain);
-    ap2cl_force_native(plain);
-    ap2cl_test_set_splice(plain, true);
-    assert(ap2cl_test_pacing_window_frames(plain) == 26460);
+        /* A report at or under the margin leaves nothing to hold back, so it
+         * counts as no report and the override stands again. */
+        ap2cl_test_set_dev_latency_max(client, cases[i].under_margin);
+        assert(ap2cl_test_pacing_window_frames(client) == cases[i].override_unreported);
 
-    assert(ap2cl_destroy(plain));
-    assert(ap2cl_destroy(client));
+        assert(ap2cl_destroy(client));
+    }
     puts("ap2_client splice depth override tests passed");
 }
 

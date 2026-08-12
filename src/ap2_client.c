@@ -2698,8 +2698,10 @@ static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
     /* Same cap as the pacing window - the receiver's reported buffer minus
      * the delivery margin - so every consumer (pacing, warm lead,
      * verification windows, the connect log) sees one effective depth. A
-     * reported window is authoritative: the device named its limit and
-     * overflowing it drops frames. */
+     * window wide enough to hold that margin back is authoritative: the
+     * device named its limit and overflowing it drops frames. A report at or
+     * under the margin leaves nothing to hold back and is treated as no
+     * report at all, same as the default path below. */
     if (p->format.sample_rate > 0) {
         uint64_t margin = MS2TS(AP2_PACING_MARGIN_MS, p->format.sample_rate);
         if (p->dev_latency_max > margin) {
@@ -3399,11 +3401,11 @@ static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
     if (p->splice_timeline) {
         uint64_t depth = (uint64_t)MS2TS(ap2_splice_depth_ms(p),
                                          p->format.sample_rate);
-        /* A reported window is authoritative and clamps the depth. Unreported,
-         * the standard buffer is only a stand-in, so an explicit override
-         * outranks it: a renderer that starves below its real buffer needs
-         * that headroom, and the caller naming a depth knows the device
-         * better than a default can. */
+        /* A window wide enough to hold the margin back is authoritative and
+         * clamps the depth. Without one the standard buffer is only a
+         * stand-in, so an explicit override outranks it: a renderer that
+         * starves below its real buffer needs that headroom, and the caller
+         * naming a depth knows the device better than a default can. */
         if (!reported && p->splice_depth_ms > 0) return depth;
         return depth < window ? depth : window;
     }

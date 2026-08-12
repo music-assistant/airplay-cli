@@ -478,7 +478,12 @@ therefore runs up to `window` ahead of the deadline — the device-reported
 window less a 250 ms margin when known, else 1.75 s (inside every AirPlay
 receiver's standard 2 s, the same assumption our own stream SETUP proposes as
 `latencyMax` 88200 frames) — which fills the receiver's buffer before a
-scheduled start no matter how far ahead T lies.
+scheduled start no matter how far ahead T lies. That 1.75 s is only a
+stand-in for a window the receiver never reported, so it bounds the compiled
+default but not an explicit `--latency`: a renderer that starves below its
+real buffer needs a depth the assumption cannot express (an Edifier MS50A
+stays silent until 2500 ms, matching the 2250 ms it declares as its RAOP
+latency). A reported window still clamps.
 
 **Per-process timeline offsets**: streams in one group share T, and with
 identical RTP positions two sessions from one host are wire-identical twins
@@ -1004,7 +1009,9 @@ callers:
   from one host; per-process RTP timeline offsets are required (§6).
 - **Receiver buffer windows are ~2 s** — the AirPlay standard our own stream
   SETUP proposes as `latencyMax` 88200 frames. The receiver's echo of the
-  window is optional (Sonos omits it), so pacing falls back to 1.75 s.
+  window is optional (Sonos omits it), so pacing falls back to 1.75 s — for
+  the compiled default only, since an explicit `--latency` outranks a window
+  that was never reported (§6).
 - **Pairing posture differs by vendor**: Sonos/JBL/WiiM accept transient
   pairing (no PIN); Apple TV/HomePod require stored credentials from a PIN
   pair-setup (transient returns 200 + an in-band TLV error and silence).
