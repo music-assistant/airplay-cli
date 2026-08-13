@@ -937,11 +937,13 @@ capture.
   REANCHOR, §12) instead of bursting the queued content on past timestamps when
   sending resumes. The 2026-07-31 fleet A/B validated the same mechanism on
   the third-party park (Sonos Era 100 pair and solo, Sonos Bookshelf, WiiM
-  Pro, Edifier MS50A, Samsung HW-LS60D:
+  Pro, Samsung HW-LS60D:
   cold/seek/next/pause/park/keepalive/late-join/group runs plus
   delivery-stall ladders), so it is the default for everyone; a code-level
   deny-list (`ap2_splice_denied`, empty) keeps the classic flush + re-anchor
-  path available for a receiver that measures splice-hostile. The commanded
+  path available for a receiver that measures splice-hostile. An Edifier
+  MS50A took part in that run but carries no verdict from it, being below
+  its render threshold (§6) at stock depth, silent throughout. The commanded
   START selects the splice instant on the line (the same instant for every
   member of a sync group, so a group splices sample-aligned); the pacing
   depth is kept shallow (600 ms) because the receiver's queued audio plays
@@ -960,7 +962,11 @@ capture.
   rounds, no convergence).
   A lapsed line (resume over a long-idle pipeline) re-anchors fresh — the
   clean session-start shape — and deny-listed receivers keep the classic
-  warm path throughout.
+  warm path throughout. The deny-list overrides the depth control: the
+  pacing window reads the splice depth only on this timeline, so a
+  deny-listed receiver's `--latency` stops doing anything and its queue
+  reverts to the reported or assumed window. A receiver that starves above
+  that window can therefore never be deny-listed.
 - **Realtime send outcomes** — local UDP backpressure is a bounded transient
   drop that advances sequence, RTP, and scheduling timestamps. Encode,
   allocation, encryption, socket, and control failures are terminal and produce

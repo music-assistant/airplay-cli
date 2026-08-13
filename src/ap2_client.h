@@ -450,7 +450,8 @@ void ap2cl_set_ptp(struct ap2cl_s *p, bool enable);
  * queued audio and render silence, so their caller asks for more. Values
  * <= 0 are ignored and anything past 3000 ms is clamped to it with a warning;
  * the effective depth stays capped by the receiver's reported buffer window
- * on top of that.
+ * on top of that. A receiver that takes the classic warm path instead of the
+ * splice timeline ignores the depth entirely (see ap2_splice_denied).
  */
 void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms);
 
