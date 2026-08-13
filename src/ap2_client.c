@@ -1217,11 +1217,23 @@ static bool ap2_features_has_ptp(const char *txt)
  * on an Apple TV 4K, tvOS 27, 2026-07-30; the only clean warm transitions
  * were a natural drain and a bitstream-continuous splice), and the
  * 2026-07-31 fleet A/B cleared the third-party park (Sonos Era 100 pair and
- * solo, Sonos Bookshelf, WiiM Pro, Edifier MS50A, Samsung HW-LS60D:
- * cold/seek/next/pause/park/keepalive/late-join/group runs, delivery-stall
- * ladders) on the same mechanism. Add a `model=` (_airplay TXT) / `am=`
- * (_raop) prefix here only when a receiver measures splice-hostile on
- * hardware. */
+ * solo, Sonos Bookshelf, WiiM Pro, Samsung HW-LS60D: cold/seek/next/pause/
+ * park/keepalive/late-join/group runs, delivery-stall ladders) on the same
+ * mechanism. An Edifier MS50A took part in that run but carries no verdict
+ * from it: that receiver renders nothing below a ~2500 ms queue and the run
+ * used the 600 ms stock depth, so it was silent throughout.
+ *
+ * Deny-listing also takes away the depth CONTROL, because
+ * ap2_pacing_window_frames() reads ap2_splice_depth_ms() only on the splice
+ * timeline. The queue reverts to the reported receiver window, or the assumed
+ * one when unreported — deeper than the stock depth, but a ceiling `--latency`
+ * can no longer lift, and ap2cl_set_splice_depth_ms() still logs an override
+ * that now does nothing. A receiver starving above that ceiling therefore
+ * cannot be deny-listed: the deny-list cannot trade its queue depth back for
+ * the classic path's instant flush, because the depth goes with it.
+ *
+ * Add a `model=` (_airplay TXT) / `am=` (_raop) prefix here only when a
+ * receiver measures splice-hostile on hardware. */
 static bool ap2_splice_denied(const char *txt, const char *am)
 {
     static const char *const prefixes[] = { NULL };
@@ -2698,7 +2710,9 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
 /* Effective splice queue depth: the compiled default unless the caller
  * supplied --latency. Every consumer of the depth (pacing, warm lead,
  * clock-verification windows, connect log) reads it from here so an override
- * moves them all coherently. */
+ * moves them all coherently — and every one of them is additionally gated on
+ * p->splice_timeline, so off that timeline an override moves nothing at all
+ * (see ap2_splice_denied). */
 static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
 {
     uint32_t depth = p->splice_depth_ms > 0 ? (uint32_t)p->splice_depth_ms
