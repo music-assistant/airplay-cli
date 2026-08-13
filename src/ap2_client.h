@@ -448,8 +448,9 @@ void ap2cl_set_ptp(struct ap2cl_s *p, bool enable);
  * depth is the audible latency of every warm seek/next, but receivers that
  * feed a native multiroom pipeline (LinkPlay masters) starve below ~1 s of
  * queued audio and render silence, so their caller asks for more. Values
- * <= 0 are ignored; the effective depth stays capped by the receiver's
- * reported (or assumed) buffer window.
+ * <= 0 are ignored and anything past 3000 ms is clamped to it with a warning;
+ * the effective depth stays capped by the receiver's reported buffer window
+ * on top of that.
  */
 void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms);
 

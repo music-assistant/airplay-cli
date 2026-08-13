@@ -483,7 +483,9 @@ stand-in for a window the receiver never reported, so it bounds the compiled
 default but not an explicit `--latency`: a renderer that starves below its
 real buffer needs a depth the assumption cannot express (an Edifier MS50A
 stays silent until 2500 ms, matching the 2250 ms it declares as its RAOP
-latency). A reported window still clamps.
+latency). A reported window still clamps, and with none reported the flag is
+bounded at 3000 ms so an unreviewed value cannot outrun the EOF drain budget
+(§10).
 
 **Per-process timeline offsets**: streams in one group share T, and with
 identical RTP positions two sessions from one host are wire-identical twins
@@ -493,10 +495,14 @@ offsets its on-wire RTP timeline (and sequence numbers) by a pid-derived
 constant; the anchor line carries the same offset, so the audible schedule is
 untouched.
 
-**Lead**: `--latency` defaults to 2000 ms and is clamped into the
-device-reported `latencyMin..latencyMax` from stream SETUP. The effective
-lead and the raw window are surfaced on stdout
-(`[STATUS] latency lead_ms=... device_min_frames=... device_max_frames=... device_render_ms=...`)
+**Lead**: the anchor→render lead is a fixed 2000 ms request (the
+AirPlay-standard 2 s) with no external knob, clamped into the device-reported
+`latencyMin..latencyMax` from stream SETUP. `--latency` sets the queue depth
+instead (above), bounded at 3000 ms — an unreported window leaves nothing to
+clamp an override, and a depth past the EOF drain budget (§10) would have
+`[STATUS] eof` arrive while the receiver is still playing what it holds. The
+effective lead, the depth and the raw window are surfaced on stdout
+(`[STATUS] latency lead_ms=... device_min_frames=... device_max_frames=... device_render_ms=... warm_lead_ms=...`)
 so the caller plans group starts from device reality. The SETUP echo of the
 window is receiver-optional (Sonos omits it — then the 1.75 s default
 applies); parsing `audioLatencies` from GET /info is an open item.
@@ -960,10 +966,14 @@ capture.
   allocation, encryption, socket, and control failures are terminal and produce
   a nonzero process exit rather than a false EOF.
 - **EOF drain** — `[STATUS] eof` means the single stdin input ended (the whole
-  feed, not one track). The receiver then drains at most `latency + 2 s`, and
-  the connection idles awaiting the next `START`, the orphan idle timeout, or
-  `DISCONNECT`. The session stays in its playing state across EOF, so the
-  timeout arms on the input closing rather than on that state (§12).
+  feed, not one track). The receiver then drains at most 4 s — the 2 s lead
+  request plus 2 s, not the clamped effective lead — a budget the 3000 ms depth
+  ceiling (§6) keeps the queued audio inside, since the splice timeline keeps
+  feeding silence past the input and so never reports the drain complete on its
+  own — and the connection idles
+  awaiting the next `START`, the orphan idle timeout, or `DISCONNECT`. The
+  session stays in its playing state across EOF, so the timeout arms on the
+  input closing rather than on that state (§12).
 - **Initial metadata** — pushed at the first START with a placeholder title if the
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
