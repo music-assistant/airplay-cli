@@ -122,6 +122,14 @@ extern log_level *loglevel;
  * LinkPlay receivers acting as native multiroom master starve the AirPlay
  * renderer below ~1 s of queued audio, so their caller asks for more. */
 #define AP2_SPLICE_PACING_MS         600
+/* Ceiling on that override. A receiver reporting no window of its own has
+ * nothing left to clamp the depth, so the bound lives here. It sits under the
+ * caller's EOF drain budget (cliairplay.c reports eof once the input has been
+ * closed for the render lead plus 2 s): a depth past that budget leaves the
+ * last content still queued when eof fires, so it is reported mid-playback.
+ * Raising this means raising that budget too. Well clear of the deepest depth
+ * a device has needed (2500 ms on an Edifier MS50A). */
+#define AP2_SPLICE_DEPTH_MAX_MS      3000
 /* Delivery pacing depth (§ pacing below). A frame handed over more than the
  * receiver's buffer ahead of its deadline overflows that buffer and is
  * dropped, so delivery runs at most the reported latencyMax less a margin
@@ -2688,9 +2696,9 @@ void ap2cl_set_publish_ip(struct ap2cl_s *p, const char *ip)
 }
 
 /* Effective splice queue depth: the compiled default unless the caller
- * supplied --buffer-depth-ms. Every consumer of the depth (pacing, warm
- * lead, clock-verification windows, connect log) reads it from here so an
- * override moves them all coherently. */
+ * supplied --latency. Every consumer of the depth (pacing, warm lead,
+ * clock-verification windows, connect log) reads it from here so an override
+ * moves them all coherently. */
 static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
 {
     uint32_t depth = p->splice_depth_ms > 0 ? (uint32_t)p->splice_depth_ms
@@ -2722,6 +2730,11 @@ static uint32_t ap2_splice_depth_ms(struct ap2cl_s *p)
 void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms)
 {
     if (!p || ms <= 0) return;
+    if (ms > AP2_SPLICE_DEPTH_MAX_MS) {
+        LOG_WARN("[AP2] splice queue depth %d ms exceeds the %d ms maximum, clamping",
+                 ms, AP2_SPLICE_DEPTH_MAX_MS);
+        ms = AP2_SPLICE_DEPTH_MAX_MS;
+    }
     p->splice_depth_ms = ms;
     LOG_INFO("[AP2] splice queue depth override: %d ms", ms);
 }

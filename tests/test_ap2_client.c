@@ -1604,6 +1604,55 @@ static void test_splice_depth_override_vs_reported_buffer(void)
     puts("ap2_client splice depth override tests passed");
 }
 
+/* A receiver that reports no window leaves the override unbounded, so the
+ * setter bounds it: past the maximum the depth is clamped rather than taken,
+ * keeping it inside the caller's EOF drain budget. */
+static void test_splice_depth_bounds(void)
+{
+    ap2_device_info_t device = {
+        .name = "depth bounds test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client =
+        ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, true);
+
+    /* Nothing set yet: the compiled default, itself under the assumed window. */
+    assert(ap2cl_warm_lead_ms(client) == 600);
+
+    /* Junk and negatives stay ignored, leaving the default in place. */
+    ap2cl_set_splice_depth_ms(client, 0);
+    assert(ap2cl_warm_lead_ms(client) == 600);
+    ap2cl_set_splice_depth_ms(client, -1750);
+    assert(ap2cl_warm_lead_ms(client) == 600);
+
+    /* The maximum itself is taken as given. */
+    ap2cl_set_splice_depth_ms(client, 3000);
+    assert(ap2cl_warm_lead_ms(client) == 3000);
+
+    /* Beyond it the depth is clamped, not truncated to junk or refused: the
+     * pacing window follows the clamped depth, not the value asked for. */
+    ap2cl_set_splice_depth_ms(client, 60000);
+    assert(ap2cl_warm_lead_ms(client) == 3000);
+    assert(ap2cl_test_pacing_window_frames(client) == 132300);
+
+    /* A clamped depth is still an override, so it outranks the assumed window
+     * and a reported buffer still clamps it further. */
+    ap2cl_test_set_dev_latency_max(client, 88200);
+    assert(ap2cl_warm_lead_ms(client) == 1750);
+
+    assert(ap2cl_destroy(client));
+    puts("ap2_client splice depth bounds tests passed");
+}
+
 /* A start committed before the receiver's first timing probe arms the
  * post-commit verification; the poll then verifies, corrects forward, or
  * closes the window, exactly once per commit. */
@@ -2037,6 +2086,7 @@ int main(void)
     test_apple_model_resolution();
     test_pacing_window_rate_scaling();
     test_splice_depth_override_vs_reported_buffer();
+    test_splice_depth_bounds();
     test_clock_verified_anchor();
     test_clock_readiness_report();
     test_clock_stall_detection();

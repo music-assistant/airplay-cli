@@ -104,14 +104,23 @@ Starting before readiness is still supported and still corrected — see
 `START_JOIN=1` below.
 
 Delivery is not gated on the start time: frames are released up to the
-receiver's buffer window ahead of each frame's deadline (the device-reported
-`latencyMax`, or 1.75 s when the receiver does not report one), so receiver
-buffers fill before a scheduled start and the start cannot underrun.
+receiver's queue depth ahead of each frame's deadline (600 ms by default — see
+`--latency` below), itself bounded by the device-reported `latencyMax` less a
+250 ms margin, or by 1.75 s when the receiver reports no window. Receiver
+buffers therefore fill before a scheduled start and the start cannot underrun.
 
-`--latency <ms>` is the playback lead (default 2000 ms, the AirPlay-standard
-2 s), clamped into the window the device reports at stream SETUP. The
-effective lead and the device window are printed as a `[STATUS] latency ...`
-line so the caller can plan group starts from real device capabilities.
+`--latency <ms>` overrides the receiver's queue depth on the native AirPlay 2
+splice timeline (default 600 ms, maximum 3000 ms — deeper values are clamped
+with a warning). That depth is the audible latency of every warm seek and
+track change, so it stays shallow; raise it only for a receiver whose renderer
+starves at the stock depth and plays silence behind a perfectly healthy
+session. A window the device reports at stream SETUP still clamps the
+effective depth, but the 1.75 s stand-in for a window it never reported does
+not — a caller naming a depth knows the device better than an assumption does.
+
+The effective depth (`warm_lead_ms`), the render lead and the device window are
+printed as a `[STATUS] latency ...` line so the caller can plan group starts
+from real device capabilities.
 
 ### Pairing
 
@@ -175,7 +184,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 |--------|-------------|
 | `--port <port>` | Device RTSP port (default: 5000; AirPlay 2 devices use 7000). |
 | `--volume <0-100>` | Initial volume. Mapped linear-in-dB onto -30..0 dB (the AirPlay ecosystem convention); 0 mutes. |
-| `--latency <ms>` | Playback lead / buffer (default: 2000, clamped into the device-reported window). |
+| `--latency <ms>` | Receiver queue depth on the native AirPlay 2 splice timeline (default: 600, maximum: 3000). Raise only for receivers whose renderer starves at the stock depth; a device-reported window still clamps it. |
 | `--samplerate <rate>` | Input sample rate (default: 44100). |
 | `--bitdepth <16\|24>` | Input bit depth (default: 16). 24 requires the native AirPlay 2 flow and s32le input. |
 | `--channels <n>` | Input channel count (default: 2). |
