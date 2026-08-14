@@ -3939,11 +3939,12 @@ void ap2cl_play(struct ap2cl_s *p)
          * Re-anchor here instead, the same fresh line ap2cl_resume freezes
          * for a commanded START on this path.
          *
-         * A standby park (AP2_CONNECTED) leaves an equally stale head and is
-         * still deliberately not covered: PLAY and PAUSE act on the transport
-         * alone, while STANDBY parks the session engine and only START
-         * un-parks it — so a PLAY out of standby sends no frames at all, and
-         * the START that has to follow re-anchors through ap2cl_resume. */
+         * A standby park is deliberately not covered: STANDBY drops this path
+         * back to AP2_CONNECTED with an equally stale head, but PLAY and PAUSE
+         * act on the transport alone while STANDBY parks the session engine,
+         * and only START un-parks it. Re-anchoring for a PLAY out of standby
+         * would change nothing — the loop reads no frames until that START,
+         * which re-anchors through ap2cl_resume. */
         uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
         if (p->head_ts <= now_ts) {
             ap2_reanchor_after_drain(p);
