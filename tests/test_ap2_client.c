@@ -950,6 +950,103 @@ static void test_splice_pause_keeps_line_hot(void)
     puts("ap2_client splice pause keepalive tests passed");
 }
 
+/* The stock (non-splice) pause/resume pair. No receiver reaches this path
+ * today — ap2_splice_denied's prefix list is empty, so every native session
+ * takes the splice timeline — so this pins the behavior for work that would
+ * route a deep-queue receiver onto it. */
+static void test_stock_pause_resume_reanchors(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    assert(fcntl(sockets[1], F_SETFL, O_NONBLOCK) == 0);
+
+    ap2_device_info_t device = {
+        .name = "stock pause test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_splice(client, false);
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
+    ap2cl_test_set_first_packet(client, false);
+    ap2cl_test_set_anchor_valid(client, true);
+
+    /* A pause the receiver's queue outlasts: the head is still ahead of the
+     * wall clock, so the buffered audio covers the whole gap and delivery
+     * resumes on the frozen line. Moving it here would jump the stamps under
+     * audio the receiver is still rendering. */
+    uint64_t head_hot = ap2cl_test_head_ts(client);
+    uint32_t rtp_hot = ap2cl_test_rtp_timestamp(client);
+    ap2cl_pause(client);
+    assert(ap2cl_state(client) == AP2_PAUSED);
+    assert(!ap2cl_is_playing(client));
+    assert(!ap2cl_test_anchor_valid(client));
+    assert(ap2cl_test_head_ts(client) == head_hot);
+
+    ap2cl_play(client);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+    assert(ap2cl_is_playing(client));
+    assert(ap2cl_test_head_ts(client) == head_hot);
+    assert(ap2cl_test_rtp_timestamp(client) == rtp_hot);
+    assert(!ap2cl_test_first_packet(client));
+
+    /* A pause long enough to drain the receiver: the head lapses behind the
+     * wall clock. Resuming on it would hand the pending content elapsed
+     * timestamps — the pacing gate passes them (it only holds frames that are
+     * too EARLY) and neither recovery helper covers this path, so the
+     * un-pause has to re-anchor. Drag the head 5 s back to stand in for the
+     * pause span. */
+    ap2cl_pause(client);
+    assert(ap2cl_state(client) == AP2_PAUSED);
+    uint64_t lapsed = ap2cl_test_head_ts(client) - 5 * 44100;
+    ap2cl_test_set_head_ts(client, lapsed);
+    uint32_t rtp_lapsed = ap2cl_test_rtp_timestamp(client);
+    uint64_t reanchors_before = ap2cl_test_timeline_reanchors(client);
+
+    ap2cl_play(client);
+    assert(ap2cl_state(client) == AP2_STREAMING);
+
+    /* The line moved forward by the lapse plus the minimum lead. The wall
+     * clock advances between the two calls, so the bounds are sanity rails
+     * around the injected 5 s; the stamp delta below is exact. */
+    uint64_t head_after = ap2cl_test_head_ts(client);
+    uint64_t shift = head_after - lapsed;
+    assert(shift > 4 * 44100 && shift < 7 * 44100);
+    /* The wire timestamp tracks the head 1:1 (both carry the same per-process
+     * offset), so the receiver re-seats on one consistent line. */
+    assert(ap2cl_test_rtp_timestamp(client) - rtp_lapsed == (uint32_t)shift);
+    /* The next packet carries the RTP marker and a fresh sync, and the anchor
+     * is re-derived from the new start. */
+    assert(ap2cl_test_first_packet(client));
+    assert(!ap2cl_test_anchor_valid(client));
+    /* A commanded un-pause is not drift: it must not land in the REANCHOR
+     * accounting Music Assistant tracks. */
+    assert(ap2cl_test_timeline_reanchors(client) == reanchors_before);
+    /* The stock path owes no splice pad. */
+    assert(ap2cl_splice_pad_frames(client) == 0);
+
+    /* The whole pair put nothing on the RTSP socket. */
+    char scratch[16];
+    assert(recv(sockets[1], scratch, sizeof(scratch), 0) == -1);
+    assert(errno == EAGAIN || errno == EWOULDBLOCK);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client stock pause/resume re-anchor tests passed");
+}
+
 static bool bytes_contain(const uint8_t *data, size_t data_len,
                           const void *needle, size_t needle_len)
 {
@@ -2080,6 +2177,7 @@ int main(void)
     test_splice_timeline_warm_path();
     test_splice_delivery_gap_recovery();
     test_splice_pause_keeps_line_hot();
+    test_stock_pause_resume_reanchors();
     test_mrp_bundle_and_pause_publish();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
