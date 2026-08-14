@@ -463,6 +463,13 @@ void ap2cl_set_splice_depth_ms(struct ap2cl_s *p, int ms);
  * before ap2cl_connect(). */
 void ap2cl_set_ptp_shared(struct ap2cl_s *p, bool enable);
 
+/* Request the buffered audio stream (type 103): RTP pushed over TCP to the
+ * receiver's dataPort, playback scheduled by SETRATEANCHORTIME against the
+ * PTP timeline (falls back to realtime when PTP is unavailable). Warm
+ * boundaries use FLUSHBUFFERED + a fresh anchor instead of the splice
+ * timeline. Must be called before ap2cl_connect(). */
+void ap2cl_set_buffered(struct ap2cl_s *p, bool enable);
+
 /* Set the address we advertise to the device (multi-homed hosts), used
  * wherever the protocol carries our own address (e.g. timing peer lists).
  * Defaults to the bind/source address when unset. */

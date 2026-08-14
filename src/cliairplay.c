@@ -104,6 +104,7 @@ typedef struct {
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
     int splice_depth_ms;    /* >0: override the splice receiver-queue depth */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
+    bool buffered;          /* force the buffered audio stream (type 103) */
 
     /* Audio format */
     int sample_rate;
@@ -1535,6 +1536,7 @@ static int run_airplay2(cli_config_t *cfg)
     if (cfg->splice_depth_ms > 0)
         ap2cl_set_splice_depth_ms(client, cfg->splice_depth_ms);
     ap2cl_set_ptp_shared(client, cfg->ptp_shared);
+    ap2cl_set_buffered(client, cfg->buffered);
     ap2cl_set_remote_command_callback(
         client, remote_command_event, NULL);
 
@@ -2100,6 +2102,9 @@ static void print_usage(const char *name)
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
     printf("                             SupportsPTP feature bit)\n");
+    printf("  --buffered                 EXPERIMENTAL: buffered audio stream (type 103,\n");
+    printf("                             native AP2, RTP over TCP + PTP anchor);\n");
+    printf("                             realtime fallback when PTP is unavailable\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
     printf("                             read the elected clock from shared memory and do\n");
     printf("                             not bind 319/320 when a daemon is present; else\n");
@@ -2174,6 +2179,7 @@ int main(int argc, char *argv[])
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
+        {"buffered",     no_argument,       0, 1010},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
         {"check",        no_argument,       0, 1002},
@@ -2224,6 +2230,7 @@ int main(int argc, char *argv[])
         case 1007: cfg.force_native = true; break;
         case 1008: cfg.publish_ip = optarg; break;
         case 1009: cfg.ptp = true; break;
+        case 1010: cfg.buffered = true; break;
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
@@ -2310,6 +2317,16 @@ int main(int argc, char *argv[])
     cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
                                   have_password, cfg.bit_depth, cfg.force_native,
                                   cfg.ptp, cfg.ptp);
+    /* --buffered pulls the route onto native AP2 with PTP timing (the anchor
+     * needs a grandmaster); the client falls back to realtime if PTP later
+     * proves unavailable. */
+    if (cfg.buffered) {
+        cfg.route.use_raop = false;
+        cfg.route.native = true;
+        cfg.route.transient = !have_creds;
+        cfg.route.ptp = true;
+        cfg.route.reason = "buffered (type 103) forced";
+    }
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
              cfg.route.reason,
@@ -2318,13 +2335,12 @@ int main(int argc, char *argv[])
              (unsigned long long)cfg.route.flags,
              cfg.bit_depth);
     /* Machine-parseable route report on stdout so the caller (MA) can log and
-     * surface which route this stream actually took. The literal buffered=0
-     * keeps the line shape stable for existing parsers; buffered playback
-     * itself was investigated and removed (DESIGN.md). */
-    printf("[STATUS] route protocol=%s flow=%s timing=%s buffered=0\n",
+     * surface which route this stream actually took. */
+    printf("[STATUS] route protocol=%s flow=%s timing=%s buffered=%d\n",
            cfg.route.use_raop ? "raop" : "airplay2",
            cfg.route.use_raop ? "legacy" : (cfg.route.native ? "native" : "raop-compat"),
-           (!cfg.route.use_raop && cfg.route.ptp) ? "ptp" : "ntp");
+           (!cfg.route.use_raop && cfg.route.ptp) ? "ptp" : "ntp",
+           cfg.buffered ? 1 : 0);
     fflush(stdout);
 
     /* The device advertises that it needs a password and we hold neither one
