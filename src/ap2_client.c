@@ -3879,6 +3879,19 @@ void ap2cl_pause(struct ap2cl_s *p)
     ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_PAUSED, true);
 }
 
+/* Freeze a fresh anchor line one minimum lead ahead of now — the clean
+ * session-start shape over a pipeline the receiver has already drained. The
+ * next packet carries the RTP marker and a fresh sync ahead of its payload,
+ * so the receiver re-seats on the new line. */
+static void ap2_reanchor_after_drain(struct ap2cl_s *p)
+{
+    p->start_ntp = raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+    p->head_ts = NTP2TS(p->start_ntp, p->format.sample_rate);
+    p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
+    p->rt_anchor_valid = false;
+    p->first_packet = true;
+}
+
 void ap2cl_play(struct ap2cl_s *p)
 {
     if (!p) return;
@@ -3909,13 +3922,26 @@ void ap2cl_play(struct ap2cl_s *p)
             /* Lapsed line (receiver drained long ago): re-anchor fresh over
              * the idle pipeline, the clean session-start shape. */
             p->splice_pad_frames = 0;
-            p->start_ntp = raopcl_get_ntp(NULL) + MS2NTP(AP2_MIN_WARM_LEAD_MS);
-            p->head_ts = NTP2TS(p->start_ntp, p->format.sample_rate);
-            p->rtp_timestamp = (uint32_t)p->head_ts +
-                               atomic_load(&p->rtp_offset);
-            p->rt_anchor_valid = false;
-            p->first_packet = true;
+            ap2_reanchor_after_drain(p);
             LOG_INFO("[AP2] splice un-pause after drain: fresh anchor line");
+        }
+    } else if (p->flow == FLOW_NATIVE_AP2 && !p->splice_timeline &&
+               p->state == AP2_PAUSED) {
+        /* Stock un-pause. The pause parked delivery and left the head frozen,
+         * so it now sits a whole pause behind the wall clock while the
+         * receiver rendered on. While its queue still reaches the head the
+         * wire is unbroken and delivery just resumes on the frozen line; once
+         * that queue has drained the head is in the past, and resuming there
+         * would burst the pending content on elapsed timestamps. Pacing
+         * cannot catch that — the gate only holds frames that are too EARLY —
+         * and neither recovery helper sees it either: the delivery-stall
+         * guard is splice-only and the starvation guard needs a dry input.
+         * Re-anchor here instead, the same fresh line ap2cl_resume freezes
+         * for a commanded START on this path. */
+        uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
+        if (p->head_ts <= now_ts) {
+            ap2_reanchor_after_drain(p);
+            LOG_INFO("[AP2] un-pause after drain: fresh anchor line");
         }
     }
     p->state = AP2_STREAMING;
