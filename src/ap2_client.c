@@ -3937,7 +3937,13 @@ void ap2cl_play(struct ap2cl_s *p)
          * and neither recovery helper sees it either: the delivery-stall
          * guard is splice-only and the starvation guard needs a dry input.
          * Re-anchor here instead, the same fresh line ap2cl_resume freezes
-         * for a commanded START on this path. */
+         * for a commanded START on this path.
+         *
+         * A standby park (AP2_CONNECTED) leaves an equally stale head and is
+         * still deliberately not covered: PLAY and PAUSE act on the transport
+         * alone, while STANDBY parks the session engine and only START
+         * un-parks it — so a PLAY out of standby sends no frames at all, and
+         * the START that has to follow re-anchors through ap2cl_resume. */
         uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
         if (p->head_ts <= now_ts) {
             ap2_reanchor_after_drain(p);
