@@ -564,7 +564,7 @@ static bool ap2_rtsp_write_request(struct ap2cl_s *p, const char *method,
 {
     char hdr[1024];
     int hdr_len = snprintf(hdr, sizeof(hdr),
-        "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: AirPlay/670.6.2\r\n"
+        "%s %s RTSP/1.0\r\nCSeq: %d\r\nUser-Agent: " AP2_USER_AGENT "\r\n"
         "DACP-ID: %s\r\nActive-Remote: %s\r\n%s%s%s%s"
         "Content-Length: %d\r\n\r\n",
         method, uri, cseq,

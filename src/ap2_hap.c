@@ -552,6 +552,7 @@ static int hap_post_pair_setup_path(int sock_fd, const char *path, int cseq, int
     char http_req[256];
     int hdr_len = snprintf(http_req, sizeof(http_req),
         "POST %s RTSP/1.0\r\n"
+        "User-Agent: " AP2_USER_AGENT "\r\n"
         "Content-Type: application/octet-stream\r\n"
         "X-Apple-HKP: %d\r\n"
         "CSeq: %d\r\n"
@@ -711,6 +712,7 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd,
     char http_req[512];
     int hdr_len = snprintf(http_req, sizeof(http_req),
         "POST /pair-verify RTSP/1.0\r\n"
+        "User-Agent: " AP2_USER_AGENT "\r\n"
         "Content-Type: application/octet-stream\r\n"
         "X-Apple-HKP: 3\r\n"
         "CSeq: 1\r\n"
@@ -955,6 +957,7 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd,
     /* Send M3 */
     hdr_len = snprintf(http_req, sizeof(http_req),
         "POST /pair-verify RTSP/1.0\r\n"
+        "User-Agent: " AP2_USER_AGENT "\r\n"
         "Content-Type: application/octet-stream\r\n"
         "X-Apple-HKP: 3\r\n"
         "CSeq: 2\r\n"
