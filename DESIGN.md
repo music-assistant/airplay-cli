@@ -17,9 +17,11 @@ One binary, three streaming paths plus utility modes:
 | **AP2 RAOP-compat** | RAOP flow + `auth-setup` | NTP | none | AirPlay 2 receivers, as fallback |
 | **AP2 native** | encrypted RTSP + realtime RTP/UDP (type 96), ChaCha20-Poly1305 | **PTP** (or NTP) | transient (`HKP:4`) or pair-verify (`HKP:3`, stored creds) | Sonos, Apple TV, HomePod, JBL, WiiM |
 
-Native AP2 with PTP-timed realtime streaming is the primary path: it carries
-16- and 24-bit ALAC, sample-aligned multi-room, and scheduled group starts.
-The buffered stream (type 103) was investigated and removed (§9).
+Native AP2 with PTP timing is the primary path: it carries 16- and 24-bit
+ALAC, sample-aligned multi-room, and scheduled group starts. Two stream types
+ride it: realtime (type 96, RTP/UDP) and buffered (type 103, RTP over TCP,
+anchored by `SETRATEANCHORTIME`) — the buffered stream auto-selects on
+receivers that advertise it (§9).
 
 Utility modes: `--pair` (legacy RAOP secret), `--pair-setup` (HomeKit PIN
 pairing producing `--auth` credentials), `--ptp-daemon` (shared clock,
@@ -62,8 +64,12 @@ Decision order:
 3. **Timing** — `--ptp` forces PTP; otherwise the SupportsPTP feature bit
    selects PTP vs the NTP responder. If PTP is selected but UDP 319/320
    cannot be bound (no privilege, no daemon), the session falls back to NTP.
-4. **Stream type** — realtime (96) always; 16- and 24-bit both ride it
-   (buffered type 103 was investigated and removed, §9).
+4. **Stream type** — on a native PTP route, buffered (103) when the receiver
+   advertises SupportsBufferedAudio (bit 40) and its model is not on the
+   in-code buffered deny-list; realtime (96) otherwise. `--buffered` forces
+   the buffered stream on any native PTP route, and `CLIAIRPLAY_BUFFERED`
+   (0 = never, else = always) outranks both — the fleet A/B lever and kill
+   switch. 16- and 24-bit ride either stream type (§9).
 
 ## 3. The two AirPlay 2 flows
 
@@ -801,36 +807,63 @@ proto2 emitters, the `/command` builders, the bplist `params.data` wrapper, the
 DataStream key derivation and channel framing, and answers inbound `sync`
 frames with `rply`.
 
-## 9. Buffered audio (type 103) — investigated and removed
+## 9. Buffered audio (type 103)
 
-Buffered streaming was implemented end-to-end and validated where it could
-be: SETUP type 103, TCP push with correct length-prefix framing (verified
-against a reference receiver; sustained ALAC 44.1/16 playback worked on a
-Sonos Era 100), PTP-anchored start with anchor retry (a strict receiver 400s
-`SETRATEANCHORTIME` until it has measured our clock), rate-0 pause,
-`FLUSHBUFFERED`. It was then **removed** rather than parked, because every
-reason to want it fell away:
+The buffered stream pushes the encrypted RTP packets over a TCP connection
+to the dataPort the receiver returns from the stream SETUP, framed with a
+2-byte big-endian length prefix that counts itself:
+`[len][12B RTP hdr, PT 103][ciphertext][16B tag][8B nonce]`. The nonce
+carries an 8-byte per-packet counter (a 2-byte sequence would wrap and reuse
+a nonce inside long sessions). There are no sync packets and no retransmit
+path — TCP is the reliability layer — and playback is scheduled entirely by
+`SETRATEANCHORTIME`: "sample rtpTime renders at PTP time networkTime, at
+rate". Rate 1 plays, rate 0 pauses in place; `FLUSHBUFFERED`
+(`flushUntilSeq`/`flushUntilTS`) discards the receiver's buffer, so a warm
+seek is FLUSHBUFFERED + a fresh rate-1 anchor and needs none of the splice
+timeline's machinery (the splice path is bypassed on buffered sessions). A
+commanded START maps 1:1 onto the anchor — the anchor's networkTime IS the
+commanded instant on the shared PTP timeline, which is also why a mixed
+group (buffered and realtime members) can share one start instant: both
+stream types express the same timeline, two ways.
 
-- **The Apple TV cannot use it**: it will not send Delay_Req on a buffered
-  stream, so it never measures our clock and its rate anchor never clears.
-  Cracking that needs a capture of an iOS → Apple TV buffered session — and
-  real iOS buffered sessions carry AAC, not ALAC, so even a fix lands us on
-  a wire format no real sender exercises.
-- **Realtime carries everything**: 16- and 24-bit ALAC render on the
-  realtime stream on every tested receiver class, and a live realtime
-  session accepts a classic RTSP `FLUSH` + a re-based frozen anchor line
-  with warm leads measured down to 150 ms on both Sonos and Apple TV — so
-  fast seek/next does not need buffered's explicit anchoring either.
-- **No startup win**: buffered cold start measured slower than realtime
-  (both dominated by initial PTP acquisition).
+The receiver **owns its buffer** and pulls the TCP stream on its own
+schedule — bursts ahead of render, long read pauses in between (a warm
+receiver has ingested 75 s ≈ 10 MB at line speed; a cold-clock one prefetches
+a few seconds until its servo trusts the timeline). Two sender rules follow,
+both learned the hard way:
 
-What was kept: the `/info` `bufferStream` format-table parsing — a device
-advertising 24-bit ALAC there is a capability signal (the Apple TV
-advertises hi-res only in that table) even though the stream type itself is
-gone. The working implementation remains recoverable from git history
-(≤ v0.2.0). Revisiting would only make sense for deterministic late-join in
-homogeneous buffered groups, and must start with that iOS → Apple TV
-capture.
+- **Read-throttling is not a fault.** The unwritten tail of a frame parks in
+  a pending stash and the pacing gate holds new frames until it drains; a
+  send deadline must never kill the session (the removed v0.2.0
+  implementation did exactly that and could not survive a healthy receiver).
+- **Pacing still applies.** Delivery runs at most one window ahead of the
+  render line — `--latency` sizes that window (an explicit depth outranks
+  the standard 1.75 s assumption, mirroring the realtime rule), which is how
+  receivers with a deep render floor (LinkPlay masters starve below ~2.5 s)
+  get theirs, while a FLUSHBUFFERED never discards more than one window.
+
+Anchor acceptance differs by class: strict receivers (Sonos, WiiM) 400 the
+anchor until they have measured our clock (~1.3–2.3 s of Delay_Req, retried
+at 500 ms); lenient ones (Edifier MS50A) 200 it immediately. Neither is
+proof of a clock lock — buffered render is hard-gated on the receiver
+actually slaving the advertised timeline, and unlike realtime there are no
+per-second sync re-announces to heal a missed election, so `RECORD` before
+the stream SETUP (§4) and a live grandmaster matter even more here.
+
+History: the type-103 path was first implemented pre-v0.2.0, then removed
+(PR #10) on three findings — Apple TV never measured our clock on buffered,
+realtime carried everything, no startup win. The 2026-08-14 re-evaluation
+(LinkPlay starvation and pause latency, server#5618) overturned the
+generalization: the removed code had disqualifying sender bugs (the send
+deadline above, and a drain that tore down with the receiver's buffer still
+full), it predated the RECORD-before-SETUP discovery — which buffered needs
+too: with the old order a Sonos ACKs everything and never reads the data
+socket — and the Apple TV finding was measured with that wrong order and
+without clock observability. Buffered ALAC 44.1/16 is hardware-verified
+audible on Edifier MS50A, WiiM Pro and Sonos Era 100, with exact commanded
+instants and an instant rate-0 pause. The Apple TV remains the open
+question, pending a fresh pairing; if it misbehaves on type 103 it earns a
+deny-list entry, not a policy retreat.
 
 ## 10. Session robustness
 

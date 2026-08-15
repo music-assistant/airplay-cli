@@ -556,6 +556,73 @@ static void test_route_with_password(void)
     puts("ap2_client route password selection tests passed");
 }
 
+/* Buffered (type 103) auto-selects on a native PTP route when the receiver
+ * advertises SupportsBufferedAudio (bit 40); --buffered forces it there, and
+ * CLIAIRPLAY_BUFFERED overrides both ways. The deny-list ships empty — adding
+ * an entry must consciously update the pins here. */
+static void test_buffered_route_resolution(void)
+{
+    unsetenv("CLIAIRPLAY_BUFFERED");
+
+    /* LinkPlay-class TXT: bits 40 (buffered) + 41 (PTP) + pairing. */
+    const char *linkplay = "features=0x445F8A00,0x1C340";
+    ap2_route_t r = ap2_resolve_route(AP2_PROTO_AUTO, linkplay, NULL, false,
+                                      false, 16, false, false, false);
+    assert(r.native && r.ptp);
+    assert(ap2_buffered_route(&r, linkplay, NULL, false));
+
+    /* The kill switch outranks auto and force alike; =1 forces it on. */
+    setenv("CLIAIRPLAY_BUFFERED", "0", 1);
+    assert(!ap2_buffered_route(&r, linkplay, NULL, false));
+    assert(!ap2_buffered_route(&r, linkplay, NULL, true));
+    setenv("CLIAIRPLAY_BUFFERED", "1", 1);
+    const char *no_bit40 = "features=0x445F8A00,0x10200";
+    ap2_route_t plain = ap2_resolve_route(AP2_PROTO_AUTO, no_bit40, NULL,
+                                          false, false, 16, false, false,
+                                          false);
+    assert(plain.native && plain.ptp);
+    assert(ap2_buffered_route(&plain, no_bit40, NULL, false));
+    unsetenv("CLIAIRPLAY_BUFFERED");
+
+    /* Without the bit, auto stays realtime; --buffered still forces. */
+    assert(!ap2_buffered_route(&plain, no_bit40, NULL, false));
+    assert(ap2_buffered_route(&plain, no_bit40, NULL, true));
+
+    /* Bit 40 without PTP (bit 41) cannot anchor: never buffered. */
+    const char *no_ptp = "features=0x445F8A00,0x10100";
+    ap2_route_t unanchored = ap2_resolve_route(AP2_PROTO_AUTO, no_ptp, NULL,
+                                               false, false, 16, false, false,
+                                               false);
+    assert(unanchored.native && !unanchored.ptp);
+    assert(!ap2_buffered_route(&unanchored, no_ptp, NULL, true));
+
+    /* A RAOP route carries no buffered stream, forced or not. */
+    ap2_route_t raop = ap2_resolve_route(AP2_PROTO_AUTO, "features=0x0,0x0",
+                                         NULL, false, false, 16, false, false,
+                                         false);
+    assert(raop.use_raop);
+    assert(!ap2_buffered_route(&raop, "features=0x0,0x0", NULL, true));
+
+    /* Fleet pins: third-party bit-40 classes auto-route buffered; Apple
+     * models never do (hardware-measured: an Apple TV ACKs the type-103
+     * SETUP but never probes our clock, so its anchor can never clear —
+     * they keep the ear-validated realtime splice lane). --buffered still
+     * forces them on for experiments. */
+    const char *atv = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE";
+    ap2_route_t atv_route = ap2_resolve_route(AP2_PROTO_AUTO, atv, NULL, true,
+                                              false, 16, false, false, false);
+    assert(!ap2_buffered_route(&atv_route, atv, NULL, false));
+    assert(ap2_buffered_route(&atv_route, atv, NULL, true));
+    assert(!ap2_buffered_route(&atv_route, NULL, "AudioAccessory5,1", false));
+    const char *sonos = "model=Era 100 features=0x445F8A00,0x801C340";
+    ap2_route_t sonos_route = ap2_resolve_route(AP2_PROTO_AUTO, sonos, NULL,
+                                                false, false, 16, false,
+                                                false, false);
+    assert(ap2_buffered_route(&sonos_route, sonos, NULL, false));
+
+    puts("ap2_client buffered route resolution tests passed");
+}
+
 /* A 401/403 is classified from what we actually presented, because the two
  * verdicts send the caller to different remedies: AUTH_REQUIRED becomes MA's
  * "password required" prompt, AUTH_FAILED tells the user to fix the secret.
@@ -2166,6 +2233,7 @@ int main(void)
 {
     test_retransmit_responder();
     test_route_with_password();
+    test_buffered_route_resolution();
     test_route_explicit_airplay2();
     test_auth_error_kind();
     test_info_format_tables();
