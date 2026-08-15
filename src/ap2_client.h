@@ -80,7 +80,17 @@ typedef enum {
     AP2_PROTO_AUTO = 0,
     AP2_PROTO_RAOP,
     AP2_PROTO_AIRPLAY2,
+    AP2_PROTO_AIRPLAY2_COMPAT,   /* force the auth-setup + RAOP flow */
 } ap2_proto_pref_t;
+
+/* Session timing preference (from --timing). AUTO derives PTP vs NTP from the
+ * SupportsPTP feature bit; PTP/NTP force it — NTP being the escape for
+ * receivers that advertise the bit but never answer a clock probe. */
+typedef enum {
+    AP2_TIMING_AUTO = 0,
+    AP2_TIMING_PTP,
+    AP2_TIMING_NTP,
+} ap2_timing_pref_t;
 
 /* Resolved streaming route: the concrete decision the caller acts on. */
 typedef struct {

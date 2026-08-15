@@ -102,6 +102,8 @@ typedef struct {
     bool force_native;      /* force native AP2 flow (transient pairing) */
     char *publish_ip;       /* address advertised to devices (multi-homed hosts) */
     bool ptp;               /* force PTP grandmaster timing for native AP2 */
+    ap2_timing_pref_t timing;   /* --timing auto|ptp|ntp (ntp = force the NTP
+                                   responder even when SupportsPTP is set) */
     int splice_depth_ms;    /* >0: override the splice receiver-queue depth */
     bool ptp_shared;        /* prefer a shared PTP daemon clock (multi-room) */
     bool buffered;          /* force the buffered audio stream (type 103) */
@@ -2053,9 +2055,11 @@ static void print_usage(const char *name)
     printf("cliairplay v%s - Unified AirPlay streaming CLI\n\n", CLIAIRPLAY_VERSION);
     printf("Usage: %s [options] --cmdpipe <path> <host_ip>\n\n", name);
     printf("Protocol selection:\n");
-    printf("  --protocol <auto|raop|airplay2>  Protocol to use (default: auto).\n");
-    printf("                             auto picks RAOP vs AirPlay 2 from the mDNS\n");
-    printf("                             features in --txt; raop/airplay2 force it.\n\n");
+    printf("  --protocol <auto|raop|airplay2|airplay2-compat>\n");
+    printf("                             Protocol to use (default: auto). auto picks\n");
+    printf("                             RAOP vs AirPlay 2 from the mDNS features in\n");
+    printf("                             --txt; raop/airplay2 force it; airplay2-compat\n");
+    printf("                             forces the auth-setup + RAOP flow.\n\n");
     printf("Common options:\n");
     printf("  --port <port>              Device port (default: 5000)\n");
     printf("  --volume <0-100>           Initial volume level\n");
@@ -2102,6 +2106,11 @@ static void print_usage(const char *name)
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
     printf("                             SupportsPTP feature bit)\n");
+    printf("  --timing <auto|ptp|ntp>    Session timing (default: auto = the SupportsPTP\n");
+    printf("                             bit, or --ptp). ntp forces the NTP responder —\n");
+    printf("                             the escape for receivers that advertise PTP\n");
+    printf("                             but never answer a clock probe; buffered\n");
+    printf("                             audio then resolves off (needs PTP).\n");
     printf("  --buffered                 Force the buffered audio stream (type 103,\n");
     printf("                             native AP2, RTP over TCP + PTP anchor); else\n");
     printf("                             auto by the SupportsBufferedAudio feature bit.\n");
@@ -2180,6 +2189,7 @@ int main(int argc, char *argv[])
         {"ap2-native",   no_argument,       0, 1007},
         {"publish-ip",   required_argument, 0, 1008},
         {"ptp",          no_argument,       0, 1009},
+        {"timing",       required_argument, 0, 1014},
         {"buffered",     no_argument,       0, 1010},
         {"ptp-daemon",   no_argument,       0, 1011},
         {"ptp-shared",   no_argument,       0, 1012},
@@ -2200,7 +2210,15 @@ int main(int argc, char *argv[])
             if (strcmp(optarg, "auto") == 0) cfg.proto_pref = AP2_PROTO_AUTO;
             else if (strcmp(optarg, "raop") == 0) cfg.proto_pref = AP2_PROTO_RAOP;
             else if (strcmp(optarg, "airplay2") == 0) cfg.proto_pref = AP2_PROTO_AIRPLAY2;
+            else if (strcmp(optarg, "airplay2-compat") == 0)
+                cfg.proto_pref = AP2_PROTO_AIRPLAY2_COMPAT;
             else { fprintf(stderr, "Unknown protocol: %s\n", optarg); return 1; }
+            break;
+        case 1014:
+            if (strcmp(optarg, "auto") == 0) cfg.timing = AP2_TIMING_AUTO;
+            else if (strcmp(optarg, "ptp") == 0) cfg.timing = AP2_TIMING_PTP;
+            else if (strcmp(optarg, "ntp") == 0) cfg.timing = AP2_TIMING_NTP;
+            else { fprintf(stderr, "Unknown timing: %s\n", optarg); return 1; }
             break;
         case 'p': cfg.port = atoi(optarg); break;
         case 'v': cfg.volume = atoi(optarg); break;
@@ -2315,18 +2333,27 @@ int main(int argc, char *argv[])
      * cfg.route carries the AirPlay 2 sub-decisions applied in run_airplay2(). */
     bool have_creds = cfg.auth && strlen(cfg.auth) == 192;
     bool have_password = cfg.password && *cfg.password;
+    /* --timing outranks the legacy --ptp force-on: auto leaves the decision
+     * to --ptp / the SupportsPTP bit, ptp/ntp force it either way. */
+    bool timing_forced = cfg.timing != AP2_TIMING_AUTO || cfg.ptp;
+    bool timing_ptp = cfg.timing == AP2_TIMING_AUTO ? cfg.ptp
+                                                    : cfg.timing == AP2_TIMING_PTP;
     cfg.route = ap2_resolve_route(cfg.proto_pref, cfg.ap2_txt, cfg.pw, have_creds,
                                   have_password, cfg.bit_depth, cfg.force_native,
-                                  cfg.ptp, cfg.ptp);
+                                  timing_forced, timing_ptp);
     /* --buffered pulls the route onto native AP2 with PTP timing (the anchor
-     * needs a grandmaster); the client falls back to realtime if PTP later
-     * proves unavailable. */
+     * needs a grandmaster) — unless NTP timing was forced, which the client
+     * would only fall back from anyway; buffered then resolves off. */
     if (cfg.buffered) {
         cfg.route.use_raop = false;
         cfg.route.native = true;
         cfg.route.transient = !have_creds;
-        cfg.route.ptp = true;
-        cfg.route.reason = "buffered (type 103) forced";
+        if (cfg.timing != AP2_TIMING_NTP) {
+            cfg.route.ptp = true;
+            cfg.route.reason = "buffered (type 103) forced";
+        } else {
+            cfg.route.reason = "native AP2 forced (buffered request on NTP timing)";
+        }
     }
     /* Buffered (type 103) rides a native PTP route: forced, or auto when the
      * receiver advertises SupportsBufferedAudio; CLIAIRPLAY_BUFFERED

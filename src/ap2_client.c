@@ -1357,7 +1357,8 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     bool is_ap2;
     if (pref == AP2_PROTO_RAOP) {
         is_ap2 = false;
-    } else if (pref == AP2_PROTO_AIRPLAY2) {
+    } else if (pref == AP2_PROTO_AIRPLAY2 ||
+               pref == AP2_PROTO_AIRPLAY2_COMPAT) {
         is_ap2 = true;
     } else { /* AUTO */
         is_ap2 = AP2_FEAT(r.features, AP2_FEAT_UNIFIED_MEDIA) ||
@@ -1388,6 +1389,15 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     bool native = have_credentials || force_native || (pairable && !pairing_blocked);
     bool transient = native && !have_credentials;   /* stored keys => pair-verify */
 
+    /* An explicit compat preference outranks every native selector: it is the
+     * caller naming a receiver whose native flow misbehaves. */
+    if (pref == AP2_PROTO_AIRPLAY2_COMPAT) {
+        r.use_raop = false;
+        r.native = false;
+        r.reason = "AirPlay 2 (RAOP-compat, forced)";
+        return r;
+    }
+
     if (!native) {
         r.use_raop = false;
         r.native = false;
@@ -1399,12 +1409,11 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
     r.native = true;
     r.transient = transient;
 
-    /* 3. Timing: PTP grandmaster when forced, else the SupportsPTP feature bit. */
+    /* 3. Timing: PTP when forced (a forced-OFF is the escape for receivers
+     * that advertise SupportsPTP and never answer a probe), else the
+     * SupportsPTP feature bit. The stream type (realtime vs buffered) is a
+     * separate decision on top of this route: see ap2_buffered_route. */
     r.ptp = ptp_forced ? ptp_enabled : (AP2_FEAT(r.features, AP2_FEAT_PTP) != 0);
-
-    /* Stream type is always realtime (type 96); it carries 16- and 24-bit —
-     * verified audible on device. Buffered (type 103) was investigated and
-     * removed: see DESIGN.md for the findings and rationale. */
     (void)bit_depth;
 
     if (transient)

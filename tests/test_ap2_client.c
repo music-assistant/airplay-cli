@@ -560,6 +560,44 @@ static void test_route_with_password(void)
  * advertises SupportsBufferedAudio (bit 40); --buffered forces it there, and
  * CLIAIRPLAY_BUFFERED overrides both ways. The deny-list ships empty — adding
  * an entry must consciously update the pins here. */
+/* Forced timing and the forced compat flow: NTP-forced routes drop PTP (and
+ * with it any buffered eligibility) even on receivers that advertise both
+ * bits, and an explicit airplay2-compat preference outranks every native
+ * selector. */
+static void test_forced_timing_and_compat_route(void)
+{
+    unsetenv("CLIAIRPLAY_BUFFERED");
+    const char *linkplay = "features=0x445F8A00,0x1C340";
+
+    /* (ptp_forced=true, ptp_enabled=false) = --timing ntp. */
+    ap2_route_t ntp = ap2_resolve_route(AP2_PROTO_AIRPLAY2, linkplay, NULL,
+                                        false, false, 16, false, true, false);
+    assert(ntp.native && !ntp.ptp);
+    assert(!ap2_buffered_route(&ntp, linkplay, NULL, false));
+    assert(!ap2_buffered_route(&ntp, linkplay, NULL, true));
+
+    /* Auto timing still follows the SupportsPTP bit. */
+    ap2_route_t auto_t = ap2_resolve_route(AP2_PROTO_AIRPLAY2, linkplay, NULL,
+                                           false, false, 16, false, false,
+                                           false);
+    assert(auto_t.ptp);
+
+    /* Forced compat beats a pairable device's native selection, and pulls a
+     * legacy-featured device onto AirPlay 2 rather than plain RAOP. */
+    ap2_route_t compat = ap2_resolve_route(AP2_PROTO_AIRPLAY2_COMPAT, linkplay,
+                                           NULL, false, false, 16, false,
+                                           false, false);
+    assert(!compat.use_raop && !compat.native);
+    assert(strcmp(compat.reason, "AirPlay 2 (RAOP-compat, forced)") == 0);
+    ap2_route_t compat_legacy = ap2_resolve_route(AP2_PROTO_AIRPLAY2_COMPAT,
+                                                  "features=0x0,0x0", NULL,
+                                                  false, false, 16, false,
+                                                  false, false);
+    assert(!compat_legacy.use_raop && !compat_legacy.native);
+
+    puts("ap2_client forced timing and compat route tests passed");
+}
+
 static void test_buffered_route_resolution(void)
 {
     unsetenv("CLIAIRPLAY_BUFFERED");
@@ -2234,6 +2272,7 @@ int main(void)
     test_retransmit_responder();
     test_route_with_password();
     test_buffered_route_resolution();
+    test_forced_timing_and_compat_route();
     test_route_explicit_airplay2();
     test_auth_error_kind();
     test_info_format_tables();

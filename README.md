@@ -178,7 +178,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 
 | Option | Description |
 |--------|-------------|
-| `--protocol <auto\|raop\|airplay2>` | Streaming protocol (default: `auto`, which resolves the full route — RAOP vs AirPlay 2, native vs compat, PTP vs NTP — from the mDNS TXT records in `--txt`). `raop`/`airplay2` force the protocol; `airplay2` picks native vs RAOP-compat on the same terms as `auto`, and goes native when `--txt` advertises no features at all (an AirPlay-2-only receiver). |
+| `--protocol <auto\|raop\|airplay2\|airplay2-compat>` | Streaming protocol (default: `auto`, which resolves the full route — RAOP vs AirPlay 2, native vs compat, PTP vs NTP — from the mDNS TXT records in `--txt`). `raop`/`airplay2` force the protocol; `airplay2` picks native vs RAOP-compat on the same terms as `auto`, and goes native when `--txt` advertises no features at all (an AirPlay-2-only receiver); `airplay2-compat` forces the auth-setup + RAOP flow outright. |
 
 ### Common
 
@@ -218,6 +218,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--name <name>` | Device name (native flow). |
 | `--hostname <host>` | Device hostname (native flow). |
 | `--ptp` | Force PTP grandmaster timing (binds UDP 319/320, needs privilege). Default: auto by the SupportsPTP feature bit. |
+| `--timing <auto\|ptp\|ntp>` | Session timing. `auto` (default) follows the SupportsPTP bit (or `--ptp`); `ntp` forces the NTP responder — the escape for receivers that advertise PTP but never answer a clock probe (e.g. AirPlay-2 video-class TVs). An NTP-timed route never selects the buffered stream. |
 | `--buffered` | Force the buffered stream (type 103, RTP over TCP + PTP anchor) on a native PTP route. Default: auto by the SupportsBufferedAudio feature bit (in-code deny-list for measured-hostile models). `CLIAIRPLAY_BUFFERED=0\|1` outranks both — kill switch / fleet A/B lever. |
 | `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. Picks the clock *source*, not the timing mode — pair it with `--ptp` or a `--txt` advertising SupportsPTP. |
 
