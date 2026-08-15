@@ -2351,6 +2351,8 @@ int main(int argc, char *argv[])
         if (cfg.timing != AP2_TIMING_NTP) {
             cfg.route.ptp = true;
             cfg.route.reason = "buffered (type 103) forced";
+        } else {
+            cfg.route.reason = "native AP2 forced (buffered request on NTP timing)";
         }
     }
     /* Buffered (type 103) rides a native PTP route: forced, or auto when the
