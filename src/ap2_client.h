@@ -88,6 +88,8 @@ typedef struct {
     bool native;        /* AirPlay 2: native flow (else RAOP-compatible) */
     bool transient;     /* native AP2: transient pairing (else pair-verify) */
     bool ptp;           /* native AP2: PTP grandmaster timing (else NTP) */
+    bool buffered;      /* native AP2: buffered stream, type 103 (see
+                           ap2_buffered_route) */
     uint64_t features;  /* parsed mDNS features bitmask (for logging) */
     uint64_t flags;     /* parsed mDNS status flags bitmask (for logging) */
     const char *reason; /* short human-readable summary of the decision */
@@ -118,6 +120,22 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
                               bool have_credentials, bool have_password,
                               int bit_depth, bool force_native,
                               bool ptp_forced, bool ptp_enabled);
+
+/*
+ * Decide the buffered (type 103) stream for an already-resolved route. Only a
+ * native AP2 + PTP route can carry it; there, in order of precedence:
+ * the CLIAIRPLAY_BUFFERED environment variable (0 = never, else = always),
+ * the --buffered force flag, and finally auto-selection — the receiver
+ * advertises SupportsBufferedAudio (features bit 40) and its model is not on
+ * the in-code buffered deny-list.
+ *
+ * :param route: the resolved route (ap2_resolve_route), plus any overrides.
+ * :param txt: full _airplay._tcp TXT blob, or NULL.
+ * :param am: mDNS am= model override (RAOP discovery), or NULL.
+ * :param forced: --buffered was given.
+ */
+bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
+                        const char *am, bool forced);
 
 /* Why the last connect attempt failed, for the caller's structured report. */
 typedef enum {

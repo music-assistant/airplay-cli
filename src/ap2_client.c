@@ -1267,6 +1267,42 @@ static bool ap2_splice_denied(const char *txt, const char *am)
     return false;
 }
 
+/* Receivers measured buffered-hostile take the realtime stream instead. Match
+ * by model=/am= prefix, exactly like ap2_splice_denied: an entry here must
+ * name hardware where type 103 was accepted but misbehaved on the device. */
+static bool ap2_buffered_denied(const char *txt, const char *am)
+{
+    static const char *const prefixes[] = { NULL };
+    const char *model = txt ? strstr(txt, "model=") : NULL;
+    if (model) model += strlen("model=");
+    for (size_t i = 0; prefixes[i]; i++) {
+        size_t len = strlen(prefixes[i]);
+        if (model && strncmp(model, prefixes[i], len) == 0) return true;
+        if (am && strncmp(am, prefixes[i], len) == 0) return true;
+    }
+    return false;
+}
+
+bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
+                        const char *am, bool forced)
+{
+    /* Buffered rides native AP2 and is scheduled against the PTP timeline;
+     * any other route stays realtime whatever the caller asked. */
+    if (!route || route->use_raop || !route->native || !route->ptp)
+        return false;
+    /* CLIAIRPLAY_BUFFERED outranks everything: the fleet-wide A/B and kill
+     * switch (0 = never, anything else = always on eligible routes). */
+    if (getenv("CLIAIRPLAY_BUFFERED"))
+        return ap2_env_enabled("CLIAIRPLAY_BUFFERED", false);
+    if (forced) return true;
+    /* Auto: the receiver advertises SupportsBufferedAudio and is not
+     * deny-listed. The bit is trusted here because it is the same signal a
+     * real Apple sender routes on — a device that sets it and cannot render
+     * type 103 earns a deny-list entry, not a policy retreat. */
+    return AP2_FEAT(ap2_txt_features(txt), AP2_FEAT_BUFFERED) &&
+           !ap2_buffered_denied(txt, am);
+}
+
 /* Apple receivers, from the `model=` (_airplay TXT) / `am=` (_raop) field.
  * They converge a still-settling PTP servo onto a committed anchor (solo
  * Apple TV starts render exactly on anchors well inside the servo-lock
@@ -2237,8 +2273,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         return false;
     }
     /* Non-fatal: without the responder the stream still plays, it just cannot
-     * repair receiver-side loss. */
-    ap2_rtx_start(p);
+     * repair receiver-side loss. Buffered audio rides TCP, which needs (and
+     * gets) no retransmit path. */
+    if (!p->use_buffered)
+        ap2_rtx_start(p);
     ap2_set_connect_error(p, AP2_CONNECT_ERROR_NONE, 0, "%s", "");
     LOG_INFO("[AP2] Native AP2 session ready");
     return true;
@@ -3715,13 +3753,16 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
      * shape, which is clean; padding silence from a lapsed head would deliver
      * late frames, which is not. */
     p->splice_pad_frames = 0;
-    if (p->state == AP2_STREAMING && !p->splice_timeline) {
+    if (p->state == AP2_STREAMING && !p->splice_timeline &&
+        (!p->use_buffered || p->anchored)) {
         /* A re-anchor on an already-streaming stock stream (the corrective
          * round of a group start) must discard the receiver's audio from the
          * previous anchor first: without the flush the receiver keeps
          * rendering the buffered frames on the OLD line and stays offset by
          * the correction delta until the next clean anchor (measured on
-         * Sonos as a persistent few-hundred-ms group desync). */
+         * Sonos as a persistent few-hundred-ms group desync). A buffered
+         * stream the session engine already flushed (anchor cleared) has
+         * nothing left to discard. */
         ap2cl_flush(p);
     }
     uint64_t start_ntp = 0;
@@ -3801,11 +3842,13 @@ static uint64_t ap2_pacing_window_frames(struct ap2cl_s *p)
      * how far delivery runs ahead of the render line (the FLUSHBUFFERED
      * discard size and the stall exposure). Receivers with a deep render
      * floor (LinkPlay masters go silent below ~2.5 s of buffered audio) need
-     * the caller's --latency honored above the realtime default, exactly as
-     * an explicit depth outranks the assumed window on the splice path. */
+     * the caller's --latency depth honored above the realtime default,
+     * exactly as an explicit depth outranks the assumed window on the
+     * splice path. */
     if (p->use_buffered) {
-        uint64_t lead = MS2TS(p->lead_ms, p->format.sample_rate);
-        return lead > window ? lead : window;
+        uint64_t depth = (uint64_t)MS2TS(ap2_splice_depth_ms(p),
+                                         p->format.sample_rate);
+        return depth > window ? depth : window;
     }
     /* The splice timeline keeps the receiver queue shallow: with warm
      * boundaries expressed as content splices on one immutable line, the

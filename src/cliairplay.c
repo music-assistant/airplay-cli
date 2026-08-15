@@ -1536,7 +1536,7 @@ static int run_airplay2(cli_config_t *cfg)
     if (cfg->splice_depth_ms > 0)
         ap2cl_set_splice_depth_ms(client, cfg->splice_depth_ms);
     ap2cl_set_ptp_shared(client, cfg->ptp_shared);
-    ap2cl_set_buffered(client, cfg->buffered);
+    ap2cl_set_buffered(client, cfg->route.buffered);
     ap2cl_set_remote_command_callback(
         client, remote_command_event, NULL);
 
@@ -2102,9 +2102,10 @@ static void print_usage(const char *name)
     printf("  --ptp                      Force PTP grandmaster timing (native AP2;\n");
     printf("                             binds UDP 319/320, needs root; else auto by\n");
     printf("                             SupportsPTP feature bit)\n");
-    printf("  --buffered                 EXPERIMENTAL: buffered audio stream (type 103,\n");
-    printf("                             native AP2, RTP over TCP + PTP anchor);\n");
-    printf("                             realtime fallback when PTP is unavailable\n");
+    printf("  --buffered                 Force the buffered audio stream (type 103,\n");
+    printf("                             native AP2, RTP over TCP + PTP anchor); else\n");
+    printf("                             auto by the SupportsBufferedAudio feature bit.\n");
+    printf("                             CLIAIRPLAY_BUFFERED=0|1 overrides both.\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
     printf("                             read the elected clock from shared memory and do\n");
     printf("                             not bind 319/320 when a daemon is present; else\n");
@@ -2327,6 +2328,11 @@ int main(int argc, char *argv[])
         cfg.route.ptp = true;
         cfg.route.reason = "buffered (type 103) forced";
     }
+    /* Buffered (type 103) rides a native PTP route: forced, or auto when the
+     * receiver advertises SupportsBufferedAudio; CLIAIRPLAY_BUFFERED
+     * overrides both ways (fleet A/B and kill switch). */
+    cfg.route.buffered =
+        ap2_buffered_route(&cfg.route, cfg.ap2_txt, cfg.am, cfg.buffered);
     cfg.protocol = cfg.route.use_raop ? PROTO_RAOP : PROTO_AIRPLAY2;
     LOG_INFO("[AP2] auto-selected: %s; timing=%s; features=0x%llx; flags=0x%llx; bitdepth=%d",
              cfg.route.reason,
@@ -2340,7 +2346,7 @@ int main(int argc, char *argv[])
            cfg.route.use_raop ? "raop" : "airplay2",
            cfg.route.use_raop ? "legacy" : (cfg.route.native ? "native" : "raop-compat"),
            (!cfg.route.use_raop && cfg.route.ptp) ? "ptp" : "ntp",
-           cfg.buffered ? 1 : 0);
+           cfg.route.buffered ? 1 : 0);
     fflush(stdout);
 
     /* The device advertises that it needs a password and we hold neither one

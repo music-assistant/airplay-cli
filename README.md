@@ -21,7 +21,9 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   AirPlay 2 receivers that can neither pair-verify nor pair transiently.
 - **AirPlay 2 native**: HAP pairing (transient, or pair-verify with stored
   credentials), encrypted RTSP, binary-plist SETUP, ChaCha20-Poly1305 audio,
-  realtime (type 96) streaming with PTP or NTP timing.
+  realtime (type 96) streaming with PTP or NTP timing, and buffered
+  (type 103, RTP over TCP + `SETRATEANCHORTIME`) auto-selected on receivers
+  that advertise it.
 - **Apple MediaRemote metadata**: pair-verified Apple targets receive the full
   now-playing client, playback-state, transport-command, text and artwork
   sequence used by current Apple senders.
@@ -216,6 +218,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--name <name>` | Device name (native flow). |
 | `--hostname <host>` | Device hostname (native flow). |
 | `--ptp` | Force PTP grandmaster timing (binds UDP 319/320, needs privilege). Default: auto by the SupportsPTP feature bit. |
+| `--buffered` | Force the buffered stream (type 103, RTP over TCP + PTP anchor) on a native PTP route. Default: auto by the SupportsBufferedAudio feature bit (in-code deny-list for measured-hostile models). `CLIAIRPLAY_BUFFERED=0\|1` outranks both — kill switch / fleet A/B lever. |
 | `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. Picks the clock *source*, not the timing mode — pair it with `--ptp` or a `--txt` advertising SupportsPTP. |
 
 ### Utility / daemon modes
