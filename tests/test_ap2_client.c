@@ -603,13 +603,17 @@ static void test_buffered_route_resolution(void)
     assert(raop.use_raop);
     assert(!ap2_buffered_route(&raop, "features=0x0,0x0", NULL, true));
 
-    /* Fleet pins on the empty deny-list: every bit-40 class auto-routes,
-     * Apple models included (hardware verdict pending — a deny entry, not a
-     * policy retreat, is the answer if one misbehaves). */
+    /* Fleet pins: third-party bit-40 classes auto-route buffered; Apple
+     * models never do (hardware-measured: an Apple TV ACKs the type-103
+     * SETUP but never probes our clock, so its anchor can never clear —
+     * they keep the ear-validated realtime splice lane). --buffered still
+     * forces them on for experiments. */
     const char *atv = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE";
     ap2_route_t atv_route = ap2_resolve_route(AP2_PROTO_AUTO, atv, NULL, true,
                                               false, 16, false, false, false);
-    assert(ap2_buffered_route(&atv_route, atv, NULL, false));
+    assert(!ap2_buffered_route(&atv_route, atv, NULL, false));
+    assert(ap2_buffered_route(&atv_route, atv, NULL, true));
+    assert(!ap2_buffered_route(&atv_route, NULL, "AudioAccessory5,1", false));
     const char *sonos = "model=Era 100 features=0x445F8A00,0x801C340";
     ap2_route_t sonos_route = ap2_resolve_route(AP2_PROTO_AUTO, sonos, NULL,
                                                 false, false, 16, false,

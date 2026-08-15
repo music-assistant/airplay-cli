@@ -1292,6 +1292,8 @@ static bool ap2_buffered_denied(const char *txt, const char *am)
     return false;
 }
 
+static bool ap2_apple_model(const char *txt, const char *am);
+
 bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
                         const char *am, bool forced)
 {
@@ -1304,11 +1306,19 @@ bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
     if (getenv("CLIAIRPLAY_BUFFERED"))
         return ap2_env_enabled("CLIAIRPLAY_BUFFERED", false);
     if (forced) return true;
-    /* Auto: the receiver advertises SupportsBufferedAudio and is not
-     * deny-listed. The bit is trusted here because it is the same signal a
-     * real Apple sender routes on — a device that sets it and cannot render
-     * type 103 earns a deny-list entry, not a policy retreat. */
+    /* Auto: the receiver advertises SupportsBufferedAudio and is neither an
+     * Apple model nor deny-listed. The bit is otherwise trusted — it is the
+     * same signal a real Apple sender routes on, and a third-party device
+     * that sets it and cannot render type 103 earns a deny-list entry, not a
+     * policy retreat. Apple receivers are excluded on measurement, not
+     * caution alone: an Apple TV (tvOS 26/27, RECORD-first order, live
+     * grandmaster, verified pairing) ACKs the type-103 SETUP and then never
+     * sends a single Delay_Req, so its rate anchor 400s forever — while the
+     * realtime lane carries 16- and 24-bit with the ear-validated splice
+     * timeline. Mixed groups stay aligned either way: both stream types
+     * anchor the same commanded instant on the same PTP timeline. */
     return AP2_FEAT(ap2_txt_features(txt), AP2_FEAT_BUFFERED) &&
+           !ap2_apple_model(txt, am) &&
            !ap2_buffered_denied(txt, am);
 }
 
@@ -4454,7 +4464,7 @@ void ap2cl_play(struct ap2cl_s *p)
             LOG_INFO("[AP2] splice un-pause after drain: fresh anchor line");
         }
     } else if (p->flow == FLOW_NATIVE_AP2 && !p->splice_timeline &&
-               p->state == AP2_PAUSED) {
+               !p->use_buffered && p->state == AP2_PAUSED) {
         /* Stock un-pause. The pause parked delivery and left the head frozen,
          * so it now sits a whole pause behind the wall clock while the
          * receiver rendered on. While its queue still reaches the head the
@@ -4472,7 +4482,11 @@ void ap2cl_play(struct ap2cl_s *p)
          * leave the session engine untouched while STANDBY parks it, and only
          * START resumes delivery. Re-anchoring for a PLAY out of standby would
          * change nothing — the loop reads no frames until that START, which
-         * re-anchors through ap2cl_resume. */
+         * re-anchors through ap2cl_resume.
+         *
+         * Buffered sessions are excluded: their un-pause block below owns the
+         * re-anchor, and a wall-clock re-base here would break the monotonic
+         * wire-timestamp continuation it relies on. */
         uint64_t now_ts = NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate);
         if (p->head_ts <= now_ts) {
             ap2_reanchor_after_drain(p);
