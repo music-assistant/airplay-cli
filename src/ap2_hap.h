@@ -12,6 +12,14 @@
 #include <stdint.h>
 
 /*
+ * Sender identification sent on every request to the receiver. AirTunes 980.77.2
+ * (tvOS/HomePod OS 26) answers 403 Forbidden to a pair-setup POST that carries no
+ * User-Agent, so this belongs on the pairing endpoints as much as on the RTSP
+ * control channel.
+ */
+#define AP2_USER_AGENT "AirPlay/670.6.2"
+
+/*
  * HAP pairing context.
  *
  * Credentials format (192 hex chars = 96 bytes):
