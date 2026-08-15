@@ -1906,11 +1906,18 @@ static bool ap2_native_connect(struct ap2cl_s *p)
 
     /* Buffered (type 103) schedules playback entirely by SETRATEANCHORTIME
      * against the PTP timeline, so it is only viable with an active
-     * grandmaster; fall back to realtime otherwise. */
+     * grandmaster; fall back to realtime otherwise — and give that realtime
+     * session the warm path its receiver would have had without the buffered
+     * request (the splice opt-out above was for the buffered timeline, which
+     * is not the one running now). */
     p->use_buffered = p->buffered_requested && p->use_ptp;
-    if (p->buffered_requested && !p->use_buffered)
+    if (p->buffered_requested && !p->use_buffered) {
+        p->splice_timeline =
+            !ap2_splice_denied(p->device.txt_records, p->am);
         LOG_WARN("[AP2] Buffered audio requested but PTP is unavailable; "
-                 "using the realtime stream");
+                 "using the realtime stream (%s warm path)",
+                 p->splice_timeline ? "splice" : "classic");
+    }
 
     /* 4. Session SETUP (encrypted). PTP and NTP use different session dicts. */
     uint8_t *plist_data = NULL; int plist_len = 0;
@@ -2615,17 +2622,24 @@ static int ap2_buffered_flush_pending(struct ap2cl_s *p);
 static void ap2_buffered_quiesce_data(struct ap2cl_s *p)
 {
     if (p->buffered_sock < 0) return;
+    /* One wall-clock budget for the whole quiesce: it runs under the
+     * session's send serialization, so stalling here stalls every command.
+     * A receiver dead enough to absorb nothing for a second gets the flush
+     * anyway — every unrecalled byte is named below untilSeq, so a correct
+     * receiver still discards the late tail. */
+    uint64_t deadline = ap2_io_monotonic_ms() + 1000;
     if (p->buffered_pending_len) {
         if (p->buffered_pending_off == 0) {
             free(p->buffered_pending);
             p->buffered_pending = NULL;
             p->buffered_pending_len = p->buffered_pending_off = 0;
         } else {
-            for (int i = 0; i < 30 && ap2_buffered_flush_pending(p) == 0; i++)
+            while (ap2_buffered_flush_pending(p) == 0 &&
+                   ap2_io_monotonic_ms() < deadline)
                 usleep(10000);
         }
     }
-    for (int i = 0; i < 30; i++) {
+    while (ap2_io_monotonic_ms() < deadline) {
         int queued = 0;
 #if defined(__APPLE__)
         socklen_t qlen = sizeof(queued);
@@ -4516,7 +4530,13 @@ void ap2cl_play(struct ap2cl_s *p)
                              atomic_load(&p->rtp_offset) + (uint32_t)ahead);
         }
         p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
-        ap2_buffered_anchor_start(p, resume_ntp);
+        /* A refused re-anchor means the receiver can schedule nothing we
+         * send: fail the media health so the session ends loudly (the
+         * caller restarts it) instead of "playing" into a dead schedule. */
+        if (!ap2_buffered_anchor_start(p, resume_ntp)) {
+            atomic_store(&p->media_healthy, false);
+            return;
+        }
     }
     p->state = AP2_STREAMING;
     ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_PLAYING, true);
@@ -5267,7 +5287,10 @@ void ap2cl_latency_info(struct ap2cl_s *p, int *lead_ms, uint32_t *dev_min, uint
 uint32_t ap2cl_audible_lag_frames(struct ap2cl_s *p)
 {
     if (!p) return 0;
-    if (p->flow == FLOW_NATIVE_AP2 && p->splice_timeline)
+    /* Both delivery-paced timelines run up to one pacing window ahead of the
+     * render line, so that window IS the sent-to-audible distance; the stock
+     * paths deliver one latency lead ahead instead. */
+    if (p->flow == FLOW_NATIVE_AP2 && (p->splice_timeline || p->use_buffered))
         return (uint32_t)ap2_pacing_window_frames(p);
     return (uint32_t)MS2TS(p->lead_ms, p->format.sample_rate);
 }
