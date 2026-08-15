@@ -52,7 +52,9 @@ accepted as `ft=`) and the status flags (`flags=`/`sf=`) drive the decision:
 Decision order:
 
 1. **Protocol** — bit 38 or 48 set ⇒ AirPlay 2, else legacy RAOP.
-   `--ap2-native` forces AirPlay 2 regardless.
+   `--ap2-native` forces AirPlay 2 regardless, and `--protocol
+   airplay2-compat` forces the auth-setup + RAOP flow for receivers whose
+   native flow misbehaves.
 2. **Native vs RAOP-compat** — stored credentials (`--auth`) ⇒ native with
    pair-verify. `--ap2-native` ⇒ native with transient pairing.
    Otherwise a device that advertises pairing (bit 46 or 48) with no PIN and
@@ -61,9 +63,12 @@ Decision order:
    `--protocol airplay2` takes that route on the same terms, and also when the
    TXT advertises no features at all — an AirPlay-2-only receiver, with no
    `_raop` service behind it. Everything else ⇒ the RAOP-compat flow.
-3. **Timing** — `--ptp` forces PTP; otherwise the SupportsPTP feature bit
-   selects PTP vs the NTP responder. If PTP is selected but UDP 319/320
-   cannot be bound (no privilege, no daemon), the session falls back to NTP.
+3. **Timing** — `--timing ptp|ntp` (or the legacy `--ptp`) forces it;
+   otherwise the SupportsPTP feature bit selects PTP vs the NTP responder.
+   Forced NTP is the escape for receivers that advertise the bit but never
+   answer a clock probe (AirPlay-2 video-class TVs). If PTP is selected but
+   UDP 319/320 cannot be bound (no privilege, no daemon), the session falls
+   back to NTP.
 4. **Stream type** — on a native PTP route, buffered (103) when the receiver
    advertises SupportsBufferedAudio (bit 40) and its model is not on the
    in-code buffered deny-list; realtime (96) otherwise. `--buffered` forces
