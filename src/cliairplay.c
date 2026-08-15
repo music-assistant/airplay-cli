@@ -44,7 +44,7 @@
 #include "artwork.h"
 #include "announce.h"
 
-#define VERSION "0.5.0"
+#define VERSION "0.5.1"
 /* Overridden at build time from the git tag for tagged releases (see Makefile). */
 #ifndef CLIAIRPLAY_VERSION
 #define CLIAIRPLAY_VERSION VERSION
