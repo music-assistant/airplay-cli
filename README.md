@@ -219,6 +219,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--hostname <host>` | Device hostname (native flow). |
 | `--ptp` | Force PTP grandmaster timing (binds UDP 319/320, needs privilege). Default: auto by the SupportsPTP feature bit. |
 | `--buffered` | Force the buffered stream (type 103, RTP over TCP + PTP anchor) on a native PTP route. Default: auto by the SupportsBufferedAudio feature bit (in-code deny-list for measured-hostile models). `CLIAIRPLAY_BUFFERED=0\|1` outranks both — kill switch / fleet A/B lever. |
+| *(env)* `CLIAIRPLAY_FEEDBACK_MISSES=<1..30>` | Native AP2 sessions POST a `/feedback` keepalive every 2 s and give the session up after this many consecutive timed-out beats (default `3`, about six seconds of control-channel silence). Raise it for a receiver on a marginal wireless link that stalls its control channel for longer than that while its audio buffer is still fine — a Sonos on weak Wi-Fi is the measured case; a dead channel is then noticed within `n × 2 s`. Hard peer errors (reset/EOF/protocol) stay immediately fatal whatever the budget, and an out-of-range or malformed value is logged and ignored. |
 | `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. Picks the clock *source*, not the timing mode — pair it with `--ptp` or a `--txt` advertising SupportsPTP. |
 
 ### Utility / daemon modes

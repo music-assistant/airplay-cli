@@ -903,12 +903,16 @@ deny-list entry, not a policy retreat.
 - **Keepalive miss tolerance** — a timeout-shaped `/feedback` failure (the
   device riding out a short local network blackout with its buffered audio
   intact) does not kill the channel: up to three consecutive missed beats are
-  tolerated (the third kills), while hard peer errors (reset/EOF/protocol)
-  stay immediately fatal. Responses to abandoned beats arrive late once the
-  device recovers, so the response reader skips complete stale responses by
-  CSeq, and bytes of a response that was mid-flight at an abandoned deadline
-  carry over into the next exchange to keep the byte stream and the HAP
-  read-nonce sequence intact. A succeeded beat resets the miss count.
+  tolerated by default (the third kills), while hard peer errors
+  (reset/EOF/protocol) stay immediately fatal. The budget is fixed per session
+  from `CLIAIRPLAY_FEEDBACK_MISSES` (1–30) for receivers whose control channel
+  stalls longer than three beats on a marginal wireless link; the cap keeps a
+  genuinely dead channel detectable within about a minute. Responses to
+  abandoned beats arrive late once the device recovers, so the response reader
+  skips complete stale responses by CSeq, and bytes of a response that was
+  mid-flight at an abandoned deadline carry over into the next exchange to keep
+  the byte stream and the HAP read-nonce sequence intact. A succeeded beat
+  resets the miss count.
 - **Farewell teardown** — giving up on the channel writes one last `TEARDOWN`
   before the socket is shut down, because the regular teardown at disconnect
   cannot pass the fail-closed send gate any more. Without it the receiver keeps

@@ -85,6 +85,15 @@ bool ap2_io_feedback_miss_tolerated(const char *uri, int err,
                                     unsigned prior_misses,
                                     unsigned max_misses);
 
+/* Parses an operator-supplied keepalive miss budget (the CLIAIRPLAY_FEEDBACK_MISSES
+ * environment variable): a plain decimal count of consecutive missed beats,
+ * 1..max_budget inclusive. Returns false and leaves *budget untouched when the
+ * setting is absent, empty, not a bare decimal, zero, or above max_budget, so
+ * a typo can never silently disable channel-death detection. */
+bool ap2_io_parse_feedback_miss_budget(const char *setting,
+                                       unsigned max_budget,
+                                       unsigned *budget);
+
 /* Returns 1 for a complete response, 0 for incomplete input, and -1 for
  * malformed input. */
 int ap2_io_parse_rtsp_response(const uint8_t *data, size_t len,

@@ -85,8 +85,14 @@ extern log_level *loglevel;
  * receivers ride out multi-second local network blackouts (wifi roams, DFS
  * scans) with their buffered audio intact. Consecutive timeout-shaped misses
  * are tolerated up to this count (the final one kills), so a genuinely dead
- * channel is still detected within roughly misses x (interval + timeout). */
-#define AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES 3
+ * channel is still detected within roughly misses x (interval + timeout).
+ * The default suits a healthy LAN; CLIAIRPLAY_FEEDBACK_MISSES raises (or
+ * lowers) the per-session budget for receivers on a marginal wireless link
+ * that stall the control channel for longer than three beats while their
+ * audio buffer is still fine. The cap keeps a dead channel detectable within
+ * about a minute whatever the operator sets. */
+#define AP2_FEEDBACK_DEFAULT_MISSES  3
+#define AP2_FEEDBACK_MAX_MISSES      30
 #define AP2_EVENT_POLL_INTERVAL_MS   100
 #define AP2_RTSP_RX_BUF_SIZE         16384
 #define AP2_UDP_SEND_TIMEOUT_MS      20
@@ -276,6 +282,9 @@ struct ap2cl_s {
     uint64_t sync_packets_sent;
     uint64_t sync_packets_dropped;
     atomic_uint feedback_failures;
+    /* Consecutive missed beats that spend the keepalive budget (the miss that
+     * kills), fixed per session from CLIAIRPLAY_FEEDBACK_MISSES at creation. */
+    unsigned feedback_miss_budget;
     uint64_t timeline_reanchors;
     bool splice_timeline;         /* discard-free warm path on one immutable
                                      anchor line — the native default; false
@@ -672,14 +681,14 @@ static void ap2_mark_rtsp_dead(struct ap2cl_s *p, const char *method,
     int saved_errno = errno;
     unsigned prior_misses = atomic_load(&p->feedback_failures);
     if (ap2_io_feedback_miss_tolerated(uri, saved_errno, prior_misses,
-                                       AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES)) {
+                                       p->feedback_miss_budget)) {
         /* The device may just be riding out a short local network blackout
          * with its buffered audio intact. Leave the channel open — the next
          * exchange skips this beat's late response by CSeq — and only give
          * up after the consecutive-miss budget is spent. */
         LOG_WARN("[AP2] POST /feedback keepalive miss %u/%d (%s after %" PRIu64
                  "ms: %s); tolerating transient failure",
-                 prior_misses + 1, AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES, phase,
+                 prior_misses + 1, p->feedback_miss_budget, phase,
                  elapsed_ms, strerror(saved_errno));
         errno = saved_errno;
         return;
@@ -3044,6 +3053,20 @@ struct ap2cl_s *ap2cl_create(
     atomic_init(&p->rtsp_dead, false);
     atomic_init(&p->media_healthy, true);
     atomic_init(&p->feedback_failures, 0);
+    p->feedback_miss_budget = AP2_FEEDBACK_DEFAULT_MISSES;
+    const char *miss_setting = getenv("CLIAIRPLAY_FEEDBACK_MISSES");
+    if (miss_setting) {
+        if (ap2_io_parse_feedback_miss_budget(miss_setting, AP2_FEEDBACK_MAX_MISSES,
+                                              &p->feedback_miss_budget)) {
+            LOG_INFO("[AP2] keepalive miss budget set to %u beat(s) by "
+                     "CLIAIRPLAY_FEEDBACK_MISSES",
+                     p->feedback_miss_budget);
+        } else {
+            LOG_WARN("[AP2] Ignoring CLIAIRPLAY_FEEDBACK_MISSES=%s (want 1..%d); "
+                     "keeping the default budget of %u beat(s)",
+                     miss_setting, AP2_FEEDBACK_MAX_MISSES, p->feedback_miss_budget);
+        }
+    }
     atomic_init(&p->mrp_event_health, -1);
     atomic_init(&p->feedback_stop, true);
     atomic_init(&p->rtp_offset, 0);
@@ -4669,7 +4692,7 @@ bool ap2cl_control_healthy(struct ap2cl_s *p)
     if (!p || p->flow != FLOW_NATIVE_AP2) return true;
     if (atomic_load(&p->rtsp_dead) ||
         !atomic_load(&p->media_healthy) ||
-        atomic_load(&p->feedback_failures) >= AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES)
+        atomic_load(&p->feedback_failures) >= p->feedback_miss_budget)
         return false;
     return atomic_load(&p->mrp_event_health) != 0;
 }
@@ -5424,8 +5447,12 @@ void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd)
  * that spends it whatever the budget is set to. */
 void ap2cl_test_prime_feedback_misses(struct ap2cl_s *p)
 {
-    atomic_store(&p->feedback_failures,
-                 AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES - 1);
+    atomic_store(&p->feedback_failures, p->feedback_miss_budget - 1);
+}
+
+unsigned ap2cl_test_feedback_miss_budget(struct ap2cl_s *p)
+{
+    return p->feedback_miss_budget;
 }
 
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p)

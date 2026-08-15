@@ -2106,6 +2106,9 @@ static void print_usage(const char *name)
     printf("                             native AP2, RTP over TCP + PTP anchor); else\n");
     printf("                             auto by the SupportsBufferedAudio feature bit.\n");
     printf("                             CLIAIRPLAY_BUFFERED=0|1 overrides both.\n");
+    printf("                             CLIAIRPLAY_FEEDBACK_MISSES=<1..30> sets how many\n");
+    printf("                             consecutive missed 2 s keepalive beats end a\n");
+    printf("                             native AP2 session (default 3).\n");
     printf("  --ptp-shared               Prefer a shared PTP daemon clock (multi-room):\n");
     printf("                             read the elected clock from shared memory and do\n");
     printf("                             not bind 319/320 when a daemon is present; else\n");

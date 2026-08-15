@@ -32,6 +32,7 @@ void ap2cl_test_lock_mrp(struct ap2cl_s *p);
 void ap2cl_test_unlock_mrp(struct ap2cl_s *p);
 void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd);
 void ap2cl_test_prime_feedback_misses(struct ap2cl_s *p);
+unsigned ap2cl_test_feedback_miss_budget(struct ap2cl_s *p);
 void ap2cl_test_detach_rtsp_socket(struct ap2cl_s *p);
 bool ap2cl_test_first_packet(struct ap2cl_s *p);
 void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet);
@@ -370,6 +371,86 @@ static void test_dead_channel_writes_farewell_teardown(void)
     assert(close(sockets[1]) == 0);
     assert(ap2cl_destroy(client));
     puts("ap2_client farewell teardown test passed");
+}
+
+static struct ap2cl_s *create_feedback_test_client(char *name)
+{
+    ap2_device_info_t device = {
+        .name = name,
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    return client;
+}
+
+/* The keepalive miss budget is fixed per session from the environment at
+ * creation: a bare in-range count is taken, anything else keeps the default
+ * so a typo cannot disable channel-death detection. */
+static void test_feedback_miss_budget_from_env(void)
+{
+    assert(unsetenv("CLIAIRPLAY_FEEDBACK_MISSES") == 0);
+    char name_default[] = "budget default";
+    struct ap2cl_s *client = create_feedback_test_client(name_default);
+    assert(ap2cl_test_feedback_miss_budget(client) == 3);
+    assert(ap2cl_destroy(client));
+
+    assert(setenv("CLIAIRPLAY_FEEDBACK_MISSES", "8", 1) == 0);
+    char name_raised[] = "budget raised";
+    client = create_feedback_test_client(name_raised);
+    assert(ap2cl_test_feedback_miss_budget(client) == 8);
+    assert(ap2cl_destroy(client));
+
+    static const char *const rejected[] = { "0", "31", "abc", "8s", "" };
+    char name_rejected[] = "budget rejected";
+    for (size_t i = 0; i < sizeof(rejected) / sizeof(rejected[0]); i++) {
+        assert(setenv("CLIAIRPLAY_FEEDBACK_MISSES", rejected[i], 1) == 0);
+        client = create_feedback_test_client(name_rejected);
+        assert(ap2cl_test_feedback_miss_budget(client) == 3);
+        assert(ap2cl_destroy(client));
+    }
+    assert(unsetenv("CLIAIRPLAY_FEEDBACK_MISSES") == 0);
+    puts("ap2_client feedback miss budget env tests passed");
+}
+
+/* A budget of one restores single-strike behaviour: the very first missed
+ * beat kills the channel (and still says goodbye), with nothing primed. */
+static void test_feedback_miss_budget_of_one_kills_first_miss(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    feedback_peer_t peer = {
+        .fd = sockets[1],
+    };
+    pthread_t peer_thread;
+    assert(pthread_create(
+               &peer_thread, NULL, run_farewell_teardown_peer, &peer) == 0);
+
+    assert(setenv("CLIAIRPLAY_FEEDBACK_MISSES", "1", 1) == 0);
+    char name_one[] = "budget of one";
+    struct ap2cl_s *client = create_feedback_test_client(name_one);
+    assert(unsetenv("CLIAIRPLAY_FEEDBACK_MISSES") == 0);
+    assert(ap2cl_test_feedback_miss_budget(client) == 1);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+
+    assert(!ap2cl_feedback(client));
+    assert(!ap2cl_control_healthy(client));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client feedback miss budget of one test passed");
 }
 
 typedef struct {
@@ -2249,6 +2330,8 @@ int main(void)
     test_mrp_bundle_and_pause_publish();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
+    test_feedback_miss_budget_from_env();
+    test_feedback_miss_budget_of_one_kills_first_miss();
     test_apple_model_resolution();
     test_pacing_window_rate_scaling();
     test_splice_depth_override_vs_reported_buffer();

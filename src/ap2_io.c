@@ -216,6 +216,22 @@ bool ap2_io_feedback_miss_tolerated(const char *uri, int err,
     return prior_misses + 1 < max_misses;
 }
 
+bool ap2_io_parse_feedback_miss_budget(const char *setting,
+                                       unsigned max_budget,
+                                       unsigned *budget)
+{
+    if (!setting || !*setting || !budget) return false;
+    for (const char *c = setting; *c; c++)
+        if (*c < '0' || *c > '9') return false;
+    /* Bounded by max_budget, so a decimal longer than that can only be an
+     * over-bound value; refuse it before strtoul can wrap. */
+    if (strlen(setting) > 9) return false;
+    unsigned long value = strtoul(setting, NULL, 10);
+    if (value < 1 || value > max_budget) return false;
+    *budget = (unsigned)value;
+    return true;
+}
+
 static size_t ap2_find_header_end(const uint8_t *data, size_t len)
 {
     for (size_t i = 0; i + 3 < len; i++) {

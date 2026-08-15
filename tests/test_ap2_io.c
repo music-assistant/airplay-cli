@@ -80,6 +80,30 @@ static bool test_feedback_miss_policy(void)
     return true;
 }
 
+static bool test_feedback_miss_budget_parser(void)
+{
+    unsigned budget = 3;
+    /* Bare decimals inside the bounds are taken as-is. */
+    CHECK(ap2_io_parse_feedback_miss_budget("1", 30, &budget) && budget == 1);
+    CHECK(ap2_io_parse_feedback_miss_budget("8", 30, &budget) && budget == 8);
+    CHECK(ap2_io_parse_feedback_miss_budget("30", 30, &budget) && budget == 30);
+    /* Everything else is refused and leaves the caller's default alone. */
+    budget = 3;
+    CHECK(!ap2_io_parse_feedback_miss_budget(NULL, 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("0", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("31", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("-1", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("+4", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("4 ", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("4s", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("0x8", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("99999999999999999999", 30, &budget));
+    CHECK(!ap2_io_parse_feedback_miss_budget("5", 30, NULL));
+    CHECK(budget == 3);
+    return true;
+}
+
 static bool test_match_rtsp_response_skips_stale(void)
 {
     static const uint8_t stream[] =
@@ -377,6 +401,8 @@ int main(void)
     fprintf(stderr, "RTSP parser passed\n");
     if (!test_feedback_miss_policy()) return 1;
     fprintf(stderr, "feedback miss policy passed\n");
+    if (!test_feedback_miss_budget_parser()) return 1;
+    fprintf(stderr, "feedback miss budget parser passed\n");
     if (!test_match_rtsp_response_skips_stale()) return 1;
     fprintf(stderr, "stale response matcher passed\n");
     if (!test_read_timeout_is_bounded()) return 1;
