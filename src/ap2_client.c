@@ -23,7 +23,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
-#ifndef __APPLE__
+#ifdef __linux__
 #include <sys/ioctl.h>
 #include <linux/sockios.h>
 #endif
@@ -2627,13 +2627,15 @@ static void ap2_buffered_quiesce_data(struct ap2cl_s *p)
     }
     for (int i = 0; i < 30; i++) {
         int queued = 0;
+#if defined(__APPLE__)
         socklen_t qlen = sizeof(queued);
-#ifdef __APPLE__
         if (getsockopt(p->buffered_sock, SOL_SOCKET, SO_NWRITE, &queued,
                        &qlen) != 0)
             break;
-#else
+#elif defined(__linux__)
         if (ioctl(p->buffered_sock, SIOCOUTQ, &queued) != 0) break;
+#else
+        break;   /* no send-queue introspection here; skip the drain wait */
 #endif
         if (queued <= 0) return;
         usleep(10000);

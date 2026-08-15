@@ -2340,8 +2340,10 @@ int main(int argc, char *argv[])
              (unsigned long long)cfg.route.features,
              (unsigned long long)cfg.route.flags,
              cfg.bit_depth);
-    /* Machine-parseable route report on stdout so the caller (MA) can log and
-     * surface which route this stream actually took. */
+    /* Machine-parseable report of the RESOLVED route on stdout so the caller
+     * (MA) can log and surface it. Connect-time fallbacks (PTP that cannot
+     * bind, buffered without a grandmaster) are warned in the session log;
+     * the line itself reports the decision, like timing= always has. */
     printf("[STATUS] route protocol=%s flow=%s timing=%s buffered=%d\n",
            cfg.route.use_raop ? "raop" : "airplay2",
            cfg.route.use_raop ? "legacy" : (cfg.route.native ? "native" : "raop-compat"),
