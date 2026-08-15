@@ -23,6 +23,10 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#ifndef __APPLE__
+#include <sys/ioctl.h>
+#include <linux/sockios.h>
+#endif
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <arpa/inet.h>
@@ -2193,10 +2197,14 @@ static bool ap2_native_connect(struct ap2cl_s *p)
                                   .tv_usec = (AP2_BUFFERED_WRITE_TIMEOUT_MS % 1000) * 1000};
             setsockopt(p->buffered_sock, SOL_SOCKET, SO_SNDTIMEO, &stv, sizeof(stv));
             setsockopt(p->buffered_sock, SOL_SOCKET, SO_RCVTIMEO, &stv, sizeof(stv));
-            /* A roomy kernel buffer absorbs the pacing window in full, so
-             * steady-state writes return immediately even while the receiver
-             * reads in bursts. */
-            int sndbuf = 1 << 20;
+            /* Keep the kernel send queue SMALL: bytes there are the only old
+             * audio a flush verb cannot recall (they drain out after the
+             * receiver processed the FLUSHBUFFERED, and lazy receivers render
+             * them over the new content). 64 KB still holds ~0.5 s of ALAC —
+             * far more than LAN throughput needs — and bounds the
+             * quiesce-before-flush drain wait; the pending stash absorbs the
+             * extra EAGAIN cycles this causes. */
+            int sndbuf = 64 << 10;
             setsockopt(p->buffered_sock, SOL_SOCKET, SO_SNDBUF, &sndbuf, sizeof(sndbuf));
         }
         if (p->buffered_sock < 0 ||
@@ -2581,10 +2589,53 @@ static bool ap2_buffered_anchor_start(struct ap2cl_s *p, uint64_t ntp_start)
     return true;
 }
 
+/* Quiesce the buffered data channel before a flush verb: a FLUSHBUFFERED
+ * that races our own in-flight audio arrives at the receiver BEFORE those
+ * bytes do, and a receiver that filters its flush against the buffer it
+ * holds at that instant — rather than by untilSeq forever — then renders
+ * the late old packets over the new content (heard as a post-seek blip of
+ * pre-seek audio, per member, so grouped members transiently disagree).
+ * A whole unwritten pending frame is dropped (its content is pre-flush and
+ * already sequence-accounted; the gap sits below untilSeq); a partially
+ * written one MUST complete — truncating it would desync the TCP framing.
+ * Then the kernel send queue is drained (bounded: the send buffer is sized
+ * small) so the flush verb is ordered strictly after all old audio. */
+static int ap2_buffered_flush_pending(struct ap2cl_s *p);
+
+static void ap2_buffered_quiesce_data(struct ap2cl_s *p)
+{
+    if (p->buffered_sock < 0) return;
+    if (p->buffered_pending_len) {
+        if (p->buffered_pending_off == 0) {
+            free(p->buffered_pending);
+            p->buffered_pending = NULL;
+            p->buffered_pending_len = p->buffered_pending_off = 0;
+        } else {
+            for (int i = 0; i < 30 && ap2_buffered_flush_pending(p) == 0; i++)
+                usleep(10000);
+        }
+    }
+    for (int i = 0; i < 30; i++) {
+        int queued = 0;
+        socklen_t qlen = sizeof(queued);
+#ifdef __APPLE__
+        if (getsockopt(p->buffered_sock, SOL_SOCKET, SO_NWRITE, &queued,
+                       &qlen) != 0)
+            break;
+#else
+        if (ioctl(p->buffered_sock, SIOCOUTQ, &queued) != 0) break;
+#endif
+        if (queued <= 0) return;
+        usleep(10000);
+    }
+    LOG_WARN("[AP2] buffered data channel not fully drained before flush");
+}
+
 /* Discard buffered audio on stop/flush. flushUntilSeq/TS mark the end of the
  * range to drop; the receiver stops rendering and clears its buffer. */
 static bool ap2_send_flushbuffered(struct ap2cl_s *p)
 {
+    ap2_buffered_quiesce_data(p);
     ap2_pl_node *root = ap2_pl_dict();
     ap2_pl_dict_set(root, "flushUntilSeq", ap2_pl_int((int64_t)p->seq_number));
     ap2_pl_dict_set(root, "flushUntilTS", ap2_pl_int((int64_t)p->rtp_timestamp));
