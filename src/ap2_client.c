@@ -143,6 +143,11 @@ extern log_level *loglevel;
  * an expired write parks the unwritten tail in buffered_pending and the
  * pacing gate holds new frames until the receiver drains it. */
 #define AP2_BUFFERED_WRITE_TIMEOUT_MS 2000
+
+/* Wire-RTP gap left between the last delivered buffered packet and the first
+ * packet of a re-anchored timeline, so the FLUSHBUFFERED cut point can never
+ * touch the new region. */
+#define AP2_BUFFERED_RTP_GAP_MS 100
 /* Raw bytes kept from a failed exchange for the auth diagnostics dump: enough
  * for a full header block plus the start of a TLV/plist body. */
 #define AP2_DIAG_RESPONSE_MAX        1536
@@ -3175,6 +3180,9 @@ bool ap2cl_connect(struct ap2cl_s *p)
         if (p->splice_timeline) {
             LOG_INFO("[AP2] splice timeline (discard-free warm path, "
                      "%u ms queue depth)", ap2_splice_depth_ms(p));
+        } else if (p->buffered_requested) {
+            LOG_INFO("[AP2] buffered timeline (FLUSHBUFFERED + re-anchor "
+                     "warm path)");
         } else {
             LOG_INFO("[AP2] deny-listed receiver: classic flush + re-anchor "
                      "warm path");
@@ -3776,7 +3784,25 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
      * wire timestamp follows it plus the per-process offset, and the next
      * sync packet freezes the new line from start_ntp. */
     p->start_ntp = start_ntp;
+    uint32_t prev_rtp = p->rtp_timestamp;   /* wire head before the re-base */
     p->head_ts = NTP2TS(start_ntp, p->format.sample_rate);
+    if (p->use_buffered && p->audio_packets_sent) {
+        /* Buffered wire timestamps CONTINUE monotonically across a re-anchor
+         * (Apple senders and owntone never re-base): a wall-derived value
+         * would land the new region inside the already-delivered rtp range —
+         * the resume lead is shorter than the delivery window — making the
+         * FLUSHBUFFERED cut point ambiguous, and receivers then replay the
+         * old tail over the new content or drop the new head (both audible
+         * at every seek). The divergence folds into the per-process offset,
+         * so rtp = head + offset keeps holding everywhere. */
+        uint32_t wall_rtp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
+        uint32_t cont_rtp = prev_rtp +
+            (uint32_t)MS2TS(AP2_BUFFERED_RTP_GAP_MS, p->format.sample_rate);
+        int32_t ahead = (int32_t)(cont_rtp - wall_rtp);
+        if (ahead > 0)
+            atomic_store(&p->rtp_offset,
+                         atomic_load(&p->rtp_offset) + (uint32_t)ahead);
+    }
     p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
     p->reanchor_shifted_frames = 0;
     p->rt_anchor_valid = false;
@@ -4403,11 +4429,25 @@ void ap2cl_play(struct ap2cl_s *p)
         }
     }
     /* Buffered: resume the frozen timeline with a rate-1 anchor one lead
-     * ahead, mapping the current RTP head to that instant. */
+     * ahead, mapping the current RTP head to that instant. The wire rtp
+     * continues monotonically past everything already delivered (see
+     * ap2cl_resume) so the paused buffer's range stays unambiguous. */
     if (p->use_buffered && p->buffered_sock >= 0) {
         uint64_t resume_ntp = raopcl_get_ntp(NULL) +
                               MS2NTP(AP2_MIN_WARM_LEAD_MS);
+        uint32_t prev_rtp = p->rtp_timestamp;
         p->head_ts = NTP2TS(resume_ntp, p->format.sample_rate);
+        if (p->audio_packets_sent) {
+            uint32_t wall_rtp =
+                (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
+            uint32_t cont_rtp = prev_rtp +
+                (uint32_t)MS2TS(AP2_BUFFERED_RTP_GAP_MS,
+                                p->format.sample_rate);
+            int32_t ahead = (int32_t)(cont_rtp - wall_rtp);
+            if (ahead > 0)
+                atomic_store(&p->rtp_offset,
+                             atomic_load(&p->rtp_offset) + (uint32_t)ahead);
+        }
         p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
         ap2_buffered_anchor_start(p, resume_ntp);
     }
