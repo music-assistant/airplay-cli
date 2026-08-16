@@ -2078,8 +2078,17 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     if (!p->use_buffered)
         ap2_plist_stream_add_int(ssp, "dataPort", local_data_port);
     ap2_plist_stream_add_bool(ssp, "isMedia", true);
-    ap2_plist_stream_add_int(ssp, "latencyMax", 88200);
-    ap2_plist_stream_add_int(ssp, "latencyMin", 11025);
+    /* latencyMin/latencyMax are realtime-stream fields (the receiver's
+     * buffering window for a live RTP feed). On the buffered stream the
+     * receiver owns its buffer and playback is scheduled by the anchor
+     * alone — and a receiver handed these fields applies them as an extra
+     * render delay on top of the anchor (Sonos: latencyMax = a constant
+     * 2 s lag against every realtime group member, ear-measured). Real
+     * Apple buffered senders do not send them. */
+    if (!p->use_buffered) {
+        ap2_plist_stream_add_int(ssp, "latencyMax", 88200);
+        ap2_plist_stream_add_int(ssp, "latencyMin", 11025);
+    }
     ap2_plist_stream_add_data(ssp, "shk", p->audio_key, 32);
     ap2_plist_stream_add_int(ssp, "spf", 352);
     ap2_plist_stream_add_int(ssp, "sr", p->format.sample_rate);

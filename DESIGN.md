@@ -837,6 +837,13 @@ receiver has ingested 75 s ≈ 10 MB at line speed; a cold-clock one prefetches
 a few seconds until its servo trusts the timeline). Two sender rules follow,
 both learned the hard way:
 
+- **No realtime latency fields in the SETUP.** `latencyMin`/`latencyMax`
+  describe a live feed's buffering window and belong to the realtime stream
+  only; a buffered receiver handed them applies `latencyMax` as an extra
+  render delay on top of the anchor (Sonos: a constant 2 s lag against every
+  realtime member of a mixed group, ear-measured — invisible in homogeneous
+  buffered groups, where the shared constant cancels). Apple buffered
+  senders omit them.
 - **Read-throttling is not a fault.** The unwritten tail of a frame parks in
   a pending stash and the pacing gate holds new frames until it drains; a
   send deadline must never kill the session (the removed v0.2.0
