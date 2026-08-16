@@ -2083,8 +2083,8 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * receiver owns its buffer and playback is scheduled by the anchor
      * alone — and a receiver handed these fields applies them as an extra
      * render delay on top of the anchor (Sonos: latencyMax = a constant
-     * 2 s lag against every realtime group member, ear-measured). Real
-     * Apple buffered senders do not send them. */
+     * 2 s lag against every realtime group member, ear-measured).
+     * Apple's own buffered senders omit them. */
     if (!p->use_buffered) {
         ap2_plist_stream_add_int(ssp, "latencyMax", 88200);
         ap2_plist_stream_add_int(ssp, "latencyMin", 11025);

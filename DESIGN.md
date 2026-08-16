@@ -837,7 +837,7 @@ receiver has ingested 75 s ≈ 10 MB at line speed; a cold-clock one prefetches
 a few seconds until its servo trusts the timeline). Two sender rules follow,
 both learned the hard way:
 
-- **No realtime latency fields in the SETUP.** `latencyMin`/`latencyMax`
+- **No realtime latency fields in the type-103 SETUP.** `latencyMin`/`latencyMax`
   describe a live feed's buffering window and belong to the realtime stream
   only; a buffered receiver handed them applies `latencyMax` as an extra
   render delay on top of the anchor (Sonos: a constant 2 s lag against every
