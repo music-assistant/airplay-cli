@@ -179,6 +179,11 @@ static void status_connected(void)
 static struct ap2_session_s *g_session = NULL;
 static pthread_mutex_t g_audio_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_first_start_done = false;
+/* A SENDMETA already delivered real track metadata (the command thread only
+ * runs with the transport connected, so the send reached the receiver): the
+ * placeholder re-send at the first START is then a byte-identical replace
+ * burst, not a gate-opener (see session_commit). */
+static bool g_real_metadata_sent = false;
 static uint64_t g_pend_start_unix_ms = 0;
 static bool g_pend_start_join = false;
 
@@ -848,6 +853,14 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
              * the verification can resolve — and emit — before this line. */
             if (!g_start_ack_withheld)
                 status_started(g_pend_start_unix_ms, at_ms);
+            /* The commit flipped the derived state to PLAYING; on a cold
+             * start every metadata push may have gone out before this, all
+             * carrying rate 0 — without a publish here the receiver keeps
+             * extrapolating a frozen progress bar. Published even with the
+             * ack withheld (the start is committed either way), and outside
+             * the send lock like the PAUSE announce below. */
+            if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl)
+                ap2cl_mrp_publish_playback_state(g_ap2cl);
         } else {
             /* No instant was scheduled, so the caller must not map content
              * onto one. Coded so it can abort its pending ack wait at once
@@ -965,6 +978,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         if (stopped_ap2) ap2cl_mrp_publish_playback_state(g_ap2cl);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "SENDMETA") == 0) {
         send_track_metadata(cfg, metadata_str(g_metadata.title));
+        g_real_metadata_sent = true;
     }
 }
 
@@ -1026,8 +1040,12 @@ static ap2_commit_result_t session_commit(void *transport,
         g_start_ack_at_ms = at_unix_ms ? *at_unix_ms : start_unix_ms;
     }
 
-    /* Metadata-gated receivers must receive a placeholder before audio. */
-    if (!g_first_start_done) send_initial_metadata(cfg);
+    /* Metadata-gated receivers must receive a placeholder before audio. Real
+     * metadata delivered by a pre-START SENDMETA already opened that gate,
+     * and re-sending the same bundle here is the replace burst that degrades
+     * the Apple TV now-playing view (DESIGN.md §8). */
+    if (!g_first_start_done && !g_real_metadata_sent)
+        send_initial_metadata(cfg);
     g_first_start_done = true;
     g_status = STATUS_PLAYING;
     return AP2_COMMIT_OK;

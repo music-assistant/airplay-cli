@@ -1620,7 +1620,14 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
     mrp_replace_str(&m->artist, artist);
     mrp_replace_str(&m->album, album);
     mrp_replace_str(&m->item_id, item_id);
-    m->duration_ms = duration_ms > 0 ? duration_ms : 0;
+    /* A duration-less update of the same item keeps the known total: the
+     * timeline "update" push never re-supplies Duration, so zeroing it here
+     * would strip the total from every later replace push. A new item with
+     * unknown duration must not inherit the previous track's length. */
+    if (duration_ms > 0)
+        m->duration_ms = duration_ms;
+    else if (track_changed)
+        m->duration_ms = 0;
     if (track_changed || m->np_uid == 0) {
         uint64_t uid = 0;
         RAND_bytes((uint8_t *)&uid, sizeof(uid));

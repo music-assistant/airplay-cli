@@ -263,6 +263,17 @@ struct ap2cl_s {
     bool mrp_progress_push_full;  /* receiver rejected the "update" policy;
                                      timeline pushes use the full replace */
     int mrp_last_playback_state;
+    /* Identity of the last metadata bundle that fully delivered (DMAP, and
+     * the MRP push where active): a byte-identical repeat is skipped end to
+     * end, mirroring the artwork "unchanged" no-op — every redundant replace
+     * push re-renders the Apple TV Now Playing view. A failed delivery
+     * clears the flag so the retry goes out; disconnect clears the lot. */
+    char *meta_title;
+    char *meta_artist;
+    char *meta_album;
+    char *meta_item_id;
+    int meta_duration;
+    bool meta_delivered;
     ap2_remote_command_cb_t remote_command_cb;
     void *remote_command_userdata;
     int data_sock;                /* UDP audio */
@@ -3116,6 +3127,39 @@ static void ap2_raop_session_cleanup(struct ap2cl_s *p)
     }
 }
 
+/* NULL and "" compare equal, matching mrp_str_eq: the pipe cannot tell an
+ * unset field from an empty one. */
+static bool ap2_meta_str_eq(const char *a, const char *b)
+{
+    return strcmp(a ? a : "", b ? b : "") == 0;
+}
+
+static void ap2_meta_delivered_reset(struct ap2cl_s *p)
+{
+    free(p->meta_title); p->meta_title = NULL;
+    free(p->meta_artist); p->meta_artist = NULL;
+    free(p->meta_album); p->meta_album = NULL;
+    free(p->meta_item_id); p->meta_item_id = NULL;
+    p->meta_duration = 0;
+    p->meta_delivered = false;
+}
+
+static void ap2_meta_delivered_store(struct ap2cl_s *p, const char *title,
+                                     const char *artist, const char *album,
+                                     int duration, const char *item_id)
+{
+    ap2_meta_delivered_reset(p);
+    p->meta_title = strdup(title ? title : "");
+    p->meta_artist = strdup(artist ? artist : "");
+    p->meta_album = strdup(album ? album : "");
+    p->meta_item_id = strdup(item_id ? item_id : "");
+    p->meta_duration = duration;
+    /* A failed strdup leaves the identity partial; not marking it delivered
+     * keeps a false skip impossible. */
+    p->meta_delivered = p->meta_title && p->meta_artist && p->meta_album &&
+                        p->meta_item_id;
+}
+
 bool ap2cl_destroy(struct ap2cl_s *p)
 {
     if (!p) return false;
@@ -3150,6 +3194,8 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
     free(p->secret); free(p->password); free(p->et); free(p->md); free(p->am);
     free(p->auth_credentials);
+    free(p->meta_title); free(p->meta_artist); free(p->meta_album);
+    free(p->meta_item_id);
     free(p);
     return true;
 }
@@ -3354,6 +3400,11 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     } else if (p->raopcl) {
         raopcl_disconnect(p->raopcl);
     }
+    /* The receiver's now-playing state died with the connection: nothing is
+     * "already delivered" for the byte-identical metadata skip any more. */
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    ap2_meta_delivered_reset(p);
+    pthread_mutex_unlock(&p->mrp_publish_lock);
     p->state = AP2_DOWN;
     return true;
 }
@@ -5157,6 +5208,25 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
     pthread_mutex_unlock(&p->mrp_lock);
     if (track_changed_out) *track_changed_out = track_changed;
 
+    /* Byte-identical bundle: the receiver already holds exactly this state,
+     * so the DMAP re-send is redundant and the MRP replace push only
+     * re-renders the Apple TV Now Playing view — the metadata counterpart of
+     * the artwork "unchanged" no-op. A stable item id alone is NOT identical
+     * (the same id can carry refined tags, which must deliver), so every
+     * field is compared. Only a fully delivered previous bundle is
+     * skippable, and artwork riding along must itself be unchanged — without
+     * MRP to judge the bytes, the push goes out. */
+    if (p->meta_delivered && p->meta_duration == duration &&
+        ap2_meta_str_eq(p->meta_title, title) &&
+        ap2_meta_str_eq(p->meta_artist, artist) &&
+        ap2_meta_str_eq(p->meta_album, album) &&
+        ap2_meta_str_eq(p->meta_item_id, item_id) &&
+        (!have_art || (have_mrp &&
+                       mrp_info->result == AP2_MRP_ARTWORK_UNCHANGED))) {
+        pthread_mutex_unlock(&p->mrp_publish_lock);
+        return true;
+    }
+
     bool dmap_ok;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0)
         dmap_ok = ap2_native_send_metadata(p, title, artist, album);
@@ -5174,6 +5244,7 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                      mrp_info->result != AP2_MRP_ARTWORK_UNCHANGED))
         ap2_send_dmap_artwork(p, content_type, art_len,
                               (const char *)art_data);
+    bool delivered = dmap_ok;
     if (have_mrp) {
         /* One full replace push carries item + timeline + artwork together —
          * the real Apple sender shape. Splitting it (a replace without art,
@@ -5181,7 +5252,12 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
          * its Now Playing view on every track change. */
         ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
         if (mrp_push) *mrp_push = result;
+        delivered = delivered && ap2_mrp_status_ok(result.overall_status);
     }
+    if (delivered)
+        ap2_meta_delivered_store(p, title, artist, album, duration, item_id);
+    else
+        p->meta_delivered = false;
     pthread_mutex_unlock(&p->mrp_publish_lock);
     return dmap_ok;
 }

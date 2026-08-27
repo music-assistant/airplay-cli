@@ -44,6 +44,17 @@ static bool bytes_contain_string(const uint8_t *data, size_t data_len,
     return bytes_contain(data, data_len, needle, strlen(needle));
 }
 
+/* A bplist real object: marker 0x23 then the big-endian IEEE-754 double. */
+static bool bplist_contains_real(const uint8_t *data, size_t len, double value)
+{
+    uint8_t needle[9] = {0x23};
+    uint64_t bits;
+    memcpy(&bits, &value, sizeof(bits));
+    for (int i = 0; i < 8; i++)
+        needle[1 + i] = (uint8_t)(bits >> (56 - 8 * i));
+    return bytes_contain(data, len, needle, sizeof(needle));
+}
+
 static size_t jpeg_marker_offset(const uint8_t *data, size_t len,
                                  uint8_t marker)
 {
@@ -591,6 +602,62 @@ static bool test_set_track_bundle(void)
     return true;
 }
 
+/* A duration-less bundle for the same item keeps the known total (the
+ * timeline "update" push never re-supplies Duration, so a zero would strip
+ * the receiver's total on the next replace push); a new item with unknown
+ * duration must not inherit the previous track's length. */
+static bool test_set_track_duration_keep(void)
+{
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "Test sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL);
+    CHECK(mrp != NULL);
+
+    ap2_mrp_artwork_info_t info;
+    bool track_changed = false;
+    CHECK(ap2_mrp_set_track(mrp, "Track One", "Artist", "Album", 180000,
+                            "item-1", NULL, NULL, 0, &track_changed, &info));
+    uint8_t *body = NULL;
+    int body_len = 0;
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &body, &body_len));
+    CHECK(bplist_contains_real(body, (size_t)body_len, 180.0));
+    free(body);
+
+    /* Tag refinement without a total (DURATION=0): the same item keeps its
+     * known duration. */
+    CHECK(ap2_mrp_set_track(mrp, "Track One (remastered)", "Artist", "Album",
+                            0, "item-1", NULL, NULL, 0, &track_changed,
+                            &info));
+    CHECK(!track_changed);
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &body, &body_len));
+    CHECK(bytes_contain_string(body, (size_t)body_len,
+                               "kMRMediaRemoteNowPlayingInfoDuration"));
+    CHECK(bplist_contains_real(body, (size_t)body_len, 180.0));
+    free(body);
+
+    /* A track change with unknown duration: no Duration key, not 180s. */
+    CHECK(ap2_mrp_set_track(mrp, "Track Two", "Artist", "Album", 0, "item-2",
+                            NULL, NULL, 0, &track_changed, &info));
+    CHECK(track_changed);
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &body, &body_len));
+    CHECK(!bytes_contain_string(body, (size_t)body_len,
+                                "kMRMediaRemoteNowPlayingInfoDuration"));
+    free(body);
+
+    /* The settled total for the new item lands normally. */
+    CHECK(ap2_mrp_set_track(mrp, "Track Two", "Artist", "Album", 200000,
+                            "item-2", NULL, NULL, 0, &track_changed, &info));
+    CHECK(!track_changed);
+    CHECK(ap2_mrp_build_nowplaying_command(mrp, &body, &body_len));
+    CHECK(bplist_contains_real(body, (size_t)body_len, 200.0));
+    free(body);
+
+    ap2_mrp_destroy(mrp);
+    puts("MRP set_track duration keep tests passed");
+    return true;
+}
+
 typedef struct {
     ap2_mrp_serial_t serial;
     atomic_int active;
@@ -664,6 +731,7 @@ int main(int argc, char **argv)
         !test_decoder_valid_profile_fixtures() ||
         !test_nowplaying_command_payload() ||
         !test_set_track_bundle() ||
+        !test_set_track_duration_keep() ||
         !test_push_result_scope())
         return 1;
     for (int i = 1; i < argc; i++) {

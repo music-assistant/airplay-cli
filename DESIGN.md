@@ -724,7 +724,10 @@ three times within ~100 ms of every track change; observed on tvOS, that
 burst left the Now Playing view degraded (progress bar gone, artwork not
 re-rendered) until the app was re-entered. The DMAP `SET_PARAMETER` copy is
 still re-sent on every identity change, byte-identical or not, since
-Sonos-class receivers consume only that path.
+Sonos-class receivers consume only that path. A fully byte-identical bundle —
+every metadata field and the artwork bytes unchanged since a delivered push —
+is skipped end to end on both paths: the receiver already holds exactly that
+state, and each redundant replace push re-renders its Now Playing view.
 
 The complete registration/now-playing/extended-state sequence is serialized;
 its return value carries request-scoped overall and `updateMRNowPlayingInfo`
@@ -1028,7 +1031,10 @@ deny-list entry, not a policy retreat.
 - **Initial metadata** — pushed at the first START with a placeholder title if the
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
-  without it).
+  without it). A `SENDMETA` processed before the first START already delivered
+  real metadata — the command thread only runs with the transport connected —
+  so the placeholder push is skipped then, rather than re-sending the same
+  bundle as a byte-identical replace burst (§8).
 - **Apple MediaRemote metadata** — pair-verified native sessions register a
   DEVICE_INFO origin, then send `updateMRNowPlayingInfo` followed by supported
   commands, explicit playback state, and a serialized NowPlayingClient.
