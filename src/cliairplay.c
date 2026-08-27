@@ -179,6 +179,11 @@ static void status_connected(void)
 static struct ap2_session_s *g_session = NULL;
 static pthread_mutex_t g_audio_send_lock = PTHREAD_MUTEX_INITIALIZER;
 static bool g_first_start_done = false;
+/* A SENDMETA delivered real track metadata (latched only on a send that
+ * reached the receiver, so a failed pre-START push keeps the first-START
+ * re-send as its retry): the placeholder re-send at the first START is then
+ * a byte-identical replace burst, not a gate-opener (see session_commit). */
+static bool g_real_metadata_sent = false;
 static uint64_t g_pend_start_unix_ms = 0;
 static bool g_pend_start_join = false;
 
@@ -652,9 +657,12 @@ static char *metadata_take_artwork_file(void)
 /* Push the current metadata — and any staged artwork file — as one track
  * bundle. On AP2 this reaches the receiver as a single now-playing replace
  * push carrying item + timeline + artwork (the real Apple sender shape);
- * split pushes make tvOS re-render its Now Playing UI on every track change. */
-static void send_track_metadata(const cli_config_t *cfg, const char *title)
+ * split pushes make tvOS re-render its Now Playing UI on every track change.
+ * Returns whether the metadata text bundle reached the receiver (artwork
+ * delivery does not gate it). */
+static bool send_track_metadata(const cli_config_t *cfg, const char *title)
 {
+    bool delivered = false;
     char *artwork_file = metadata_take_artwork_file();
     uint8_t *image = NULL;
     size_t image_size = 0;
@@ -674,10 +682,10 @@ static void send_track_metadata(const cli_config_t *cfg, const char *title)
         }
     }
     if (cfg->protocol == PROTO_RAOP && g_raopcl) {
-        raopcl_set_daap(g_raopcl, 4, "minm", 's', title,
-                        "asar", 's', metadata_str(g_metadata.artist),
-                        "asal", 's', metadata_str(g_metadata.album),
-                        "astn", 'i', 1);
+        delivered = raopcl_set_daap(g_raopcl, 4, "minm", 's', title,
+                                    "asar", 's', metadata_str(g_metadata.artist),
+                                    "asal", 's', metadata_str(g_metadata.album),
+                                    "astn", 'i', 1);
         if (image)
             raopcl_set_artwork(g_raopcl, content_type, (int)image_size,
                                (char *)image);
@@ -685,13 +693,11 @@ static void send_track_metadata(const cli_config_t *cfg, const char *title)
         ap2_mrp_artwork_info_t mrp_info;
         ap2_mrp_push_result_t push;
         bool track_changed = false;
-        ap2cl_set_metadata_ex(g_ap2cl, title, metadata_str(g_metadata.artist),
-                              metadata_str(g_metadata.album),
-                              g_metadata.duration,
-                              metadata_str(g_metadata.item_id),
-                              image ? content_type : NULL, image,
-                              (int)image_size, &track_changed, &mrp_info,
-                              &push);
+        delivered = ap2cl_set_metadata_ex(
+            g_ap2cl, title, metadata_str(g_metadata.artist),
+            metadata_str(g_metadata.album), g_metadata.duration,
+            metadata_str(g_metadata.item_id), image ? content_type : NULL,
+            image, (int)image_size, &track_changed, &mrp_info, &push);
         if (artwork_failed && track_changed && push.overall_status >= 0) {
             /* The track changed, so the retained art was dropped and the
              * bundle push above already went out without artwork: no
@@ -708,6 +714,7 @@ static void send_track_metadata(const cli_config_t *cfg, const char *title)
     }
     free(image);
     free(artwork_file);
+    return delivered;
 }
 
 /* ACTION=ANNOUNCE: arm the staged clip for mixing at the commanded instant.
@@ -848,6 +855,16 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
              * the verification can resolve — and emit — before this line. */
             if (!g_start_ack_withheld)
                 status_started(g_pend_start_unix_ms, at_ms);
+            /* The commit flipped the derived state to PLAYING; on a cold
+             * start every metadata push may have gone out before this, all
+             * carrying rate 0 — without a publish here the receiver keeps
+             * extrapolating a frozen progress bar. Transition-gated so the
+             * warm seek STARTs (state already PLAYING) add no wire traffic.
+             * Published even with the ack withheld (the start is committed
+             * either way), and outside the send lock like the PAUSE announce
+             * below. */
+            if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl)
+                ap2cl_mrp_publish_playback_state_on_transition(g_ap2cl);
         } else {
             /* No instant was scheduled, so the caller must not map content
              * onto one. Coded so it can abort its pending ack wait at once
@@ -964,7 +981,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         /* Blocking announce outside the send lock (see PAUSE above). */
         if (stopped_ap2) ap2cl_mrp_publish_playback_state(g_ap2cl);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "SENDMETA") == 0) {
-        send_track_metadata(cfg, metadata_str(g_metadata.title));
+        if (send_track_metadata(cfg, metadata_str(g_metadata.title)))
+            g_real_metadata_sent = true;
     }
 }
 
@@ -1026,8 +1044,12 @@ static ap2_commit_result_t session_commit(void *transport,
         g_start_ack_at_ms = at_unix_ms ? *at_unix_ms : start_unix_ms;
     }
 
-    /* Metadata-gated receivers must receive a placeholder before audio. */
-    if (!g_first_start_done) send_initial_metadata(cfg);
+    /* Metadata-gated receivers must receive a placeholder before audio. Real
+     * metadata delivered by a pre-START SENDMETA already opened that gate,
+     * and re-sending the same bundle here is the replace burst that degrades
+     * the Apple TV now-playing view (DESIGN.md §8). */
+    if (!g_first_start_done && !g_real_metadata_sent)
+        send_initial_metadata(cfg);
     g_first_start_done = true;
     g_status = STATUS_PLAYING;
     return AP2_COMMIT_OK;

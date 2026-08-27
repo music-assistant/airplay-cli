@@ -390,6 +390,13 @@ void ap2cl_stop(struct ap2cl_s *p);
  * only; a no-op otherwise. */
 void ap2cl_mrp_publish_playback_state(struct ap2cl_s *p);
 
+/* As above, but only when the derived state differs from the last one sent.
+ * The START commit needs the announce on a real transition (cold start,
+ * standby wake) while a warm seek re-anchors with the state unchanged, where
+ * a forced re-assert would add a state POST — and on receivers demoted to
+ * full replace pushes, a now-playing re-render — per seek. */
+void ap2cl_mrp_publish_playback_state_on_transition(struct ap2cl_s *p);
+
 /* Session keepalive: POST /feedback over the encrypted RTSP channel, as real
  * Apple senders do every ~2 s (long sessions can otherwise hit receiver-side
  * idle timeouts). Native AP2 flow only; a no-op returning false otherwise.
@@ -411,6 +418,9 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
  * drops retained MRP artwork when the track changed. track_changed_out
  * (optional) receives whether the item identity changed; mrp_info and
  * mrp_push receive the request-scoped artwork verdict and push statuses.
+ * Returns whether the whole bundle was delivered (DMAP, and the MRP push
+ * where active) — a fully byte-identical bundle after a delivered one is
+ * skipped and reported as delivered.
  */
 bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                            const char *artist, const char *album,

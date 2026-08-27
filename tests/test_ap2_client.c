@@ -1510,6 +1510,115 @@ static void test_mrp_bundle_and_pause_publish(void)
     puts("ap2_client MRP bundle and pause publication tests passed");
 }
 
+/* A byte-identical metadata bundle (fields and artwork alike) after a fully
+ * delivered one is skipped end to end — no DMAP re-send, no MRP replace push
+ * (each redundant replace re-renders the Apple TV Now Playing view). A
+ * refined field on the same item (a duration settling in) still delivers. */
+static void test_mrp_identical_metadata_skip(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    peer->expected_requests = 9;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "mrp identical skip test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_splice(client, true);
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
+    ap2cl_test_set_first_packet(client, false);
+    ap2cl_test_set_anchor_valid(client, true);
+
+    /* The test bypasses pairing, so hand the client a ready MRP context; the
+     * client owns it from here (ap2cl_destroy frees it). */
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "skip sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL);
+    assert(mrp);
+    ap2cl_test_set_mrp(client, mrp);
+
+    /* Delivered bundle: DMAP metadata + artwork, registration, one replace
+     * push chained with the extended registration (requests 1-7). */
+    ap2_mrp_artwork_info_t info;
+    ap2_mrp_push_result_t push;
+    bool track_changed = false;
+    assert(ap2cl_set_metadata_ex(client, "Track One", "Artist", "Album", 180,
+                                 "item-1", "image/jpeg", k_baseline_jpeg,
+                                 (int)sizeof(k_baseline_jpeg), &track_changed,
+                                 &info, &push));
+    assert(track_changed);
+    assert(info.result == AP2_MRP_ARTWORK_ACCEPTED);
+    assert(push.overall_status == 200);
+
+    /* Byte-identical repeat: reported success without any wire traffic. */
+    assert(ap2cl_set_metadata_ex(client, "Track One", "Artist", "Album", 180,
+                                 "item-1", "image/jpeg", k_baseline_jpeg,
+                                 (int)sizeof(k_baseline_jpeg), &track_changed,
+                                 &info, &push));
+    assert(!track_changed);
+    assert(info.result == AP2_MRP_ARTWORK_UNCHANGED);
+    assert(push.overall_status == -1);
+
+    /* A refined duration on the same item is NOT identical: the DMAP copy
+     * and one replace push go out (requests 8-9; the chained state send
+     * dedupes on the unchanged Playing state, and the unchanged image stays
+     * off the DMAP path). */
+    assert(ap2cl_set_metadata_ex(client, "Track One", "Artist", "Album", 200,
+                                 "item-1", "image/jpeg", k_baseline_jpeg,
+                                 (int)sizeof(k_baseline_jpeg), &track_changed,
+                                 &info, &push));
+    assert(!track_changed);
+    assert(push.overall_status == 200);
+
+    /* Identical again, this time without artwork riding along: skipped. */
+    assert(ap2cl_set_metadata_ex(client, "Track One", "Artist", "Album", 200,
+                                 "item-1", NULL, NULL, 0, &track_changed,
+                                 &info, &push));
+    assert(push.overall_status == -1);
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok);
+    assert(peer->request_count == 9);
+
+    /* Requests 8-9 are the refined bundle: nothing rode the wire between the
+     * first bundle's chained registration and it. */
+    assert(strcmp(peer->requests[7].method, "SET_PARAMETER") == 0);
+    assert(request_has(&peer->requests[7], "mlit"));
+    assert(request_has(&peer->requests[8], "updateMRNowPlayingInfo"));
+    assert(request_has(&peer->requests[8], "replace"));
+    int nowplaying_posts = 0;
+    for (int i = 0; i < peer->request_count; i++) {
+        if (request_has(&peer->requests[i], "updateMRNowPlayingInfo"))
+            nowplaying_posts++;
+    }
+    assert(nowplaying_posts == 2);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    puts("ap2_client identical metadata skip tests passed");
+}
+
 /* An explicit --protocol airplay2 reaches the native flow on exactly the same
  * terms as auto, so an AirPlay-2-only receiver (no _raop service to fall back
  * on) is not routed into a RAOP-compatible flow it cannot answer. Only a real
@@ -2311,6 +2420,7 @@ int main(void)
     test_splice_pause_keeps_line_hot();
     test_stock_pause_resume_reanchors();
     test_mrp_bundle_and_pause_publish();
+    test_mrp_identical_metadata_skip();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();
