@@ -3651,8 +3651,10 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
  * parks members through standby), and a line kept hot makes the next resume
  * a splice instead of a fresh anchor. The stock path discards buffered audio
  * with an RTSP FLUSH and drops back to CONNECTED so a later warm flush can
- * restart. Both publish the stopped playback state; the session engine's
- * idle timeout still ends a park that nothing ever resumes. */
+ * restart. The stopped playback state is left for the caller to publish
+ * (ap2cl_mrp_publish_playback_state) once the audio send path is released;
+ * the session engine's idle timeout still ends a park that nothing ever
+ * resumes. */
 void ap2cl_standby(struct ap2cl_s *p)
 {
     if (!p || p->state == AP2_DOWN) return;
@@ -3675,7 +3677,6 @@ void ap2cl_standby(struct ap2cl_s *p)
         LOG_INFO("[AP2] splice standby: content stopped, keeping the line fed");
         p->content_stopped = true;
         p->splice_pad_frames = 0;
-        ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
         return;
     }
     if (!atomic_load(&p->rtsp_dead)) {
@@ -3700,7 +3701,6 @@ void ap2cl_standby(struct ap2cl_s *p)
             LOG_INFO("[AP2] standby FLUSH -> %d", status);
         }
     }
-    ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
     p->rt_anchor_valid = false;
     p->state = AP2_CONNECTED;
 }
@@ -4437,7 +4437,6 @@ void ap2cl_pause(struct ap2cl_s *p)
          * and the immutable anchor survives by construction. content_paused
          * keeps the published now-playing state truthful meanwhile. */
         p->content_paused = true;
-        ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_PAUSED, true);
         return;
     }
     /* Buffered: freeze the timeline in place with a rate-0 anchor; the
@@ -4448,7 +4447,6 @@ void ap2cl_pause(struct ap2cl_s *p)
     /* Stock timeline: park the stream; resume re-anchors a fresh line. */
     p->rt_anchor_valid = false;
     p->state = AP2_PAUSED;
-    ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_PAUSED, true);
 }
 
 /* Freeze a fresh anchor line one minimum lead ahead of now — the clean
@@ -4557,7 +4555,6 @@ void ap2cl_play(struct ap2cl_s *p)
         }
     }
     p->state = AP2_STREAMING;
-    ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_PLAYING, true);
 }
 
 void ap2cl_stop(struct ap2cl_s *p)
@@ -4574,7 +4571,6 @@ void ap2cl_stop(struct ap2cl_s *p)
     if (p->use_buffered && p->buffered_sock >= 0 &&
         !atomic_load(&p->rtsp_dead))
         ap2_send_flushbuffered(p);
-    ap2_mrp_publish_playback(p, AP2_MRP_PLAYBACK_STOPPED, true);
     p->rt_anchor_valid = false;
     p->state = AP2_DOWN;
 }
@@ -5001,6 +4997,12 @@ ap2_mrp_push_result_t ap2cl_mrp_push_ex(struct ap2cl_s *p)
 int ap2cl_mrp_push(struct ap2cl_s *p)
 {
     return ap2cl_mrp_push_ex(p).overall_status;
+}
+
+void ap2cl_mrp_publish_playback_state(struct ap2cl_s *p)
+{
+    if (!p) return;
+    ap2_mrp_publish_playback(p, ap2_mrp_current_playback_state(p), true);
 }
 
 /* Timeline (mergePolicy "update") push for callers already holding

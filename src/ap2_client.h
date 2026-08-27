@@ -231,8 +231,8 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
 /* Park the stream but keep the session warm: the splice timeline stops the
  * content while the armed line keeps carrying silence (an underrun while
  * armed is an audible noise trigger); the stock path discards buffered audio
- * and drops to CONNECTED awaiting the next warm flush. Both publish the
- * stopped playback state. */
+ * and drops to CONNECTED awaiting the next warm flush. The caller publishes
+ * the stopped playback state afterwards (ap2cl_mrp_publish_playback_state). */
 void ap2cl_standby(struct ap2cl_s *p);
 
 /* Send a chunk of PCM audio data.
@@ -380,6 +380,15 @@ void ap2cl_play(struct ap2cl_s *p);
 
 /* Stop playback. */
 void ap2cl_stop(struct ap2cl_s *p);
+
+/* Publish the current playback state to the receiver's now-playing display
+ * (paused/playing carry their timeline, stopped is state-only). Blocking MRP
+ * RTSP round-trips with seconds-scale worst cases: call it after a
+ * pause/play/stop/standby transition, never from under the audio send path —
+ * a send stall longer than the shallow splice pacing depth underruns the
+ * receiver's queue, which pops audibly on Apple receivers. Native AP2 flow
+ * only; a no-op otherwise. */
+void ap2cl_mrp_publish_playback_state(struct ap2cl_s *p);
 
 /* Session keepalive: POST /feedback over the encrypted RTSP channel, as real
  * Apple senders do every ~2 s (long sessions can otherwise hit receiver-side
