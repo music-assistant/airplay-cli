@@ -390,6 +390,13 @@ void ap2cl_stop(struct ap2cl_s *p);
  * only; a no-op otherwise. */
 void ap2cl_mrp_publish_playback_state(struct ap2cl_s *p);
 
+/* As above, but only when the derived state differs from the last one sent.
+ * The START commit needs the announce on a real transition (cold start,
+ * standby wake) while a warm seek re-anchors with the state unchanged, where
+ * a forced re-assert would add a state POST — and on receivers demoted to
+ * full replace pushes, a now-playing re-render — per seek. */
+void ap2cl_mrp_publish_playback_state_on_transition(struct ap2cl_s *p);
+
 /* Session keepalive: POST /feedback over the encrypted RTSP channel, as real
  * Apple senders do every ~2 s (long sessions can otherwise hit receiver-side
  * idle timeouts). Native AP2 flow only; a no-op returning false otherwise.

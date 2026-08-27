@@ -5073,6 +5073,18 @@ void ap2cl_mrp_publish_playback_state(struct ap2cl_s *p)
     ap2_mrp_publish_playback(p, ap2_mrp_current_playback_state(p), true);
 }
 
+void ap2cl_mrp_publish_playback_state_on_transition(struct ap2cl_s *p)
+{
+    if (!p) return;
+    pthread_mutex_lock(&p->mrp_publish_lock);
+    bool changed =
+        p->mrp_last_playback_state != (int)ap2_mrp_current_playback_state(p);
+    pthread_mutex_unlock(&p->mrp_publish_lock);
+    /* A failed publish never records its state, so the stale last-state
+     * makes the next START retry the announce. */
+    if (changed) ap2cl_mrp_publish_playback_state(p);
+}
+
 /* Timeline (mergePolicy "update") push for callers already holding
  * mrp_publish_lock: seek progress and the pause/resume transitions. */
 static ap2_mrp_push_result_t ap2cl_mrp_push_progress_serialized(
