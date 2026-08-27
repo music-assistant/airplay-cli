@@ -381,12 +381,13 @@ void ap2cl_play(struct ap2cl_s *p);
 /* Stop playback. */
 void ap2cl_stop(struct ap2cl_s *p);
 
-/* Publish the current playback state (with its timeline) to the receiver's
- * now-playing display. Blocking MRP RTSP round-trips with seconds-scale worst
- * cases: call it after a pause/play/stop/standby transition, never from under
- * the audio send path — a send stall longer than the shallow splice pacing
- * depth underruns the receiver's queue, which pops audibly on Apple
- * receivers. Native AP2 flow only; a no-op otherwise. */
+/* Publish the current playback state to the receiver's now-playing display
+ * (paused/playing carry their timeline, stopped is state-only). Blocking MRP
+ * RTSP round-trips with seconds-scale worst cases: call it after a
+ * pause/play/stop/standby transition, never from under the audio send path —
+ * a send stall longer than the shallow splice pacing depth underruns the
+ * receiver's queue, which pops audibly on Apple receivers. Native AP2 flow
+ * only; a no-op otherwise. */
 void ap2cl_mrp_publish_playback_state(struct ap2cl_s *p);
 
 /* Session keepalive: POST /feedback over the encrypted RTSP channel, as real
