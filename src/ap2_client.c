@@ -162,7 +162,13 @@ extern log_level *loglevel;
  * the ring only has to outlast the send window (1.75 s at its default): 512
  * packets is 4.1 s at 352 frames/packet and 44.1 kHz, comfortably more. */
 #define AP2_RTX_RING_SLOTS           512
-#define AP2_RTX_MAX_PKT              2048
+/* Slot payload sized to the worst-case wire packet: a 24-bit stereo chunk
+ * whose ALAC frame does not compress falls back to an escape frame (the raw
+ * 352 x 6 bytes plus an up-to-8-byte header), wrapped as
+ * [12B RTP][payload][16B tag][8B nonce] = 2156 bytes. 16-bit tops out at
+ * 1452. Ring memory is SLOTS x this, ~1.1 MB. */
+#define AP2_RTX_MAX_PKT              (12 + AP2_FRAMES_PER_CHUNK * 6 + 8 + \
+                                      AP2_CHACHA_TAG_SIZE + 8)
 #define AP2_RTX_CTRL_POLL_MS         200
 /* Initial-fill pacing. The window gate alone lets the whole 1.75 s send window
  * go out back-to-back at stream start (measured: ~99 packets in 7 ms), which
@@ -948,7 +954,18 @@ static int ap2_rtsp_send_tracked(
 static void ap2_rtx_store(struct ap2cl_s *p, uint16_t seq,
                           const uint8_t *pkt, int len)
 {
-    if (!p->rtx_ring || len <= 0 || len > AP2_RTX_MAX_PKT) return;
+    if (!p->rtx_ring || len <= 0) return;
+    if (len > AP2_RTX_MAX_PKT) {
+        /* The slot covers the worst-case wire packet, so this cannot happen —
+         * but a packet kept out of the ring is unrecoverable once lost, so a
+         * future regression must be loud, not a silent hole in the stream. */
+        static atomic_bool warned = false;
+        if (!atomic_exchange(&warned, true))
+            LOG_WARN("[AP2] Packet seq=%u (%d bytes) exceeds retransmit slot "
+                     "(%d bytes): lost packets cannot be recovered",
+                     seq, len, AP2_RTX_MAX_PKT);
+        return;
+    }
     struct ap2_rtx_slot *slot = &p->rtx_ring[seq % AP2_RTX_RING_SLOTS];
     pthread_mutex_lock(&p->rtx_lock);
     slot->seq = seq;
