@@ -1364,8 +1364,10 @@ static void test_mrp_bundle_and_pause_publish(void)
     /* A progress set while playing stages state without wire traffic. */
     assert(ap2cl_set_progress(client, 42, 180));
 
-    /* Splice pause: timeline push then playback state (requests 8-9). */
+    /* Splice pause with its caller-side announce: timeline push then playback
+     * state (requests 8-9). */
     ap2cl_pause(client);
+    ap2cl_mrp_publish_playback_state(client);
 
     /* A progress set while content-paused must report rate 0: the splice
      * pause keeps the client AP2_STREAMING, so the content flags own the
@@ -1387,8 +1389,11 @@ static void test_mrp_bundle_and_pause_publish(void)
      * an unchanged state, so only the kept force reaches the wire. Then stop:
      * playback state only (request 14). */
     ap2cl_play(client);
+    ap2cl_mrp_publish_playback_state(client);
     ap2cl_play(client);
+    ap2cl_mrp_publish_playback_state(client);
     ap2cl_stop(client);
+    ap2cl_mrp_publish_playback_state(client);
 
     /* Next track with byte-identical artwork: one more bundle (15-17). */
     assert(ap2cl_set_metadata_ex(client, "Track Two", "Artist", "Album", 200,

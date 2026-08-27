@@ -867,16 +867,22 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                                               : "no live session to flush",
                             "FLUSH failed");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STANDBY") == 0) {
-        if (!g_session || !ap2_session_standby(g_session))
+        if (!g_session || !ap2_session_standby(g_session)) {
             status_error_ex(ERROR_CODE_STANDBY_FAILED, 0,
                             session_is_live() ? "session rejected the standby"
                                               : "no live session to stand by",
                             "STANDBY failed");
+        } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+            /* Blocking announce outside the engine's quiesce bracket, which
+             * held the send lock across the park (see PAUSE below). */
+            ap2cl_mrp_publish_playback_state(g_ap2cl);
+        }
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "DISCONNECT") == 0) {
         if (g_session) ap2_session_end(g_session);
         g_status = STATUS_STOPPED;
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "PAUSE") == 0) {
         if (g_status == STATUS_PLAYING) {
+            bool paused_ap2 = false;
             pthread_mutex_lock(&g_audio_send_lock);
             if (g_status == STATUS_PLAYING) {
                 /* A pause freezes the content the clip rode on. */
@@ -889,15 +895,23 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                                         "RAOP pause failed");
                 } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
                     ap2cl_pause(g_ap2cl);
+                    paused_ap2 = true;
                 }
                 g_status = STATUS_PAUSED;
                 status_paused(0);
             }
             pthread_mutex_unlock(&g_audio_send_lock);
+            /* The now-playing announce is blocking RTSP with seconds-scale
+             * worst cases, so it runs outside the send lock: an armed splice
+             * line whose sends stall longer than the shallow pacing depth
+             * underruns the receiver's queue, which pops audibly on Apple
+             * receivers. */
+            if (paused_ap2) ap2cl_mrp_publish_playback_state(g_ap2cl);
         }
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "PLAY") == 0) {
         pthread_mutex_lock(&g_audio_send_lock);
         bool play_ok = true;
+        bool resumed_ap2 = false;
         if (cfg->protocol == PROTO_RAOP && g_raopcl) {
             raop_head_reset();
             if (!raop_session_resume(g_raopcl)) {
@@ -908,6 +922,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             }
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_play(g_ap2cl);
+            resumed_ap2 = true;
         } else {
             /* No client for the resolved protocol: the command reached nothing,
              * and the status stays where it was. Coded so the caller does not
@@ -922,7 +937,10 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
          * STATUS_PLAYING) re-reports the true elapsed within a second. */
         if (play_ok) g_status = STATUS_PLAYING;
         pthread_mutex_unlock(&g_audio_send_lock);
+        /* Blocking announce outside the send lock (see PAUSE above). */
+        if (resumed_ap2) ap2cl_mrp_publish_playback_state(g_ap2cl);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "STOP") == 0) {
+        bool stopped_ap2 = false;
         pthread_mutex_lock(&g_audio_send_lock);
         announce_abort();
         g_status = STATUS_STOPPED;
@@ -931,6 +949,7 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
             raopcl_stop(g_raopcl);
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_stop(g_ap2cl);
+            stopped_ap2 = true;
         } else {
             /* Neither transport call reports a result, so the one failure that
              * can be seen here is having no client to make the call on. The
@@ -942,6 +961,8 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         }
         status_print("[STATUS] stopped");
         pthread_mutex_unlock(&g_audio_send_lock);
+        /* Blocking announce outside the send lock (see PAUSE above). */
+        if (stopped_ap2) ap2cl_mrp_publish_playback_state(g_ap2cl);
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "SENDMETA") == 0) {
         send_track_metadata(cfg, metadata_str(g_metadata.title));
     }
@@ -1893,7 +1914,13 @@ static int run_airplay2(cli_config_t *cfg)
              * boundary a hot splice; the resume pad still lands the new
              * content on the commanded instant. Stop and teardown end the
              * feed — a teardown with audio still queued is clean — and the
-             * session engine's idle timeout still ends a forgotten park. */
+             * session engine's idle timeout still ends a forgotten park.
+             * A delivery stall here needs no recovery call: the content
+             * path's stall guard exists to convert queued content into
+             * silence pad, and this branch sends nothing but silence, so
+             * its catch-up after a stall is already that recovered wire
+             * shape — while the un-pause and the next START each re-derive
+             * their splice from head vs now, drained line included. */
             if (g_first_start_done && cfg->protocol == PROTO_AIRPLAY2 &&
                 ap2cl_splice_hot(g_ap2cl)) {
                 pthread_mutex_lock(&g_audio_send_lock);
