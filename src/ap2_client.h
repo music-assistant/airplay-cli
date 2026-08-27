@@ -231,8 +231,8 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
 /* Park the stream but keep the session warm: the splice timeline stops the
  * content while the armed line keeps carrying silence (an underrun while
  * armed is an audible noise trigger); the stock path discards buffered audio
- * and drops to CONNECTED awaiting the next warm flush. Both publish the
- * stopped playback state. */
+ * and drops to CONNECTED awaiting the next warm flush. The caller publishes
+ * the stopped playback state afterwards (ap2cl_mrp_publish_playback_state). */
 void ap2cl_standby(struct ap2cl_s *p);
 
 /* Send a chunk of PCM audio data.
