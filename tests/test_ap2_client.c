@@ -1649,6 +1649,26 @@ static void test_retransmit_responder(void)
         usleep(50000);
     assert(ap2cl_test_rtx_answered(client) == 2);
 
+    /* The largest packet the realtime path can produce — a 24-bit stereo
+     * chunk whose ALAC frame does not compress (escape frame), fully wrapped:
+     * [12B RTP][352*6+8 payload][16B tag][8B nonce] — must fit a ring slot
+     * and come back whole. */
+    enum { RTX_WORST_CASE = 12 + 352 * 6 + 8 + 16 + 8 };
+    static uint8_t pkt_c[RTX_WORST_CASE];
+    for (size_t i = 0; i < sizeof(pkt_c); i++) { pkt_c[i] = (uint8_t)(i * 7); }
+    ap2cl_test_rtx_store(client, 1002, pkt_c, (int)sizeof(pkt_c));
+    uint8_t big_req[8] = {0x80, 0xd5, 0x00, 0x09, 0x03, 0xea, 0x00, 0x01};
+    assert(sendto(peer, big_req, sizeof(big_req), 0,
+                  (struct sockaddr *)&to, sizeof(to)) == (ssize_t)sizeof(big_req));
+    static uint8_t big_resp[4 + RTX_WORST_CASE + 64];
+    ssize_t bn = recv(peer, big_resp, sizeof(big_resp), 0);
+    assert(bn == 4 + (ssize_t)sizeof(pkt_c));
+    assert(big_resp[0] == 0x80 && big_resp[1] == 0xd6);
+    assert(!memcmp(big_resp + 4, pkt_c, sizeof(pkt_c)));
+    for (int i = 0; i < 30 && ap2cl_test_rtx_answered(client) < 3; i++)
+        usleep(50000);
+    assert(ap2cl_test_rtx_answered(client) == 3);
+
     /* A packet that has already aged out is counted, not answered. */
     uint8_t stale[8] = {0x80, 0xd5, 0x00, 0x08, 0x00, 0x2a, 0x00, 0x01};
     assert(sendto(peer, stale, sizeof(stale), 0,
@@ -1656,7 +1676,7 @@ static void test_retransmit_responder(void)
     for (int i = 0; i < 30 && ap2cl_test_rtx_expired(client) == 0; i++)
         usleep(50000);
     assert(ap2cl_test_rtx_expired(client) == 1);
-    assert(ap2cl_test_rtx_answered(client) == 2);
+    assert(ap2cl_test_rtx_answered(client) == 3);
 
     close(peer);
     ap2cl_test_stop_rtx(client);
