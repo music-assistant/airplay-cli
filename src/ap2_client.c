@@ -959,7 +959,7 @@ static void ap2_rtx_store(struct ap2cl_s *p, uint16_t seq,
         /* The slot covers the worst-case wire packet, so this cannot happen —
          * but a packet kept out of the ring is unrecoverable once lost, so a
          * future regression must be loud, not a silent hole in the stream. */
-        static atomic_bool warned;
+        static atomic_bool warned = false;
         if (!atomic_exchange(&warned, true))
             LOG_WARN("[AP2] Packet seq=%u (%d bytes) exceeds retransmit slot "
                      "(%d bytes): lost packets cannot be recovered",
