@@ -5271,7 +5271,10 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
     else
         p->meta_delivered = false;
     pthread_mutex_unlock(&p->mrp_publish_lock);
-    return dmap_ok;
+    /* Full-bundle delivery, matching the stored identity above: a caller
+     * gating a retry on this (the first-START placeholder skip) must not
+     * read a DMAP-only success with a failed MRP push as delivered. */
+    return delivered;
 }
 
 bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist,

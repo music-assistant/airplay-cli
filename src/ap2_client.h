@@ -418,6 +418,9 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
  * drops retained MRP artwork when the track changed. track_changed_out
  * (optional) receives whether the item identity changed; mrp_info and
  * mrp_push receive the request-scoped artwork verdict and push statuses.
+ * Returns whether the whole bundle was delivered (DMAP, and the MRP push
+ * where active) — a fully byte-identical bundle after a delivered one is
+ * skipped and reported as delivered.
  */
 bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                            const char *artist, const char *album,
