@@ -118,6 +118,31 @@ extern log_level *loglevel;
 /* Revert to grandmaster if the elected peer stops announcing for this long
  * (3x the 1 s announce interval, so a couple of dropped Announces don't flap). */
 #define PTP_PEER_SILENCE_NS    3000000000ULL      /* 3 s */
+/* A followed receiver's clock (struct ptp_follow) whose Sync has been silent
+ * this long is dropped, so a stream to it falls back to our own timeline
+ * rather than anchoring on a dead offset. */
+#define PTP_FOLLOW_STALE_NS    60000000000ULL     /* 60 s */
+#define PTP_MAX_FOLLOW 4
+
+/* A receiver whose own clock we follow instead of serving ours. Standalone
+ * HomePods on OS 27 never render audio anchored to a sender's timeline: they
+ * keep announcing their own grandmaster for the whole session and stay silent.
+ * Slaving to their clock (unicast Sync/Follow_Up they send us after SETPEERS)
+ * and expressing the session anchor in THEIR timeline makes them play. Kept
+ * per receiver so the engine can still serve its own grandmaster to every
+ * other peer at the same time (multi-room with mixed receivers). */
+struct ptp_follow {
+    struct in_addr addr;            /* s_addr == 0: free slot */
+    bool have_clock;                /* an Announce named its grandmaster */
+    bool have_offset;               /* >= 1 offset sample folded in */
+    uint64_t clock_id;              /* its grandmasterIdentity (timeline id) */
+    int64_t offset_ns;              /* local -> its clock (add to local ns) */
+    uint64_t last_ns;               /* local ns of its last Announce/Sync */
+    bool pending_sync_valid;        /* two-step Sync awaiting its Follow_Up */
+    uint16_t pending_sync_seq;
+    uint64_t pending_sync_rx_ns;
+    int64_t pending_sync_corr_ns;
+};
 
 /* A receiver mid-session probes at least ~1 Hz, so 3 s of silence means its
  * PTP client stopped (session teardown); the next probe then starts a NEW
@@ -180,6 +205,15 @@ struct ap2_ptp_ctx {
      * diagnostics and the synthetic harness. */
     bool hold_master;
     bool hold_notice_logged;        /* one INFO line per session about an ignored peer GM */
+    /* Followed receivers (see struct ptp_follow): the addresses registered
+     * with ap2_ptp_follow_receiver() (in-process) or `R <ip> F` (daemon), and
+     * the clocks learnt from their Announce/Sync. */
+    struct ptp_follow follow[PTP_MAX_FOLLOW];
+    struct in_addr follow_cfg[PTP_MAX_FOLLOW];
+    int nfollow_cfg;
+    /* The receiver this (streaming) context serves, for the getters below to
+     * pick its followed clock: device_ip in-process, shared_ip via the daemon. */
+    struct in_addr own_receiver;
     bool unicast_granted;           /* a peer negotiated unicast PTP via Signaling */
     bool peer_kick;                 /* send timing immediately after peer registration */
     uint64_t master_clock_id;       /* elected GM identity (peer's grandmasterIdentity when slaving) */
@@ -326,6 +360,8 @@ static void ptp_write_hdr(uint8_t *b, int msg_type, uint16_t msg_len, uint16_t f
     b[33] = (uint8_t)log_interval;
 }
 
+static bool ptp_follow_is_configured(struct ap2_ptp_ctx *ctx, struct in_addr addr);
+
 /* Send a PTP message. iOS senders unicast timing straight to each timing peer
  * (never an open multicast election), so with a peer list the message goes
  * unicast to every peer; without one (daemon idle, pre-SETPEERS) it falls back
@@ -339,8 +375,13 @@ static void ptp_send(struct ap2_ptp_ctx *ctx, int sock, uint16_t port,
     int npeers = 0;
     pthread_mutex_lock(&ctx->lock);
     bool unicast_mirror = ctx->unicast_mirror;
-    for (int i = 0; i < ctx->npeers && npeers < PTP_MAX_PEERS; i++)
-        if (inet_pton(AF_INET, ctx->peers[i], &peers[npeers]) == 1) npeers++;
+    for (int i = 0; i < ctx->npeers && npeers < PTP_MAX_PEERS; i++) {
+        if (inet_pton(AF_INET, ctx->peers[i], &peers[npeers]) != 1) continue;
+        /* A followed receiver is the master of its own session: never offer
+         * it our grandmaster, or it competes instead of syncing us. */
+        if (ptp_follow_is_configured(ctx, peers[npeers])) continue;
+        npeers++;
+    }
     pthread_mutex_unlock(&ctx->lock);
 
     bool sent = false;
@@ -738,6 +779,174 @@ static void ptp_apply_offset_sample(struct ap2_ptp_ctx *ctx, int64_t raw_offset)
     pthread_mutex_unlock(&ctx->lock);
 }
 
+/* ---- followed receivers ---- */
+
+/* Lock held. Return the follow slot for `addr`, creating one when the address
+ * is a registered followed receiver and `create` is set; NULL when not followed. */
+static struct ptp_follow *ptp_follow_slot(struct ap2_ptp_ctx *ctx, struct in_addr addr,
+                                          bool create)
+{
+    if (addr.s_addr == 0) return NULL;
+    struct ptp_follow *free_slot = NULL;
+    for (int i = 0; i < PTP_MAX_FOLLOW; i++) {
+        if (ctx->follow[i].addr.s_addr == addr.s_addr) return &ctx->follow[i];
+        if (ctx->follow[i].addr.s_addr == 0 && !free_slot) free_slot = &ctx->follow[i];
+    }
+    if (!create) return NULL;
+    bool configured = false;
+    for (int i = 0; !configured && i < ctx->nfollow_cfg; i++)
+        configured = ctx->follow_cfg[i].s_addr == addr.s_addr;
+    if (!configured || !free_slot) return NULL;
+    memset(free_slot, 0, sizeof(*free_slot));
+    free_slot->addr = addr;
+    return free_slot;
+}
+
+/* Lock held. Fold one local->peer offset sample into a follow slot (same
+ * snap/EMA policy as the BMCA slave path). */
+static void ptp_follow_fold_offset(struct ptp_follow *f, int64_t raw_offset)
+{
+    if (!f->have_offset) {
+        f->offset_ns = raw_offset;
+        f->have_offset = true;
+        return;
+    }
+    int64_t delta = raw_offset - f->offset_ns;
+    if (delta > PTP_OFFSET_SNAP_NS || delta < -PTP_OFFSET_SNAP_NS)
+        f->offset_ns = raw_offset;
+    else
+        f->offset_ns += delta / PTP_OFFSET_EMA_DIV;
+}
+
+/* Announce from a followed receiver: record its grandmaster identity and
+ * keep BMCA out of it (we stay grandmaster for everyone else). Returns true
+ * when the sender is followed. */
+static bool ptp_follow_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
+                                uint64_t rx_ns, struct in_addr src, const char *srcip)
+{
+    struct ptp_dataset peer;
+    pthread_mutex_lock(&ctx->lock);
+    struct ptp_follow *f = ptp_follow_slot(ctx, src, true);
+    if (!f) { pthread_mutex_unlock(&ctx->lock); return false; }
+    bool first = !f->have_clock;
+    if (ptp_parse_announce(buf, n, &peer)) {
+        if (f->have_clock && f->clock_id != peer.grandmaster_identity) {
+            f->have_offset = false;       /* new timeline: re-acquire */
+            f->pending_sync_valid = false;
+        }
+        f->clock_id = peer.grandmaster_identity;
+        f->have_clock = true;
+        f->last_ns = rx_ns;
+    }
+    uint64_t cid = f->clock_id;
+    pthread_mutex_unlock(&ctx->lock);
+    if (first)
+        LOG_INFO("[PTP] Following receiver %s clock gm=%016" PRIx64 " (its Announce)",
+                 srcip, cid);
+    return true;
+}
+
+/* Sync / Follow_Up from a followed receiver: its clock is the master for the
+ * stream serving it, so track the local->peer offset from its two-step (or
+ * one-step) Sync exactly as the slave path does. Returns true when handled. */
+static bool ptp_follow_sync(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
+                            uint64_t rx_ns, struct in_addr src, bool follow_up)
+{
+    if (n < PTP_HDR_LEN + 10) return false;
+    uint16_t flags = ((uint16_t)buf[6] << 8) | buf[7];
+    uint16_t seq = ((uint16_t)buf[30] << 8) | buf[31];
+    int64_t corr = ptp_read_correction_ns(buf);
+    uint64_t t1 = ptp_read_ts(buf + PTP_HDR_LEN);
+
+    pthread_mutex_lock(&ctx->lock);
+    struct ptp_follow *f = ptp_follow_slot(ctx, src, false);
+    if (!f) { pthread_mutex_unlock(&ctx->lock); return false; }
+    bool locked_now = false;
+    f->last_ns = rx_ns;
+    if (!follow_up) {
+        if (flags & PTP_FLAG_TWO_STEP) {
+            f->pending_sync_valid = true;
+            f->pending_sync_seq = seq;
+            f->pending_sync_rx_ns = rx_ns;
+            f->pending_sync_corr_ns = corr;
+        } else {
+            bool had = f->have_offset;
+            ptp_follow_fold_offset(f, (int64_t)t1 + corr - (int64_t)rx_ns);
+            locked_now = !had;
+        }
+    } else if (f->pending_sync_valid && f->pending_sync_seq == seq) {
+        f->pending_sync_valid = false;
+        bool had = f->have_offset;
+        ptp_follow_fold_offset(f, (int64_t)t1 + f->pending_sync_corr_ns + corr
+                                  - (int64_t)f->pending_sync_rx_ns);
+        locked_now = !had;
+    }
+    int64_t off = f->offset_ns;
+    uint64_t cid = f->clock_id;
+    pthread_mutex_unlock(&ctx->lock);
+    if (locked_now)
+        LOG_INFO("[PTP] Followed clock gm=%016" PRIx64 " locked: local->peer offset=%" PRId64
+                 "ns", cid, off);
+    return true;
+}
+
+/* Lock held. Followed clock for `addr` (a stream's own receiver), if locked. */
+static bool ptp_follow_lookup(struct ap2_ptp_ctx *ctx, struct in_addr addr,
+                              uint64_t *clock_id, int64_t *offset_ns)
+{
+    for (int i = 0; i < PTP_MAX_FOLLOW; i++) {
+        struct ptp_follow *f = &ctx->follow[i];
+        if (f->addr.s_addr != addr.s_addr || !f->have_clock || !f->have_offset) continue;
+        if (clock_id) *clock_id = f->clock_id;
+        if (offset_ns) *offset_ns = f->offset_ns;
+        return true;
+    }
+    return false;
+}
+
+/* Lock held. Is `addr` a followed receiver? */
+static bool ptp_follow_is_configured(struct ap2_ptp_ctx *ctx, struct in_addr addr)
+{
+    for (int i = 0; i < ctx->nfollow_cfg; i++)
+        if (ctx->follow_cfg[i].s_addr == addr.s_addr) return true;
+    return false;
+}
+
+bool ap2_ptp_follow_receiver(struct ap2_ptp_ctx *ctx, const char *ip)
+{
+    struct in_addr addr;
+    if (!ctx || !ip || inet_pton(AF_INET, ip, &addr) != 1) return false;
+    pthread_mutex_lock(&ctx->lock);
+    bool ok = ptp_follow_is_configured(ctx, addr);
+    if (!ok && ctx->nfollow_cfg < PTP_MAX_FOLLOW) {
+        ctx->follow_cfg[ctx->nfollow_cfg++] = addr;
+        ok = true;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    if (ok) {
+        LOG_INFO("[PTP] Will follow the clock of receiver %s", ip);
+    } else {
+        LOG_WARN("[PTP] Cannot follow %s: %d followed receivers already", ip, PTP_MAX_FOLLOW);
+    }
+    return ok;
+}
+
+void ap2_ptp_unfollow_receiver(struct ap2_ptp_ctx *ctx, const char *ip)
+{
+    struct in_addr addr;
+    if (!ctx || !ip || inet_pton(AF_INET, ip, &addr) != 1) return;
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < ctx->nfollow_cfg; i++) {
+        if (ctx->follow_cfg[i].s_addr != addr.s_addr) continue;
+        ctx->follow_cfg[i] = ctx->follow_cfg[--ctx->nfollow_cfg];
+        break;
+    }
+    for (int i = 0; i < PTP_MAX_FOLLOW; i++)
+        if (ctx->follow[i].addr.s_addr == addr.s_addr)
+            memset(&ctx->follow[i], 0, sizeof(ctx->follow[i]));
+    pthread_mutex_unlock(&ctx->lock);
+}
+
 /* Run BMCA against a freshly received peer Announce and (re)assign our role. */
 static void ptp_handle_announce(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
                                 uint64_t rx_ns, const char *srcip)
@@ -913,6 +1122,17 @@ static void *ptp_thread_func(void *arg)
         bool gm = ctx->is_grandmaster;
         bool peer_kick = ctx->peer_kick;
         ctx->peer_kick = false;
+        /* Drop a followed clock that stopped syncing (session gone): streams
+         * to it fall back to our own timeline instead of a stale offset. */
+        for (int i = 0; i < PTP_MAX_FOLLOW; i++) {
+            struct ptp_follow *f = &ctx->follow[i];
+            if (f->addr.s_addr && f->have_clock && now - f->last_ns > PTP_FOLLOW_STALE_NS) {
+                LOG_INFO("[PTP] Followed clock of %s silent > %llu ms; dropping it",
+                         inet_ntoa(f->addr),
+                         (unsigned long long)(PTP_FOLLOW_STALE_NS / 1000000ULL));
+                memset(f, 0, sizeof(*f));
+            }
+        }
         pthread_mutex_unlock(&ctx->lock);
         if (reclaimed)
             LOG_INFO("[PTP] peer silent > %llu ms; reclaiming GRANDMASTER",
@@ -978,14 +1198,21 @@ static void *ptp_thread_func(void *arg)
                 ptp_send_pdelay_resp(ctx, buf, rx, &src);
                 break;
             case PTP_MSG_ANNOUNCE:
-                ptp_handle_announce(ctx, buf, n, rx, srcip);
+                if (!ptp_follow_announce(ctx, buf, n, rx, src.sin_addr, srcip))
+                    ptp_handle_announce(ctx, buf, n, rx, srcip);
                 break;
             case PTP_MSG_SYNC:
-                /* Peer Sync only matters when we are slaving to it. */
-                if (!gm) ptp_handle_sync(ctx, buf, n, rx);
+                /* A followed receiver's Sync is its clock probe (counts toward
+                 * its readiness streak); any other peer's Sync only matters
+                 * when we are slaving to it. */
+                if (ptp_follow_sync(ctx, buf, n, rx, src.sin_addr, false))
+                    ptp_track_exchange(ctx, src.sin_addr, rx);
+                else if (!gm)
+                    ptp_handle_sync(ctx, buf, n, rx);
                 break;
             case PTP_MSG_FOLLOW_UP:
-                if (!gm) ptp_handle_follow_up(ctx, buf, n);
+                if (!ptp_follow_sync(ctx, buf, n, rx, src.sin_addr, true) && !gm)
+                    ptp_handle_follow_up(ctx, buf, n);
                 break;
             case PTP_MSG_SIGNALING:
                 ptp_handle_signaling(ctx, buf, n, &src, srcip);
@@ -1181,6 +1408,7 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
 {
     if (!ctx) return false;
     if (device_ip && !ctx->device_ip) ctx->device_ip = strdup(device_ip);
+    if (device_ip) inet_pton(AF_INET, device_ip, &ctx->own_receiver);
     ctx->bind_addr = bind_addr;
     ctx->mcast_addr.s_addr = inet_addr(PTP_MCAST_ADDR);
 
@@ -1289,9 +1517,36 @@ void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms)
     pthread_mutex_unlock(&ctx->lock);
 }
 
+/* The followed clock of this context's own receiver, when the daemon (shared
+ * mode) or the in-process engine has locked one. */
+static bool ptp_own_followed_clock(struct ap2_ptp_ctx *ctx, uint64_t *clock_id,
+                                   int64_t *offset_ns)
+{
+    if (ctx->own_receiver.s_addr == 0) return false;
+    if (ctx->shm_active) {
+        struct ap2_ptp_shm_sample s;
+        if (!ap2_ptp_shm_read(&ctx->shm_reader, &s)) return false;
+        for (int i = 0; i < AP2_PTP_SHM_MAX_FOLLOW; i++) {
+            if (s.follow[i].ip != ctx->own_receiver.s_addr ||
+                !(s.follow[i].flags & AP2_PTP_SHM_F_FOLLOW_LOCKED))
+                continue;
+            if (clock_id) *clock_id = s.follow[i].clock_id;
+            if (offset_ns) *offset_ns = s.follow[i].offset;
+            return true;
+        }
+        return false;
+    }
+    pthread_mutex_lock(&ctx->lock);
+    bool ok = ptp_follow_lookup(ctx, ctx->own_receiver, clock_id, offset_ns);
+    pthread_mutex_unlock(&ctx->lock);
+    return ok;
+}
+
 uint64_t ap2_ptp_master_clock_id(struct ap2_ptp_ctx *ctx)
 {
     if (!ctx) return 0;
+    uint64_t followed;
+    if (ptp_own_followed_clock(ctx, &followed, NULL)) return followed;
     if (ctx->shm_active) {
         struct ap2_ptp_shm_sample s;
         if (ap2_ptp_shm_read(&ctx->shm_reader, &s)) return s.master_clock_id;
@@ -1307,6 +1562,9 @@ uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx)
 {
     uint64_t local = ap2_ptp_now_ns(ctx);
     if (!ctx) return local;
+    int64_t followed_off;
+    if (ptp_own_followed_clock(ctx, NULL, &followed_off))
+        return (uint64_t)((int64_t)local + followed_off);
     if (ctx->shm_active) {
         /* The daemon publishes a local->master offset; the daemon and this
          * process share CLOCK_REALTIME, so master-now is our own now + offset. */
@@ -1412,14 +1670,17 @@ bool ap2_ptp_attach_shared(struct ap2_ptp_ctx *ctx)
     return true;
 }
 
-void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip)
+void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip, bool follow)
 {
     if (!ctx || !ctx->shm_active || !ip || !*ip) return;
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), "R %s", ip);
+    snprintf(cmd, sizeof(cmd), follow ? "R %s F" : "R %s", ip);
     char ack[128] = {0};
     bool ok = ap2_ptp_ctrl_send(cmd, 250, ack, sizeof(ack));
-    if (!ctx->shared_ip) ctx->shared_ip = strdup(ip);
+    if (!ctx->shared_ip) {
+        ctx->shared_ip = strdup(ip);
+        inet_pton(AF_INET, ip, &ctx->own_receiver);
+    }
     LOG_INFO("[PTP] Registered receiver %s with daemon -> %s", ip, ok ? ack : "(no ack)");
 }
 
@@ -1505,6 +1766,16 @@ static void daemon_fill_sample(struct ap2_ptp_ctx *ctx, uint64_t start_ns,
     out->master_clock_start_time = start_ns;
     out->flags = (gm ? AP2_PTP_SHM_F_GRANDMASTER : 0u) |
                  (locked ? AP2_PTP_SHM_F_OFFSET_LOCKED : 0u);
+    pthread_mutex_lock(&ctx->lock);
+    for (int i = 0; i < PTP_MAX_FOLLOW && i < AP2_PTP_SHM_MAX_FOLLOW; i++) {
+        const struct ptp_follow *f = &ctx->follow[i];
+        if (!f->addr.s_addr || !f->have_clock) continue;
+        out->follow[i].ip = f->addr.s_addr;
+        out->follow[i].clock_id = f->clock_id;
+        out->follow[i].offset = f->offset_ns;
+        out->follow[i].flags = f->have_offset ? AP2_PTP_SHM_F_FOLLOW_LOCKED : 0u;
+    }
+    pthread_mutex_unlock(&ctx->lock);
 }
 
 /* Read and act on one control datagram; reply with a status ack. */
@@ -1524,12 +1795,20 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
     bool changed = false;
 
     switch (cmd) {
-    case 'R':   /* register (add) */
+    case 'R':   /* register (add); "F" after an ip: follow that receiver's clock */
     case 'T': { /* nqptp-compatible alias: ADD (see header note) */
-        char *ip;
+        char *ip, *last_ip = NULL;
         while ((ip = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
             struct in_addr tmp;
-            if (inet_pton(AF_INET, ip, &tmp) == 1) { peerset_add(ps, ip); changed = true; }
+            if (strcmp(ip, "F") == 0) {
+                if (last_ip) ap2_ptp_follow_receiver(ctx, last_ip);
+                continue;
+            }
+            if (inet_pton(AF_INET, ip, &tmp) == 1) {
+                peerset_add(ps, ip);
+                changed = true;
+                last_ip = ip;
+            }
         }
         break;
     }
@@ -1537,6 +1816,7 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
         char *ip;
         while ((ip = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
             peerset_remove(ps, ip);
+            ap2_ptp_unfollow_receiver(ctx, ip);
             changed = true;
         }
         break;

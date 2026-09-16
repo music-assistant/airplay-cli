@@ -560,6 +560,45 @@ static void test_route_with_password(void)
  * advertises SupportsBufferedAudio (bit 40); --buffered forces it there, and
  * CLIAIRPLAY_BUFFERED overrides both ways. The deny-list ships empty — adding
  * an entry must consciously update the pins here. */
+/* A standalone HomePod (AudioAccessory, own group, no parent group, no
+ * stereo partner) has its clock followed; every other shape — Apple TV
+ * audio-output member, stereo pair, non-Apple receiver — keeps the sender's
+ * grandmaster. CLIAIRPLAY_PTP_FOLLOW overrides both ways. */
+static void test_follow_receiver_clock_resolution(void)
+{
+    unsetenv("CLIAIRPLAY_PTP_FOLLOW");
+    const char *standalone =
+        "acl=0 deviceid=02:00:00:00:00:01 features=0x4A7FCA00,0x3C354BD0 flags=0x98404 "
+        "gid=11111111-1111-1111-1111-111111111111+22222222-2222-2222-2222-222222222222 "
+        "igl=1 gcgl=1 model=AudioAccessory1,1 protovers=1.1 "
+        "pi=33333333-3333-3333-3333-333333333333 srcvers=980.77.2 osvers=27.0";
+    const char *tv_member =
+        "features=0x4A7FCA00,0x3C354BD0 flags=0xb8c04 gid=44444444-4444-4444-4444-444444444444 "
+        "igl=0 gpn=Living Room gcgl=1 pgid=44444444-4444-4444-4444-444444444444 pgcgl=1 "
+        "model=AudioAccessory5,1 osvers=27.0";
+    const char *stereo_pair =
+        "features=0x4A7FCA00,0x3C354BD0 gid=55555555-5555-5555-5555-555555555555 igl=1 "
+        "gcgl=1 tsid=66666666-6666-6666-6666-666666666666 model=AudioAccessory5,1";
+    const char *sonos = "features=0x445F8A00,0x1C340 igl=1 model=Sonos One";
+
+    assert(ap2_follow_receiver_clock(standalone, NULL));
+    assert(ap2_follow_receiver_clock(NULL, "AudioAccessory1,1") == false); /* no igl */
+    assert(ap2_follow_receiver_clock("igl=1", "AudioAccessory1,1"));     /* am= carries the model */
+    assert(!ap2_follow_receiver_clock(tv_member, NULL));
+    assert(!ap2_follow_receiver_clock(stereo_pair, NULL));
+    assert(!ap2_follow_receiver_clock(sonos, NULL));
+    /* "gid=" must not be mistaken for "pgid=". */
+    assert(ap2_follow_receiver_clock("igl=1 gid=X model=AudioAccessory5,1", NULL));
+    assert(!ap2_follow_receiver_clock("igl=1 pgid=X model=AudioAccessory5,1", NULL));
+
+    setenv("CLIAIRPLAY_PTP_FOLLOW", "0", 1);
+    assert(!ap2_follow_receiver_clock(standalone, NULL));
+    setenv("CLIAIRPLAY_PTP_FOLLOW", "1", 1);
+    assert(ap2_follow_receiver_clock(sonos, NULL));
+    unsetenv("CLIAIRPLAY_PTP_FOLLOW");
+    puts("ap2_client follow-receiver-clock resolution tests passed");
+}
+
 /* Forced timing and the forced compat flow: NTP-forced routes drop PTP (and
  * with it any buffered eligibility) even on receivers that advertise both
  * bits, and an explicit airplay2-compat preference outranks every native
@@ -2407,6 +2446,7 @@ int main(void)
     test_route_with_password();
     test_buffered_route_resolution();
     test_forced_timing_and_compat_route();
+    test_follow_receiver_clock_resolution();
     test_route_explicit_airplay2();
     test_auth_error_kind();
     test_info_format_tables();

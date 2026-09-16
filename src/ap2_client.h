@@ -147,6 +147,19 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
 bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
                         const char *am, bool forced);
 
+/*
+ * Whether the PTP engine should follow this receiver's OWN clock instead of
+ * serving it ours. True for a standalone HomePod — `model=`/`am=`
+ * AudioAccessory*, `igl=1`, and neither `pgid` (Apple TV audio-output group
+ * member) nor `tsid` (stereo pair) — which on HomePod OS 27 never slaves to
+ * the sender's grandmaster and stays silent on a sender-anchored stream.
+ * CLIAIRPLAY_PTP_FOLLOW outranks the rule (0 = never, else = always).
+ *
+ * :param txt: full _airplay._tcp TXT blob, or NULL.
+ * :param am: mDNS am= model override (RAOP discovery), or NULL.
+ */
+bool ap2_follow_receiver_clock(const char *txt, const char *am);
+
 /* Why the last connect attempt failed, for the caller's structured report. */
 typedef enum {
     AP2_CONNECT_ERROR_NONE = 0,

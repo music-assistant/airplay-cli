@@ -1322,6 +1322,46 @@ static bool ap2_buffered_denied(const char *txt, const char *am)
 
 static bool ap2_apple_model(const char *txt, const char *am);
 
+/* Value of a TXT `key=` field (the key must start the blob or follow a
+ * space, so "gid=" cannot match inside "pgid="), or NULL when absent. */
+static const char *ap2_txt_field(const char *txt, const char *key)
+{
+    if (!txt) return NULL;
+    size_t klen = strlen(key);
+    for (const char *f = strstr(txt, key); f; f = strstr(f + 1, key)) {
+        if ((f == txt || f[-1] == ' ') && f[klen] == '=') return f + klen + 1;
+    }
+    return NULL;
+}
+
+/* Model prefix match on the `model=` (_airplay TXT) / `am=` (_raop) field. */
+static bool ap2_model_prefix(const char *txt, const char *am, const char *prefix)
+{
+    size_t len = strlen(prefix);
+    const char *model = ap2_txt_field(txt, "model");
+    if (model && strncmp(model, prefix, len) == 0) return true;
+    return am && strncmp(am, prefix, len) == 0;
+}
+
+bool ap2_follow_receiver_clock(const char *txt, const char *am)
+{
+    /* CLIAIRPLAY_PTP_FOLLOW outranks the auto rule (0 = never, else = every
+     * receiver): the kill switch, and the lever for testing a receiver the
+     * rule does not name yet. */
+    if (getenv("CLIAIRPLAY_PTP_FOLLOW"))
+        return ap2_env_enabled("CLIAIRPLAY_PTP_FOLLOW", false);
+    /* A HomePod that leads its own group (igl=1) with no parent group (not
+     * an Apple TV's audio output) and no tight-sync partner (not a stereo
+     * pair): the standalone HomePod. On HomePod OS 27 it never slaves to the
+     * sender's grandmaster — it keeps announcing its own for the whole
+     * session and stays silent — whereas the same model as an Apple TV
+     * group member stops announcing within ~0.4 s and plays. */
+    if (!ap2_model_prefix(txt, am, "AudioAccessory")) return false;
+    const char *igl = ap2_txt_field(txt, "igl");
+    if (!igl || igl[0] != '1') return false;
+    return !ap2_txt_field(txt, "pgid") && !ap2_txt_field(txt, "tsid");
+}
+
 bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
                         const char *am, bool forced)
 {
@@ -1922,11 +1962,20 @@ static bool ap2_native_connect(struct ap2cl_s *p)
          * than running our own engine (only one process per host can bind
          * 319/320). Without --ptp-shared, or with no live daemon, fall through to
          * the in-process engine — the single-device path, byte-for-byte. */
+        /* A receiver that only renders against its OWN clock (standalone
+         * HomePod on OS 27, see ap2_follow_receiver_clock) is followed rather
+         * than served: the engine — in-process or the shared daemon — reads
+         * its Announce/Sync and expresses this session's timeline in it. */
+        bool follow = ap2_follow_receiver_clock(p->device.txt_records, p->am);
+        if (follow)
+            LOG_INFO("[AP2] Receiver keeps its own PTP clock (standalone HomePod); "
+                     "following it instead of serving ours");
         if (p->ptp_shared && ap2_ptp_attach_shared(p->ptp)) {
             p->use_ptp = true;
-            ap2_ptp_shared_register(p->ptp, p->device.address);
+            ap2_ptp_shared_register(p->ptp, p->device.address, follow);
             ap2_ptp_engine_settle(p->ptp, 400);
-        } else if (ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
+        } else if ((follow ? ap2_ptp_follow_receiver(p->ptp, p->device.address) : true) &&
+                   ap2_ptp_engine_start(p->ptp, p->bind_addr, p->device.address)) {
             p->use_ptp = true;
             /* Let BMCA hear any competing Announce and resolve the grandmaster
              * before we build the SETUP, so the timeline ClockID below is the
@@ -2473,7 +2522,12 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-            p->rt_anchor_wall0 = unix_ns - (uint64_t)p->lead_ms * 1000000ULL;
+            /* When slaving to a receiver's clock (follow mode) the timeline is
+             * NOT host CLOCK_REALTIME: shift the commanded unix instant into
+             * the master domain by the current local->master offset. */
+            int64_t master_shift = (int64_t)wall - (int64_t)ap2_ptp_now_ns(p->ptp);
+            p->rt_anchor_wall0 = (uint64_t)((int64_t)unix_ns + master_shift)
+                               - (uint64_t)p->lead_ms * 1000000ULL;
             p->rt_anchor_pos0 = (uint32_t)NTP2TS(p->start_ntp, p->format.sample_rate)
                               + atomic_load(&p->rtp_offset);
         } else {
