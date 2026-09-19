@@ -122,7 +122,14 @@ extern log_level *loglevel;
  * this long is dropped, so a stream to it falls back to our own timeline
  * rather than anchoring on a dead offset. */
 #define PTP_FOLLOW_STALE_NS    60000000000ULL     /* 60 s */
-#define PTP_MAX_FOLLOW 4
+/* Every followed receiver is also a timing peer (registered "R <ip> F"), so we
+ * can never need to follow more receivers than we serve: size the follow table
+ * to PTP_MAX_PEERS. Must equal AP2_PTP_SHM_MAX_FOLLOW, the daemon's mirror of
+ * this table in shared memory. */
+#define PTP_MAX_FOLLOW PTP_MAX_PEERS
+_Static_assert(PTP_MAX_FOLLOW == AP2_PTP_SHM_MAX_FOLLOW,
+               "engine and shm follow tables must match; bump AP2_PTP_SHM_MAX_FOLLOW "
+               "(and AP2_PTP_SHM_VERSION) when PTP_MAX_PEERS changes");
 
 /* A receiver whose own clock we follow instead of serving ours. Standalone
  * HomePods on OS 27 never render audio anchored to a sender's timeline: they
