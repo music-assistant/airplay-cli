@@ -151,8 +151,10 @@ bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
  * Whether the PTP engine should follow this receiver's OWN clock instead of
  * serving it ours. True for a standalone HomePod — `model=`/`am=`
  * AudioAccessory*, `igl=1`, and neither `pgid` (Apple TV audio-output group
- * member) nor `tsid` (stereo pair) — which on HomePod OS 27 never slaves to
- * the sender's grandmaster and stays silent on a sender-anchored stream.
+ * member) nor `tsid` (stereo pair), and advertising HomePod OS 27+ (osvers,
+ * or the srcvers/`vs` firmware) — which on that OS never slaves to the
+ * sender's grandmaster and stays silent on a sender-anchored stream. Earlier
+ * firmware slaves and plays, so it is left on our grandmaster.
  * CLIAIRPLAY_PTP_FOLLOW outranks the rule (0 = never, else = always).
  *
  * :param txt: full _airplay._tcp TXT blob, or NULL.

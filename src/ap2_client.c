@@ -1343,6 +1343,31 @@ static bool ap2_model_prefix(const char *txt, const char *am, const char *prefix
     return am && strncmp(am, prefix, len) == 0;
 }
 
+/* Leading integer of a TXT version field, or -1 when absent. The value runs to
+ * the next space, so read only the leading digits (e.g. "27.0" -> 27). */
+static int ap2_txt_version_major(const char *txt, const char *key)
+{
+    const char *v = ap2_txt_field(txt, key);
+    if (!v || v[0] < '0' || v[0] > '9') return -1;
+    int major = 0;
+    for (; *v >= '0' && *v <= '9'; v++) major = major * 10 + (*v - '0');
+    return major;
+}
+
+/* True only for a receiver advertising HomePod OS 27 or newer. Trust osvers
+ * (`ov` on _raop); fall back to the AirPlay firmware (srcvers/`vs`, 980.x ships
+ * with OS 27) when the OS version is absent, and stay false when neither is
+ * known — so a receiver whose version we cannot read is never followed. */
+static bool ap2_receiver_os_ge_27(const char *txt)
+{
+    int osv = ap2_txt_version_major(txt, "osvers");
+    if (osv < 0) osv = ap2_txt_version_major(txt, "ov");
+    if (osv >= 0) return osv >= 27;
+    int src = ap2_txt_version_major(txt, "srcvers");
+    if (src < 0) src = ap2_txt_version_major(txt, "vs");
+    return src >= 980;
+}
+
 bool ap2_follow_receiver_clock(const char *txt, const char *am)
 {
     /* CLIAIRPLAY_PTP_FOLLOW outranks the auto rule (0 = never, else = every
@@ -1355,11 +1380,14 @@ bool ap2_follow_receiver_clock(const char *txt, const char *am)
      * pair): the standalone HomePod. On HomePod OS 27 it never slaves to the
      * sender's grandmaster — it keeps announcing its own for the whole
      * session and stays silent — whereas the same model as an Apple TV
-     * group member stops announcing within ~0.4 s and plays. */
+     * group member stops announcing within ~0.4 s and plays. Gate on the OS
+     * version: on OS 26 and earlier the same standalone HomePod slaves to the
+     * sender and plays, so following it there would break what works today. */
     if (!ap2_model_prefix(txt, am, "AudioAccessory")) return false;
     const char *igl = ap2_txt_field(txt, "igl");
     if (!igl || igl[0] != '1') return false;
-    return !ap2_txt_field(txt, "pgid") && !ap2_txt_field(txt, "tsid");
+    if (ap2_txt_field(txt, "pgid") || ap2_txt_field(txt, "tsid")) return false;
+    return ap2_receiver_os_ge_27(txt);
 }
 
 bool ap2_buffered_route(const ap2_route_t *route, const char *txt,

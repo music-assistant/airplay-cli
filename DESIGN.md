@@ -273,7 +273,9 @@ grandmaster — but MA spawns one cliairplay per device. The split
   output (`igl=0`, `pgid` set) or in a stereo pair (`tsid`) stops announcing
   within ~0.4 s and plays. `ap2_follow_receiver_clock()` recognises the
   standalone shape from the TXT (`model=AudioAccessory*`, `igl=1`, no
-  `pgid`, no `tsid`; `CLIAIRPLAY_PTP_FOLLOW=0|1` overrides) and the stream
+  `pgid`, no `tsid`, and `osvers`>=27 — earlier firmware slaves to the sender
+  and plays, so it keeps our grandmaster; `CLIAIRPLAY_PTP_FOLLOW=0|1`
+  overrides) and the stream
   registers the receiver as followed (`ap2_ptp_follow_receiver()` in-process,
   `R <ip> F` on the daemon). For a followed receiver the engine records the
   grandmasterIdentity from its Announce, folds the local->peer offset from
