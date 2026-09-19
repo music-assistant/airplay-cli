@@ -282,7 +282,8 @@ grandmaster — but MA spawns one cliairplay per device. The split
   the unicast two-step Sync/Follow_Up it then sends (~8 Hz), counts those
   Syncs toward its exchange streak (clock readiness), and never sends it our
   Announce/Sync; it stays grandmaster for every other peer. The daemon
-  publishes up to four followed clocks in the shm sample (layout v2); a
+  publishes up to eight followed clocks in the shm sample (layout v3, one per
+  timing peer); a
   stream picks the entry for its own registered receiver, so
   `ap2_ptp_master_clock_id()`/`ap2_ptp_master_now_ns()` and with them the
   realtime sync packets and the START anchor (shifted from host

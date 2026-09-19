@@ -27,7 +27,7 @@
 
 /* Shared-memory layout version. Readers refuse a mismatch so a future layout
  * change cannot be misread as the current one. */
-#define AP2_PTP_SHM_VERSION 2u
+#define AP2_PTP_SHM_VERSION 3u
 
 /* localhost UDP control channel the daemon listens on; streaming processes
  * register/unregister their receiver IP(s) here. A DEDICATED port (not nqptp's
@@ -44,7 +44,12 @@
  * the daemon tracks instead of serving them its grandmaster. A stream to such
  * a receiver expresses its anchor in the receiver's timeline (clock_id, and
  * local ns + offset). */
-#define AP2_PTP_SHM_MAX_FOLLOW      4
+/* Sized to match PTP_MAX_PEERS (the daemon's receiver ceiling): every receiver
+ * it serves may be a standalone OS 27 HomePod whose own clock we follow, so the
+ * follow table has to hold as many entries as there are peers. Must equal
+ * PTP_MAX_FOLLOW (see the _Static_assert in ap2_ptp.c); growing it changes this
+ * struct's layout, so bump AP2_PTP_SHM_VERSION when it changes. */
+#define AP2_PTP_SHM_MAX_FOLLOW      8
 #define AP2_PTP_SHM_F_FOLLOW_LOCKED 0x1u  /* >=1 offset sample folded for this receiver */
 struct ap2_ptp_shm_follow {
     uint32_t ip;                      /* receiver IPv4, network byte order; 0 = unused */
