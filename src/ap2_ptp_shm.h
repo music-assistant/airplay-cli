@@ -27,7 +27,7 @@
 
 /* Shared-memory layout version. Readers refuse a mismatch so a future layout
  * change cannot be misread as the current one. */
-#define AP2_PTP_SHM_VERSION 1u
+#define AP2_PTP_SHM_VERSION 2u
 
 /* localhost UDP control channel the daemon listens on; streaming processes
  * register/unregister their receiver IP(s) here. A DEDICATED port (not nqptp's
@@ -39,6 +39,19 @@
 /* sample flags */
 #define AP2_PTP_SHM_F_GRANDMASTER   0x1u  /* the daemon holds the timeline (offset 0) */
 #define AP2_PTP_SHM_F_OFFSET_LOCKED 0x2u  /* slaving to a peer and >=1 offset sample folded */
+
+/* Followed receivers (registered with "R <ip> F"): receivers whose OWN clock
+ * the daemon tracks instead of serving them its grandmaster. A stream to such
+ * a receiver expresses its anchor in the receiver's timeline (clock_id, and
+ * local ns + offset). */
+#define AP2_PTP_SHM_MAX_FOLLOW      4
+#define AP2_PTP_SHM_F_FOLLOW_LOCKED 0x1u  /* >=1 offset sample folded for this receiver */
+struct ap2_ptp_shm_follow {
+    uint32_t ip;                      /* receiver IPv4, network byte order; 0 = unused */
+    uint32_t flags;                   /* AP2_PTP_SHM_F_FOLLOW_* */
+    uint64_t clock_id;                /* the receiver's grandmasterIdentity */
+    int64_t  offset;                  /* add to a local ns to get receiver-clock ns */
+};
 
 /*
  * One published clock sample. All times are nanoseconds on CLOCK_REALTIME,
@@ -53,6 +66,7 @@ struct ap2_ptp_shm_sample {
     uint64_t master_clock_start_time; /* master timebase epoch (daemon start), informational */
     uint32_t flags;                   /* AP2_PTP_SHM_F_* */
     uint32_t reserved;
+    struct ap2_ptp_shm_follow follow[AP2_PTP_SHM_MAX_FOLLOW];
 };
 
 /*
@@ -131,7 +145,10 @@ void ap2_ptp_shm_reader_close(struct ap2_ptp_shm_reader *r);
 /*
  * Control datagrams are plain text; the first non-space character selects the
  * command (arguments are space-separated):
- *   R <ip> [<ip> ...]   register (add) receiver IP(s) into the timing peer set
+ *   R <ip> [F] [<ip> [F] ...]
+ *                       register (add) receiver IP(s) into the timing peer set;
+ *                       an "F" after an ip follows that receiver's own clock
+ *                       (standalone HomePod, see ap2_ptp_follow_receiver)
  *   U <ip> [<ip> ...]   unregister (remove) receiver IP(s)
  *   T <ip> [<ip> ...]   nqptp-compatible alias for register (ADD; see note)
  *   B | E | P           begin / end / pause (accepted + acked; no-op for a sender)

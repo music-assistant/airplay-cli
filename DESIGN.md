@@ -266,6 +266,29 @@ grandmaster — but MA spawns one cliairplay per device. The split
   SETUP `timingPeerInfo.ClockID` and the realtime sync packets — without
   binding 319/320 or running an engine. With no live daemon the stream runs
   the in-process engine, byte-for-byte the single-device path.
+- **Followed receivers** — the exception to "the sender owns the timeline".
+  A standalone HomePod on HomePod OS 27 never slaves to the sender: it
+  announces its own grandmaster (prio1 248) every ~20 s for the whole
+  session and stays silent, whereas the same model as an Apple TV audio
+  output (`igl=0`, `pgid` set) or in a stereo pair (`tsid`) stops announcing
+  within ~0.4 s and plays. `ap2_follow_receiver_clock()` recognises the
+  standalone shape from the TXT (`model=AudioAccessory*`, `igl=1`, no
+  `pgid`, no `tsid`, and `osvers`>=27 — earlier firmware slaves to the sender
+  and plays, so it keeps our grandmaster; `CLIAIRPLAY_PTP_FOLLOW=0|1`
+  overrides) and the stream
+  registers the receiver as followed (`ap2_ptp_follow_receiver()` in-process,
+  `R <ip> F` on the daemon). For a followed receiver the engine records the
+  grandmasterIdentity from its Announce, folds the local->peer offset from
+  the unicast two-step Sync/Follow_Up it then sends (~8 Hz), counts those
+  Syncs toward its exchange streak (clock readiness), and never sends it our
+  Announce/Sync; it stays grandmaster for every other peer. The daemon
+  publishes up to four followed clocks in the shm sample (layout v2); a
+  stream picks the entry for its own registered receiver, so
+  `ap2_ptp_master_clock_id()`/`ap2_ptp_master_now_ns()` and with them the
+  realtime sync packets and the START anchor (shifted from host
+  CLOCK_REALTIME into the followed timeline) are per receiver. The session
+  SETUP still names our clock (the receiver has not announced yet); measured
+  not to matter. A followed clock silent for 60 s is dropped.
 
 ## 6. Timing and the start contract
 
