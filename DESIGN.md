@@ -224,9 +224,11 @@ authority. The engine (`ap2_ptp.c`) implements:
   248/248/0xFE) or the session anchor is not honored.
 - **Two-step Sync/Follow_Up** every 125 ms and Announce every 1 s, **unicast**
   on UDP 319/320 to every timing peer — Apple receivers consume the session
-  clock as unicast PTP and never join an open multicast election. The multicast
-  group (224.0.1.129) is only the fallback while the peer list is still empty,
-  before SETPEERS fills it in.
+  clock as unicast PTP and never join an open multicast election. The engine
+  joins the multicast group (224.0.1.129) for receiving only and never transmits
+  to it, so it stays silent while it has no timing peers (an idle
+  `--ptp-daemon`). The in-process engine starts with the receiver as its only
+  peer until SETPEERS fills in the list.
 - **Unicast negotiation** — REQUEST_UNICAST_TRANSMISSION Signaling TLVs from
   receivers are answered with GRANT TLVs (Apple receivers request unicast
   Announce/Sync/Delay_Resp this way).

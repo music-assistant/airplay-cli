@@ -188,18 +188,15 @@ struct ap2_ptp_ctx {
     pthread_t ptp_thread;
     bool ptp_running;
     bool engine_active;
-    struct in_addr bind_addr;    /* multicast egress/join interface (INADDR_ANY = default) */
+    struct in_addr bind_addr;    /* multicast join interface (INADDR_ANY = default) */
     struct in_addr mcast_addr;
     uint16_t sync_seq;
     uint16_t announce_seq;
     uint16_t signaling_seq;
+    /* Timing messages go unicast to every entry here; Apple receivers consume
+     * the session clock as unicast PTP and never join an open multicast election. */
     char *peers[PTP_MAX_PEERS];
     int npeers;
-    /* Timing messages go unicast to every timing peer; multicast is only the
-     * fallback while the peer list is still empty. Set true at create and never
-     * cleared — Apple receivers consume the session clock as unicast PTP and
-     * never join an open multicast election. */
-    bool unicast_mirror;
 
     /* ---- BMCA / slave state (guarded by lock) ---- */
     pthread_mutex_t lock;
@@ -369,10 +366,8 @@ static void ptp_write_hdr(uint8_t *b, int msg_type, uint16_t msg_len, uint16_t f
 
 static bool ptp_follow_is_configured(struct ap2_ptp_ctx *ctx, struct in_addr addr);
 
-/* Send a PTP message. iOS senders unicast timing straight to each timing peer
- * (never an open multicast election), so with a peer list the message goes
- * unicast to every peer; without one (daemon idle, pre-SETPEERS) it falls back
- * to the multicast group. */
+/* Send a PTP message unicast to every timing peer, as iOS senders do (never an
+ * open multicast election). Without timing peers nothing is sent. */
 static void ptp_send(struct ap2_ptp_ctx *ctx, int sock, uint16_t port,
                      const uint8_t *buf, int len)
 {
@@ -381,7 +376,6 @@ static void ptp_send(struct ap2_ptp_ctx *ctx, int sock, uint16_t port,
     struct in_addr peers[PTP_MAX_PEERS];
     int npeers = 0;
     pthread_mutex_lock(&ctx->lock);
-    bool unicast_mirror = ctx->unicast_mirror;
     for (int i = 0; i < ctx->npeers && npeers < PTP_MAX_PEERS; i++) {
         if (inet_pton(AF_INET, ctx->peers[i], &peers[npeers]) != 1) continue;
         /* A followed receiver is the master of its own session: never offer
@@ -391,19 +385,10 @@ static void ptp_send(struct ap2_ptp_ctx *ctx, int sock, uint16_t port,
     }
     pthread_mutex_unlock(&ctx->lock);
 
-    bool sent = false;
-    if (unicast_mirror) {
-        for (int i = 0; i < npeers; i++) {
-            struct sockaddr_in u = {.sin_family = AF_INET, .sin_port = htons(port)};
-            u.sin_addr = peers[i];
-            sendto(sock, buf, len, 0, (struct sockaddr *)&u, sizeof(u));
-            sent = true;
-        }
-    }
-    if (!sent) {
-        struct sockaddr_in dst = {.sin_family = AF_INET, .sin_port = htons(port)};
-        dst.sin_addr = ctx->mcast_addr;
-        sendto(sock, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
+    for (int i = 0; i < npeers; i++) {
+        struct sockaddr_in u = {.sin_family = AF_INET, .sin_port = htons(port)};
+        u.sin_addr = peers[i];
+        sendto(sock, buf, len, 0, (struct sockaddr *)&u, sizeof(u));
     }
 }
 
@@ -633,7 +618,6 @@ static void ptp_handle_signaling(struct ap2_ptp_ctx *ctx, const uint8_t *buf, in
     pthread_mutex_lock(&ctx->lock);
     bool first = !ctx->unicast_granted;
     ctx->unicast_granted = true;
-    ctx->unicast_mirror = true;                    /* serve the peer unicast from now on */
     pthread_mutex_unlock(&ctx->lock);
     if (first) {
         LOG_INFO("[PTP] Granted unicast transmission to %s (msgTypes %s) — serving "
@@ -1248,12 +1232,6 @@ struct ap2_ptp_ctx *ap2_ptp_create(void)
      * before the engine ever runs. */
     ctx->is_grandmaster = true;
     ctx->hold_master = true;
-    /* Apple receivers consume the session clock as UNICAST PTP sent straight
-     * to them (the nqptp model — they never join an open multicast election),
-     * so mirror Announce/Sync/Follow_Up unicast to every timing peer from the
-     * start. Signaling REQUEST_UNICAST_TRANSMISSION is granted as well for
-     * stacks that negotiate explicitly. */
-    ctx->unicast_mirror = true;
     return ctx;
 }
 
@@ -1435,6 +1413,9 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
      * keep it for the whole session; only with holding disabled can BMCA hand
      * the timeline to a peer announcing a strictly better dataset. */
     pthread_mutex_lock(&ctx->lock);
+    /* Serve the receiver until SETPEERS replaces the list with the session's
+     * timing peers. */
+    if (device_ip && ctx->npeers == 0) ctx->peers[ctx->npeers++] = strdup(device_ip);
     ctx->is_grandmaster = true;
     ctx->master_clock_id = ctx->clock_id;
     ctx->master_offset_ns = 0;
