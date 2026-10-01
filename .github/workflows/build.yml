@@ -211,7 +211,7 @@ jobs:
   release:
     # Publish binaries for tag-based and reusable release runs.
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
-    needs: [immutable-settings, test-updater, build-linux, build-macos]
+    needs: [immutable-settings, test-updater, build-linux, sanitize-linux, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write

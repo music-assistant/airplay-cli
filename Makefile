@@ -86,7 +86,8 @@ endif
 CFLAGS  += $(EXTRA_CFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
 
-# Sanitizer build for the tests (Linux only), e.g.:
+# Sanitizer build for the tests (Linux only); run `make clean` first when
+# switching from a regular build, e.g.:
 #   make test STATIC=1 SANITIZE=address,undefined
 ifneq ($(SANITIZE),)
 SANITIZE_FLAGS = -fsanitize=$(SANITIZE) -fno-omit-frame-pointer -g
