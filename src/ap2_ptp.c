@@ -641,7 +641,7 @@ static int ptp_open_socket(struct ap2_ptp_ctx *ctx, uint16_t port)
 
     /* Bind INADDR_ANY:port. Binding a specific unicast address would stop the
      * kernel from delivering datagrams sent to the multicast group on BSD and
-     * Linux; interface selection is done via the join and IP_MULTICAST_IF. */
+     * Linux; the interface is selected by the group join. */
     struct sockaddr_in a = {
         .sin_family = AF_INET, .sin_port = htons(port), .sin_addr.s_addr = INADDR_ANY,
     };
@@ -655,12 +655,6 @@ static int ptp_open_socket(struct ap2_ptp_ctx *ctx, uint16_t port)
     mreq.imr_interface = ctx->bind_addr;     /* INADDR_ANY -> kernel default */
     if (setsockopt(s, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mreq, sizeof(mreq)) < 0)
         LOG_WARN("[PTP] IP_ADD_MEMBERSHIP failed on %u: %s", port, strerror(errno));
-
-    setsockopt(s, IPPROTO_IP, IP_MULTICAST_IF, &ctx->bind_addr, sizeof(ctx->bind_addr));
-    unsigned char ttl = 1;      /* link-local timing domain */
-    setsockopt(s, IPPROTO_IP, IP_MULTICAST_TTL, &ttl, sizeof(ttl));
-    unsigned char loop = 0;
-    setsockopt(s, IPPROTO_IP, IP_MULTICAST_LOOP, &loop, sizeof(loop));
     return s;
 }
 
