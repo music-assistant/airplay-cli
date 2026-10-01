@@ -46,6 +46,7 @@ TIMELINE_TEST = build/tests/test_ap2_timeline
 EVENT_TEST    = build/tests/test_ap2_event
 CLIENT_TEST   = build/tests/test_ap2_client
 SESSION_TEST  = build/tests/test_ap2_session
+PTP_TEST      = build/tests/test_ap2_ptp
 TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
@@ -211,13 +212,14 @@ clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
-		$(SESSION_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
+		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
 		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
 	$(CLIENT_TEST)
 	$(SESSION_TEST)
+	$(PTP_TEST)
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
@@ -267,6 +269,16 @@ $(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_session.c \
 		build/tests/ap2_session_fifo_test.o src/ap2_io.c $(TOOLS)/cross_log.c \
 		$(EXTRA_LDFLAGS) -lpthread -o $@
+
+# ap2_ptp.c binds ephemeral ports and records datagrams instead of sending them.
+$(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_shm.c \
+		src/ap2_ptp_shm.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dbind=ap2_ptp_test_bind \
+		-Dsendto=ap2_ptp_test_sendto -c src/ap2_ptp.c -o build/tests/ap2_ptp_test.o
+	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_ptp.c \
+		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c $(TOOLS)/cross_log.c \
+		$(LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)

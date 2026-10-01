@@ -61,18 +61,19 @@ void ap2_ptp_set_clock_id(struct ap2_ptp_ctx *ctx, uint64_t clock_id);
 
 /*
  * Set the timing peer IP list (typically [receiver_ip, our_ip]) learned from
- * SETPEERS / timingPeerInfo. Used for logging and, when unicast mirroring is
- * enabled, as additional unicast destinations. Strings are copied.
+ * SETPEERS / timingPeerInfo. These are the unicast destinations of the
+ * engine's timing messages. Strings are copied.
  */
 void ap2_ptp_set_peers(struct ap2_ptp_ctx *ctx, const char *const *ips, int count);
 
 /*
  * Start the PTP grandmaster engine: bind UDP 319 (event) and 320 (general) and
- * spawn a thread that emits Announce/Sync/Follow_Up on the PTP multicast group
- * and answers Delay_Req with Delay_Resp.
+ * spawn a thread that unicasts Announce/Sync/Follow_Up to the timing peers and
+ * answers Delay_Req with Delay_Resp. Without timing peers it sends nothing.
  *
- * :param bind_addr: local interface to join/egress multicast on (INADDR_ANY for default).
- * :param device_ip: receiver IP (for logging).
+ * :param bind_addr: local interface to join the PTP multicast group on (INADDR_ANY for default).
+ * :param device_ip: receiver IP; the timing peer until ap2_ptp_set_peers() is
+ *                   called. NULL starts with no timing peers.
  * :returns: true on success; false if 319/320 cannot be bound (e.g. lacking
  *           privilege) — the caller should then fall back to NTP timing.
  */
@@ -199,7 +200,7 @@ void ap2_ptp_shared_kick(struct ap2_ptp_ctx *ctx);
  * channel (streams register their receiver IPs). Blocks until *stop becomes
  * true (set from a signal handler). This is the body of `--ptp-daemon`.
  *
- * :param bind_addr: multicast egress/join interface (INADDR_ANY for default).
+ * :param bind_addr: multicast join interface (INADDR_ANY for default).
  * :param clock_id: grandmaster identity to advertise; 0 keeps the default.
  * :param stop: pointer to a flag polled for shutdown.
  * :returns: 0 on clean shutdown; non-zero if the engine could not bind 319/320.
