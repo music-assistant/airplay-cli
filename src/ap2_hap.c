@@ -757,12 +757,8 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd,
         LOG_ERROR("[HAP] Invalid pair-verify M2 response (resp_len=%d, body_len=%d)", resp_len, body_len);
         hap_set_error(err_out,
                       rejected ? AP2_HAP_ERR_AUTH : AP2_HAP_ERR_PROTOCOL, 0, 0);
-        /* Dump first 200 bytes for debugging */
-        char hex[600];
-        int dump_len = resp_len < 200 ? resp_len : 200;
-        for (int i = 0; i < dump_len; i++) sprintf(hex + i*3, "%02x ", resp_buf[i]);
-        hex[dump_len*3] = '\0';
-        LOG_ERROR("[HAP] Response hex: %s", hex);
+        /* A rejection was dumped along with its status already. */
+        if (!rejected) hap_log_response("pair-verify M2", resp_buf, resp_len);
         EVP_PKEY_free(eph_key);
         return false;
     }
