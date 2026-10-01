@@ -17,6 +17,7 @@
 
 #include "ap2_bplist.h"
 #include "ap2_client.h"
+#include "ap2_hap.h"
 #include "ap2_io.h"
 #include "cross_log.h"
 
@@ -771,6 +772,48 @@ static void test_auth_error_kind(void)
     assert(ap2cl_destroy(both));
 
     puts("ap2_client auth error classification tests passed");
+}
+
+/* A pair-verify reply without a body fails cleanly, short or long, and keeps
+ * its error category: a protocol error after a 200, a rejection otherwise. */
+static void test_pair_verify_headers_only_reply(void)
+{
+    char creds[192 + 1]; /* 192-hex HAP credential + NUL */
+    memset(creds, 'a', sizeof(creds) - 1);
+    creds[sizeof(creds) - 1] = '\0';
+
+    static const struct {
+        const char *status_line;
+        int len;
+        ap2_hap_result_t result;
+        int http_status;
+    } cases[] = {
+        { "RTSP/1.0 200 OK", 64, AP2_HAP_ERR_PROTOCOL, 0 },
+        { "RTSP/1.0 200 OK", 512, AP2_HAP_ERR_PROTOCOL, 0 },
+        { "RTSP/1.0 403 Forbidden", 512, AP2_HAP_ERR_AUTH, 403 },
+    };
+    for (size_t c = 0; c < sizeof(cases) / sizeof(cases[0]); c++) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        /* A status line and one long header, never the blank line ending them. */
+        char reply[512];
+        int len = cases[c].len;
+        int n = snprintf(reply, sizeof(reply), "%s\r\nX-Pad: ", cases[c].status_line);
+        memset(reply + n, 'x', (size_t)(len - n));
+        assert(write(sockets[1], reply, (size_t)len) == len);
+
+        struct ap2_hap_ctx *hap = ap2_hap_create(creds);
+        assert(hap);
+        ap2_hap_error_t err;
+        assert(!ap2_hap_pair_verify(hap, sockets[0], &err));
+        assert(err.result == cases[c].result);
+        assert(err.http_status == cases[c].http_status);
+        ap2_hap_destroy(hap);
+        close(sockets[0]);
+        close(sockets[1]);
+    }
+
+    puts("ap2_hap pair-verify headers-only reply tests passed");
 }
 
 /* Both MediaRemote toggles parse their value, so the spellings a user reaches
@@ -2461,6 +2504,7 @@ int main(void)
     test_follow_receiver_clock_resolution();
     test_route_explicit_airplay2();
     test_auth_error_kind();
+    test_pair_verify_headers_only_reply();
     test_info_format_tables();
     test_feedback_stream_counts();
     test_native_flush_resume_reuses_rtsp_session();
