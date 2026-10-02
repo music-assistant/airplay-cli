@@ -7,7 +7,11 @@ endif
 
 ifeq ($(findstring gcc,$(CC)),gcc)
 CFLAGS  += -Wno-stringop-truncation -Wno-stringop-overflow -Wno-format-truncation -Wno-multichar
-LDFLAGS += -s -lstdc++ -latomic
+LDFLAGS += -lstdc++ -latomic
+# Sanitizer reports need the symbols, so only strip regular builds.
+ifeq ($(SANITIZE),)
+LDFLAGS += -s
+endif
 else
 CFLAGS += -fno-temp-file
 LDFLAGS += -lc++
@@ -81,6 +85,16 @@ endif
 #   make HOST=macos PLATFORM=x86_64 EXTRA_CFLAGS="-arch x86_64" EXTRA_LDFLAGS="-arch x86_64"
 CFLAGS  += $(EXTRA_CFLAGS)
 LDFLAGS += $(EXTRA_LDFLAGS)
+
+# Sanitizer build for the tests (Linux only); run `make clean` first when
+# switching from a regular build, e.g.:
+#   make test STATIC=1 SANITIZE=address,undefined
+ifneq ($(SANITIZE),)
+SANITIZE_FLAGS = -fsanitize=$(SANITIZE) -fno-omit-frame-pointer -g
+CFLAGS      += $(SANITIZE_FLAGS)
+TEST_CFLAGS += $(SANITIZE_FLAGS)
+LDFLAGS     += -fsanitize=$(SANITIZE)
+endif
 
 # Paths into libraop submodule
 TOOLS       = $(LIBRAOP)/crosstools/src

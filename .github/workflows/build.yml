@@ -143,6 +143,23 @@ jobs:
           path: bin/cliairplay-linux-${{ matrix.platform }}
           if-no-files-found: error
 
+  sanitize-linux:
+    name: Test with sanitizers
+    # AddressSanitizer + UndefinedBehaviorSanitizer over the test suite. Linux
+    # only: ASan hangs during runtime init on recent macOS.
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.release_tag || github.ref }}
+          submodules: recursive
+          persist-credentials: false
+      - name: Run tests under ASan and UBSan
+        env:
+          ASAN_OPTIONS: detect_leaks=0
+          UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
+        run: make test STATIC=1 CC=gcc CXX=g++ SANITIZE=address,undefined
+
   build-macos:
     # Both arches build on the arm64 runner: arm64 natively, x86_64 cross-compiled
     # via -arch (the Intel macos-13 runner is being retired).
@@ -194,7 +211,7 @@ jobs:
   release:
     # Publish binaries for tag-based and reusable release runs.
     if: startsWith(github.ref, 'refs/tags/v') || startsWith(inputs.release_tag, 'v')
-    needs: [immutable-settings, test-updater, build-linux, build-macos]
+    needs: [immutable-settings, test-updater, build-linux, sanitize-linux, build-macos]
     runs-on: ubuntu-latest
     permissions:
       contents: write
