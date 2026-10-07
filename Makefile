@@ -263,6 +263,13 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 		grep -q '^\[STATUS\] error code=connect_failed http=0 detail="[^"]*"$$' && \
 		printf '%s\n' "$$setup_failed" | \
 		grep -q "Failed to create command pipe"
+# An Apple TV advertising a public key may still accept unpaired RAOP, so no
+# secret is demanded up front: the connect attempt (to a closed port) must run.
+	@appletv_pk="$$($(EXECUTABLE) --protocol raop --port 1 --cmdpipe \
+		/tmp/cliairplay-test-unused --am AppleTV2,1 \
+		--pk 0000000000000000000000000000000000000000000000000000000000000000 \
+		127.0.0.1 < /dev/null 2>&1 || true)"; \
+		printf '%s\n' "$$appletv_pk" | grep -q 'detail="RAOP connect failed"'
 
 $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 		src/raop_session.h Makefile
