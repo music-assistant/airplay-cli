@@ -155,7 +155,7 @@ jobs:
           persist-credentials: false
       - name: Run tests under ASan and UBSan
         env:
-          ASAN_OPTIONS: detect_leaks=0
+          ASAN_OPTIONS: detect_leaks=1
           UBSAN_OPTIONS: halt_on_error=1:print_stacktrace=1
         run: make test STATIC=1 CC=gcc CXX=g++ SANITIZE=address,undefined
 
