@@ -226,6 +226,11 @@ $(BUILDDIR)/%.o: %.cpp
 clean:
 	rm -rf $(BUILDDIR) $(EXECUTABLE) $(LIBCODECS_PATCHED) build/tests
 
+# The CLI checks in `test` expect the binary to fail and swallow its exit
+# status, so they rely on this to fail on a sanitizer report (and show it).
+no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
+	printf '%s\n' "$(1)" >&2; false;; esac
+
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
 		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
 		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST)
@@ -242,9 +247,11 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	python3 tests/mrp_artwork_matrix.py --help >/dev/null
 	@missing_pipe="$$($(EXECUTABLE) --protocol raop \
 		127.0.0.1 2>&1 || true)"; \
+		$(call no_sanitizer_report,$$missing_pipe) && \
 		printf '%s\n' "$$missing_pipe" | grep -q "Streaming requires --cmdpipe"
 	@argv_audio="$$($(EXECUTABLE) --protocol raop --cmdpipe \
 		/tmp/cliairplay-test-unused 127.0.0.1 - 2>&1 || true)"; \
+		$(call no_sanitizer_report,$$argv_audio) && \
 		printf '%s\n' "$$argv_audio" | \
 		grep -q "Streaming audio must be provided on stdin, not argv"
 # Both greps are chained with && on purpose: a recipe line reports only its
@@ -252,6 +259,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 # assertion unenforced.
 	@auth_required="$$($(EXECUTABLE) --protocol raop --pw true \
 		127.0.0.1 2>&1 || true)"; \
+		$(call no_sanitizer_report,$$auth_required) && \
 		printf '%s\n' "$$auth_required" | \
 		grep -q '^\[STATUS\] error code=auth_required http=0 detail="[^"]*"$$' && \
 		printf '%s\n' "$$auth_required" | \
@@ -260,6 +268,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 # has nothing to fail fast on and waits out its connect timeout instead.
 	@setup_failed="$$($(EXECUTABLE) --protocol raop --cmdpipe \
 		/nonexistent-cliairplay-test-dir/pipe 127.0.0.1 2>&1 || true)"; \
+		$(call no_sanitizer_report,$$setup_failed) && \
 		printf '%s\n' "$$setup_failed" | \
 		grep -q '^\[STATUS\] error code=connect_failed http=0 detail="[^"]*"$$' && \
 		printf '%s\n' "$$setup_failed" | \
