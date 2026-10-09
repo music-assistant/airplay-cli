@@ -165,8 +165,9 @@ RAOP_LIFECYCLE_TEST_EXECUTABLE = $(BUILDDIR)/test-ap2-raop-lifecycle
 RAOP_LIFECYCLE_TEST_OBJECTS = $(BUILDDIR)/test_ap2_raop_lifecycle.o \
 	$(BUILDDIR)/ap2_client_raop_lifecycle_test.o \
 	$(BUILDDIR)/raop_session_raop_lifecycle_test.o \
+	build/tests/cross_ssl.o \
 	$(filter-out $(BUILDDIR)/ap2_client.o $(BUILDDIR)/cliairplay.o \
-		$(BUILDDIR)/raop_session.o,$(OBJECTS_ALL))
+		$(BUILDDIR)/raop_session.o $(BUILDDIR)/cross_ssl.o,$(OBJECTS_ALL))
 RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_create=ap2_test_raopcl_create \
 	-Draopcl_connect=ap2_test_raopcl_connect \
