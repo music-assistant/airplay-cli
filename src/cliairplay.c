@@ -1285,14 +1285,6 @@ static int run_raop(cli_config_t *cfg)
     }
     memcpy(&player_addr.s_addr, hostent->h_addr_list[0], hostent->h_length);
 
-    /* Check AppleTV auth requirement */
-    if (cfg->am && strcasestr(cfg->am, "appletv") && cfg->pk && *cfg->pk && (!cfg->secret || !*cfg->secret)) {
-        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
-                        "AppleTV pairing secret (--secret) is missing",
-                        "AppleTV requires authentication (need secret)");
-        return 1;
-    }
-
     /* Encryption setup */
     if ((cfg->encrypt) && cfg->et && strchr(cfg->et, '1'))
         crypto = RAOP_RSA;
