@@ -4976,7 +4976,7 @@ static void ap2_log_response_body(const char *tag, const uint8_t *body, int len)
     char hex[8 * 3 + 1];
     int hn = len < 8 ? len : 8;
     for (int i = 0; i < hn; i++) sprintf(hex + i * 3, "%02x ", body[i]);
-    hex[hn * 3 ? hn * 3 - 1 : 0] = '\0';
+    hex[hn * 3 - 1] = '\0';
     bool is_bplist = len >= 8 && memcmp(body, "bplist00", 8) == 0;
     LOG_INFO("%s response body: %d bytes%s [%s] text=\"%s\"",
              tag, len, is_bplist ? " (bplist00)" : "", hex, text);
