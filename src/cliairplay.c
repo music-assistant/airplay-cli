@@ -1464,6 +1464,7 @@ static int run_raop(cli_config_t *cfg)
             }
             if (n == 0) {
                 pthread_mutex_unlock(&g_audio_send_lock);
+                usleep(1000);
                 continue;
             }
             n = pad_final_pcm_chunk(
@@ -1806,6 +1807,7 @@ static int run_airplay2(cli_config_t *cfg)
                     content_cut_report(ap2_input_byte_rate);
                 }
                 pthread_mutex_unlock(&g_audio_send_lock);
+                if (dropped == 0) usleep(1000);
                 continue;
             }
             content_cut_report(ap2_input_byte_rate);
@@ -1866,6 +1868,7 @@ static int run_airplay2(cli_config_t *cfg)
                      * stream is an input gap. */
                     if (ap2_session_state(g_session) != AP2_SESSION_PLAYING) {
                         pthread_mutex_unlock(&g_audio_send_lock);
+                        usleep(1000);
                         continue;
                     }
                     if (!starving) {
@@ -1876,6 +1879,7 @@ static int run_airplay2(cli_config_t *cfg)
                     }
                     ap2cl_recover_input_gap(g_ap2cl);
                     pthread_mutex_unlock(&g_audio_send_lock);
+                    usleep(1000);
                     continue;
                 }
                 if (starving) {
