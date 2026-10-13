@@ -51,6 +51,7 @@ void ap2cl_test_rtx_store(struct ap2cl_s *p, uint16_t seq,
 unsigned long long ap2cl_test_rtx_answered(struct ap2cl_s *p);
 unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p);
 void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable);
+void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 bool ap2cl_test_env_enabled(const char *name, bool unset_default);
@@ -2315,6 +2316,111 @@ static void test_clock_verified_anchor(void)
     puts("ap2_client clock verified anchor tests passed");
 }
 
+typedef struct {
+    int fd;
+    bool ok;
+    uint64_t accepted_anchor_ms;
+} anchor_peer_t;
+
+/* Refuse the first anchor, as a receiver does before its clock is seated,
+ * then accept the retry and record what it schedules. */
+static void *run_anchor_retry_peer(void *arg)
+{
+    anchor_peer_t *peer = arg;
+    peer->ok = false;
+    for (int request = 0; request < 2; request++) {
+        uint8_t buffer[4096];
+        size_t fill = 0;
+        char *body = NULL;
+        while (!body) {
+            ssize_t n = read(peer->fd, buffer + fill, sizeof(buffer) - fill - 1);
+            if (n <= 0) return NULL;
+            fill += (size_t)n;
+            buffer[fill] = 0;
+            body = strstr((char *)buffer, "\r\n\r\n");
+        }
+        body += 4;
+        int cseq = 0;
+        int body_len = 0;
+        char *cseq_header = strstr((char *)buffer, "\r\nCSeq: ");
+        char *len_header = strstr((char *)buffer, "\r\nContent-Length: ");
+        if (strncmp((char *)buffer, "SETRATEANCHORTIME ", 18) != 0 ||
+            !cseq_header || sscanf(cseq_header, "\r\nCSeq: %d", &cseq) != 1 ||
+            !len_header ||
+            sscanf(len_header, "\r\nContent-Length: %d", &body_len) != 1)
+            return NULL;
+        size_t header_len = (size_t)(body - (char *)buffer);
+        while (fill < header_len + (size_t)body_len) {
+            ssize_t n = read(peer->fd, buffer + fill, sizeof(buffer) - fill - 1);
+            if (n <= 0) return NULL;
+            fill += (size_t)n;
+        }
+        if (request == 1) {
+            uint64_t secs = 0, frac = 0;
+            if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                      "networkTimeSecs", &secs) ||
+                !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                      "networkTimeFrac", &frac))
+                return NULL;
+            peer->accepted_anchor_ms =
+                secs * 1000ULL + (((frac >> 32) * 1000ULL) >> 32);
+        }
+        char response[96];
+        int response_len = snprintf(
+            response, sizeof(response),
+            "RTSP/1.0 %s\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
+            request == 0 ? "400 Bad Request" : "200 OK", cseq);
+        if (write(peer->fd, response, (size_t)response_len) != response_len)
+            return NULL;
+    }
+    peer->ok = true;
+    return NULL;
+}
+
+/* A buffered start whose anchor is refused once acks the instant the retry
+ * actually scheduled, and its head moves to that instant. */
+static void test_buffered_anchor_retry_acks_scheduled_instant(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    anchor_peer_t peer = {.fd = sockets[1]};
+    pthread_t peer_thread;
+    assert(pthread_create(
+               &peer_thread, NULL, run_anchor_retry_peer, &peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "buffered anchor test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_use_buffered(client, true);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+
+    uint64_t at = 0;
+    assert(ap2cl_start(client, 0, &at) == AP2_COMMIT_OK);
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+    int64_t ack_error_ms = (int64_t)at - (int64_t)peer.accepted_anchor_ms;
+    assert(ack_error_ms >= -10 && ack_error_ms <= 10);
+    int64_t head_error_frames = (int64_t)ap2cl_test_head_ts(client) -
+                                (int64_t)(at * format.sample_rate / 1000);
+    assert(head_error_frames >= -441 && head_error_frames <= 441);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+}
+
 /* Readiness reported from connect, so a caller can plan a join anchor the
  * receiver can actually meet instead of guessing a headroom. */
 static void test_clock_readiness_report(void)
@@ -2549,6 +2655,7 @@ int main(void)
     test_splice_depth_override_vs_reported_buffer();
     test_splice_depth_bounds();
     test_clock_verified_anchor();
+    test_buffered_anchor_retry_acks_scheduled_instant();
     test_clock_readiness_report();
     test_clock_stall_detection();
 

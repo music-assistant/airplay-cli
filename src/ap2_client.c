@@ -2703,30 +2703,32 @@ static bool ap2_send_setrateanchortime(struct ap2cl_s *p, uint32_t rtp_time,
 }
 
 /* Anchor a buffered stream's playback: rate-1 SETRATEANCHORTIME mapping the
- * current RTP head to the commanded NTP instant. A strict receiver 400s the
+ * current RTP head to the instant *ntp_start. A strict receiver 400s the
  * anchor until it has measured our clock (a second or two of Delay_Req), so
- * retry over the readiness window. */
-static bool ap2_buffered_anchor_start(struct ap2cl_s *p, uint64_t ntp_start)
+ * retry over the readiness window. A retry that would leave less than the
+ * minimum lead moves the instant and the RTP head forward together, to the
+ * floor plus one lead of retry slack, and writes the moved instant to
+ * *ntp_start and *at_unix_ms. */
+static bool ap2_buffered_anchor_start(struct ap2cl_s *p, uint64_t *ntp_start,
+                                      uint64_t *at_unix_ms)
 {
-    uint64_t now_ntp = raopcl_get_ntp(NULL);
-    uint64_t lead_ns = 0;
-    if (ntp_start > now_ntp) {
-        uint64_t d = ntp_start - now_ntp;  /* NTP fixed-point: sec<<32 | frac */
-        lead_ns = (d >> 32) * 1000000000ULL +
-                  (((d & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
-    }
+    uint64_t requested_ntp = *ntp_start;
     bool anchored_ok = false;
     for (int try = 0; try < 12 && !anchored_ok; try++) {
-        if (try) {
-            usleep(500000);
-            /* The commanded instant stays fixed; only the remaining lead
-             * shrinks as the wall clock advances toward it. */
-            uint64_t n = raopcl_get_ntp(NULL);
-            lead_ns = ntp_start > n
-                          ? (((ntp_start - n) >> 32) * 1000000000ULL +
-                             ((((ntp_start - n) & 0xFFFFFFFFULL) *
-                               1000000000ULL) >> 32))
-                          : 0;
+        if (try) usleep(500000);
+        uint64_t now_ntp = raopcl_get_ntp(NULL);
+        uint64_t floor_ntp = now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+        if (try && *ntp_start < floor_ntp) {
+            *ntp_start = floor_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+            uint64_t head_ts = NTP2TS(*ntp_start, p->format.sample_rate);
+            p->rtp_timestamp += (uint32_t)(head_ts - p->head_ts);
+            p->head_ts = head_ts;
+        }
+        uint64_t lead_ns = 0;
+        if (*ntp_start > now_ntp) {
+            uint64_t d = *ntp_start - now_ntp;  /* NTP fixed-point: sec<<32 | frac */
+            lead_ns = (d >> 32) * 1000000000ULL +
+                      (((d & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
         }
         uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + lead_ns;
         anchored_ok = ap2_send_setrateanchortime(p, p->rtp_timestamp,
@@ -2735,6 +2737,13 @@ static bool ap2_buffered_anchor_start(struct ap2cl_s *p, uint64_t ntp_start)
     if (!anchored_ok) {
         LOG_ERROR("[AP2] Unable to establish buffered playback anchor");
         return false;
+    }
+    if (*ntp_start != requested_ntp) {
+        if (at_unix_ms) *at_unix_ms = ap2_ntp_to_unix_ms(*ntp_start);
+        LOG_WARN("[AP2] buffered anchor accepted late, start moved %llu ms "
+                 "later",
+                 (unsigned long long)(ap2_ntp_to_unix_ms(*ntp_start) -
+                                      ap2_ntp_to_unix_ms(requested_ntp)));
     }
     p->anchored = true;
     return true;
@@ -3761,7 +3770,7 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
          * No sync packets exist on this stream type — the anchor IS the
          * timeline announcement. */
         if (p->use_buffered) {
-            if (!ap2_buffered_anchor_start(p, ntp_start)) {
+            if (!ap2_buffered_anchor_start(p, &p->start_ntp, at_unix_ms)) {
                 atomic_store(&p->media_healthy, false);
                 return AP2_COMMIT_FAILED;
             }
@@ -4067,7 +4076,7 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
      * boundary (FLUSHBUFFERED); a fresh rate-1 anchor maps the re-based RTP
      * head to the commanded instant. */
     if (p->use_buffered) {
-        if (!ap2_buffered_anchor_start(p, start_ntp)) {
+        if (!ap2_buffered_anchor_start(p, &p->start_ntp, at_unix_ms)) {
             atomic_store(&p->media_healthy, false);
             return AP2_COMMIT_FAILED;
         }
@@ -4705,7 +4714,7 @@ void ap2cl_play(struct ap2cl_s *p)
         /* A refused re-anchor means the receiver can schedule nothing we
          * send: fail the media health so the session ends loudly (the
          * caller restarts it) instead of "playing" into a dead schedule. */
-        if (!ap2_buffered_anchor_start(p, resume_ntp)) {
+        if (!ap2_buffered_anchor_start(p, &resume_ntp, NULL)) {
             atomic_store(&p->media_healthy, false);
             return;
         }
@@ -5768,6 +5777,11 @@ unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p)
 void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable)
 {
     p->use_ptp = enable;
+}
+
+void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable)
+{
+    p->use_buffered = enable;
 }
 
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple)
