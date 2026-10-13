@@ -2532,6 +2532,7 @@ static void test_buffered_resume_anchor_retry_keeps_held_frame(void)
     assert(peer.rate[1] == 0 && peer.rate[2] == 1 && peer.rate[3] == 1);
 
     uint32_t paused_rtp = (uint32_t)peer.rtp[0];
+    assert(peer.rtp[1] == paused_rtp);
     assert(wire_rtp == paused_rtp + QUEUED);
     assert(peer.rtp[3] == paused_rtp + CHUNK);
     assert(peer.rtp[2] == peer.rtp[3]);
