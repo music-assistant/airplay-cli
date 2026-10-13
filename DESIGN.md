@@ -625,14 +625,26 @@ normalization, not in the protocol curve.
 tvOS draws its on-screen now-playing UI only from **MediaRemote** state, not
 from the DMAP metadata that speakers consume over RTSP `SET_PARAMETER` (the
 Apple TV 200-accepts that metadata but never renders it; the DMAP path stays,
-because Sonos-class speakers require and consume it). Pair-verified native
-sessions therefore additionally push MediaRemote now-playing, so an Apple TV
+because Sonos-class speakers require and consume it). Native Apple sessions
+therefore additionally push MediaRemote now-playing, so an Apple TV
 renders our stream the way it renders an iPhone sender. Maintaining that
 session also keeps tvOS awake mid-stream: tvOS treats the MediaRemote
 now-playing session, not raw RTP flow, as playback activity. The path is gated
-to pair-verified native sessions — Apple devices in practice — since
-transient-paired and third-party receivers neither need nor render it.
-`CLIAIRPLAY_MRP=0` disables the whole path (diagnostic opt-out).
+to encrypted native sessions that are either pair-verified (Apple devices in
+practice) or transient-paired with an Apple `model=`/`am=` (a HomePod whose
+access is "Everyone on the same network" pairs transiently — measured on
+HomePod OS 27 — and delivers its Siri / touch-surface commands only on the
+reverse event channel this path services). Transient third-party receivers
+neither need nor render it. `CLIAIRPLAY_MRP=0` disables the whole path
+(diagnostic opt-out).
+
+**Channel keys.** The event (`Events-Salt`) and DataStream channel keys are
+HKDF-SHA512 over the pairing's full secret: the 32-byte X25519 shared secret
+after pair-verify, but the **full 64-byte SRP session key** after transient
+pair-setup (owntone `pair_homekit` does the same). Only the audio key (`shk`)
+is the 32-byte prefix. Keying the event channel from that prefix makes the
+first receiver command fail to authenticate and the HomePod resets the
+session.
 
 **Transport — `POST /command`** on the main encrypted RTSP channel (same
 channel and HAP framing as `/feedback`), `Content-Type:
@@ -963,8 +975,10 @@ deny-list entry, not a policy retreat.
   nothing depends on it, and only the write nonce advances, so none is reused.
   Best-effort by nature: a receiver wedged badly enough to miss three
   keepalives may never read it, and the socket shutdown follows immediately.
-- **Reverse event channel** — pair-verified sessions derive independent
-  `Events-Salt` keys, decrypt receiver HTTP requests, and return encrypted
+- **Reverse event channel** — MediaRemote-eligible sessions (§8) derive
+  independent `Events-Salt` keys, decrypt receiver HTTP requests (including
+  `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
+  reported as `[EVENT] remote command=`), and return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
   to tear down a MediaRemote-active stream after roughly 30 seconds.
 - **Single-stream flush-and-refill** — one reader thread drains the persistent
@@ -1061,7 +1075,7 @@ deny-list entry, not a policy retreat.
   real metadata — the command thread only runs with the transport connected —
   so the placeholder push is skipped then, rather than re-sending the same
   bundle as a byte-identical replace burst (§8).
-- **Apple MediaRemote metadata** — pair-verified native sessions register a
+- **Apple MediaRemote metadata** — MediaRemote-eligible native sessions (§8) register a
   DEVICE_INFO origin, then send `updateMRNowPlayingInfo` followed by supported
   commands, explicit playback state, and a serialized NowPlayingClient.
   Start/pause/resume/stop transitions stay synchronized with the audio state.
@@ -1106,8 +1120,10 @@ callers:
   the compiled default only, since an explicit `--latency` outranks a window
   that was never reported (§6).
 - **Pairing posture differs by vendor**: Sonos/JBL/WiiM accept transient
-  pairing (no PIN); Apple TV/HomePod require stored credentials from a PIN
-  pair-setup (transient returns 200 + an in-band TLV error and silence).
+  pairing (no PIN). Apple TV, and a HomePod whose AirPlay access is restricted
+  in Home, require stored credentials from a PIN pair-setup (transient returns
+  200 + an in-band TLV error and silence); a HomePod set to "Everyone on the
+  same network" accepts transient pairing.
 - **Sonos withholds audio until metadata arrives** (§10).
 - **Cross-VLAN**: HomeKit pairing and PTP do not survive subnet boundaries;
   same-L2 is assumed.

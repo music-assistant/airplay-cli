@@ -9,6 +9,7 @@
 #define __AP2_HAP_H_
 
 #include <stdbool.h>
+#include <stddef.h>
 #include <stdint.h>
 
 /*
@@ -130,5 +131,10 @@ void ap2_hap_restore_read_counter(struct ap2_hap_ctx *ctx, uint64_t counter);
 
 /* Get the X25519 shared secret (32 bytes) - used as audio encryption key. */
 const uint8_t *ap2_hap_get_shared_secret(struct ap2_hap_ctx *ctx);
+
+/* HKDF input for the derived event/DataStream channels: the X25519 secret
+ * (32 bytes) after pair-verify, the full SRP session key (64 bytes) after
+ * transient pair-setup. NULL with *len = 0 before pairing completes. */
+const uint8_t *ap2_hap_get_kdf_secret(struct ap2_hap_ctx *ctx, size_t *len);
 
 #endif /* __AP2_HAP_H_ */

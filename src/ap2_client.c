@@ -1321,6 +1321,8 @@ static bool ap2_buffered_denied(const char *txt, const char *am)
 }
 
 static bool ap2_apple_model(const char *txt, const char *am);
+static bool ap2_mrp_session_eligible(bool encrypted, bool stored_credentials,
+                                     bool apple_model);
 
 /* Value of a TXT `key=` field (the key must start the blob or follow a
  * space, so "gid=" cannot match inside "pgid="), or NULL when absent. */
@@ -1575,11 +1577,13 @@ static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, cons
  * dataPort (DESIGN.md §8, the "combined/piggyback" model). This is
  * best-effort decoration: any failure (SETUP non-200, no dataPort, connect or
  * handshake failure) logs and leaves p->mrp NULL / audio untouched. Reachable
- * only on a pair-verified session (Apple devices) — the DataStream keys derive
- * from this session's pair-verify shared secret. */
+ * only on a MediaRemote-eligible session (ap2_mrp_session_eligible); the
+ * DataStream keys derive from that session's pairing secret. */
 static void ap2_native_setup_mrp(struct ap2cl_s *p)
 {
-    if (!p->hap || !p->auth_credentials) return;   /* pair-verified only */
+    if (!ap2_mrp_session_eligible(p->hap != NULL, p->auth_credentials != NULL,
+                                  p->apple_model))
+        return;
 
     /* Random seed < 2^63: our plist writer stores signed int64 and Apple's own
      * plist ints are signed at that width. The DataStream HKDF salt is
@@ -1634,13 +1638,15 @@ static void ap2_native_setup_mrp(struct ap2cl_s *p)
     LOG_INFO("[MRP] type-130 data-channel SETUP OK (dataPort=%d, seed=%llu)",
              data_port, (unsigned long long)seed);
 
-    /* Bind the sender to THIS session's pair-verify shared secret and open the
-     * channel (TCP connect + DEVICE_INFO-first handshake). */
-    if (!p->mrp)
+    /* Bind the sender to THIS session's pairing secret and open the channel
+     * (TCP connect + DEVICE_INFO-first handshake). */
+    if (!p->mrp) {
+        size_t kdf_len = 0;
+        const uint8_t *kdf = ap2_hap_get_kdf_secret(p->hap, &kdf_len);
         p->mrp = ap2_mrp_create(p->device.address, p->device.port,
                                 p->auth_credentials, p->dacp_id, p->device.name,
-                                p->session_uuid, p->group_uuid,
-                                ap2_hap_get_shared_secret(p->hap));
+                                p->session_uuid, p->group_uuid, kdf, kdf_len);
+    }
     if (!p->mrp) return;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
@@ -4927,20 +4933,35 @@ static ap2_mrp_playback_state_t ap2_mrp_current_playback_state(
                                      : AP2_MRP_PLAYBACK_STOPPED;
 }
 
-/* Lazily create MediaRemote for pair-verified native sessions and attach the
+/* MediaRemote is Apple-only and needs an encrypted (HAP) session. Stored
+ * credentials mean an Apple device in practice (only Apple TV and HomePod
+ * pair with a PIN); a transient session qualifies by model, because a HomePod
+ * whose access is "Everyone on the same network" pairs transiently and its
+ * Siri / touch-surface commands arrive only on the reverse event channel
+ * MediaRemote services. Transient third-party speakers never receive these
+ * Apple-specific messages. */
+static bool ap2_mrp_session_eligible(bool encrypted, bool stored_credentials,
+                                     bool apple_model)
+{
+    return encrypted && (stored_credentials || apple_model);
+}
+
+/* Lazily create MediaRemote for eligible native sessions and attach the
  * encrypted reverse event channel before advertising any controllable state.
- * Transient-paired third-party speakers never receive these Apple-specific
- * messages. Set CLIAIRPLAY_MRP=0 to disable the path for diagnosis. */
+ * Set CLIAIRPLAY_MRP=0 to disable the path for diagnosis. */
 static void ap2_mrp_ready(struct ap2cl_s *p)
 {
-    if (p->mrp || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials ||
+    if (p->mrp || p->flow != FLOW_NATIVE_AP2 ||
+        !ap2_mrp_session_eligible(p->hap != NULL, p->auth_credentials != NULL,
+                                  p->apple_model) ||
         p->sock_fd < 0 || p->events_sock < 0 || !p->session_uuid[0])
         return;
     if (!ap2_env_enabled("CLIAIRPLAY_MRP", true)) return;
+    size_t kdf_len = 0;
+    const uint8_t *kdf = ap2_hap_get_kdf_secret(p->hap, &kdf_len);
     p->mrp = ap2_mrp_create(p->device.address, p->device.port, p->auth_credentials,
                             p->dacp_id, p->device.name,
-                            p->session_uuid, p->group_uuid,
-                            ap2_hap_get_shared_secret(p->hap));
+                            p->session_uuid, p->group_uuid, kdf, kdf_len);
     if (!p->mrp) return;
     ap2_mrp_set_remote_command_callback(
         p->mrp, ap2_remote_command_received, p);
@@ -5203,12 +5224,15 @@ int ap2cl_mrp_push_progress(struct ap2cl_s *p)
 }
 
 /* MRP data-channel (path B) status for the [STATUS] mrp line:
- *   -1 = not attempted (non-Apple / not pair-verified),
+ *   -1 = not attempted (session not MediaRemote-eligible),
  *    0 = attempted but the channel is not up,
  *    1 = channel established (now-playing active). */
 int ap2cl_mrp_channel_status(struct ap2cl_s *p)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2 || !p->auth_credentials) return -1;
+    if (!p || p->flow != FLOW_NATIVE_AP2 ||
+        !ap2_mrp_session_eligible(p->hap != NULL, p->auth_credentials != NULL,
+                                  p->apple_model))
+        return -1;
     /* The type-130 channel is opt-in (see ap2_native_connect §6b); when it is
      * not attempted, report "not applicable" so the [STATUS] path=channel line
      * is suppressed and only path=command (the active now-playing path) shows. */
@@ -5764,6 +5788,12 @@ bool ap2cl_test_env_enabled(const char *name, bool unset_default)
 bool ap2cl_test_mrp_type130_enabled(void)
 {
     return ap2_mrp_type130_enabled();
+}
+
+bool ap2cl_test_mrp_session_eligible(bool encrypted, bool stored_credentials,
+                                     bool apple_model)
+{
+    return ap2_mrp_session_eligible(encrypted, stored_credentials, apple_model);
 }
 
 /* Plant a probe-streak snapshot where the shared-daemon poller would put

@@ -264,7 +264,7 @@ static bool test_nowplaying_command_payload(void)
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
         "127.0.0.1", 7000, NULL, "0011223344556677", "Test sender",
         "11111111-1111-1111-1111-111111111111",
-        "22222222-2222-2222-2222-222222222222", NULL);
+        "22222222-2222-2222-2222-222222222222", NULL, 0);
     CHECK(mrp != NULL);
     CHECK(ap2_mrp_set_metadata(mrp, "Title", "Artist", "Album", 180000,
                                "item-1"));
@@ -463,7 +463,7 @@ static bool test_set_track_bundle(void)
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
         "127.0.0.1", 7000, NULL, "0011223344556677", "Test sender",
         "11111111-1111-1111-1111-111111111111",
-        "22222222-2222-2222-2222-222222222222", NULL);
+        "22222222-2222-2222-2222-222222222222", NULL, 0);
     CHECK(mrp != NULL);
 
     /* First track with artwork: identity and image land in one state change. */
@@ -611,7 +611,7 @@ static bool test_set_track_duration_keep(void)
     struct ap2_mrp_ctx *mrp = ap2_mrp_create(
         "127.0.0.1", 7000, NULL, "0011223344556677", "Test sender",
         "11111111-1111-1111-1111-111111111111",
-        "22222222-2222-2222-2222-222222222222", NULL);
+        "22222222-2222-2222-2222-222222222222", NULL, 0);
     CHECK(mrp != NULL);
 
     ap2_mrp_artwork_info_t info;

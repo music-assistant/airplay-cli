@@ -104,6 +104,11 @@ struct ap2_hap_ctx {
 
     /* X25519 shared secret from pair-verify (kept for audio encryption) */
     uint8_t shared_secret[32];
+    /* HKDF input for the session's derived channels (events, DataStream):
+     * the 32-byte X25519 secret after pair-verify, the full 64-byte SRP
+     * session key after transient pair-setup (owntone pair_homekit). */
+    uint8_t kdf_secret[SRP_HASH_LEN];
+    size_t kdf_secret_len;
 
     /* Session keys derived after pair-verify */
     uint8_t write_key[32];           /* Control-Write-Encryption-Key */
@@ -1029,6 +1034,8 @@ bool ap2_hap_pair_verify(struct ap2_hap_ctx *ctx, int sock_fd,
 
     /* Save shared_secret for audio encryption (AP2 uses it directly as audio key) */
     memcpy(ctx->shared_secret, shared_secret, 32);
+    memcpy(ctx->kdf_secret, shared_secret, 32);
+    ctx->kdf_secret_len = 32;
 
     OPENSSL_cleanse(shared_secret, sizeof(shared_secret));
     OPENSSL_cleanse(verify_key, sizeof(verify_key));
@@ -1187,6 +1194,8 @@ bool ap2_hap_pair_setup_transient(struct ap2_hap_ctx *ctx, int sock_fd,
     /* The audio key is the first 32 bytes of the SRP session key, taking the
      * same role as the X25519 shared secret after pair-verify */
     memcpy(ctx->shared_secret, session_key, sizeof(ctx->shared_secret));
+    memcpy(ctx->kdf_secret, session_key, SRP_HASH_LEN);
+    ctx->kdf_secret_len = SRP_HASH_LEN;
 
     OPENSSL_cleanse(session_key, sizeof(session_key));
     OPENSSL_cleanse(proof_m1, sizeof(proof_m1));
@@ -1520,6 +1529,12 @@ int ap2_hap_encrypt(struct ap2_hap_ctx *ctx, const uint8_t *in, int in_len,
 uint64_t ap2_hap_save_read_counter(struct ap2_hap_ctx *ctx) { return ctx ? ctx->read_nonce_counter : 0; }
 void ap2_hap_restore_read_counter(struct ap2_hap_ctx *ctx, uint64_t counter) { if (ctx) ctx->read_nonce_counter = counter; }
 const uint8_t *ap2_hap_get_shared_secret(struct ap2_hap_ctx *ctx) { return ctx ? ctx->shared_secret : NULL; }
+
+const uint8_t *ap2_hap_get_kdf_secret(struct ap2_hap_ctx *ctx, size_t *len)
+{
+    if (len) *len = ctx ? ctx->kdf_secret_len : 0;
+    return ctx && ctx->kdf_secret_len ? ctx->kdf_secret : NULL;
+}
 
 int ap2_hap_decrypt(struct ap2_hap_ctx *ctx, const uint8_t *in, int in_len,
                     uint8_t **out)

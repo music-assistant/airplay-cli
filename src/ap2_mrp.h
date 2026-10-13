@@ -85,7 +85,7 @@ typedef struct {
  *  - piggyback: the audio session (ap2_client.c) issues the extra stream SETUP
  *    (type 130) on its already-verified RTSP channel and hands the returned
  *    dataPort to ap2_mrp_attach(). The channel keys derive from THAT session's
- *    pair-verify shared secret, passed here as reuse_shared_secret.
+ *    pairing secret, passed here as secret.
  *  - sidecar (metadata-only display mode): ap2_mrp_start() later drives its own
  *    connection + pair-verify + remote-control-only session; not implemented in
  *    the current implementation.
@@ -101,9 +101,14 @@ typedef struct {
  * :param device_name: sender display name to advertise (DEVICE_INFO).
  * :param session_uuid: UUID of the AirPlay audio session this state belongs to.
  * :param group_uuid: AirPlay group UUID advertised in the session SETUP.
- * :param reuse_shared_secret: 32-byte pairing shared secret of the verified
- *                             session the type-130 stream was SETUP on
- *                             (piggyback model). NULL for the sidecar model.
+ * :param secret: HKDF input for the event and DataStream channel keys of the
+ *                session the channels belong to (ap2_hap_get_kdf_secret): the
+ *                32-byte X25519 secret after pair-verify, the full 64-byte SRP
+ *                session key after transient pair-setup. NULL for the sidecar
+ *                model.
+ * :param secret_len: byte length of secret (1..64); ignored when secret is NULL.
+ * :returns: the context, or NULL on a missing host, allocation failure or an
+ *           out-of-range secret_len.
  */
 struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *auth_credentials,
@@ -111,7 +116,7 @@ struct ap2_mrp_ctx *ap2_mrp_create(const char *host, int port,
                                     const char *device_name,
                                     const char *session_uuid,
                                     const char *group_uuid,
-                                    const uint8_t *reuse_shared_secret);
+                                    const uint8_t *secret, size_t secret_len);
 
 /* Destroy the context and release all resources. */
 void ap2_mrp_destroy(struct ap2_mrp_ctx *m);

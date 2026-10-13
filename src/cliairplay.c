@@ -1598,7 +1598,7 @@ static int run_airplay2(cli_config_t *cfg)
 
     /* Report the MRP now-playing path so MA can log which one is active. The
      * type-130 data channel (path B) is opt-in; -1 means it was not attempted
-     * (default) or the session is not an Apple/pair-verified target. */
+     * (default) or the session is not MediaRemote-eligible. */
     {
         int mrp_ch = ap2cl_mrp_channel_status(g_ap2cl);
         if (mrp_ch >= 0) {
