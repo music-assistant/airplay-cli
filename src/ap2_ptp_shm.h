@@ -59,14 +59,15 @@ struct ap2_ptp_shm_follow {
 };
 
 /*
- * One published clock sample. All times are nanoseconds on CLOCK_REALTIME,
- * which the daemon and the streaming processes share (same host), so a stream
- * recovers master-domain time as (its own CLOCK_REALTIME now + offset).
+ * One published clock sample. All times are nanoseconds on the host clock
+ * (host_clock.h), which the daemon and the streaming processes share when they
+ * run with the same --clock-offset-ns, so a stream recovers master-domain time
+ * as (its own host clock now + offset).
  */
 struct ap2_ptp_shm_sample {
     uint64_t update_count;            /* bumped once per publish; freshness/liveness */
     uint64_t master_clock_id;         /* elected grandmaster identity (timeline id) */
-    uint64_t local_time;              /* local CLOCK_REALTIME ns at publish */
+    uint64_t local_time;              /* local host clock ns at publish */
     int64_t  local_to_master_offset;  /* add to a local ns to get master-domain ns */
     uint64_t master_clock_start_time; /* master timebase epoch (daemon start), informational */
     uint32_t flags;                   /* AP2_PTP_SHM_F_* */

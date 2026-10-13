@@ -20,6 +20,8 @@
 #include "ap2_hap.h"
 #include "ap2_io.h"
 #include "cross_log.h"
+#include "host_clock.h"
+#include "raop_client.h"
 
 #include "mrp_jpeg_fixture.h"
 
@@ -2519,8 +2521,38 @@ static void test_clock_stall_detection(void)
     puts("ap2_client clock stall detection tests passed");
 }
 
+static int64_t realtime_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_REALTIME, &ts);
+    return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void test_host_clock_defaults_to_realtime(void)
+{
+    int64_t offset;
+    assert(!host_clock_offset_ns(&offset));
+    int64_t gap = (int64_t)host_clock_now_ns() - realtime_ns();
+    assert(gap > -100000000LL && gap < 100000000LL);
+    puts("ap2_client host clock realtime default test passed");
+}
+
+/* Runs last: it leaves the host clock on the raw clock. */
+static void test_libraop_ntp_follows_host_clock(void)
+{
+    host_clock_set_offset_ns(0);
+    uint64_t ntp = raopcl_get_ntp(NULL);
+    uint64_t ntp_ns = (ntp >> 32) * 1000000000ULL +
+                      (((ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
+    uint64_t now = host_clock_now_ns();
+    assert(now >= ntp_ns && now - ntp_ns < 100000000ULL);
+    assert(realtime_ns() - (int64_t)now > 86400LL * 1000000000LL);
+    puts("ap2_client libraop host clock test passed");
+}
+
 int main(void)
 {
+    test_host_clock_defaults_to_realtime();
     test_retransmit_responder();
     test_route_with_password();
     test_buffered_route_resolution();
@@ -2593,5 +2625,6 @@ int main(void)
 
     assert(ap2cl_destroy(client));
     puts("ap2_client health snapshot test passed");
+    test_libraop_ntp_follows_host_clock();
     return 0;
 }

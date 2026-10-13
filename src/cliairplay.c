@@ -43,6 +43,7 @@
 #include "raop_session.h"
 #include "artwork.h"
 #include "announce.h"
+#include "host_clock.h"
 
 #define VERSION "0.5.2"
 /* Overridden at build time from the git tag for tagged releases (see Makefile). */
@@ -2120,6 +2121,9 @@ static void print_usage(const char *name)
     printf("  --if <ip>                  Local interface IP to bind (multi-homed hosts)\n");
     printf("  --debug <0-9>              Debug level (default: 3)\n");
     printf("  --check                    Print check info and exit\n");
+    printf("  --clock-offset-ns <ns>     Run START_UNIX_MS and AirPlay timing on the raw\n");
+    printf("                             host clock plus this offset instead of the wall\n");
+    printf("                             clock. Give every process of a group the same value\n");
     printf("  --pair                     Legacy AppleTV RAOP pairing (--secret)\n");
     printf("  --pair-setup               HomeKit pair-setup: the device shows a PIN,\n");
     printf("                             prints --auth credentials on success. Needs\n");
@@ -2237,6 +2241,7 @@ int main(int argc, char *argv[])
         {"check",        no_argument,       0, 1002},
         {"pair",         no_argument,       0, 1003},
         {"pair-setup",   no_argument,       0, 1013},
+        {"clock-offset-ns", required_argument, 0, 1015},
         {"help",         no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -2294,6 +2299,17 @@ int main(int argc, char *argv[])
         case 1011: ptp_daemon_mode = true; break;
         case 1013: pair_setup_mode = true; break;
         case 1012: cfg.ptp_shared = true; break;
+        case 1015: {
+            char *end = NULL;
+            errno = 0;
+            long long offset = strtoll(optarg, &end, 10);
+            if (errno || *end || end == optarg) {
+                fprintf(stderr, "Invalid --clock-offset-ns: %s\n", optarg);
+                return 1;
+            }
+            host_clock_set_offset_ns(offset);
+            break;
+        }
         case 1002:
             printf("cliairplay v%s check\n", CLIAIRPLAY_VERSION);
             return 0;
@@ -2316,6 +2332,12 @@ int main(int argc, char *argv[])
     util_loglevel = debug_levels[cfg.debug_level].util;
     raop_loglevel = debug_levels[cfg.debug_level].raop;
     main_log = debug_levels[cfg.debug_level].main;
+    int64_t clock_offset_ns;
+    if (host_clock_offset_ns(&clock_offset_ns)) {
+        LOG_INFO("[CLOCK] host clock offset %" PRId64 " ns", clock_offset_ns);
+    } else {
+        LOG_INFO("[CLOCK] host clock realtime");
+    }
 
     /* Initialize platform */
     netsock_init();
