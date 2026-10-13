@@ -2516,7 +2516,7 @@ static void test_buffered_resume_anchor_retry_keeps_held_frame(void)
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
 
     uint64_t at = 0;
-    assert(ap2cl_start(client, 0, &at) == AP2_COMMIT_OK);
+    assert(ap2cl_start(client, test_now_unix_ms() + 5000, &at) == AP2_COMMIT_OK);
     ap2cl_test_set_buffered_sock(client, data_fd);
     /* The write head runs ahead of the still-future anchor, so the pause
      * freezes on the anchor frame with QUEUED frames held behind it. */
