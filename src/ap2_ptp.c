@@ -43,6 +43,7 @@
 #include "cross_log.h"
 #include "ap2_ptp.h"
 #include "ap2_ptp_shm.h"
+#include "host_clock.h"
 
 extern log_level *loglevel;
 
@@ -254,10 +255,9 @@ struct ap2_ptp_ctx {
 
 static void get_ntp_time(uint32_t *sec, uint32_t *frac)
 {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    *sec = (uint32_t)(ts.tv_sec + NTP_EPOCH_DELTA);
-    *frac = (uint32_t)(((uint64_t)ts.tv_nsec << 32) / 1000000000ULL);
+    uint64_t ns = host_clock_now_ns();
+    *sec = (uint32_t)(ns / 1000000000ULL + NTP_EPOCH_DELTA);
+    *frac = (uint32_t)(((ns % 1000000000ULL) << 32) / 1000000000ULL);
 }
 
 static void *timing_thread_func(void *arg)
@@ -1066,7 +1066,7 @@ static void ptp_track_exchange(struct ap2_ptp_ctx *ctx, struct in_addr addr, uin
         ctx->exchange[slot].addr = addr;
     }
 
-    /* The unsigned delta wraps huge when CLOCK_REALTIME stepped backwards
+    /* The unsigned delta wraps huge if the host clock ever steps backwards
      * past last_ns, deliberately landing in the reset branch: receivers
      * slave to this clock, so any timebase step makes their servos
      * re-converge and the streak must restart from it. */
@@ -1362,9 +1362,7 @@ void ap2_ptp_set_clock_id(struct ap2_ptp_ctx *ctx, uint64_t clock_id)
 uint64_t ap2_ptp_now_ns(struct ap2_ptp_ctx *ctx)
 {
     (void)ctx;
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+    return host_clock_now_ns();
 }
 
 void ap2_ptp_set_peers(struct ap2_ptp_ctx *ctx, const char *const *ips, int count)
@@ -1549,7 +1547,7 @@ uint64_t ap2_ptp_master_now_ns(struct ap2_ptp_ctx *ctx)
         return (uint64_t)((int64_t)local + followed_off);
     if (ctx->shm_active) {
         /* The daemon publishes a local->master offset; the daemon and this
-         * process share CLOCK_REALTIME, so master-now is our own now + offset. */
+         * process share the host clock, so master-now is our own now + offset. */
         struct ap2_ptp_shm_sample s;
         int64_t off = ap2_ptp_shm_read(&ctx->shm_reader, &s) ? s.local_to_master_offset : 0;
         return (uint64_t)((int64_t)local + off);

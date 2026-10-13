@@ -91,7 +91,7 @@ bool ap2_ptp_engine_start(struct ap2_ptp_ctx *ctx, struct in_addr bind_addr,
 void ap2_ptp_engine_settle(struct ap2_ptp_ctx *ctx, int timeout_ms);
 
 /*
- * Local host time in nanoseconds (CLOCK_REALTIME). When we are the elected
+ * Local host time in nanoseconds (host_clock_now_ns). When we are the elected
  * grandmaster this IS the master timebase; the GM Announce/Sync/Follow_Up are
  * stamped from here.
  */

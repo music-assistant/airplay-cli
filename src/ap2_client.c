@@ -2551,13 +2551,13 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
              * exactly at the start time — anchoring one lead early makes the
              * line's audible point land on it, and mixed RAOP/AP2 groups
              * align regardless of each member's lead. Valid because our
-             * timeline — in-process GM or the shared daemon — is host
-             * CLOCK_REALTIME, the same clock the start value comes from
+             * timeline — in-process GM or the shared daemon — is the host
+             * clock (host_clock.h), the same clock the start value comes from
              * (libraop's NTP fixed-point is UNIX-epoch: seconds<<32 | frac). */
             uint64_t unix_ns = (p->start_ntp >> 32) * 1000000000ULL
                              + (((p->start_ntp & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
             /* When slaving to a receiver's clock (follow mode) the timeline is
-             * NOT host CLOCK_REALTIME: shift the commanded unix instant into
+             * NOT the host clock: shift the commanded unix instant into
              * the master domain by the current local->master offset. */
             int64_t master_shift = (int64_t)wall - (int64_t)ap2_ptp_now_ns(p->ptp);
             p->rt_anchor_wall0 = (uint64_t)((int64_t)unix_ns + master_shift)

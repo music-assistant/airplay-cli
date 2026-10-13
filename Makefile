@@ -127,7 +127,7 @@ RAOP_SOURCES = raop_client.c rtsp_client.c \
 AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_shm.c ap2_plist.c ap2_mrp.c ap2_session.c
 
 # Common/CLI sources
-CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c \
+CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
 	cliairplay.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
@@ -184,6 +184,11 @@ RAOP_SESSION_TEST = build/tests/test_raop_session
 ANNOUNCE_TEST = build/tests/test_announce
 
 all: directory $(EXECUTABLE)
+
+# libraop's raopcl_get_ntp reads crosstools' gettime_us. Rename crosstools'
+# definition so the one in host_clock.c serves libraop instead (crosstools'
+# own gettime_ms keeps the renamed wall clock version).
+$(BUILDDIR)/cross_util.o: CPPFLAGS += -Dgettime_us=crosstools_gettime_us
 
 directory:
 	@mkdir -p $(BUILDDIR)
@@ -309,12 +314,12 @@ $(SESSION_TEST): tests/test_ap2_session.c src/ap2_session.c src/ap2_session.h \
 
 # ap2_ptp.c binds ephemeral ports and records datagrams instead of sending them.
 $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_shm.c \
-		src/ap2_ptp_shm.h Makefile
+		src/ap2_ptp_shm.h src/host_clock.c src/host_clock.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) -Dbind=ap2_ptp_test_bind \
 		-Dsendto=ap2_ptp_test_sendto -c src/ap2_ptp.c -o build/tests/ap2_ptp_test.o
 	$(CC) $(TEST_CFLAGS) $(INCLUDE) tests/test_ap2_ptp.c \
-		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c $(TOOLS)/cross_log.c \
+		build/tests/ap2_ptp_test.o src/ap2_ptp_shm.c src/host_clock.c $(TOOLS)/cross_log.c \
 		$(LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
