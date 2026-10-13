@@ -376,6 +376,10 @@ struct ap2cl_s {
     bool use_buffered;          /* resolved: buffered active (needs PTP) */
     int buffered_sock;          /* TCP connection to the receiver's dataPort */
     bool anchored;              /* a rate-1 SETRATEANCHORTIME is in force */
+    uint32_t anchor_rtp;        /* accepted rate-1 anchor: this rtp renders */
+    uint64_t anchor_ns;         /* at this master-clock ns */
+    bool buffered_paused;       /* rate-0 freeze at paused_rtp is in force */
+    uint32_t paused_rtp;
     uint8_t *buffered_pending;  /* unwritten tail of the last framed packet */
     int buffered_pending_len;
     int buffered_pending_off;
@@ -2708,21 +2712,36 @@ static bool ap2_send_setrateanchortime(struct ap2cl_s *p, uint32_t rtp_time,
  * retry over the readiness window. A retry that would leave less than the
  * minimum lead moves the instant and the RTP head forward together, to the
  * floor plus one lead of retry slack, and writes the moved instant to
- * *ntp_start and *at_unix_ms. */
+ * *ntp_start and *at_unix_ms. With held_rtp the anchor is a frame the
+ * receiver already holds, so a late retry delays it rather than skipping. */
 static bool ap2_buffered_anchor_start(struct ap2cl_s *p, uint64_t *ntp_start,
-                                      uint64_t *at_unix_ms)
+                                      uint64_t *at_unix_ms,
+                                      const uint32_t *held_rtp)
 {
     uint64_t requested_ntp = *ntp_start;
     bool anchored_ok = false;
+    uint64_t anchor_ns = 0;
+    uint32_t rtp = 0;
     for (int try = 0; try < 12 && !anchored_ok; try++) {
         if (try) usleep(500000);
         uint64_t now_ntp = raopcl_get_ntp(NULL);
         uint64_t floor_ntp = now_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
         if (try && *ntp_start < floor_ntp) {
-            *ntp_start = floor_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
-            uint64_t head_ts = NTP2TS(*ntp_start, p->format.sample_rate);
-            p->rtp_timestamp += (uint32_t)(head_ts - p->head_ts);
-            p->head_ts = head_ts;
+            uint64_t moved = floor_ntp + MS2NTP(AP2_MIN_WARM_LEAD_MS);
+            if (held_rtp) {
+                /* Keep the wire head; the queued frames just render later. */
+                uint32_t shift =
+                    (uint32_t)(NTP2TS(moved, p->format.sample_rate) -
+                               NTP2TS(*ntp_start, p->format.sample_rate));
+                p->head_ts += shift;
+                atomic_store(&p->rtp_offset,
+                             atomic_load(&p->rtp_offset) - shift);
+            } else {
+                uint64_t head_ts = NTP2TS(moved, p->format.sample_rate);
+                p->rtp_timestamp += (uint32_t)(head_ts - p->head_ts);
+                p->head_ts = head_ts;
+            }
+            *ntp_start = moved;
         }
         uint64_t lead_ns = 0;
         if (*ntp_start > now_ntp) {
@@ -2730,9 +2749,9 @@ static bool ap2_buffered_anchor_start(struct ap2cl_s *p, uint64_t *ntp_start,
             lead_ns = (d >> 32) * 1000000000ULL +
                       (((d & 0xFFFFFFFFULL) * 1000000000ULL) >> 32);
         }
-        uint64_t anchor_ns = ap2_ptp_master_now_ns(p->ptp) + lead_ns;
-        anchored_ok = ap2_send_setrateanchortime(p, p->rtp_timestamp,
-                                                 anchor_ns, 1);
+        anchor_ns = ap2_ptp_master_now_ns(p->ptp) + lead_ns;
+        rtp = held_rtp ? *held_rtp : p->rtp_timestamp;
+        anchored_ok = ap2_send_setrateanchortime(p, rtp, anchor_ns, 1);
     }
     if (!anchored_ok) {
         LOG_ERROR("[AP2] Unable to establish buffered playback anchor");
@@ -2746,6 +2765,9 @@ static bool ap2_buffered_anchor_start(struct ap2cl_s *p, uint64_t *ntp_start,
                                       ap2_ntp_to_unix_ms(requested_ntp)));
     }
     p->anchored = true;
+    p->anchor_rtp = rtp;
+    p->anchor_ns = anchor_ns;
+    p->buffered_paused = false;
     return true;
 }
 
@@ -2822,6 +2844,7 @@ static bool ap2_send_flushbuffered(struct ap2cl_s *p)
     LOG_INFO("[AP2] FLUSHBUFFERED untilSeq=%u untilTS=%u -> %d",
              p->seq_number, p->rtp_timestamp, status);
     p->anchored = false;
+    p->buffered_paused = false;
     return status == 200;
 }
 
@@ -3770,7 +3793,8 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
          * No sync packets exist on this stream type — the anchor IS the
          * timeline announcement. */
         if (p->use_buffered) {
-            if (!ap2_buffered_anchor_start(p, &p->start_ntp, at_unix_ms)) {
+            if (!ap2_buffered_anchor_start(p, &p->start_ntp, at_unix_ms,
+                                           NULL)) {
                 atomic_store(&p->media_healthy, false);
                 return AP2_COMMIT_FAILED;
             }
@@ -4076,7 +4100,7 @@ ap2_commit_result_t ap2cl_resume(struct ap2cl_s *p, uint64_t start_unix_ms,
      * boundary (FLUSHBUFFERED); a fresh rate-1 anchor maps the re-based RTP
      * head to the commanded instant. */
     if (p->use_buffered) {
-        if (!ap2_buffered_anchor_start(p, &p->start_ntp, at_unix_ms)) {
+        if (!ap2_buffered_anchor_start(p, &p->start_ntp, at_unix_ms, NULL)) {
             atomic_store(&p->media_healthy, false);
             return AP2_COMMIT_FAILED;
         }
@@ -4604,11 +4628,23 @@ void ap2cl_pause(struct ap2cl_s *p)
         p->content_paused = true;
         return;
     }
-    /* Buffered: freeze the timeline in place with a rate-0 anchor; the
-     * receiver keeps its buffer and resumes on the next rate-1 anchor. */
-    if (p->use_buffered && p->buffered_sock >= 0 && p->anchored)
-        ap2_send_setrateanchortime(p, p->rtp_timestamp,
-                                   ap2_ptp_master_now_ns(p->ptp), 0);
+    /* Buffered: freeze the timeline at the audible frame with a rate-0
+     * anchor; the receiver keeps its buffer and resumes on the next rate-1
+     * anchor. The write head runs a pacing window ahead of that frame. */
+    if (p->use_buffered && p->buffered_sock >= 0 && p->anchored) {
+        uint32_t sr = (uint32_t)p->format.sample_rate;
+        uint64_t now_ns = ap2_ptp_master_now_ns(p->ptp);
+        uint32_t rtp = p->rtp_timestamp;
+        bool audible = ap2_timeline_audible_rtp(
+            p->anchor_rtp, p->anchor_ns, now_ns, p->rtp_timestamp, sr, &rtp);
+        p->buffered_paused =
+            ap2_send_setrateanchortime(p, rtp, now_ns, 0) && audible;
+        /* The receiver froze inside the round trip: sample after it. */
+        if (p->buffered_paused)
+            ap2_timeline_audible_rtp(p->anchor_rtp, p->anchor_ns,
+                                     ap2_ptp_master_now_ns(p->ptp),
+                                     p->rtp_timestamp, sr, &p->paused_rtp);
+    }
     /* Stock timeline: park the stream; resume re-anchors a fresh line. */
     p->rt_anchor_valid = false;
     p->state = AP2_PAUSED;
@@ -4691,30 +4727,49 @@ void ap2cl_play(struct ap2cl_s *p)
         }
     }
     /* Buffered: resume the frozen timeline with a rate-1 anchor one lead
-     * ahead, mapping the current RTP head to that instant. The wire rtp
-     * continues monotonically past everything already delivered (see
-     * ap2cl_resume) so the paused buffer's range stays unambiguous. */
+     * ahead. */
     if (p->use_buffered && p->buffered_sock >= 0) {
         uint64_t resume_ntp = raopcl_get_ntp(NULL) +
                               MS2NTP(AP2_MIN_WARM_LEAD_MS);
-        uint32_t prev_rtp = p->rtp_timestamp;
-        p->head_ts = NTP2TS(resume_ntp, p->format.sample_rate);
-        if (p->audio_packets_sent) {
-            uint32_t wall_rtp =
+        const uint32_t *held = NULL;
+        uint32_t held_rtp;
+        if (p->buffered_paused && p->anchored) {
+            /* Play out what the receiver still holds from the frozen frame;
+             * one chunk covers what it rendered while the pause was in
+             * flight. */
+            ap2_timeline_resume_t plan;
+            ap2_timeline_plan_buffered_resume(
+                p->paused_rtp, AP2_FRAMES_PER_CHUNK, p->rtp_timestamp,
+                NTP2TS(resume_ntp, p->format.sample_rate), &plan);
+            p->head_ts = plan.head;
+            atomic_store(&p->rtp_offset, plan.offset);
+            held_rtp = plan.anchor_rtp;
+            held = &held_rtp;
+        } else {
+            /* No frozen frame: map the current RTP head to that instant. The
+             * wire rtp continues monotonically past everything already
+             * delivered (see ap2cl_resume) so the paused buffer's range
+             * stays unambiguous. */
+            uint32_t prev_rtp = p->rtp_timestamp;
+            p->head_ts = NTP2TS(resume_ntp, p->format.sample_rate);
+            if (p->audio_packets_sent) {
+                uint32_t wall_rtp =
+                    (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
+                uint32_t cont_rtp = prev_rtp +
+                    (uint32_t)MS2TS(AP2_BUFFERED_RTP_GAP_MS,
+                                    p->format.sample_rate);
+                int32_t ahead = (int32_t)(cont_rtp - wall_rtp);
+                if (ahead > 0)
+                    atomic_store(&p->rtp_offset,
+                                 atomic_load(&p->rtp_offset) + (uint32_t)ahead);
+            }
+            p->rtp_timestamp =
                 (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
-            uint32_t cont_rtp = prev_rtp +
-                (uint32_t)MS2TS(AP2_BUFFERED_RTP_GAP_MS,
-                                p->format.sample_rate);
-            int32_t ahead = (int32_t)(cont_rtp - wall_rtp);
-            if (ahead > 0)
-                atomic_store(&p->rtp_offset,
-                             atomic_load(&p->rtp_offset) + (uint32_t)ahead);
         }
-        p->rtp_timestamp = (uint32_t)p->head_ts + atomic_load(&p->rtp_offset);
         /* A refused re-anchor means the receiver can schedule nothing we
          * send: fail the media health so the session ends loudly (the
          * caller restarts it) instead of "playing" into a dead schedule. */
-        if (!ap2_buffered_anchor_start(p, &resume_ntp, NULL)) {
+        if (!ap2_buffered_anchor_start(p, &resume_ntp, NULL, held)) {
             atomic_store(&p->media_healthy, false);
             return;
         }
