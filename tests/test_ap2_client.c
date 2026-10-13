@@ -54,6 +54,7 @@ unsigned long long ap2cl_test_rtx_answered(struct ap2cl_s *p);
 unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p);
 void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable);
+void ap2cl_test_set_buffered_sock(struct ap2cl_s *p, int fd);
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 bool ap2cl_test_env_enabled(const char *name, bool unset_default);
@@ -2423,6 +2424,143 @@ static void test_buffered_anchor_retry_acks_scheduled_instant(void)
     assert(ap2cl_destroy(client));
 }
 
+enum { RESUME_ANCHOR_REQUESTS = 4 };
+
+typedef struct {
+    int fd;
+    bool ok;
+    uint64_t rtp[RESUME_ANCHOR_REQUESTS];
+    uint64_t rate[RESUME_ANCHOR_REQUESTS];
+} resume_anchor_peer_t;
+
+/* Accept the start anchor and the rate-0 pause, refuse the first rate-1
+ * resume anchor, then accept its retry, recording each anchor's rtp and rate. */
+static void *run_resume_anchor_peer(void *arg)
+{
+    resume_anchor_peer_t *peer = arg;
+    peer->ok = false;
+    for (int request = 0; request < RESUME_ANCHOR_REQUESTS; request++) {
+        uint8_t buffer[4096];
+        size_t fill = 0;
+        char *body = NULL;
+        while (!body) {
+            ssize_t n = read(peer->fd, buffer + fill, sizeof(buffer) - fill - 1);
+            if (n <= 0) return NULL;
+            fill += (size_t)n;
+            buffer[fill] = 0;
+            body = strstr((char *)buffer, "\r\n\r\n");
+        }
+        body += 4;
+        int cseq = 0;
+        int body_len = 0;
+        char *cseq_header = strstr((char *)buffer, "\r\nCSeq: ");
+        char *len_header = strstr((char *)buffer, "\r\nContent-Length: ");
+        if (strncmp((char *)buffer, "SETRATEANCHORTIME ", 18) != 0 ||
+            !cseq_header || sscanf(cseq_header, "\r\nCSeq: %d", &cseq) != 1 ||
+            !len_header ||
+            sscanf(len_header, "\r\nContent-Length: %d", &body_len) != 1)
+            return NULL;
+        size_t header_len = (size_t)(body - (char *)buffer);
+        while (fill < header_len + (size_t)body_len) {
+            ssize_t n = read(peer->fd, buffer + fill, sizeof(buffer) - fill - 1);
+            if (n <= 0) return NULL;
+            fill += (size_t)n;
+        }
+        if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                  "rtpTime", &peer->rtp[request]) ||
+            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len, "rate",
+                                  &peer->rate[request]))
+            return NULL;
+        char response[96];
+        int response_len = snprintf(
+            response, sizeof(response),
+            "RTSP/1.0 %s\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
+            request == 2 ? "400 Bad Request" : "200 OK", cseq);
+        if (write(peer->fd, response, (size_t)response_len) != response_len)
+            return NULL;
+    }
+    peer->ok = true;
+    return NULL;
+}
+
+/* A buffered resume whose anchor is accepted late still anchors the frame the
+ * receiver holds: the wire head stays put and only the schedule moves later. */
+static void test_buffered_resume_anchor_retry_keeps_held_frame(void)
+{
+    enum { CHUNK = 352, QUEUED = 8 * CHUNK };
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    int data_fd = dup(sockets[0]);
+    assert(data_fd >= 0);
+    resume_anchor_peer_t peer = {.fd = sockets[1]};
+    pthread_t peer_thread;
+    assert(pthread_create(
+               &peer_thread, NULL, run_resume_anchor_peer, &peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "buffered resume test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, false);
+    ap2cl_test_set_use_buffered(client, true);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+
+    uint64_t at = 0;
+    assert(ap2cl_start(client, 0, &at) == AP2_COMMIT_OK);
+    ap2cl_test_set_buffered_sock(client, data_fd);
+    /* The write head runs ahead of the still-future anchor, so the pause
+     * freezes on the anchor frame with QUEUED frames held behind it. */
+    ap2cl_test_set_head_ts(client, ap2cl_test_head_ts(client) + QUEUED);
+    ap2cl_pause(client);
+    uint32_t wire_rtp = ap2cl_test_rtp_timestamp(client);
+
+    uint64_t before_ts = test_now_unix_ms() * format.sample_rate / 1000;
+    ap2cl_play(client);
+    uint64_t after_ts = test_now_unix_ms() * format.sample_rate / 1000;
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+    assert(peer.rate[1] == 0 && peer.rate[2] == 1 && peer.rate[3] == 1);
+
+    uint32_t paused_rtp = (uint32_t)peer.rtp[0];
+    assert(wire_rtp == paused_rtp + QUEUED);
+    assert(peer.rtp[3] == paused_rtp + CHUNK);
+    assert(peer.rtp[2] == peer.rtp[3]);
+    assert(ap2cl_test_rtp_timestamp(client) == wire_rtp);
+
+    /* The planned head is the resume instant (one lead past play) plus the
+     * frames still queued past the anchor; the retry moved it a further
+     * half-second retry interval at least. */
+    uint64_t lead = 250 * format.sample_rate / 1000;
+    uint64_t head = ap2cl_test_head_ts(client);
+    uint64_t planned_max = after_ts + lead + (QUEUED - CHUNK);
+    assert(head > planned_max + 200 * format.sample_rate / 1000);
+    assert(head < before_ts + 2 * lead + 600 * format.sample_rate / 1000 +
+                      (QUEUED - CHUNK));
+
+    /* Re-deriving the wire head from the moved head through the shifted offset
+     * lands on the same frame. */
+    ap2cl_test_set_head_ts(client, head);
+    assert(ap2cl_test_rtp_timestamp(client) == wire_rtp);
+
+    ap2cl_test_set_buffered_sock(client, -1);
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(data_fd) == 0);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client buffered resume anchor retry tests passed");
+}
+
 /* Readiness reported from connect, so a caller can plan a join anchor the
  * receiver can actually meet instead of guessing a headroom. */
 static void test_clock_readiness_report(void)
@@ -2688,6 +2826,7 @@ int main(void)
     test_splice_depth_bounds();
     test_clock_verified_anchor();
     test_buffered_anchor_retry_acks_scheduled_instant();
+    test_buffered_resume_anchor_retry_keeps_held_frame();
     test_clock_readiness_report();
     test_clock_stall_detection();
 

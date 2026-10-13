@@ -5839,6 +5839,12 @@ void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable)
     p->use_buffered = enable;
 }
 
+/* Stand in for the data channel; -1 detaches it so the test keeps the fd. */
+void ap2cl_test_set_buffered_sock(struct ap2cl_s *p, int fd)
+{
+    p->buffered_sock = fd;
+}
+
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple)
 {
     p->apple_model = apple;
