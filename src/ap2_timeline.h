@@ -74,18 +74,17 @@ typedef struct {
 
 /*
  * Plan a buffered resume from the frame frozen by the pause. The rate-1
- * anchor lands lag_frames past it (capped at the write head) at resume_ts,
- * the wire head stays put, and the scheduling head counts the frames the
- * receiver still holds, keeping rtp_timestamp == (uint32_t)head + offset.
+ * anchor lands on that frame at resume_ts, the wire head stays put, and the
+ * scheduling head counts the frames the receiver still holds, keeping
+ * rtp_timestamp == (uint32_t)head + offset.
  */
 static inline void ap2_timeline_plan_buffered_resume(
-    uint32_t paused_rtp, uint32_t lag_frames, uint32_t head_rtp,
-    uint64_t resume_ts, ap2_timeline_resume_t *plan)
+    uint32_t paused_rtp, uint32_t head_rtp, uint64_t resume_ts,
+    ap2_timeline_resume_t *plan)
 {
     uint32_t queued = head_rtp - paused_rtp;
-    if (lag_frames > queued) lag_frames = queued;
-    plan->anchor_rtp = paused_rtp + lag_frames;
-    plan->head = resume_ts + (queued - lag_frames);
+    plan->anchor_rtp = paused_rtp;
+    plan->head = resume_ts + queued;
     plan->offset = head_rtp - (uint32_t)plan->head;
 }
 

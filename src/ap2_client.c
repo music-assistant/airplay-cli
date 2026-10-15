@@ -4632,12 +4632,17 @@ void ap2cl_pause(struct ap2cl_s *p)
      * anchor; the receiver keeps its buffer and resumes on the next rate-1
      * anchor. The write head runs a pacing window ahead of that frame. */
     if (p->use_buffered && p->buffered_sock >= 0 && p->anchored) {
+        uint32_t sr = (uint32_t)p->format.sample_rate;
         uint64_t now_ns = ap2_ptp_master_now_ns(p->ptp);
-        p->paused_rtp = ap2_timeline_audible_rtp(
-            p->anchor_rtp, p->anchor_ns, now_ns, p->rtp_timestamp,
-            (uint32_t)p->format.sample_rate);
-        p->buffered_paused =
-            ap2_send_setrateanchortime(p, p->paused_rtp, now_ns, 0);
+        uint32_t rtp = ap2_timeline_audible_rtp(
+            p->anchor_rtp, p->anchor_ns, now_ns, p->rtp_timestamp, sr);
+        p->buffered_paused = ap2_send_setrateanchortime(p, rtp, now_ns, 0);
+        /* The receiver froze somewhere inside the exchange, which may have
+         * queued behind another RTSP call: sample the frame after it. */
+        if (p->buffered_paused)
+            p->paused_rtp = ap2_timeline_audible_rtp(
+                p->anchor_rtp, p->anchor_ns, ap2_ptp_master_now_ns(p->ptp),
+                p->rtp_timestamp, sr);
     }
     /* Stock timeline: park the stream; resume re-anchors a fresh line. */
     p->rt_anchor_valid = false;
@@ -4728,12 +4733,10 @@ void ap2cl_play(struct ap2cl_s *p)
         const uint32_t *held = NULL;
         uint32_t held_rtp;
         if (p->buffered_paused) {
-            /* Play out what the receiver still holds from the frozen frame;
-             * one chunk covers what it rendered while the pause was in
-             * flight. */
+            /* Play out what the receiver still holds from the frozen frame. */
             ap2_timeline_resume_t plan;
             ap2_timeline_plan_buffered_resume(
-                p->paused_rtp, AP2_FRAMES_PER_CHUNK, p->rtp_timestamp,
+                p->paused_rtp, p->rtp_timestamp,
                 NTP2TS(resume_ntp, p->format.sample_rate), &plan);
             p->head_ts = plan.head;
             atomic_store(&p->rtp_offset, plan.offset);

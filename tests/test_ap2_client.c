@@ -2436,7 +2436,7 @@ static void test_buffered_anchor_retry_acks_scheduled_instant(void)
  * receiver holds: the wire head stays put and only the schedule moves later. */
 static void test_buffered_resume_anchor_retry_keeps_held_frame(void)
 {
-    enum { CHUNK = 352, QUEUED = 8 * CHUNK };
+    enum { QUEUED = 8 * 352 };
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     int data_fd = dup(sockets[0]);
@@ -2483,19 +2483,16 @@ static void test_buffered_resume_anchor_retry_keeps_held_frame(void)
     uint32_t paused_rtp = (uint32_t)peer.rtp[0];
     assert(peer.rtp[1] == paused_rtp);
     assert(wire_rtp == paused_rtp + QUEUED);
-    assert(peer.rtp[3] == paused_rtp + CHUNK);
+    assert(peer.rtp[3] == paused_rtp);
     assert(peer.rtp[2] == peer.rtp[3]);
     assert(ap2cl_test_rtp_timestamp(client) == wire_rtp);
 
-    /* The planned head is the resume instant (one lead past play) plus the
-     * frames still queued past the anchor; the retry moved it a further
-     * half-second retry interval at least. */
+    /* The retry moved the head a retry interval past the resume plan, and no
+     * further than the lead window past the retry's own clock sample. */
     uint64_t lead = 250 * format.sample_rate / 1000;
     uint64_t head = ap2cl_test_head_ts(client);
-    uint64_t planned_max = after_ts + lead + (QUEUED - CHUNK);
-    assert(head > planned_max + 200 * format.sample_rate / 1000);
-    assert(head < before_ts + 2 * lead + 600 * format.sample_rate / 1000 +
-                      (QUEUED - CHUNK));
+    assert(head > before_ts + 2 * lead + QUEUED);
+    assert(head < after_ts + 3 * lead + QUEUED);
 
     /* Re-deriving the wire head from the moved head through the shifted offset
      * lands on the same frame. */

@@ -60,9 +60,9 @@ int main(void)
     assert(audible == anchor_rtp + 3 * SR);
 
     uint64_t resume_ts = 900000000ULL;
-    ap2_timeline_plan_buffered_resume(audible, 352, head_rtp, resume_ts, &resume);
-    assert(resume.anchor_rtp == audible + 352);
-    assert(resume.head == resume_ts + queued - 352);
+    ap2_timeline_plan_buffered_resume(audible, head_rtp, resume_ts, &resume);
+    assert(resume.anchor_rtp == audible);
+    assert(resume.head == resume_ts + queued);
     assert((uint32_t)resume.head + resume.offset == head_rtp);
 
     /* Before the anchor instant nothing has rendered yet. */
@@ -75,7 +75,7 @@ int main(void)
     audible = ap2_timeline_audible_rtp(anchor_rtp, anchor_ns,
                                        anchor_ns + 60 * NS, head_rtp, SR);
     assert(audible == head_rtp);
-    ap2_timeline_plan_buffered_resume(audible, 352, head_rtp, resume_ts, &resume);
+    ap2_timeline_plan_buffered_resume(audible, head_rtp, resume_ts, &resume);
     assert(resume.anchor_rtp == head_rtp);
     assert(resume.head == resume_ts);
     assert((uint32_t)resume.head + resume.offset == head_rtp);
@@ -86,8 +86,8 @@ int main(void)
     audible = ap2_timeline_audible_rtp(anchor_rtp, anchor_ns,
                                        anchor_ns + NS / 2, head_rtp, SR);
     assert(audible == anchor_rtp + SR / 2);
-    ap2_timeline_plan_buffered_resume(audible, 352, head_rtp, resume_ts, &resume);
-    assert(resume.anchor_rtp == anchor_rtp + SR / 2 + 352);
+    ap2_timeline_plan_buffered_resume(audible, head_rtp, resume_ts, &resume);
+    assert(resume.anchor_rtp == anchor_rtp + SR / 2);
     assert((uint32_t)resume.head + resume.offset == head_rtp);
 
     /* A head behind the anchor clamps to the head. */
@@ -106,7 +106,7 @@ int main(void)
                                             anchor_ns + elapsed_s * NS,
                                             head_rtp, SR);
     assert(got == audible);
-    ap2_timeline_plan_buffered_resume(got, 352, head_rtp, resume_ts, &resume);
+    ap2_timeline_plan_buffered_resume(got, head_rtp, resume_ts, &resume);
     assert((uint32_t)resume.head + resume.offset == head_rtp);
     return 0;
 }
