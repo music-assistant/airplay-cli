@@ -2319,19 +2319,25 @@ static void test_clock_verified_anchor(void)
     puts("ap2_client clock verified anchor tests passed");
 }
 
+enum { ANCHOR_PEER_MAX_REQUESTS = 4 };
+
 typedef struct {
     int fd;
+    int requests;       /* SETRATEANCHORTIME requests to serve */
+    int refuse;         /* index of the one request answered 400 */
     bool ok;
-    uint64_t accepted_anchor_ms;
+    uint64_t rtp[ANCHOR_PEER_MAX_REQUESTS];
+    uint64_t rate[ANCHOR_PEER_MAX_REQUESTS];
+    uint64_t anchor_ms[ANCHOR_PEER_MAX_REQUESTS];
 } anchor_peer_t;
 
-/* Refuse the first anchor, as a receiver does before its clock is seated,
- * then accept the retry and record what it schedules. */
-static void *run_anchor_retry_peer(void *arg)
+/* Serve SETRATEANCHORTIME requests, refusing one as a receiver does before
+ * its clock is seated, and record what each one anchors. */
+static void *run_anchor_peer(void *arg)
 {
     anchor_peer_t *peer = arg;
     peer->ok = false;
-    for (int request = 0; request < 2; request++) {
+    for (int request = 0; request < peer->requests; request++) {
         uint8_t buffer[4096];
         size_t fill = 0;
         char *body = NULL;
@@ -2358,21 +2364,23 @@ static void *run_anchor_retry_peer(void *arg)
             if (n <= 0) return NULL;
             fill += (size_t)n;
         }
-        if (request == 1) {
-            uint64_t secs = 0, frac = 0;
-            if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
-                                      "networkTimeSecs", &secs) ||
-                !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
-                                      "networkTimeFrac", &frac))
-                return NULL;
-            peer->accepted_anchor_ms =
-                secs * 1000ULL + (((frac >> 32) * 1000ULL) >> 32);
-        }
+        uint64_t secs = 0, frac = 0;
+        if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                  "rtpTime", &peer->rtp[request]) ||
+            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len, "rate",
+                                  &peer->rate[request]) ||
+            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                  "networkTimeSecs", &secs) ||
+            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                  "networkTimeFrac", &frac))
+            return NULL;
+        peer->anchor_ms[request] =
+            secs * 1000ULL + (((frac >> 32) * 1000ULL) >> 32);
         char response[96];
         int response_len = snprintf(
             response, sizeof(response),
             "RTSP/1.0 %s\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
-            request == 0 ? "400 Bad Request" : "200 OK", cseq);
+            request == peer->refuse ? "400 Bad Request" : "200 OK", cseq);
         if (write(peer->fd, response, (size_t)response_len) != response_len)
             return NULL;
     }
@@ -2386,10 +2394,10 @@ static void test_buffered_anchor_retry_acks_scheduled_instant(void)
 {
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
-    anchor_peer_t peer = {.fd = sockets[1]};
+    anchor_peer_t peer = {.fd = sockets[1], .requests = 2, .refuse = 0};
     pthread_t peer_thread;
     assert(pthread_create(
-               &peer_thread, NULL, run_anchor_retry_peer, &peer) == 0);
+               &peer_thread, NULL, run_anchor_peer, &peer) == 0);
 
     ap2_device_info_t device = {
         .name = "buffered anchor test",
@@ -2412,7 +2420,7 @@ static void test_buffered_anchor_retry_acks_scheduled_instant(void)
     assert(ap2cl_start(client, 0, &at) == AP2_COMMIT_OK);
     assert(pthread_join(peer_thread, NULL) == 0);
     assert(peer.ok);
-    int64_t ack_error_ms = (int64_t)at - (int64_t)peer.accepted_anchor_ms;
+    int64_t ack_error_ms = (int64_t)at - (int64_t)peer.anchor_ms[1];
     assert(ack_error_ms >= -10 && ack_error_ms <= 10);
     int64_t head_error_frames = (int64_t)ap2cl_test_head_ts(client) -
                                 (int64_t)(at * format.sample_rate / 1000);
@@ -2424,65 +2432,6 @@ static void test_buffered_anchor_retry_acks_scheduled_instant(void)
     assert(ap2cl_destroy(client));
 }
 
-enum { RESUME_ANCHOR_REQUESTS = 4 };
-
-typedef struct {
-    int fd;
-    bool ok;
-    uint64_t rtp[RESUME_ANCHOR_REQUESTS];
-    uint64_t rate[RESUME_ANCHOR_REQUESTS];
-} resume_anchor_peer_t;
-
-/* Accept the start anchor and the rate-0 pause, refuse the first rate-1
- * resume anchor, then accept its retry, recording each anchor's rtp and rate. */
-static void *run_resume_anchor_peer(void *arg)
-{
-    resume_anchor_peer_t *peer = arg;
-    peer->ok = false;
-    for (int request = 0; request < RESUME_ANCHOR_REQUESTS; request++) {
-        uint8_t buffer[4096];
-        size_t fill = 0;
-        char *body = NULL;
-        while (!body) {
-            ssize_t n = read(peer->fd, buffer + fill, sizeof(buffer) - fill - 1);
-            if (n <= 0) return NULL;
-            fill += (size_t)n;
-            buffer[fill] = 0;
-            body = strstr((char *)buffer, "\r\n\r\n");
-        }
-        body += 4;
-        int cseq = 0;
-        int body_len = 0;
-        char *cseq_header = strstr((char *)buffer, "\r\nCSeq: ");
-        char *len_header = strstr((char *)buffer, "\r\nContent-Length: ");
-        if (strncmp((char *)buffer, "SETRATEANCHORTIME ", 18) != 0 ||
-            !cseq_header || sscanf(cseq_header, "\r\nCSeq: %d", &cseq) != 1 ||
-            !len_header ||
-            sscanf(len_header, "\r\nContent-Length: %d", &body_len) != 1)
-            return NULL;
-        size_t header_len = (size_t)(body - (char *)buffer);
-        while (fill < header_len + (size_t)body_len) {
-            ssize_t n = read(peer->fd, buffer + fill, sizeof(buffer) - fill - 1);
-            if (n <= 0) return NULL;
-            fill += (size_t)n;
-        }
-        if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
-                                  "rtpTime", &peer->rtp[request]) ||
-            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len, "rate",
-                                  &peer->rate[request]))
-            return NULL;
-        char response[96];
-        int response_len = snprintf(
-            response, sizeof(response),
-            "RTSP/1.0 %s\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
-            request == 2 ? "400 Bad Request" : "200 OK", cseq);
-        if (write(peer->fd, response, (size_t)response_len) != response_len)
-            return NULL;
-    }
-    peer->ok = true;
-    return NULL;
-}
-
 /* A buffered resume whose anchor is accepted late still anchors the frame the
  * receiver holds: the wire head stays put and only the schedule moves later. */
 static void test_buffered_resume_anchor_retry_keeps_held_frame(void)
@@ -2492,10 +2441,10 @@ static void test_buffered_resume_anchor_retry_keeps_held_frame(void)
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
     int data_fd = dup(sockets[0]);
     assert(data_fd >= 0);
-    resume_anchor_peer_t peer = {.fd = sockets[1]};
+    anchor_peer_t peer = {.fd = sockets[1], .requests = 4, .refuse = 2};
     pthread_t peer_thread;
     assert(pthread_create(
-               &peer_thread, NULL, run_resume_anchor_peer, &peer) == 0);
+               &peer_thread, NULL, run_anchor_peer, &peer) == 0);
 
     ap2_device_info_t device = {
         .name = "buffered resume test",

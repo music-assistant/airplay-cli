@@ -53,20 +53,17 @@ static inline bool ap2_timeline_plan_recovery(
 /*
  * Frame a receiver is rendering at now_ns on a rate-1 buffered anchor
  * (anchor_rtp renders at anchor_ns), clamped to the write head head_rtp.
- * Wrap-safe past 2^31 frames. False on unusable inputs.
+ * Wrap-safe past 2^31 frames.
  */
-static inline bool ap2_timeline_audible_rtp(
+static inline uint32_t ap2_timeline_audible_rtp(
     uint32_t anchor_rtp, uint64_t anchor_ns, uint64_t now_ns,
-    uint32_t head_rtp, uint32_t sample_rate, uint32_t *audible)
+    uint32_t head_rtp, uint32_t sample_rate)
 {
-    if (!audible || !sample_rate || !now_ns) return false;
     uint64_t elapsed = now_ns > anchor_ns ? now_ns - anchor_ns : 0;
     uint64_t frames = (elapsed / 1000000000ULL) * sample_rate +
                       ((elapsed % 1000000000ULL) * sample_rate) / 1000000000ULL;
     uint32_t rtp = anchor_rtp + (uint32_t)frames;
-    if ((int32_t)(head_rtp - rtp) < 0) rtp = head_rtp;
-    *audible = rtp;
-    return true;
+    return (int32_t)(head_rtp - rtp) < 0 ? head_rtp : rtp;
 }
 
 typedef struct {

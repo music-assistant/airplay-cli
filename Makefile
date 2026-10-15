@@ -47,7 +47,6 @@ BINDIR      = bin
 EXECUTABLE  = $(BINDIR)/cliairplay-$(HOST)-$(PLATFORM)
 IO_TEST       = build/tests/test_ap2_io
 TIMELINE_TEST = build/tests/test_ap2_timeline
-BUFFERED_RESUME_TEST = build/tests/test_ap2_buffered_resume
 EVENT_TEST    = build/tests/test_ap2_event
 CLIENT_TEST   = build/tests/test_ap2_client
 SESSION_TEST  = build/tests/test_ap2_session
@@ -237,11 +236,10 @@ clean:
 no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 	printf '%s\n' "$(1)" >&2; false;; esac
 
-test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(BUFFERED_RESUME_TEST) $(EVENT_TEST) \
-		$(IO_TEST) $(CLIENT_TEST) $(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
+test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
+		$(SESSION_TEST) $(PTP_TEST) $(TEST_EXECUTABLE) $(RAOP_LIFECYCLE_TEST_EXECUTABLE) \
 		$(RAOP_SESSION_TEST) $(ANNOUNCE_TEST)
 	$(TIMELINE_TEST)
-	$(BUFFERED_RESUME_TEST)
 	$(EVENT_TEST)
 	$(IO_TEST)
 	$(CLIENT_TEST)
@@ -325,10 +323,6 @@ $(PTP_TEST): tests/test_ap2_ptp.c src/ap2_ptp.c src/ap2_ptp.h src/ap2_ptp_shm.c 
 		$(LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
-	@mkdir -p $(dir $@)
-	$(CC) $(TEST_CFLAGS) -Isrc $< $(EXTRA_LDFLAGS) -o $@
-
-$(BUFFERED_RESUME_TEST): tests/test_ap2_buffered_resume.c src/ap2_timeline.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -Isrc $< $(EXTRA_LDFLAGS) -o $@
 
