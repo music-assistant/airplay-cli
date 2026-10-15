@@ -4632,17 +4632,15 @@ void ap2cl_pause(struct ap2cl_s *p)
      * anchor; the receiver keeps its buffer and resumes on the next rate-1
      * anchor. The write head runs a pacing window ahead of that frame. */
     if (p->use_buffered && p->buffered_sock >= 0 && p->anchored) {
-        uint32_t sr = (uint32_t)p->format.sample_rate;
+        /* Sampled before the exchange on purpose: the receiver freezes
+         * somewhere inside it, and an early estimate costs a short silence
+         * at resume while a late one drops the frames in between. */
         uint64_t now_ns = ap2_ptp_master_now_ns(p->ptp);
-        uint32_t rtp = ap2_timeline_audible_rtp(
-            p->anchor_rtp, p->anchor_ns, now_ns, p->rtp_timestamp, sr);
-        p->buffered_paused = ap2_send_setrateanchortime(p, rtp, now_ns, 0);
-        /* The receiver froze somewhere inside the exchange, which may have
-         * queued behind another RTSP call: sample the frame after it. */
-        if (p->buffered_paused)
-            p->paused_rtp = ap2_timeline_audible_rtp(
-                p->anchor_rtp, p->anchor_ns, ap2_ptp_master_now_ns(p->ptp),
-                p->rtp_timestamp, sr);
+        p->paused_rtp = ap2_timeline_audible_rtp(
+            p->anchor_rtp, p->anchor_ns, now_ns, p->rtp_timestamp,
+            (uint32_t)p->format.sample_rate);
+        p->buffered_paused =
+            ap2_send_setrateanchortime(p, p->paused_rtp, now_ns, 0);
     }
     /* Stock timeline: park the stream; resume re-anchors a fresh line. */
     p->rt_anchor_valid = false;
