@@ -129,6 +129,14 @@ bool ap2_ptp_shm_reader_open(struct ap2_ptp_shm_reader *r)
     int fd = shm_open(AP2_PTP_SHM_NAME, O_RDONLY, 0);
     if (fd < 0) return false;   /* no daemon */
 
+    /* An object the daemon has created but not yet sized has no backing for
+     * the layout; reading it would fault. */
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(struct ap2_ptp_shm)) {
+        close(fd);
+        return false;
+    }
+
     void *map = mmap(NULL, sizeof(struct ap2_ptp_shm), PROT_READ, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {
         close(fd);
