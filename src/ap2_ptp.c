@@ -1796,6 +1796,9 @@ static void daemon_handle_ctrl(int sock, struct ap2_ptp_peers *ps, struct ptp_fo
             struct in_addr tmp;
             if (inet_pton(AF_INET, ip, &tmp) != 1) continue;
             bool follow = i + 1 < na && strcmp(args[i + 1], "F") == 0;
+            if (ap2_ptp_peers_add(ps, ip, owner, follow)) { changed = true; continue; }
+            /* A full table may still hold receivers of streams that just died. */
+            if (ap2_ptp_peers_reap(ps, daemon_pid_alive, daemon_log_reap)) changed = true;
             if (ap2_ptp_peers_add(ps, ip, owner, follow)) changed = true;
             else LOG_WARN("[PTP] peer set full (%d); ignoring %s", PTP_MAX_PEERS, ip);
         }
