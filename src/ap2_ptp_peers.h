@@ -29,6 +29,7 @@ struct ap2_ptp_peer_reg {
     struct in_addr addr;
     char ip[INET_ADDRSTRLEN];
     pid_t owner;                      /* registering process; 0 = none, never reaped */
+    int refs;                         /* registrations folded into this entry */
     bool follow;                      /* follow this receiver's own clock */
 };
 
@@ -39,7 +40,8 @@ struct ap2_ptp_peers {
 
 /*
  * Register `ip` for `owner`, or update `follow` of an existing registration of
- * the same (ip, owner). Registrations without an owner always add an entry.
+ * the same (ip, owner). Registrations without an owner share one counted entry
+ * per receiver, released by as many removals.
  *
  * :param p: registration table.
  * :param ip: receiver IPv4 address.
@@ -55,7 +57,8 @@ bool ap2_ptp_peers_add(struct ap2_ptp_peers *p, const char *ip, pid_t owner, boo
  *
  * :param p: registration table.
  * :param ip: receiver IPv4 address.
- * :param owner: remove the registration of this process; 0 removes the first
+ * :param owner: remove the registration of this process; 0 releases one
+ *               ownerless registration of ip, or failing that the first
  *               registration of ip regardless of owner.
  * :returns: true if a registration was removed.
  */

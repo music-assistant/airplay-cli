@@ -70,7 +70,7 @@ static void test_unowned_registrations_are_refcounted(void)
     bool follow[AP2_PTP_MAX_PEERS];
     assert(ap2_ptp_peers_add(&p, "192.0.2.1", 0, false));
     assert(ap2_ptp_peers_add(&p, "192.0.2.1", 0, false));
-    assert(p.n == 2 && snapshot(&p, ips, follow) == 1);
+    assert(p.n == 1 && p.e[0].refs == 2 && snapshot(&p, ips, follow) == 1);
     assert(ap2_ptp_peers_remove(&p, "192.0.2.1", 0));
     assert(snapshot(&p, ips, follow) == 1);
     assert(ap2_ptp_peers_remove(&p, "192.0.2.1", 0));

@@ -18,9 +18,16 @@ bool ap2_ptp_peers_add(struct ap2_ptp_peers *p, const char *ip, pid_t owner, boo
     struct in_addr addr;
     if (!ip || inet_pton(AF_INET, ip, &addr) != 1) return false;
     /* An owning process registers its receiver once; registrations without
-     * an owner cannot be told apart, so each one counts (refcount semantics). */
-    for (int i = peers_find(p, addr, 0); owner && i >= 0; i = peers_find(p, addr, i + 1)) {
-        if (p->e[i].owner == owner) { p->e[i].follow = follow; return true; }
+     * an owner cannot be told apart, so they are counted. */
+    for (int i = peers_find(p, addr, 0); i >= 0; i = peers_find(p, addr, i + 1)) {
+        if (p->e[i].owner != owner) continue;
+        if (owner) {
+            p->e[i].follow = follow;
+        } else {
+            p->e[i].refs++;
+            p->e[i].follow |= follow;
+        }
+        return true;
     }
     if (p->n >= AP2_PTP_PEERS_MAX_REGS) return false;
     if (peers_find(p, addr, 0) < 0 && peers_distinct(p) >= AP2_PTP_MAX_PEERS) return false;
@@ -28,6 +35,7 @@ bool ap2_ptp_peers_add(struct ap2_ptp_peers *p, const char *ip, pid_t owner, boo
     r->addr = addr;
     inet_ntop(AF_INET, &addr, r->ip, sizeof(r->ip));
     r->owner = owner;
+    r->refs = 1;
     r->follow = follow;
     return true;
 }
@@ -36,12 +44,15 @@ bool ap2_ptp_peers_remove(struct ap2_ptp_peers *p, const char *ip, pid_t owner)
 {
     struct in_addr addr;
     if (!ip || inet_pton(AF_INET, ip, &addr) != 1) return false;
-    for (int i = peers_find(p, addr, 0); i >= 0; i = peers_find(p, addr, i + 1)) {
-        if (owner && p->e[i].owner != owner) continue;
-        peers_drop(p, i);
+    int first = peers_find(p, addr, 0);
+    for (int i = first; i >= 0; i = peers_find(p, addr, i + 1)) {
+        if (p->e[i].owner != owner) continue;
+        if (--p->e[i].refs == 0) peers_drop(p, i);
         return true;
     }
-    return false;
+    if (owner || first < 0) return false;
+    peers_drop(p, first);
+    return true;
 }
 
 int ap2_ptp_peers_reap(struct ap2_ptp_peers *p, bool (*alive)(pid_t pid),

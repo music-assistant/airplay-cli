@@ -23,7 +23,9 @@
 /* POSIX shared-memory object name (one per host). On Linux it materialises as
  * /dev/shm/cliairplay-ptp; the leading slash and short name keep it valid on
  * macOS too (POSIX shm names there are capped near 31 chars). */
+#ifndef AP2_PTP_SHM_NAME
 #define AP2_PTP_SHM_NAME    "/cliairplay-ptp"
+#endif
 
 /* Shared-memory layout version. Readers refuse a mismatch so a future layout
  * change cannot be misread as the current one. */
@@ -34,7 +36,9 @@
  * 9000) so a real nqptp serving shairport-sync RECEIVERS on the same host does
  * not collide with our sender-side daemon. */
 #define AP2_PTP_CTRL_ADDR "127.0.0.1"
+#ifndef AP2_PTP_CTRL_PORT
 #define AP2_PTP_CTRL_PORT 9010
+#endif
 
 /* sample flags */
 #define AP2_PTP_SHM_F_GRANDMASTER   0x1u  /* the daemon holds the timeline (offset 0) */

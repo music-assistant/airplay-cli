@@ -1,5 +1,6 @@
 #include <arpa/inet.h>
 #include <assert.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -7,7 +8,9 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
 
@@ -289,6 +292,25 @@ static void test_daemon_reaps_receivers_of_dead_clients(void)
     daemon_stop(t);
 }
 
+/* A stale shm object of an older, smaller layout (a daemon that was killed)
+ * is replaced, not reused, so the new layout never writes past its end. */
+static void test_daemon_replaces_stale_smaller_shm(void)
+{
+    shm_unlink(AP2_PTP_SHM_NAME);
+    int fd = shm_open(AP2_PTP_SHM_NAME, O_CREAT | O_RDWR, 0644);
+    assert(fd >= 0 && ftruncate(fd, 64) == 0);
+    close(fd);
+
+    pthread_t t = daemon_start();
+    struct stat st;
+    fd = shm_open(AP2_PTP_SHM_NAME, O_RDONLY, 0);
+    assert(fd >= 0 && fstat(fd, &st) == 0);
+    close(fd);
+    /* Platforms that round object sizes up to a page report more than asked. */
+    assert(st.st_size >= (off_t)sizeof(struct ap2_ptp_shm));
+    daemon_stop(t);
+}
+
 struct named_test { const char *name; void (*fn)(void); };
 
 int main(int argc, char **argv)
@@ -301,6 +323,7 @@ int main(int argc, char **argv)
          test_daemon_serves_new_receiver_after_old_ones_unregister},
         {"daemon_serves_nine_receivers_at_once", test_daemon_serves_nine_receivers_at_once},
         {"daemon_reaps_receivers_of_dead_clients", test_daemon_reaps_receivers_of_dead_clients},
+        {"daemon_replaces_stale_smaller_shm", test_daemon_replaces_stale_smaller_shm},
     };
     /* An optional argument runs one test by name. */
     for (size_t i = 0; i < sizeof(tests) / sizeof(tests[0]); i++) {
