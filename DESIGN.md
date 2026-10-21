@@ -262,7 +262,10 @@ grandmaster — but MA spawns one cliairplay per device. The split
   probe, `Q <ip>` query the receiver's clock-exchange streak (§6, clock
   readiness); nqptp's `T`/`B`/`E`/`P` are accepted, with `T` treated as an
   additive register (each stream registers its own receiver; the daemon
-  aggregates).
+  aggregates). Registrations carry the stream's pid (`pid=<n>`) and the
+  daemon drops them once that pid is gone, so a stream the server kills
+  without a clean teardown does not keep its receiver in the peer set; freed
+  slots are reused.
 - **Streams with `--ptp-shared`** — probe the daemon, attach the shm
   read-only, register their receiver IP, and use the published clock for the
   SETUP `timingPeerInfo.ClockID` and the realtime sync packets — without
@@ -284,7 +287,7 @@ grandmaster — but MA spawns one cliairplay per device. The split
   the unicast two-step Sync/Follow_Up it then sends (~8 Hz), counts those
   Syncs toward its exchange streak (clock readiness), and never sends it our
   Announce/Sync; it stays grandmaster for every other peer. The daemon
-  publishes up to eight followed clocks in the shm sample (layout v3, one per
+  publishes up to sixty-four followed clocks in the shm sample (layout v4, one per
   timing peer); a
   stream picks the entry for its own registered receiver, so
   `ap2_ptp_master_clock_id()`/`ap2_ptp_master_now_ns()` and with them the
@@ -420,7 +423,7 @@ binary reports what it measures instead of leaving the caller to guess:
   not wait for it. Legacy RAOP reports `ntp` too.
 - `state=cold` — no probe recorded yet. `ready_in_ms`/`ready_at_unix_ms` are 0
   and mean nothing; ignore them. A receiver past the engine's peer limit
-  (`PTP_MAX_PEERS`, 8) gets no unicast timing and stays cold forever, so a
+  (`PTP_MAX_PEERS`, 64) gets no unicast timing and stays cold forever, so a
   caller waiting on readiness needs its own timeout for that case.
 - `state=probing` — a live streak; `ready_at_unix_ms` is the projected
   readiness instant to plan the anchor against.

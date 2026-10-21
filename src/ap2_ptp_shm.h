@@ -23,33 +23,40 @@
 /* POSIX shared-memory object name (one per host). On Linux it materialises as
  * /dev/shm/cliairplay-ptp; the leading slash and short name keep it valid on
  * macOS too (POSIX shm names there are capped near 31 chars). */
+#ifndef AP2_PTP_SHM_NAME
 #define AP2_PTP_SHM_NAME    "/cliairplay-ptp"
+#endif
 
 /* Shared-memory layout version. Readers refuse a mismatch so a future layout
  * change cannot be misread as the current one. */
-#define AP2_PTP_SHM_VERSION 3u
+#define AP2_PTP_SHM_VERSION 4u
 
 /* localhost UDP control channel the daemon listens on; streaming processes
  * register/unregister their receiver IP(s) here. A DEDICATED port (not nqptp's
  * 9000) so a real nqptp serving shairport-sync RECEIVERS on the same host does
  * not collide with our sender-side daemon. */
 #define AP2_PTP_CTRL_ADDR "127.0.0.1"
+#ifndef AP2_PTP_CTRL_PORT
 #define AP2_PTP_CTRL_PORT 9010
+#endif
 
 /* sample flags */
 #define AP2_PTP_SHM_F_GRANDMASTER   0x1u  /* the daemon holds the timeline (offset 0) */
 #define AP2_PTP_SHM_F_OFFSET_LOCKED 0x2u  /* slaving to a peer and >=1 offset sample folded */
 
+/* The most receivers the daemon serves at once (PTP_MAX_PEERS in ap2_ptp.c). */
+#define AP2_PTP_MAX_PEERS           64
+
 /* Followed receivers (registered with "R <ip> F"): receivers whose OWN clock
  * the daemon tracks instead of serving them its grandmaster. A stream to such
  * a receiver expresses its anchor in the receiver's timeline (clock_id, and
  * local ns + offset). */
-/* Sized to match PTP_MAX_PEERS (the daemon's receiver ceiling): every receiver
+/* Sized to match AP2_PTP_MAX_PEERS (the daemon's receiver ceiling): every receiver
  * it serves may be a standalone OS 27 HomePod whose own clock we follow, so the
  * follow table has to hold as many entries as there are peers. Must equal
  * PTP_MAX_FOLLOW (see the _Static_assert in ap2_ptp.c); growing it changes this
  * struct's layout, so bump AP2_PTP_SHM_VERSION when it changes. */
-#define AP2_PTP_SHM_MAX_FOLLOW      8
+#define AP2_PTP_SHM_MAX_FOLLOW      64
 #define AP2_PTP_SHM_F_FOLLOW_LOCKED 0x1u  /* >=1 offset sample folded for this receiver */
 struct ap2_ptp_shm_follow {
     uint32_t ip;                      /* receiver IPv4, network byte order; 0 = unused */
@@ -151,15 +158,23 @@ void ap2_ptp_shm_reader_close(struct ap2_ptp_shm_reader *r);
 /*
  * Control datagrams are plain text; the first non-space character selects the
  * command (arguments are space-separated):
- *   R <ip> [F] [<ip> [F] ...]
+ *   R <ip> [F] [<ip> [F] ...] [pid=<n>]
  *                       register (add) receiver IP(s) into the timing peer set;
  *                       an "F" after an ip follows that receiver's own clock
  *                       (standalone HomePod, see ap2_ptp_follow_receiver)
- *   U <ip> [<ip> ...]   unregister (remove) receiver IP(s)
- *   T <ip> [<ip> ...]   nqptp-compatible alias for register (ADD; see note)
+ *   U <ip> [<ip> ...] [pid=<n>]
+ *                       unregister (remove) receiver IP(s): with pid, that
+ *                       process's registration; without, one registration of
+ *                       each ip
+ *   T <ip> [<ip> ...] [pid=<n>]
+ *                       nqptp-compatible alias for register (ADD; see note)
  *   B | E | P           begin / end / pause (accepted + acked; no-op for a sender)
  *   ? | PING            liveness probe
  *   Q <ip>              query the receiver's clock-exchange streak
+ * The optional pid=<n> token (anywhere in the line) names the registering
+ * process. The daemon drops the registration when that pid no longer exists,
+ * so a stream killed before it could unregister does not pin its receiver in
+ * the peer set; without it the registration lives until an explicit U.
  * The daemon replies to the datagram's source with a short ack, e.g.
  *   "OK peers=2 gm=0123456789abcdef role=grandmaster"
  * except Q, whose ack carries the streak snapshot instead (zeros = cold clock):

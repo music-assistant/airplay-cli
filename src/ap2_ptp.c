@@ -36,12 +36,14 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <time.h>
+#include <signal.h>
 
 #include "../libraop/crosstools/src/platform.h"
 #include "../libraop/crosstools/src/cross_net.h"
 #include "../libraop/src/raop_client.h"
 #include "cross_log.h"
 #include "ap2_ptp.h"
+#include "ap2_ptp_peers.h"
 #include "ap2_ptp_shm.h"
 #include "host_clock.h"
 
@@ -99,11 +101,15 @@ extern log_level *loglevel;
 #define PTP_LOG_ANNOUNCE_INTERVAL  0
 #define PTP_LOG_SYNC_INTERVAL      (-3)
 
-#define PTP_MAX_PEERS       8
+/* Sizes the fixed peer tables (engine peer list, exchange slots, the follow
+ * table mirrored in shm), well above any real multi-room group. The daemon
+ * reuses slots and reaps dead owners, so this caps receivers at one moment,
+ * not over its lifetime. */
+#define PTP_MAX_PEERS       AP2_PTP_MAX_PEERS
 
 /* Per-peer exchange-streak slots, deliberately sized above PTP_MAX_PEERS so
  * evicted history (see ptp_track_exchange) is rare. */
-#define PTP_EXCHANGE_SLOTS  16
+#define PTP_EXCHANGE_SLOTS  (2 * PTP_MAX_PEERS)
 
 /* ---- BMCA / slave tuning ---- */
 
@@ -1654,7 +1660,7 @@ void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip, bool follo
 {
     if (!ctx || !ctx->shm_active || !ip || !*ip) return;
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), follow ? "R %s F" : "R %s", ip);
+    snprintf(cmd, sizeof(cmd), follow ? "R %s F pid=%d" : "R %s pid=%d", ip, (int)getpid());
     char ack[128] = {0};
     bool ok = ap2_ptp_ctrl_send(cmd, 250, ack, sizeof(ack));
     if (!ctx->shared_ip) {
@@ -1668,7 +1674,7 @@ void ap2_ptp_shared_unregister(struct ap2_ptp_ctx *ctx, const char *ip)
 {
     if (!ctx || !ip || !*ip) return;
     char cmd[64];
-    snprintf(cmd, sizeof(cmd), "U %s", ip);
+    snprintf(cmd, sizeof(cmd), "U %s pid=%d", ip, (int)getpid());
     ap2_ptp_ctrl_send(cmd, 100, NULL, 0);
     LOG_DEBUG("[PTP] Unregistered receiver %s from daemon", ip);
 }
@@ -1681,50 +1687,54 @@ void ap2_ptp_shared_kick(struct ap2_ptp_ctx *ctx)
 
 /* ---- PTP daemon ---- */
 
-/* Aggregate receiver peer set, refcounted so independent streams to the SAME
- * receiver register/unregister cleanly. */
-struct ptp_peerset {
-    struct { char ip[INET_ADDRSTRLEN]; int refs; } e[PTP_MAX_PEERS];
+static int daemon_ctrl_args(char **save, char **args, int max, pid_t *owner);
+static uint64_t daemon_monotonic_ns(void);
+static bool daemon_pid_alive(pid_t pid);
+static void daemon_log_reap(const struct ap2_ptp_peer_reg *reg);
+
+/* How often the daemon drops registrations whose owning process is gone. */
+#define PTP_DAEMON_REAP_NS  1000000000ULL     /* 1 s */
+
+/* Receivers whose own clock the daemon follows, as last applied to the engine. */
+struct ptp_followed {
+    struct in_addr addr[PTP_MAX_FOLLOW];
     int n;
 };
 
-static void peerset_apply(struct ptp_peerset *ps, struct ap2_ptp_ctx *ctx)
+static bool followed_has(const struct ptp_followed *fl, struct in_addr addr);
+
+/* Push the registered receivers into the engine: its peer list, and which of
+ * them it follows. The single place the daemon changes either. */
+static void peerset_apply(const struct ap2_ptp_peers *ps, struct ptp_followed *fl,
+                          struct ap2_ptp_ctx *ctx)
 {
     const char *ips[PTP_MAX_PEERS];
-    int n = 0;
-    for (int i = 0; i < ps->n; i++)
-        if (ps->e[i].refs > 0) ips[n++] = ps->e[i].ip;
+    bool follow[PTP_MAX_PEERS];
+    int n = ap2_ptp_peers_snapshot(ps, ips, follow, PTP_MAX_PEERS);
+    struct ptp_followed now = {0};
+    for (int i = 0; i < n && now.n < PTP_MAX_FOLLOW; i++)
+        if (follow[i]) inet_pton(AF_INET, ips[i], &now.addr[now.n++]);
+
+    for (int i = 0; i < fl->n; i++) {
+        if (followed_has(&now, fl->addr[i])) continue;
+        char ip[INET_ADDRSTRLEN];
+        inet_ntop(AF_INET, &fl->addr[i], ip, sizeof(ip));
+        ap2_ptp_unfollow_receiver(ctx, ip);
+    }
+    for (int i = 0; i < n; i++) {
+        struct in_addr addr;
+        inet_pton(AF_INET, ips[i], &addr);
+        if (follow[i] && !followed_has(fl, addr)) ap2_ptp_follow_receiver(ctx, ips[i]);
+    }
+    *fl = now;
     ap2_ptp_set_peers(ctx, ips, n);
 }
 
-static void peerset_add(struct ptp_peerset *ps, const char *ip)
+static int peerset_count(const struct ap2_ptp_peers *ps)
 {
-    for (int i = 0; i < ps->n; i++)
-        if (strcmp(ps->e[i].ip, ip) == 0) { ps->e[i].refs++; return; }
-    if (ps->n >= PTP_MAX_PEERS) {
-        LOG_WARN("[PTP] peer set full (%d); ignoring %s", PTP_MAX_PEERS, ip);
-        return;
-    }
-    snprintf(ps->e[ps->n].ip, sizeof(ps->e[ps->n].ip), "%s", ip);
-    ps->e[ps->n].refs = 1;
-    ps->n++;
-}
-
-static void peerset_remove(struct ptp_peerset *ps, const char *ip)
-{
-    for (int i = 0; i < ps->n; i++) {
-        if (strcmp(ps->e[i].ip, ip) == 0) {
-            if (ps->e[i].refs > 0) ps->e[i].refs--;
-            return;
-        }
-    }
-}
-
-static int peerset_count(const struct ptp_peerset *ps)
-{
-    int c = 0;
-    for (int i = 0; i < ps->n; i++) if (ps->e[i].refs > 0) c++;
-    return c;
+    const char *ips[PTP_MAX_PEERS];
+    bool follow[PTP_MAX_PEERS];
+    return ap2_ptp_peers_snapshot(ps, ips, follow, PTP_MAX_PEERS);
 }
 
 /* Snapshot the engine's elected clock into a shm sample, atomically. */
@@ -1759,7 +1769,8 @@ static void daemon_fill_sample(struct ap2_ptp_ctx *ctx, uint64_t start_ns,
 }
 
 /* Read and act on one control datagram; reply with a status ack. */
-static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_ctx *ctx)
+static void daemon_handle_ctrl(int sock, struct ap2_ptp_peers *ps, struct ptp_followed *fl,
+                               struct ap2_ptp_ctx *ctx)
 {
     char buf[512];
     struct sockaddr_in src;
@@ -1773,32 +1784,30 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
     if (!tok) return;
     char cmd = tok[0];
     bool changed = false;
+    char *args[sizeof(buf) / 2];
+    pid_t owner;
 
     switch (cmd) {
     case 'R':   /* register (add); "F" after an ip: follow that receiver's clock */
     case 'T': { /* nqptp-compatible alias: ADD (see header note) */
-        char *ip, *last_ip = NULL;
-        while ((ip = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
+        int na = daemon_ctrl_args(&save, args, (int)(sizeof(args) / sizeof(args[0])), &owner);
+        for (int i = 0; i < na; i++) {
+            char *ip = args[i];
             struct in_addr tmp;
-            if (strcmp(ip, "F") == 0) {
-                if (last_ip) ap2_ptp_follow_receiver(ctx, last_ip);
-                continue;
-            }
-            if (inet_pton(AF_INET, ip, &tmp) == 1) {
-                peerset_add(ps, ip);
-                changed = true;
-                last_ip = ip;
-            }
+            if (inet_pton(AF_INET, ip, &tmp) != 1) continue;
+            bool follow = i + 1 < na && strcmp(args[i + 1], "F") == 0;
+            if (ap2_ptp_peers_add(ps, ip, owner, follow)) { changed = true; continue; }
+            /* A full table may still hold receivers of streams that just died. */
+            if (ap2_ptp_peers_reap(ps, daemon_pid_alive, daemon_log_reap)) changed = true;
+            if (ap2_ptp_peers_add(ps, ip, owner, follow)) changed = true;
+            else LOG_WARN("[PTP] peer set full (%d); ignoring %s", PTP_MAX_PEERS, ip);
         }
         break;
     }
     case 'U': { /* unregister (remove) */
-        char *ip;
-        while ((ip = strtok_r(NULL, " \t\r\n", &save)) != NULL) {
-            peerset_remove(ps, ip);
-            ap2_ptp_unfollow_receiver(ctx, ip);
-            changed = true;
-        }
+        int na = daemon_ctrl_args(&save, args, (int)(sizeof(args) / sizeof(args[0])), &owner);
+        for (int i = 0; i < na; i++)
+            if (ap2_ptp_peers_remove(ps, args[i], owner)) changed = true;
         break;
     }
     case 'Q': {  /* query a receiver's exchange streak */
@@ -1833,7 +1842,7 @@ static void daemon_handle_ctrl(int sock, struct ptp_peerset *ps, struct ap2_ptp_
         break;
     }
 
-    if (changed) peerset_apply(ps, ctx);
+    if (changed) peerset_apply(ps, fl, ctx);
 
     /* Ack with the current group state so a client can confirm the daemon is
      * live and see the elected grandmaster. */
@@ -1878,7 +1887,9 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
     }
 
     uint64_t start_ns = ap2_ptp_now_ns(ctx);
-    struct ptp_peerset ps = {0};
+    struct ap2_ptp_peers ps = {0};
+    struct ptp_followed followed = {0};
+    uint64_t next_reap_ns = daemon_monotonic_ns() + PTP_DAEMON_REAP_NS;
     LOG_INFO("[PTP] daemon up: engine on 319/320, clock in %s, control on %s:%d",
              AP2_PTP_SHM_NAME, AP2_PTP_CTRL_ADDR, AP2_PTP_CTRL_PORT);
 
@@ -1891,7 +1902,13 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
         struct pollfd pfd = {.fd = ctrl, .events = POLLIN};
         int pr = poll(&pfd, 1, 100);   /* ~10 Hz publish cadence */
         if (pr > 0 && (pfd.revents & POLLIN))
-            daemon_handle_ctrl(ctrl, &ps, ctx);
+            daemon_handle_ctrl(ctrl, &ps, &followed, ctx);
+        uint64_t now = daemon_monotonic_ns();
+        if (now >= next_reap_ns) {
+            next_reap_ns = now + PTP_DAEMON_REAP_NS;
+            if (ap2_ptp_peers_reap(&ps, daemon_pid_alive, daemon_log_reap))
+                peerset_apply(&ps, &followed, ctx);
+        }
         daemon_fill_sample(ctx, start_ns, &sample);
         ap2_ptp_shm_publish(&w, sample);
     }
@@ -1901,4 +1918,47 @@ int ap2_ptp_run_daemon(struct in_addr bind_addr, uint64_t clock_id,
     ap2_ptp_shm_writer_close(&w);
     ap2_ptp_destroy(ctx);
     return 0;
+}
+
+/* Collect the arguments of an R/T/U line, taking its pid=<n> token as the owner. */
+static int daemon_ctrl_args(char **save, char **args, int max, pid_t *owner)
+{
+    int n = 0;
+    char *t;
+    *owner = 0;
+    while ((t = strtok_r(NULL, " \t\r\n", save)) != NULL) {
+        if (strncmp(t, "pid=", 4) == 0) {
+            long v = strtol(t + 4, NULL, 10);
+            *owner = v > 0 ? (pid_t)v : 0;
+        } else if (n < max) {
+            args[n++] = t;
+        }
+    }
+    return n;
+}
+
+/* The reap cadence must not move with the host clock the engine serves. */
+static uint64_t daemon_monotonic_ns(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
+/* EPERM means the process exists but belongs to another user. */
+static bool daemon_pid_alive(pid_t pid)
+{
+    return kill(pid, 0) == 0 || errno != ESRCH;
+}
+
+static void daemon_log_reap(const struct ap2_ptp_peer_reg *reg)
+{
+    LOG_INFO("[PTP] receiver %s unregistered: owner pid %d is gone", reg->ip, (int)reg->owner);
+}
+
+static bool followed_has(const struct ptp_followed *fl, struct in_addr addr)
+{
+    for (int i = 0; i < fl->n; i++)
+        if (fl->addr[i].s_addr == addr.s_addr) return true;
+    return false;
 }

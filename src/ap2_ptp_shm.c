@@ -49,6 +49,21 @@ bool ap2_ptp_shm_writer_open(struct ap2_ptp_shm_writer *w)
         return false;
     }
 
+    /* A stale object from an older layout can be smaller than this one.
+     * Resizing an existing object is undefined on some platforms, so replace
+     * it instead of growing it. */
+    struct stat st;
+    if (!created && fstat(fd, &st) == 0 && st.st_size < (off_t)sizeof(struct ap2_ptp_shm)) {
+        close(fd);
+        shm_unlink(AP2_PTP_SHM_NAME);
+        fd = shm_open(AP2_PTP_SHM_NAME, O_CREAT | O_EXCL | O_RDWR, 0644);
+        if (fd < 0) {
+            LOG_ERROR("[PTP-SHM] shm_open(%s) failed: %s", AP2_PTP_SHM_NAME, strerror(errno));
+            return false;
+        }
+        created = true;
+    }
+
     /* ftruncate is only meaningful when we just created the object; sizing an
      * existing mapping down/up is undefined on some platforms, so guard it. */
     if (created && ftruncate(fd, sizeof(struct ap2_ptp_shm)) != 0) {
@@ -113,6 +128,14 @@ bool ap2_ptp_shm_reader_open(struct ap2_ptp_shm_reader *r)
 
     int fd = shm_open(AP2_PTP_SHM_NAME, O_RDONLY, 0);
     if (fd < 0) return false;   /* no daemon */
+
+    /* An object the daemon has created but not yet sized has no backing for
+     * the layout; reading it would fault. */
+    struct stat st;
+    if (fstat(fd, &st) != 0 || st.st_size < (off_t)sizeof(struct ap2_ptp_shm)) {
+        close(fd);
+        return false;
+    }
 
     void *map = mmap(NULL, sizeof(struct ap2_ptp_shm), PROT_READ, MAP_SHARED, fd, 0);
     if (map == MAP_FAILED) {

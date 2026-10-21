@@ -92,7 +92,7 @@ when the state or the projected instant changes, ending at the first
 when `state` is `probing` or `ready`). `mode=ntp` means readiness is not
 measurable for this session — legacy RAOP, or a PTP session that fell back to
 the NTP responder — so do not wait for it. `state=cold` can also persist
-indefinitely for a receiver past the timing engine's 8-peer limit, so keep a
+indefinitely for a receiver past the timing engine's 64-peer limit, so keep a
 timeout. `FLUSH` and `START` re-arm the reporting for the next cycle.
 
 `state=stalled` means our clock has gone unanswered for 5 s — since the last
