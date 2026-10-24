@@ -177,12 +177,15 @@ int main(void)
     assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
            unix_ms_to_ntp(resume_ms));
 
-    /* A START without a preceding FLUSH must fail fast: re-anchoring a live
-     * stream would replay the receiver backlog against the new timeline. */
+    /* A START with no FLUSH before it re-anchors like the first START. */
     reset_mocks();
     client.state = RAOP_STREAMING;
-    assert(raop_session_start_at(&client, resume_ms, NULL) != AP2_COMMIT_OK);
-    assert(start_calls == 0);
+    assert(raop_session_start_at(&client, resume_ms, NULL) == AP2_COMMIT_OK);
+    assert(stop_calls == 1);
+    assert(flush_calls == 1);
+    assert(start_calls == 1);
+    assert(last_start + TS2NTP(client.latency, client.sample_rate) ==
+           unix_ms_to_ntp(resume_ms));
 
     /* The delivery-head projection: a sent chunk's playtime plus its duration
      * is the audible instant of the chunk that follows it. 352 frames is
