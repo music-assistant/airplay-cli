@@ -634,7 +634,7 @@ static void test_setpeers_body(void)
     uint64_t v = 0;
     size_t n = 0;
 
-    /* A followed receiver: SETPEERSX with one timing-peer dict per member,
+    /* An Apple or followed receiver: SETPEERSX with one timing-peer dict per member,
      * only ours naming a clock. The writer keeps a key per dict, so counting
      * key bytes counts the dicts that carry it. */
     const char *method = ap2_build_setpeers(true, "PEER-ID", clock_id, "10.0.0.2", "10.0.0.9",
@@ -649,7 +649,7 @@ static void test_setpeers_body(void)
     assert(count_bytes(body, len, "10.0.0.2") == 1 && count_bytes(body, len, "10.0.0.9") == 1);
     free(body);
 
-    /* Any other receiver: the bare SETPEERS array of the two addresses. */
+    /* A third-party receiver: the bare SETPEERS array of the two addresses. */
     method = ap2_build_setpeers(false, "PEER-ID", clock_id, "10.0.0.2", "10.0.0.9", &body, &len);
     assert(strcmp(method, "SETPEERS") == 0);
     assert(body && len > 0);
@@ -1953,6 +1953,8 @@ static void test_apple_model_resolution(void)
         "model=AppleTV11,1 features=0x4A7FDFD5,0x3C177FDE", NULL));
     assert(ap2cl_test_apple_model_default(NULL, "AudioAccessory5,1"));
     assert(ap2cl_test_apple_model_default("model=Mac16,10", NULL));
+    /* HomePod mini 2: needs SETPEERSX (ap2_build_setpeers). */
+    assert(ap2cl_test_apple_model_default("acl=0 model=AudioAccessory11,1 osvers=27.2", NULL));
     assert(!ap2cl_test_apple_model_default("model=Era 100", NULL));
     assert(!ap2cl_test_apple_model_default("model=HW-LS60D", NULL));
     assert(!ap2cl_test_apple_model_default(NULL, "Era 100"));

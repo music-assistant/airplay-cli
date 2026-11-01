@@ -1579,12 +1579,12 @@ static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, cons
     return d;
 }
 
-const char *ap2_build_setpeers(bool follow, const char *our_id, uint64_t our_clock_id,
+const char *ap2_build_setpeers(bool timing_peers, const char *our_id, uint64_t our_clock_id,
                                const char *our_addr, const char *receiver_addr,
                                uint8_t **out, int *out_len)
 {
     ap2_pl_node *arr = ap2_pl_array();
-    if (follow) {
+    if (timing_peers) {
         char receiver_id[37];
         ap2_gen_uuid(receiver_id);
         ap2_pl_array_append(arr, ap2_make_timing_peer(our_id, our_clock_id, our_addr));
@@ -1596,7 +1596,7 @@ const char *ap2_build_setpeers(bool follow, const char *our_id, uint64_t our_clo
     *out = NULL;
     *out_len = ap2_pl_serialize(arr, out);
     ap2_pl_free(arr);
-    return follow ? "SETPEERSX" : "SETPEERS";
+    return timing_peers ? "SETPEERSX" : "SETPEERS";
 }
 
 /* Issue the type-130 remote-control (MRP) data-channel stream SETUP on the
@@ -2397,11 +2397,13 @@ static bool ap2_native_connect(struct ap2cl_s *p)
     }
 
     /* 6. SETPEERS (PTP only) so the receiver knows the timing group members
-     * [receiver, us]; SETPEERSX for a followed receiver (ap2_build_setpeers). */
+     * [receiver, us]; SETPEERSX for an Apple or followed receiver
+     * (ap2_build_setpeers). */
     if (p->use_ptp) {
         uint8_t *sp_data = NULL;
         int sp_len = 0;
-        const char *method = ap2_build_setpeers(p->follow_clock, p->timing_peer_id,
+        const char *method = ap2_build_setpeers(p->apple_model || p->follow_clock,
+                                                p->timing_peer_id,
                                                 ap2_ptp_master_clock_id(p->ptp), our_addr,
                                                 p->device.address, &sp_data, &sp_len);
 

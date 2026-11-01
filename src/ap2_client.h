@@ -163,14 +163,15 @@ bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
 bool ap2_follow_receiver_clock(const char *txt, const char *am);
 
 /*
- * Build the SETPEERS body naming the timing group [receiver, us]. A followed
- * receiver (see ap2_follow_receiver_clock) gets SETPEERSX: one timing-peer
- * dict per member as current Apple senders send it, ours repeating the
- * session SETUP entry. On a bare SETPEERS the HomePod mini 2
- * (AudioAccessory11,1) stops sending its Sync and stays silent. Every other
- * receiver gets the bare SETPEERS array of address strings.
+ * Build the SETPEERS body naming the timing group [receiver, us]. An Apple
+ * receiver, or one whose clock we follow (see ap2_follow_receiver_clock),
+ * gets SETPEERSX: one timing-peer dict per member as current Apple senders
+ * send it, ours repeating the session SETUP entry. On a bare SETPEERS the
+ * HomePod mini 2 (AudioAccessory11,1) ignores our clock and, when followed,
+ * stops sending its own, so it stays silent either way. Every other receiver
+ * gets the bare SETPEERS array of address strings.
  *
- * :param follow: the engine follows the receiver's own clock.
+ * :param timing_peers: send SETPEERSX with timing-peer dicts.
  * :param our_id: our timing-peer ID from the session SETUP.
  * :param our_clock_id: the session timeline clock ID from the SETUP.
  * :param our_addr: the address we advertise to the receiver.
@@ -179,7 +180,7 @@ bool ap2_follow_receiver_clock(const char *txt, const char *am);
  * :param out_len: receives its length, 0 on error.
  * :returns: the RTSP method, "SETPEERSX" or "SETPEERS".
  */
-const char *ap2_build_setpeers(bool follow, const char *our_id, uint64_t our_clock_id,
+const char *ap2_build_setpeers(bool timing_peers, const char *our_id, uint64_t our_clock_id,
                                const char *our_addr, const char *receiver_addr,
                                uint8_t **out, int *out_len);
 
