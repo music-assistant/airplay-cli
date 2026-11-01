@@ -123,7 +123,12 @@ Connect sequence (`ap2_native_connect()`):
    `latencyMin`/`latencyMax` (when present) clamp our lead and size the
    pacing window (§6).
 7. For PTP sessions, **SETPEERS** (a bare plist array `[receiver, us]`) and
-   the same peer list handed to the PTP engine.
+   the same peer list handed to the PTP engine. A followed receiver (§5) gets
+   **SETPEERSX** instead: the same two members as timing-peer dicts (`ID`,
+   `DeviceType`, `ClockID` for us, `SupportsClockPortMatchingOverride`,
+   `Addresses`), the form current Apple senders use. On a bare SETPEERS the
+   HomePod mini 2 (`AudioAccessory11,1`) stops sending us its Sync and stays
+   silent; on SETPEERSX it keeps its clock running and plays.
 
 The audio key (`shk`) is the first 32 bytes of the pairing shared secret —
 the raw X25519 secret for pair-verify, `SHA512(S)[:32]` for transient.
