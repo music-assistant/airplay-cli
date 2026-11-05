@@ -2364,8 +2364,11 @@ static void *run_anchor_peer(void *arg)
             if (n <= 0) return NULL;
             fill += (size_t)n;
         }
-        uint64_t secs = 0, frac = 0;
+        uint64_t secs = 0, frac = 0, flags = 1;
+        /* HomePod OS 27 refuses an anchor without networkTimeFlags (400). */
         if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                  "networkTimeFlags", &flags) || flags != 0 ||
+            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
                                   "rtpTime", &peer->rtp[request]) ||
             !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len, "rate",
                                   &peer->rate[request]) ||
