@@ -1352,6 +1352,16 @@ static bool ap2_model_prefix(const char *txt, const char *am, const char *prefix
     return am && strncmp(am, prefix, len) == 0;
 }
 
+/* Declare relay support on HomePod native PTP sessions so iOS can expose
+ * their existing MediaRemote controls. Keep the change scoped to HomePod, and
+ * do not advertise controls when their event/metadata path is disabled. */
+static bool ap2_control_relay_enabled(const char *txt, const char *am)
+{
+    return ap2_model_prefix(txt, am, "AudioAccessory") &&
+           ap2_env_enabled("CLIAIRPLAY_MRP", true) &&
+           ap2_env_enabled("CLIAIRPLAY_CONTROL_RELAY", true);
+}
+
 /* Leading integer of a TXT version field, or -1 when absent. The value runs to
  * the next space, so read only the leading digits (e.g. "27.0" -> 27). */
 static int ap2_txt_version_major(const char *txt, const char *key)
@@ -2090,6 +2100,11 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_pl_dict_set(root, "macAddress", ap2_pl_string(mac_colon));
         ap2_pl_dict_set(root, "groupUUID", ap2_pl_string(p->group_uuid));
         ap2_pl_dict_set(root, "groupContainsGroupLeader", ap2_pl_bool(false));
+        if (ap2_control_relay_enabled(p->device.txt_records, p->am)) {
+            ap2_pl_dict_set(root, "senderSupportsRelay", ap2_pl_bool(true));
+            ap2_pl_dict_set(root, "isMultiSelectAirPlay", ap2_pl_bool(true));
+            LOG_INFO("[AP2] HomePod control relay enabled (PTP session)");
+        }
         ap2_pl_dict_set(root, "timingPeerInfo",
                         ap2_make_timing_peer(peer_id, timeline_id, our_addr));
         ap2_pl_node *peer_list = ap2_pl_array();
@@ -5889,6 +5904,11 @@ bool ap2cl_test_env_enabled(const char *name, bool unset_default)
 bool ap2cl_test_mrp_type130_enabled(void)
 {
     return ap2_mrp_type130_enabled();
+}
+
+bool ap2cl_test_control_relay_enabled(const char *txt, const char *am)
+{
+    return ap2_control_relay_enabled(txt, am);
 }
 
 bool ap2cl_test_mrp_session_eligible(bool encrypted, bool stored_credentials,

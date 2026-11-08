@@ -648,6 +648,22 @@ reverse event channel this path services). Transient third-party receivers
 neither need nor render it. `CLIAIRPLAY_MRP=0` disables the whole path
 (diagnostic opt-out).
 
+**HomePod iOS control discovery.** The native PTP session SETUP includes
+`senderSupportsRelay=true` and `isMultiSelectAirPlay=true` for HomePod models
+when MediaRemote is enabled. On a standalone HomePod mini (OS 27.2), adding
+these fields changed the receiver's TXT flags from `0x1a0404` to `0x1a0c04`
+(DeviceSupportsRelay, bit 11), and an iPhone could display metadata and
+pause/resume through both the original Home tile and Control Center. The
+same PTP session without the fields did not advertise relay support. An
+earlier NTP session with the fields also failed, so the NTP path is left
+unchanged; timing and SETUP shape have not been independently isolated.
+`CLIAIRPLAY_CONTROL_RELAY=0` restores the previous PTP SETUP for A/B testing.
+No proxy or Companion service is involved. The iOS volume slider was also
+confirmed working with the v0.5.8 backport in MA 2.10.9. The user subsequently
+confirmed multiroom playback with a living-room stereo pair grouped with a
+single Kitchen HomePod. Other OS releases and long-run reliability remain
+unverified.
+
 **Channel keys.** The event (`Events-Salt`) and DataStream channel keys are
 HKDF-SHA512 over the pairing's full secret: the 32-byte X25519 shared secret
 after pair-verify, but the **full 64-byte SRP session key** after transient
