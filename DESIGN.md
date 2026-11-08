@@ -658,8 +658,9 @@ same PTP session without the fields did not advertise relay support. An
 earlier NTP session with the fields also failed, so the NTP path is left
 unchanged; timing and SETUP shape have not been independently isolated.
 `CLIAIRPLAY_CONTROL_RELAY=0` restores the previous PTP SETUP for A/B testing.
-No proxy or Companion service is involved. The iOS volume slider was also
-confirmed working with the v0.5.8 backport in MA 2.10.9. The user subsequently
+No proxy or Companion service is involved. With the v0.5.8 backport in MA
+2.10.9, the Home app volume slider does not work; the earlier report that it
+worked was mistaken. Volume control remains unresolved. The user subsequently
 confirmed multiroom playback with a living-room stereo pair grouped with a
 single Kitchen HomePod. Other OS releases and long-run reliability remain
 unverified.

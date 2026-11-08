@@ -314,8 +314,9 @@ HomePod native PTP sessions declare relay support so iOS can expose metadata
 and playback controls in Home and Control Other Speakers & TVs. Set
 `CLIAIRPLAY_CONTROL_RELAY=0` to restore the previous session SETUP for
 troubleshooting; disabling MediaRemote also disables this declaration.
-Metadata, artwork, playback controls, and the iOS volume slider were verified
-on a standalone HomePod mini. Playback was also confirmed in a multiroom group
+Metadata, artwork, and pause/resume were verified on a standalone HomePod mini.
+The Home app volume slider does not work and remains unresolved. Playback was
+also confirmed in a multiroom group
 combining a stereo pair and a single HomePod. See `DESIGN.md` §8 for the
 hardware results and validation limits.
 
