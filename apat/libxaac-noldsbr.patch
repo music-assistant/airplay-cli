@@ -1,0 +1,13 @@
+diff --git a/encoder/ixheaace_api.c b/encoder/ixheaace_api.c
+index 943d6f9..239f797 100644
+--- a/encoder/ixheaace_api.c
++++ b/encoder/ixheaace_api.c
+@@ -906,7 +906,7 @@ static IA_ERRORCODE ixheaace_set_config_params(ixheaace_api_struct *pstr_api_str
+       }
+     }
+     if ((AOT_SBR == pstr_input_config->aot) || (AOT_PS == pstr_input_config->aot) ||
+-        (AOT_AAC_ELD == pstr_input_config->aot)) {
++        (AOT_AAC_ELD == pstr_input_config->aot && !getenv("XELD_NOSBR"))) {  /* Smartcore: ELD ohne LD-SBR */
+       pstr_api_struct->config[ele_idx].aac_classic = 0;
+     }
+     if (pstr_api_struct->config[ele_idx].sample_rate < 32000) {

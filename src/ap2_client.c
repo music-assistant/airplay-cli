@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/socket.h>
+#include <openssl/kdf.h>
 #ifdef __linux__
 #include <sys/ioctl.h>
 #include <linux/sockios.h>
@@ -59,7 +60,10 @@
 
 extern log_level *loglevel;
 
-#define AP2_FRAMES_PER_CHUNK 352
+#ifndef AP2_SPF
+#define AP2_SPF 352
+#endif
+#define AP2_FRAMES_PER_CHUNK AP2_SPF
 #define AP2_CHACHA_TAG_SIZE  16
 
 /* audioFormat codes (bit positions shared with the /info format tables). */
@@ -1562,6 +1566,41 @@ static void ap2_parse_format_capability(const uint8_t *data, size_t len,
         *known = true;
 }
 
+/* streams[0].streamConnections.<type>.streamConnectionKeyPort from a binary plist. */
+static uint64_t bp_be(const uint8_t *b, int n) { uint64_t v = 0; for (int i = 0; i < n; i++) v = (v << 8) | b[i]; return v; }
+static int bp_is_str(const uint8_t *d, uint64_t off, const char *want)
+{
+    uint8_t m = d[off]; size_t wl = strlen(want);
+    return (m & 0xF0) == 0x50 && (m & 0x0F) == wl && wl < 15 ? memcmp(d + off + 1, want, wl) == 0 :
+           (m == 0x5F && (d[off + 1] & 0xF0) == 0x10 && bp_be(d + off + 2, 1 << (d[off + 1] & 0xF)) == wl &&
+            memcmp(d + off + 2 + (1 << (d[off + 1] & 0xF)), want, wl) == 0);
+}
+static int bp_conn_port(const uint8_t *d, size_t len, const char *type)
+{
+    if (len < 40) return 0;
+    const uint8_t *t = d + len - 32; int osz = t[6], rsz = t[7];
+    uint64_t n = bp_be(t + 8, 8), tab = bp_be(t + 24, 8);
+#define OFF(i) bp_be(d + tab + (i) * osz, osz)
+    for (uint64_t o = 0; o < n; o++) {
+        uint64_t a = OFF(o); uint8_t m = d[a];
+        if ((m & 0xF0) != 0xD0 || (m & 0x0F) == 15) continue;
+        int cnt = m & 0x0F; const uint8_t *keys = d + a + 1, *vals = keys + cnt * rsz;
+        for (int i = 0; i < cnt; i++) {
+            if (!bp_is_str(d, OFF(bp_be(keys + i * rsz, rsz)), type)) continue;
+            uint64_t v = OFF(bp_be(vals + i * rsz, rsz)); uint8_t vm = d[v];
+            if ((vm & 0xF0) != 0xD0) return 0;
+            int c2 = vm & 0x0F; const uint8_t *k2 = d + v + 1, *v2 = k2 + c2 * rsz;
+            for (int j = 0; j < c2; j++) {
+                if (!bp_is_str(d, OFF(bp_be(k2 + j * rsz, rsz)), "streamConnectionKeyPort")) continue;
+                uint64_t iv = OFF(bp_be(v2 + j * rsz, rsz));
+                if ((d[iv] & 0xF0) == 0x10) return (int)bp_be(d + iv + 1, 1 << (d[iv] & 0xF));
+            }
+        }
+    }
+#undef OFF
+    return 0;
+}
+
 /* Build one timing-peer dict {ID, DeviceType, ClockID, SupportsClockPort..., Addresses:[addr]}. */
 static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, const char *addr)
 {
@@ -1569,7 +1608,7 @@ static ap2_pl_node *ap2_make_timing_peer(const char *id, uint64_t clock_id, cons
     ap2_pl_dict_set(d, "ID", ap2_pl_string(id));
     ap2_pl_dict_set(d, "DeviceType", ap2_pl_int(0));
     ap2_pl_dict_set(d, "ClockID", ap2_pl_int((int64_t)clock_id));
-    ap2_pl_dict_set(d, "SupportsClockPortMatchingOverride", ap2_pl_bool(false));
+    ap2_pl_dict_set(d, "SupportsClockPortMatchingOverride", ap2_pl_bool(getenv("CLIAIRPLAY_APPLE_SESSION") != NULL));
     ap2_pl_node *addrs = ap2_pl_array();
     ap2_pl_array_append(addrs, ap2_pl_string(addr));
     ap2_pl_dict_set(d, "Addresses", addrs);
@@ -2069,6 +2108,20 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_pl_node *peer_list = ap2_pl_array();
         ap2_pl_array_append(peer_list, ap2_make_timing_peer(peer_id, timeline_id, our_addr));
         ap2_pl_dict_set(root, "timingPeerList", peer_list);
+        if (getenv("CLIAIRPLAY_APPLE_SESSION")) {
+            ap2_pl_dict_set(root, "asyncPTPClockConfig", ap2_pl_bool(true));
+            ap2_pl_dict_set(root, "isMultiSelectAirPlay", ap2_pl_bool(true));
+            ap2_pl_dict_set(root, "combinedGetInfoWithControlSetup", ap2_pl_bool(true));
+            ap2_pl_dict_set(root, "senderSupportsRelay", ap2_pl_bool(true));
+            ap2_pl_dict_set(root, "statsCollectionEnabled", ap2_pl_bool(false));
+            ap2_pl_dict_set(root, "updateSessionRequest", ap2_pl_bool(false));
+            ap2_pl_dict_set(root, "osName", ap2_pl_string("macOS"));
+            ap2_pl_dict_set(root, "osVersion", ap2_pl_string("27.2"));
+            ap2_pl_dict_set(root, "osBuildVersion", ap2_pl_string("26B123"));
+            ap2_pl_dict_set(root, "model", ap2_pl_string("Mac16,12"));
+            ap2_pl_dict_set(root, "sourceVersion", ap2_pl_string("1005.13.1"));
+            ap2_pl_dict_set(root, "sessionCorrelationUUID", ap2_pl_string(p->session_uuid));
+        }
 
         plist_len = ap2_pl_serialize(root, &plist_data);
         ap2_pl_free(root);
@@ -2182,17 +2235,17 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * in the SETUP; buffered (type 103) pushes RTP over a TCP connection to
      * the receiver's dataPort, so we advertise no dataPort and let the
      * receiver assign the TCP listener it returns in the response. */
-    int stream_type = p->use_buffered ? 103 : 96;
+    int stream_type = (getenv("CLIAIRPLAY_ST_TYPE") ? (int)strtol(getenv("CLIAIRPLAY_ST_TYPE"), NULL, 0) : (p->use_buffered ? 103 : 96));
 
     struct ap2_plist *ssp = ap2_plist_create();
     ap2_plist_stream_begin(ssp);
-    ap2_plist_stream_add_int(ssp, "audioFormat", audio_format);
-    ap2_plist_stream_add_string(ssp, "audioMode", "default");
+    ap2_plist_stream_add_int(ssp, "audioFormat", (getenv("CLIAIRPLAY_ST_FMT") ? (int)strtol(getenv("CLIAIRPLAY_ST_FMT"), NULL, 0) : audio_format));
+    ap2_plist_stream_add_string(ssp, "audioMode", getenv("CLIAIRPLAY_ST_MODE") ? getenv("CLIAIRPLAY_ST_MODE") : "default");
     ap2_plist_stream_add_int(ssp, "controlPort", local_ctrl_port);
-    ap2_plist_stream_add_int(ssp, "ct", 2);  /* ALAC */
+    ap2_plist_stream_add_int(ssp, "ct", (getenv("CLIAIRPLAY_ST_CT") ? (int)strtol(getenv("CLIAIRPLAY_ST_CT"), NULL, 0) : 2));  /* ALAC */
     if (!p->use_buffered)
         ap2_plist_stream_add_int(ssp, "dataPort", local_data_port);
-    ap2_plist_stream_add_bool(ssp, "isMedia", true);
+    ap2_plist_stream_add_bool(ssp, "isMedia", getenv("CLIAIRPLAY_ST_NOMEDIA") ? false : true);
     /* latencyMin/latencyMax are realtime-stream fields (the receiver's
      * buffering window for a live RTP feed). On the buffered stream the
      * receiver owns its buffer and playback is scheduled by the anchor
@@ -2201,12 +2254,12 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * 2 s lag against every realtime group member, ear-measured).
      * Apple's own buffered senders omit them. */
     if (!p->use_buffered) {
-        ap2_plist_stream_add_int(ssp, "latencyMax", 88200);
-        ap2_plist_stream_add_int(ssp, "latencyMin", 11025);
+        ap2_plist_stream_add_int(ssp, "latencyMax", (getenv("CLIAIRPLAY_ST_LATMAX") ? (int)strtol(getenv("CLIAIRPLAY_ST_LATMAX"), NULL, 0) : 88200));
+        ap2_plist_stream_add_int(ssp, "latencyMin", (getenv("CLIAIRPLAY_ST_LATMIN") ? (int)strtol(getenv("CLIAIRPLAY_ST_LATMIN"), NULL, 0) : 11025));
     }
     ap2_plist_stream_add_data(ssp, "shk", p->audio_key, 32);
-    ap2_plist_stream_add_int(ssp, "spf", 352);
-    ap2_plist_stream_add_int(ssp, "sr", p->format.sample_rate);
+    ap2_plist_stream_add_int(ssp, "spf", (getenv("CLIAIRPLAY_ST_SPF") ? (int)strtol(getenv("CLIAIRPLAY_ST_SPF"), NULL, 0) : 352));
+    ap2_plist_stream_add_int(ssp, "sr", (getenv("CLIAIRPLAY_ST_SR") ? (int)strtol(getenv("CLIAIRPLAY_ST_SR"), NULL, 0) : p->format.sample_rate));
     ap2_plist_stream_add_int(ssp, "streamConnectionID", p->session_id);
     ap2_plist_stream_add_bool(ssp, "supportsDynamicStreamID", false);
     ap2_plist_stream_add_int(ssp, "type", stream_type);
@@ -2214,6 +2267,50 @@ static bool ap2_native_connect(struct ap2cl_s *p)
 
     plist_len = ap2_plist_serialize(ssp, &plist_data);
     ap2_plist_free(ssp);
+    if (getenv("CLIAIRPLAY_APPLE_STREAM")) {
+        free(plist_data); plist_data = NULL;
+        ap2_pl_node *st = ap2_pl_dict();
+        ap2_pl_dict_set(st, "audioFormat", ap2_pl_int(getenv("CLIAIRPLAY_ST_FMT") ? strtol(getenv("CLIAIRPLAY_ST_FMT"), NULL, 0) : (int64_t)audio_format));
+        if (getenv("CLIAIRPLAY_V_IDX")) ap2_pl_dict_set(st, "audioFormatIndex", ap2_pl_int(atoi(getenv("CLIAIRPLAY_V_IDX"))));
+        ap2_pl_dict_set(st, "audioMode", ap2_pl_string("default"));
+        if (!getenv("CLIAIRPLAY_V_NOPORTS")) ap2_pl_dict_set(st, "controlPort", ap2_pl_int(local_ctrl_port));
+        ap2_pl_dict_set(st, "ct", ap2_pl_int(getenv("CLIAIRPLAY_ST_CT") ? atoi(getenv("CLIAIRPLAY_ST_CT")) : 2));
+        if (!getenv("CLIAIRPLAY_V_NOPORTS")) ap2_pl_dict_set(st, "dataPort", ap2_pl_int(local_data_port));
+        ap2_pl_dict_set(st, "isMedia", ap2_pl_bool(true));
+        if (!getenv("CLIAIRPLAY_V_NOLAT")) ap2_pl_dict_set(st, "latencyMax", ap2_pl_int(getenv("CLIAIRPLAY_ST_LATMAX") ? atoi(getenv("CLIAIRPLAY_ST_LATMAX")) : 88200));
+        if (!getenv("CLIAIRPLAY_V_NOLAT")) ap2_pl_dict_set(st, "latencyMin", ap2_pl_int(getenv("CLIAIRPLAY_ST_LATMIN") ? atoi(getenv("CLIAIRPLAY_ST_LATMIN")) : 11025));
+        ap2_pl_dict_set(st, "shk", ap2_pl_data(p->audio_key, 32));
+        if (getenv("CLIAIRPLAY_V_BUF")) ap2_pl_dict_set(st, "audioBufferSize", ap2_pl_int(atoi(getenv("CLIAIRPLAY_V_BUF"))));
+        if (getenv("CLIAIRPLAY_V_LATMS")) ap2_pl_dict_set(st, "audioLatencyMs", ap2_pl_int(atoi(getenv("CLIAIRPLAY_V_LATMS"))));
+        if (getenv("CLIAIRPLAY_V_RT")) ap2_pl_dict_set(st, "isRealtimeAPAT", ap2_pl_bool(true));
+        ap2_pl_dict_set(st, "spf", ap2_pl_int(getenv("CLIAIRPLAY_ST_SPF") ? atoi(getenv("CLIAIRPLAY_ST_SPF")) : 352));
+        ap2_pl_dict_set(st, "sr", ap2_pl_int(getenv("CLIAIRPLAY_ST_SR") ? atoi(getenv("CLIAIRPLAY_ST_SR")) : (int)p->format.sample_rate));
+        ap2_pl_dict_set(st, "streamConnectionID", ap2_pl_int(p->session_id));
+        ap2_pl_dict_set(st, "supportsDynamicStreamID", ap2_pl_bool(true));
+        ap2_pl_dict_set(st, "type", ap2_pl_int(stream_type));
+        ap2_pl_node *conns = ap2_pl_dict(), *c1 = ap2_pl_dict(), *c2 = ap2_pl_dict(), *c3 = ap2_pl_dict();
+        ap2_pl_dict_set(c1, "streamConnectionKeyUseStreamEncryptionKey", ap2_pl_bool(true));
+        ap2_pl_dict_set(c2, "streamConnectionKeyEncryptionSeed", ap2_pl_int((int64_t)(rand() & 0x7fffffff) << 30 | rand()));
+        ap2_pl_dict_set(c3, "streamConnectionKeyPort", ap2_pl_int(local_ctrl_port));
+        ap2_pl_dict_set(conns, "streamConnectionTypeRTP", c1);
+        ap2_pl_dict_set(conns, "streamConnectionTypeMediaDataControl", c2);
+        ap2_pl_dict_set(conns, "streamConnectionTypeRTCP", c3);
+        if (getenv("CLIAIRPLAY_V_APAT")) {
+            int v = atoi(getenv("CLIAIRPLAY_V_APAT"));
+            ap2_pl_node *ac = ap2_pl_dict(), *c4 = ap2_pl_dict();
+            if (v & 1) ap2_pl_dict_set(c4, "streamConnectionKeyUseStreamEncryptionKey", ap2_pl_bool(true));
+            if (v & 2) ap2_pl_dict_set(c4, "streamConnectionKeyPort", ap2_pl_int(local_data_port));
+            if (v & 4) ap2_pl_dict_set(c4, "streamConnectionKeyEncryptionSeed", ap2_pl_int(1234567890123LL));
+            if (v & 8) ap2_pl_dict_set(c4, "streamConnectionKeyTransportProtocol", ap2_pl_string("UDP"));
+            ap2_pl_dict_set(ac, "streamConnectionTypeAPAT", c4);
+            ap2_pl_dict_set(st, "streamConnections", ac);
+        } else
+        if (!getenv("CLIAIRPLAY_V_NOCONN")) ap2_pl_dict_set(st, "streamConnections", conns);
+        ap2_pl_node *arr = ap2_pl_array(); ap2_pl_array_append(arr, st);
+        ap2_pl_node *top = ap2_pl_dict(); ap2_pl_dict_set(top, "streams", arr);
+        plist_len = ap2_pl_serialize(top, &plist_data);
+        ap2_pl_free(top);
+    }
 
     /* RECORD on the session URL, before the stream SETUP (see the note
      * above): required for Samsung AirPlay 2 receivers to actually render
@@ -2263,6 +2360,15 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         if (ap2_bplist_find_uint(resp, (size_t)resp_len, "controlPort", &v) &&
             v >= 1024 && v <= 65535)
             remote_ctrl = (int)v;
+        if (!remote_data) {
+            remote_data = bp_conn_port(resp, (size_t)resp_len, "streamConnectionTypeRTP");
+            if (!remote_data) { remote_data = bp_conn_port(resp, (size_t)resp_len, "streamConnectionTypeAPAT");
+                LOG_INFO("[AP2] APAT port %d", remote_data); }
+            remote_ctrl = bp_conn_port(resp, (size_t)resp_len, "streamConnectionTypeRTCP");
+            if (!remote_ctrl) remote_ctrl = getenv("CLIAIRPLAY_APAT") ? 9 : remote_data;   /* never the APAT port: the receiver binds to the first sender it sees */
+            LOG_INFO("[AP2] streamConnections: rtp=%d rtcp=%d mdc=%d", remote_data, remote_ctrl,
+                     bp_conn_port(resp, (size_t)resp_len, "streamConnectionTypeMediaDataControl"));
+        }
         LOG_DEBUG("[AP2] Stream response ports: data=%d control=%d", remote_data, remote_ctrl);
 
         /* Downstream pipeline delay the device itself reports (Apple TV: its
@@ -2378,6 +2484,21 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         ap2_pl_node *arr = ap2_pl_array();
         ap2_pl_array_append(arr, ap2_pl_string(p->device.address));
         ap2_pl_array_append(arr, ap2_pl_string(our_addr));
+        /* Group members (stereo pair partner etc.): a pair can keep its PTP
+         * master on the NON-leader HomePod; unless that member is in the
+         * timing group too, it never hears our clock, stays master, and the
+         * leader follows it and renders silence. Apple senders list every
+         * member. CLIAIRPLAY_EXTRA_PEERS=ip[,ip...] */
+        const char *xp[8]; int nxp = 0;
+        static char xbuf[256];
+        const char *xenv = getenv("CLIAIRPLAY_EXTRA_PEERS");
+        if (xenv && *xenv) {
+            snprintf(xbuf, sizeof(xbuf), "%s", xenv);
+            for (char *t = strtok(xbuf, ","); t && nxp < 8; t = strtok(NULL, ",")) {
+                xp[nxp++] = t;
+                ap2_pl_array_append(arr, ap2_pl_string(t));
+            }
+        }
         uint8_t *sp_data = NULL;
         int sp_len = ap2_pl_serialize(arr, &sp_data);
         ap2_pl_free(arr);
@@ -2390,8 +2511,10 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         LOG_INFO("[AP2] SETPEERS [%s, %s] -> %d", p->device.address, our_addr, sp_status);
         if (sp_status <= 0) return false;
 
-        const char *peers[2] = { p->device.address, our_addr };
-        ap2_ptp_set_peers(p->ptp, peers, 2);
+        const char *peers[10] = { p->device.address, our_addr };
+        for (int i = 0; i < nxp; i++) peers[2 + i] = xp[i];
+        if (nxp) LOG_INFO("[AP2] SETPEERS +%d group member(s): %s", nxp, xenv);
+        ap2_ptp_set_peers(p->ptp, peers, 2 + nxp);
         /* Kick timing at the fresh peer so it measures our clock right away
          * (no-op without a shared daemon; the in-process engine kicks itself
          * from ap2_ptp_set_peers). */
@@ -2592,7 +2715,9 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
                        - (int64_t)p->lead_ms * 1000000LL;
     uint32_t play_pos = p->rt_anchor_pos0
                       + (uint32_t)((elapsed_ns * p->format.sample_rate) / 1000000000LL);
-    uint32_t frame_1 = play_pos + 11035;
+    static int sync_off = -1;
+    if (sync_off < 0) { const char *e = getenv("CLIAIRPLAY_SYNC_OFF_FRAMES"); sync_off = (e && *e) ? atoi(e) : 11035; }
+    uint32_t frame_1 = play_pos + (uint32_t)sync_off;
     uint32_t frame_2 = frame_1 + 77175;
 
     uint32_t be = htonl(frame_1);
@@ -2688,8 +2813,16 @@ static bool ap2_send_setrateanchortime(struct ap2cl_s *p, uint32_t rtp_time,
                     ap2_pl_int((int64_t)ap2_ptp_master_clock_id(p->ptp)));
     ap2_pl_dict_set(root, "networkTimeSecs", ap2_pl_int((int64_t)secs));
     ap2_pl_dict_set(root, "networkTimeFrac", ap2_pl_int((int64_t)network_time_frac));
+    if (getenv("CLIAIRPLAY_APAT")) {   /* APAT: media time instead of RTP time */
+        ap2_pl_dict_set(root, "mediaTimeValue", ap2_pl_int((int64_t)rtp_time));
+        ap2_pl_dict_set(root, "mediaTimeScale", ap2_pl_int(48000));
+    } else
     ap2_pl_dict_set(root, "rtpTime", ap2_pl_int((int64_t)rtp_time));
     ap2_pl_dict_set(root, "rate", ap2_pl_int((int64_t)rate));
+    /* HomePod OS 27 (AirTunes 1005.x) rejects an anchor without
+     * networkTimeFlags with 400 Bad Request, so buffered playback never
+     * starts; Apple senders always include it (0). */
+    ap2_pl_dict_set(root, "networkTimeFlags", ap2_pl_int(0));
 
     uint8_t *body = NULL;
     int body_len = ap2_pl_serialize(root, &body);
@@ -2702,6 +2835,7 @@ static bool ap2_send_setrateanchortime(struct ap2cl_s *p, uint32_t rtp_time,
     free(body);
     LOG_INFO("[AP2] SETRATEANCHORTIME rtp=%u anchor=%" PRIu64 "ns rate=%" PRIu64
              " -> %d", rtp_time, anchor_ns, rate, status);
+    if (getenv("CLIAIRPLAY_APAT") && resp && resp_len > 0) { FILE *f = fopen("/tmp/anchor-resp.bin", "wb"); if (f) { fwrite(resp, 1, resp_len, f); fclose(f); } }
     free(resp);
     return status == 200;
 }
@@ -2990,6 +3124,128 @@ static ap2_send_result_t ap2_buffered_send_chunk(
     return AP2_SEND_SENT;
 }
 
+
+
+static bool apat_hkdf(const uint8_t *secret, size_t slen, const char *salt, const char *info, uint8_t out[32])
+{
+    EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL); size_t l = 32; bool ok = c != NULL;
+    ok = ok && EVP_PKEY_derive_init(c) > 0 && EVP_PKEY_CTX_set_hkdf_md(c, EVP_sha512()) > 0
+            && EVP_PKEY_CTX_set1_hkdf_salt(c, (const unsigned char *)salt, (int)strlen(salt)) > 0
+            && EVP_PKEY_CTX_set1_hkdf_key(c, secret, (int)slen) > 0
+            && EVP_PKEY_CTX_add1_hkdf_info(c, (const unsigned char *)info, (int)strlen(info)) > 0
+            && EVP_PKEY_derive(c, out, &l) > 0;
+    EVP_PKEY_CTX_free(c); return ok;
+}
+static uint8_t apat_rtp_key[32], apat_rtcp_key[32], apat_in_key[32];
+static void apat_keys(const uint8_t *shk, const uint8_t *kdf, size_t kl)
+{
+    uint8_t o[32], in[32]; const char *m = getenv("CLIAIRPLAY_APAT_KEYS"); if (!m || strlen(m) < 2) m = "ss";
+    apat_hkdf(kdf, kl, "DataStream-Salt1234567890123", "DataStream-Output-Encryption-Key", o);
+    apat_hkdf(kdf, kl, "DataStream-Salt1234567890123", "DataStream-Input-Encryption-Key", in);
+    memcpy(apat_rtp_key, m[0] == 'o' ? o : m[0] == 'i' ? in : shk, 32);
+    memcpy(apat_rtcp_key, m[1] == 'o' ? o : m[1] == 'i' ? in : shk, 32);
+    memcpy(apat_in_key, in, 32);
+    LOG_INFO("[APAT] Schluessel %s (kdf %zu Byte)", m, kl);
+}
+
+/* APAT sender report (RTCP 207): [8B header][16B encrypted payload][4B index][16B tag][8B counter] */
+static bool apat_seal(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *aad, int aadlen,
+                      const uint8_t *in, int n, uint8_t *out, uint8_t *tag)
+{
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new(); int l = 0; bool ok = c != NULL;
+    ok = ok && EVP_EncryptInit_ex(c, EVP_chacha20_poly1305(), NULL, NULL, NULL) > 0
+            && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) > 0
+            && EVP_EncryptInit_ex(c, NULL, NULL, key, nonce) > 0;
+    if (ok && aadlen) ok = EVP_EncryptUpdate(c, NULL, &l, aad, aadlen) > 0;
+    ok = ok && EVP_EncryptUpdate(c, out, &l, in, n) > 0 && EVP_EncryptFinal_ex(c, out + l, &l) > 0
+            && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_GET_TAG, 16, tag) > 0;
+    EVP_CIPHER_CTX_free(c); return ok;
+}
+static bool apat_open(const uint8_t key[32], const uint8_t nonce[12], const uint8_t *aad, int al, const uint8_t *in, int n, const uint8_t *tag, uint8_t *out)
+{
+    EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new(); int l = 0; bool ok = c != NULL;
+    ok = ok && EVP_DecryptInit_ex(c, EVP_chacha20_poly1305(), NULL, NULL, NULL) > 0
+            && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_IVLEN, 12, NULL) > 0
+            && EVP_DecryptInit_ex(c, NULL, NULL, key, nonce) > 0;
+    if (ok && al) ok = EVP_DecryptUpdate(c, NULL, &l, aad, al) > 0;
+    ok = ok && EVP_DecryptUpdate(c, out, &l, in, n) > 0
+            && EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_AEAD_SET_TAG, 16, (void *)tag) > 0
+            && EVP_DecryptFinal_ex(c, out + l, &l) > 0;
+    EVP_CIPHER_CTX_free(c); return ok;
+}
+/* Receiver feedback: [8B header][ct][4B index][16B tag][8B counter] */
+static int apat_ccfb_log;
+/* Repair packet as Apple sends it: PT 0x70, SSRC ending in 0bad, same seq, single block without RED. */
+#define APAT_RTX_SLOTS 256
+static struct { uint8_t d[1100]; int len; uint32_t ts; uint16_t seq; uint64_t t_ms; int sent; } apat_rtx[APAT_RTX_SLOTS];
+static uint16_t apat_rtx_q[128]; static int apat_rtx_n; static uint32_t apat_rtx_cnt, apat_rtx_miss, apat_r0;
+static void apat_rtx_note(uint16_t seq)
+{
+    apat_r0++;
+    __typeof__(apat_rtx[0]) *e = &apat_rtx[seq % APAT_RTX_SLOTS];
+    uint64_t now = ap2_io_monotonic_ms();
+    if (e->seq != seq || !e->len || now - e->t_ms > 400) { apat_rtx_miss++; return; }
+    if (e->sent || now - e->t_ms < 30 || apat_rtx_n >= 128) return;
+    e->sent = 1; apat_rtx_q[apat_rtx_n++] = seq;
+}
+static void apat_dump_ccfb(const uint8_t *b, ssize_t n)
+{
+    if (n < 36 + 8) return;
+    int ctn = (int)n - 8 - 28; uint8_t out[1600], nonce[12] = {0}, a[12];
+    const uint8_t *idx = b + 8 + ctn, *tag = idx + 4, *ctr = tag + 16;
+    memcpy(nonce + 4, ctr, 8); memcpy(a, b, 8); memcpy(a + 8, idx, 4);
+    const uint8_t *keys[2] = {apat_rtp_key, apat_in_key};
+    for (int k = 0; k < 2; k++) for (int m = 0; m < 2; m++) {
+        if (!apat_open(keys[k], nonce, a, m ? 12 : 8, b + 8, ctn, tag, out)) continue;
+        { static FILE *cf; if (!cf) cf = fopen("/tmp/apat-ccfb.bin", "wb");
+          if (ctn >= 8) { int bg = (out[4] << 8) | out[5], nm = (out[6] << 8) | out[7]; nm = nm > (ctn - 8) / 2 ? (ctn - 8) / 2 : nm;
+            for (int i = 0; i < nm; i++) if (!(out[8 + 2 * i] >> 7)) apat_rtx_note((uint16_t)(bg + i)); }
+          if (cf) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec; uint16_t l = (uint16_t)ctn;
+                    fwrite(&ns, 8, 1, cf); fwrite(&l, 2, 1, cf); fwrite(out, 1, ctn, cf); fflush(cf); } }
+        if (!apat_ccfb_log) return;
+        char hx[121] = ""; for (int i = 0; i < 60 && i < ctn; i++) sprintf(hx + 2 * i, "%02x", out[i]);
+        int rec = 0, tot = 0;
+        if (ctn >= 8) { int num = (out[6] << 8) | out[7]; num = num > (ctn - 8) / 2 ? (ctn - 8) / 2 : num;
+            for (int i = 0; i < num; i++) { tot++; rec += out[8 + 2 * i] >> 7; } }
+        LOG_INFO("[APAT] CCFB key%d aad%d ct=%d begin=%u num=%u empfangen=%d/%d %s", k, m ? 12 : 8, ctn, (out[4] << 8) | out[5], (out[6] << 8) | out[7], rec, tot, hx);
+        return;
+    }
+    LOG_INFO("[APAT] CCFB could not be decrypted ct=%d", ctn);
+}
+static void apat_send_report(struct ap2cl_s *p, const uint8_t *key, uint64_t *ctr, uint32_t *idx, uint32_t ssrc, uint32_t rtp, uint32_t pkts)
+{
+    int mode = getenv("CLIAIRPLAY_APAT_RTCP") ? atoi(getenv("CLIAIRPLAY_APAT_RTCP")) : 0;
+    uint8_t pk[52], plain[16], nonce[12] = {0};
+    pk[0] = 0x80; pk[1] = 0xCF; pk[2] = 0; pk[3] = 5;
+    uint32_t v = htonl(ssrc); memcpy(pk + 4, &v, 4);
+    /* XR block type 25 (RLE as in RFC 3611): send window of the latest sequence numbers */
+    uint16_t end = (uint16_t)p->seq_number, n = 11, begin = (uint16_t)(end - n);
+    plain[0] = 25; plain[1] = 0; plain[2] = 0; plain[3] = 3;
+    v = htonl(ssrc); memcpy(plain + 4, &v, 4);
+    plain[8] = begin >> 8; plain[9] = begin & 0xFF; plain[10] = end >> 8; plain[11] = end & 0xFF;
+    uint16_t chunk = 0x4000 | n; plain[12] = chunk >> 8; plain[13] = chunk & 0xFF; plain[14] = 0; plain[15] = 0;
+    (void)rtp; (void)pkts;
+    uint64_t c = (*ctr)++; memcpy(nonce + 4, &c, 8);
+    uint32_t ix = htonl(0x80000000u | (*idx)++); memcpy(pk + 24, &ix, 4);
+    const uint8_t *aad = pk; int al = 8;
+    uint8_t a2[12]; memcpy(a2, pk, 8); memcpy(a2 + 8, pk + 24, 4);
+    if (mode == 1) { aad = a2; al = 12; } else if (mode == 2) { aad = pk + 4; al = 4; } else if (mode == 3) { al = 0; }
+    uint8_t tag[16];
+    if (!apat_seal(key, nonce, aad, al, plain, 16, pk + 8, tag)) return;
+    memcpy(pk + 28, tag, 16); memcpy(pk + 44, nonce + 4, 8);
+    sendto(p->data_sock, pk, 52, 0, (struct sockaddr *)&p->data_addr, sizeof(p->data_addr));
+}
+
+
+#ifdef AP2_ELD
+/* AAC-ELD via libxaac (Apache-2.0, apat/xeld.c) instead of fdk-aac */
+int xeld_open(int sr, int br);
+int xeld_encode(const short *pcm, unsigned char *dst, int cap);
+static int g_eld;
+static bool eld_open(int sr, int bitrate) { g_eld = xeld_open(sr, bitrate); return g_eld != 0; }
+static int eld_encode(const int16_t *pcm, uint8_t *out, int cap) { int n = xeld_encode(pcm, out, cap); return n < 0 ? 0 : n; }
+#endif
+
 static ap2_send_result_t ap2_native_send_chunk(
     struct ap2cl_s *p, uint8_t *sample, int frames)
 {
@@ -3002,8 +3258,54 @@ static ap2_send_result_t ap2_native_send_chunk(
     /* Send initial sync/anchor packet before the very first audio packet, then
      * periodically every ~100 chunks (~0.8s at 352fpp/44.1kHz). PTP sessions use
      * the 28-byte anchor form; NTP sessions the 20-byte form. */
+    static int apat = -1;
+    if (apat < 0) apat = getenv("CLIAIRPLAY_APAT") ? 1 : 0;
+    static uint64_t apat_ctr = 0x1000; static uint32_t apat_rx = 0, apat_tx = 0;
+    if (apat) {
+        if (p->first_packet) {
+            uint64_t lead_ns = (uint64_t)(getenv("CLIAIRPLAY_APAT_LEAD_MS") ? atoi(getenv("CLIAIRPLAY_APAT_LEAD_MS")) : 500) * 1000000ULL;
+            bool ok = ap2_send_setrateanchortime(p, p->rtp_timestamp, ap2_ptp_master_now_ns(p->ptp) + lead_ns, 1);
+            LOG_INFO("[APAT] Anker rtp=%u ok=%d", p->rtp_timestamp, (int)ok);
+            { size_t kl = 0; const uint8_t *kdf = ap2_hap_get_kdf_secret(p->hap, &kl);
+              apat_keys(ap2_hap_get_shared_secret(p->hap), kdf, kl); }
+        }
+        uint8_t rb[1500]; ssize_t rn;
+        while ((rn = recv(p->data_sock, rb, sizeof(rb), MSG_DONTWAIT)) > 0) {
+            apat_ccfb_log = apat_rx++ < 12 || apat_rx % 200 == 0;
+            if (apat_ccfb_log) {
+                char hx[80] = ""; for (int i = 0; i < 16 && i < rn; i++) sprintf(hx + 2 * i, "%02x", rb[i]);
+                LOG_INFO("[APAT] RX #%u len=%zd %s", apat_rx, rn, hx);
+            }
+            apat_dump_ccfb(rb, rn);
+        }
+        if (getenv("CLIAIRPLAY_APAT_RTX")) {
+            for (int i = 0; i < apat_rtx_n; i++) {
+                __typeof__(apat_rtx[0]) *e = &apat_rtx[apat_rtx_q[i] % APAT_RTX_SLOTS];
+                uint8_t h[12] = {0x80, 0x70}, n[12] = {0}, tg[16], w[1200]; uint32_t v;
+                h[2] = e->seq >> 8; h[3] = e->seq; v = htonl(e->ts); memcpy(h + 4, &v, 4);
+                v = htonl((p->ssrc & 0xFFFF0000u) | 0x0BAD); memcpy(h + 8, &v, 4);
+                uint64_t c = apat_ctr++; memcpy(n + 4, &c, 8);
+                memcpy(w, h, 12);
+                if (apat_seal(apat_rtp_key, n, h, 12, e->d, e->len, w + 12, tg)) {
+                    memcpy(w + 12 + e->len, tg, 16); memcpy(w + 28 + e->len, n + 4, 8);
+                    if (ap2_io_send_datagram_deadline(p->data_sock, w, (size_t)(36 + e->len), (const struct sockaddr *)&p->data_addr, sizeof(p->data_addr), ap2_io_monotonic_ms() + AP2_UDP_SEND_TIMEOUT_MS) == AP2_SEND_SENT) apat_rtx_cnt++;
+                }
+            }
+        }
+        apat_rtx_n = 0;
+        static uint32_t apat_idx = 1;
+        if (apat_tx % 10 == 0) {
+            const uint8_t *k = ap2_hap_get_shared_secret(p->hap);
+            if (k) apat_send_report(p, apat_rtcp_key, &apat_ctr, &apat_idx, p->ssrc & 0xFFFF0000u, p->rtp_timestamp, apat_tx);
+        }
+        { static FILE *tf; if (!tf) tf = fopen("/tmp/apat-tx.bin", "wb");
+          if (tf) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); uint64_t ns = ts.tv_sec * 1000000000ULL + ts.tv_nsec; uint32_t q = (uint16_t)p->seq_number;
+                    fwrite(&ns, 8, 1, tf); fwrite(&q, 4, 1, tf); if (apat_tx % 100 == 0) fflush(tf); } }
+        if (++apat_tx % 500 == 0) LOG_INFO("[APAT] TX %u RX %u R0 %u RTX %u late %u", apat_tx, apat_rx, apat_r0, apat_rtx_cnt, apat_rtx_miss);
+    }
     ap2_send_result_t sync_result = AP2_SEND_SENT;
-    if (p->first_packet) {
+    if (apat) {
+    } else if (p->first_packet) {
         sync_result = p->use_ptp ? ap2_send_sync_packet_ptp(p, true)
                                  : ap2_send_sync_packet(p, true);
     } else if ((p->seq_number % 100) == 0) {
@@ -3015,7 +3317,58 @@ static ap2_send_result_t ap2_native_send_chunk(
     /* ALAC encode */
     uint8_t *encoded = NULL;
     int enc_size = 0;
+#ifdef AP2_ELD
+    if (!g_eld && !eld_open(p->format.sample_rate, getenv("CLIAIRPLAY_ELD_BITRATE") ? atoi(getenv("CLIAIRPLAY_ELD_BITRATE")) : 256000))
+        return AP2_SEND_FATAL;
+    encoded = malloc(2048);
+    /* RED (RFC 2198), last block, inner type 112 (APAP-RTP): [0x70][media time hi32 BE][scale BE][AAC-ELD] */
+    {   /* APAP: [value BE][scale BE][3B seq][UIntV ext length][audio]; V=0: value without the low 32 bits (carried in the RTP timestamp) */
+        int v = getenv("CLIAIRPLAY_APAP_V") ? atoi(getenv("CLIAIRPLAY_APAP_V")) : 0;
+        int o = 0; uint32_t sc = htonl(p->format.sample_rate), lo = htonl(p->rtp_timestamp);
+        static uint32_t apap_seq = 0;
+        encoded[o++] = 0x70; memset(encoded + o, 0, 4); o += 4;
+        if (v == 1) { memcpy(encoded + o, &lo, 4); o += 4; }
+        memcpy(encoded + o, &sc, 4); o += 4;
+        if (v < 2) { encoded[o++] = apap_seq >> 16; encoded[o++] = apap_seq >> 8; encoded[o++] = apap_seq; apap_seq++; }
+        if (v == 3 || v == 5) { uint32_t f = htonl(v == 3 ? 0x2000000u : 25); encoded[o++] = 2; encoded[o++] = 4; memcpy(encoded + o, &f, 4); o += 4; }
+        if (v == 4) { encoded[o++] = 2; memset(encoded + o + 1, 0, 8); encoded[o++] = 8; encoded[o + 4] = 2; o += 8; }
+        encoded[o++] = 0;
+        enc_size = eld_encode((const int16_t *)sample, encoded + o, 2040 - o);
+        if (enc_size == 0) { encoded[o] = 0; enc_size = 1; }
+        enc_size += o;
+    }
+    if (apat) { __typeof__(apat_rtx[0]) *e = &apat_rtx[(uint16_t)p->seq_number % APAT_RTX_SLOTS];
+        int l = enc_size - 1; if (l > 0 && l <= 1100) { memcpy(e->d, encoded + 1, l); e->len = l; e->ts = p->rtp_timestamp; e->seq = (uint16_t)p->seq_number; e->t_ms = ap2_io_monotonic_ms(); e->sent = 0; } }
+    /* RED as Apple sends it (RFC 2198): [F4 + 14-bit ts offset + 10-bit length]... [70] [older units] [primary block].
+     * unit = payload without [70][hi32][scale], i.e. ext + audio. */
+    {   int red = getenv("CLIAIRPLAY_APAT_RED") ? atoi(getenv("CLIAIRPLAY_APAT_RED")) : 0;
+        if (apat && red > 0) {
+            static uint8_t ru[3][1100]; static int rl[3]; static uint32_t rts[3];
+            if (red > 3) red = 3;
+            uint8_t *nb = malloc(6000); int o = 0;
+            for (int k = red - 1; k >= 0; k--) {
+                uint32_t off = p->rtp_timestamp - rts[k];
+                if (rl[k] > 0 && rl[k] < 1024 && off > 0 && off < 16384) {
+                    uint32_t h = (0xF4u << 24) | (off << 10) | (uint32_t)rl[k];
+                    nb[o++] = h >> 24; nb[o++] = h >> 16; nb[o++] = h >> 8; nb[o++] = h;
+                }
+            }
+            nb[o++] = 0x70;
+            for (int k = red - 1; k >= 0; k--) {
+                uint32_t off = p->rtp_timestamp - rts[k];
+                if (rl[k] > 0 && rl[k] < 1024 && off > 0 && off < 16384) { memcpy(nb + o, ru[k], rl[k]); o += rl[k]; }
+            }
+            memcpy(nb + o, encoded + 1, enc_size - 1); o += enc_size - 1;
+            for (int k = red - 1; k > 0; k--) { memcpy(ru[k], ru[k - 1], rl[k - 1]); rl[k] = rl[k - 1]; rts[k] = rts[k - 1]; }
+            int un = enc_size - 9; if (un > 1100) un = 0;
+            if (un > 0) memcpy(ru[0], encoded + 9, un);
+            rl[0] = un; rts[0] = p->rtp_timestamp;
+            free(encoded); encoded = nb; enc_size = o;
+        }
+    }
+#else
     pcm_to_alac(p->alac, sample, frames, &encoded, &enc_size);
+#endif
     if (!encoded || enc_size <= 0) {
         LOG_ERROR("[AP2] ALAC encoder failed for realtime audio");
         free(encoded);
@@ -3025,12 +3378,12 @@ static ap2_send_result_t ap2_native_send_chunk(
     /* Build RTP header (12 bytes) */
     uint8_t rtp_hdr[12];
     rtp_hdr[0] = 0x80;
-    rtp_hdr[1] = p->first_packet ? 0xE0 : 0x60;
+    rtp_hdr[1] = apat ? 0x79 : (p->first_packet ? 0xE0 : 0x60);
     rtp_hdr[2] = (p->seq_number >> 8) & 0xFF;
     rtp_hdr[3] = p->seq_number & 0xFF;
     uint32_t ts_be = htonl(p->rtp_timestamp);
     memcpy(rtp_hdr + 4, &ts_be, 4);
-    uint32_t ssrc_be = htonl(p->ssrc);
+    uint32_t ssrc_be = htonl(apat ? (p->ssrc & 0xFFFF0000u) : p->ssrc);
     memcpy(rtp_hdr + 8, &ssrc_be, 4);
     /* Encrypt the ALAC payload with ChaCha20-Poly1305 (AP2 realtime audio).
      * Key:   the 32-byte pairing audio key (shk) — the raw X25519 secret for
@@ -3052,6 +3405,7 @@ static ap2_send_result_t ap2_native_send_chunk(
      * (memcpy(nonce+4, &seqnum, 2)). The same bytes are appended to the wire. */
     uint16_t seq16 = (uint16_t)p->seq_number;
     memcpy(nonce + 4, &seq16, 2);
+    if (apat) { uint64_t c = apat_ctr++; memcpy(nonce + 4, &c, 8); }
 
     int pkt_size = 12 + enc_size + AP2_CHACHA_TAG_SIZE + 8;
     uint8_t *pkt = malloc(pkt_size);
@@ -3064,7 +3418,9 @@ static ap2_send_result_t ap2_native_send_chunk(
 
     int ct_len = 0;
     uint8_t tag[AP2_CHACHA_TAG_SIZE];
-    bool encrypted_ok = ap2_encrypt_audio(
+    bool encrypted_ok;
+    if (apat) { encrypted_ok = apat_seal(apat_rtp_key, nonce, rtp_hdr, 12, encoded, enc_size, pkt + 12, tag); ct_len = enc_size; }
+    else encrypted_ok = ap2_encrypt_audio(
         audio_key, nonce, rtp_hdr + 4, encoded, enc_size,
         pkt + 12, &ct_len, tag);
     free(encoded);
