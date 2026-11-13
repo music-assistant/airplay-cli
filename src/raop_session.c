@@ -73,10 +73,13 @@ ap2_commit_result_t raop_session_start_at(struct raopcl_s *client,
                                           uint64_t *at_unix_ms)
 {
     if (!client) return AP2_COMMIT_FAILED;
-    /* Only valid after a flush (seek/standby): re-anchoring a live stream
-     * would replay the receiver's retained backlog against the new timeline.
-     * Rejecting STREAMING makes a START without a preceding FLUSH fail fast. */
     raop_state_t state = raopcl_state(client);
+    /* The corrective round of a group start re-STARTs a stream that is still
+     * playing, with no FLUSH before it. Re-anchor it the way the first START
+     * does: commit stops and flushes the receiver, then starts it at the new
+     * instant. */
+    if (state == RAOP_STREAMING)
+        return raop_session_commit(client, start_unix_ms, at_unix_ms);
     if (state != RAOP_FLUSHED) return AP2_COMMIT_FAILED;
 
     uint64_t audible_ntp = 0;
