@@ -50,7 +50,10 @@
 #ifndef CLIAIRPLAY_VERSION
 #define CLIAIRPLAY_VERSION VERSION
 #endif
-#define AP2_FRAMES_PER_CHUNK 352
+#ifndef AP2_SPF
+#define AP2_SPF 352
+#endif
+#define AP2_FRAMES_PER_CHUNK AP2_SPF
 
 /* Protocol selection (resolved, concrete protocol used for dispatch). */
 typedef enum {
@@ -2253,6 +2256,8 @@ int main(int argc, char *argv[])
     setvbuf(stderr, NULL, _IONBF, 0);  /* Unbuffered stderr for status output */
 
     int opt;
+    { const char *lv = getenv("CLIAIRPLAY_LEAD_MS");
+      if (lv && *lv) cfg.lead_ms = atoi(lv); }
     while ((opt = getopt_long(argc, argv, "hP:p:v:l:D:R:C:U:r:b:c:d:es:x:I:E:M:A:K:W:T:n:H:t:",
                               long_options, NULL)) != -1) {
         switch (opt) {
