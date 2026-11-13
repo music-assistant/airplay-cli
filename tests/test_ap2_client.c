@@ -59,6 +59,8 @@ void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 bool ap2cl_test_env_enabled(const char *name, bool unset_default);
 bool ap2cl_test_mrp_type130_enabled(void);
+int ap2cl_test_session_setup(bool use_ptp, const char *model, uint8_t **out);
+bool ap2cl_test_control_relay_enabled(const char *txt, const char *am);
 bool ap2cl_test_mrp_session_eligible(bool encrypted, bool stored_credentials,
                                      bool apple_model);
 void ap2cl_test_inject_clock_exchange(struct ap2cl_s *p, uint32_t count,
@@ -862,6 +864,33 @@ static void test_pair_verify_headers_only_reply(void)
     }
 
     puts("ap2_hap pair-verify headers-only reply tests passed");
+}
+
+/* Never declare the HomePod relay when its MediaRemote service is disabled,
+ * and keep the default SETUP of untested receiver classes unchanged. */
+static void test_control_relay_eligibility(void)
+{
+    assert(unsetenv("CLIAIRPLAY_CONTROL_RELAY") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
+    assert(ap2cl_test_control_relay_enabled("model=AudioAccessory5,1", NULL));
+    assert(ap2cl_test_control_relay_enabled(
+        "features=0x0 model=AudioAccessory5,1 osvers=27.2", NULL));
+    assert(ap2cl_test_control_relay_enabled(NULL, "AudioAccessory1,1"));
+    /* Other receivers and missing discovery data retain their old SETUP. */
+    assert(!ap2cl_test_control_relay_enabled("model=AppleTV11,1", NULL));
+    assert(!ap2cl_test_control_relay_enabled("model=Sonos", NULL));
+    assert(!ap2cl_test_control_relay_enabled(NULL, NULL));
+    assert(!ap2cl_test_control_relay_enabled("othermodel=AudioAccessory5,1", NULL));
+    assert(setenv("CLIAIRPLAY_CONTROL_RELAY", "0", 1) == 0);
+    assert(!ap2cl_test_control_relay_enabled("model=AudioAccessory5,1", NULL));
+    assert(setenv("CLIAIRPLAY_CONTROL_RELAY", "1", 1) == 0);
+    assert(ap2cl_test_control_relay_enabled("model=AudioAccessory5,1", NULL));
+    assert(!ap2cl_test_control_relay_enabled("model=Sonos", NULL));
+    assert(setenv("CLIAIRPLAY_MRP", "0", 1) == 0);
+    assert(!ap2cl_test_control_relay_enabled("model=AudioAccessory5,1", NULL));
+    assert(unsetenv("CLIAIRPLAY_CONTROL_RELAY") == 0);
+    assert(unsetenv("CLIAIRPLAY_MRP") == 0);
+    puts("ap2_client HomePod control relay eligibility tests passed");
 }
 
 /* Both MediaRemote toggles parse their value, so the spellings a user reaches
@@ -2788,8 +2817,20 @@ static void test_libraop_ntp_follows_host_clock(void)
     puts("ap2_client libraop host clock test passed");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* Emit real SETUP payloads for the independent Python plist decoder. */
+    if (argc == 4 && strcmp(argv[1], "--session-setup") == 0) {
+        assert(strcmp(argv[2], "PTP") == 0 || strcmp(argv[2], "NTP") == 0);
+        uint8_t *data = NULL;
+        int len = ap2cl_test_session_setup(strcmp(argv[2], "PTP") == 0,
+                                           argv[3], &data);
+        assert(len > 0);
+        assert(fwrite(data, 1, (size_t)len, stdout) == (size_t)len);
+        free(data);
+        return 0;
+    }
+    assert(argc == 1);
     test_host_clock_defaults_to_realtime();
     test_retransmit_responder();
     test_route_with_password();
@@ -2805,6 +2846,7 @@ int main(void)
     test_native_flush_resume_reuses_rtsp_session();
     test_native_flush_rejects_receiver_error();
     test_env_toggle_parsing();
+    test_control_relay_eligibility();
     test_splice_default_resolution();
     test_splice_timeline_warm_path();
     test_splice_delivery_gap_recovery();

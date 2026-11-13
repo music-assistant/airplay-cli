@@ -309,6 +309,13 @@ Native Apple sessions (pair-verified or transient) additionally mirror these
 updates over MediaRemote `POST /command`, including explicit play/pause/stop
 state. Set `CLIAIRPLAY_MRP=0` only to disable that path for comparison or
 diagnosis.
+
+HomePod native PTP sessions declare relay support so iOS can expose metadata,
+artwork, and playback controls in Home and Control Other Speakers & TVs.
+`CLIAIRPLAY_CONTROL_RELAY=0` disables this declaration; disabling MediaRemote
+also disables it. This does not enable the Home app volume slider. NTP sessions
+and other receiver models are unchanged. See `DESIGN.md` §8 for validation limits.
+
 `ITEMID` keys the now-playing item identity: metadata re-sent under the same
 id updates the item in place (a tag refinement never presents as a new
 track), while a new id is a track change that starts at 0:00; without ids,
