@@ -162,7 +162,7 @@ jobs:
   build-macos:
     # Both arches build on the arm64 runner: arm64 natively, x86_64 cross-compiled
     # via -arch (the Intel macos-13 runner is being retired).
-    runs-on: macos-14
+    runs-on: macos-15
     strategy:
       fail-fast: false
       matrix:
