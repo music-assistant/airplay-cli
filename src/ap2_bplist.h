@@ -87,6 +87,13 @@ int ap2_bplist_find_dict_uint_array_mask(const uint8_t *data, size_t len,
 int ap2_bplist_find_array_count(const uint8_t *data, size_t len,
                                 const char *key, size_t *out);
 
+/*
+ * Find a data (byte string) value by key anywhere in a raw binary plist.
+ * `out` points into `data`; it is valid as long as `data` is.
+ */
+int ap2_bplist_find_data(const uint8_t *data, size_t len, const char *key,
+                         const uint8_t **out, size_t *out_len);
+
 /* Find a string value by key in the root dictionary only. */
 int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
                                char *out, size_t out_size);
