@@ -32,6 +32,9 @@ class SessionSetupTest(unittest.TestCase):
                 setup = plistlib.loads(body)
                 self.assertEqual(setup["timingProtocol"], protocol)
                 self.assertEqual(setup["sessionUUID"], "test-session")
+                if protocol == "PTP":
+                    # SETPEERSX reuses the timing peer ID stored on the session.
+                    self.assertEqual(setup["timingPeerInfo"]["ID"], "test-peer")
                 for key in RELAY_KEYS:
                     if enabled:
                         self.assertIs(setup[key], True)
