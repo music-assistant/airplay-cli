@@ -40,6 +40,8 @@ bool ap2cl_test_first_packet(struct ap2cl_s *p);
 void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet);
 void ap2cl_test_set_splice(struct ap2cl_s *p, bool enable);
 bool ap2cl_test_splice_default(const char *txt, const char *am);
+uint32_t ap2cl_test_rtp_ssrc(bool ptp, bool buffered, uint32_t session_id,
+                             const ap2_audio_format_t *format);
 void ap2cl_test_set_anchor_valid(struct ap2cl_s *p, bool valid);
 bool ap2cl_test_anchor_valid(struct ap2cl_s *p);
 uint64_t ap2cl_test_head_ts(struct ap2cl_s *p);
@@ -947,6 +949,24 @@ static void test_splice_default_resolution(void)
     /* No TXT at all still defaults to the splice timeline. */
     assert(ap2cl_test_splice_default(NULL, NULL));
     puts("ap2_client splice default resolution tests passed");
+}
+
+static void test_rtp_ssrc(void)
+{
+    ap2_audio_format_t f44_16 = {.sample_rate = 44100, .bit_depth = 16, .channels = 2};
+    ap2_audio_format_t f44_24 = {.sample_rate = 44100, .bit_depth = 24, .channels = 2};
+    ap2_audio_format_t f48_16 = {.sample_rate = 48000, .bit_depth = 16, .channels = 2};
+    ap2_audio_format_t f48_24 = {.sample_rate = 48000, .bit_depth = 24, .channels = 2};
+    /* Buffered PTP audio carries the format code. */
+    assert(ap2cl_test_rtp_ssrc(true, true, 77, &f44_16) == 0x12000000u);
+    assert(ap2cl_test_rtp_ssrc(true, true, 77, &f44_24) == 0x13000000u);
+    assert(ap2cl_test_rtp_ssrc(true, true, 77, &f48_16) == 0x14000000u);
+    assert(ap2cl_test_rtp_ssrc(true, true, 77, &f48_24) == 0x15000000u);
+    /* Realtime PTP stays 0, NTP keeps the session id. */
+    assert(ap2cl_test_rtp_ssrc(true, false, 77, &f48_24) == 0);
+    assert(ap2cl_test_rtp_ssrc(false, false, 77, &f48_24) == 77);
+    assert(ap2cl_test_rtp_ssrc(false, true, 77, &f48_24) == 77);
+    puts("ap2_client RTP SSRC tests passed");
 }
 
 /* The splice timeline never sends a flush verb and never rebases: the
@@ -2848,6 +2868,7 @@ int main(int argc, char **argv)
     test_env_toggle_parsing();
     test_control_relay_eligibility();
     test_splice_default_resolution();
+    test_rtp_ssrc();
     test_splice_timeline_warm_path();
     test_splice_delivery_gap_recovery();
     test_splice_pause_keeps_line_hot();

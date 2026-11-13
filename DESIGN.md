@@ -616,7 +616,8 @@ UDP. ChaCha20-Poly1305 with key = `shk`; nonce = 12 bytes, zero except the
 AAD = RTP header bytes 4..11 (timestamp + SSRC); the trailing 8 bytes are the
 low nonce bytes so the receiver reconstructs it. SSRC is 0 for PTP sessions
 (the stream is keyed by the PTP clock identity) and the `streamConnectionID`
-for NTP sessions.
+for NTP sessions. Buffered (type 103) PTP streams instead carry the
+`audioFormat` bit index in the SSRC's top byte (ALAC 48k/24-bit = `0x15000000`).
 
 **RAOP**: compressed ALAC by default; uncompressed when the device's `cn`
 field lacks ALAC or `--raw` is given. Optional RSA-AES payload encryption

@@ -1550,6 +1550,24 @@ static uint64_t ap2_audio_format_code(const ap2_audio_format_t *format)
     return AP2_FMT_ALAC_44100_16_2;
 }
 
+/* RTP SSRC for a stream. NTP sessions use the streamConnectionID; PTP
+ * sessions key the stream by the PTP clock identity, so realtime carries 0.
+ * Buffered PTP audio carries the format's bit index in the top byte, which
+ * receivers such as Shairport Sync use to select their decoder. */
+static uint32_t ap2_rtp_ssrc(bool ptp, bool buffered, uint32_t session_id,
+                             const ap2_audio_format_t *format)
+{
+    if (!ptp)
+        return session_id;
+    if (!buffered)
+        return 0;
+    uint64_t code = ap2_audio_format_code(format);
+    uint32_t bit = 0;
+    while (code >>= 1)
+        bit++;
+    return bit << 24;
+}
+
 /* Read one stream type's advertised format table from the GET /info reply:
  * supportedAudioFormatsExtended.<stream> (array of bit indices) when present,
  * else the legacy supportedFormats.<stream> mask. The tables are advisory —
@@ -2201,10 +2219,8 @@ static bool ap2_native_connect(struct ap2cl_s *p)
      * secret: that is also the key the audio sender encrypts with, and the
      * receiver uses shk to decrypt the RTP payloads. */
     memcpy(p->audio_key, ap2_hap_get_shared_secret(p->hap), 32);
-    /* For NTP sessions the SSRC matches the streamConnectionID we register in
-     * stream SETUP; for PTP sessions the RTP SSRC is zero (the stream is keyed
-     * by the PTP clock identity instead). */
-    p->ssrc = p->use_ptp ? 0 : p->session_id;
+    p->ssrc = ap2_rtp_ssrc(p->use_ptp, p->use_buffered, p->session_id,
+                           &p->format);
 
     /* Open UDP sockets */
     p->data_sock = socket(AF_INET, SOCK_DGRAM, 0);
@@ -5803,6 +5819,12 @@ void ap2cl_test_set_first_packet(struct ap2cl_s *p, bool first_packet)
 void ap2cl_test_set_splice(struct ap2cl_s *p, bool enable)
 {
     p->splice_timeline = enable;
+}
+
+uint32_t ap2cl_test_rtp_ssrc(bool ptp, bool buffered, uint32_t session_id,
+                             const ap2_audio_format_t *format)
+{
+    return ap2_rtp_ssrc(ptp, buffered, session_id, format);
 }
 
 bool ap2cl_test_splice_default(const char *txt, const char *am)
