@@ -430,6 +430,7 @@ struct ap2cl_s {
     bool ptp_shared;   /* prefer a shared PTP daemon clock (multi-room) if present */
     bool follow_clock; /* the engine follows this receiver's own clock (standalone HomePod) */
     char timing_peer_id[37]; /* our timing-peer ID in the session SETUP and SETPEERSX */
+    uint64_t timing_clock_id; /* the timeline clock ID advertised in that SETUP */
 };
 
 static int ap2_mrp_send_playback_state(struct ap2cl_s *p,
@@ -2079,6 +2080,7 @@ static bool ap2_native_connect(struct ap2cl_s *p)
          * list — us — and cannot anchor to their own clock. The media anchor
          * below is expressed against this same clock domain. */
         uint64_t timeline_id = ap2_ptp_master_clock_id(p->ptp);
+        p->timing_clock_id = timeline_id;
 
         ap2_pl_node *root = ap2_pl_dict();
         ap2_pl_dict_set(root, "timingProtocol", ap2_pl_string("PTP"));
@@ -2403,9 +2405,9 @@ static bool ap2_native_connect(struct ap2cl_s *p)
         uint8_t *sp_data = NULL;
         int sp_len = 0;
         const char *method = ap2_build_setpeers(p->apple_model || p->follow_clock,
-                                                p->timing_peer_id,
-                                                ap2_ptp_master_clock_id(p->ptp), our_addr,
-                                                p->device.address, &sp_data, &sp_len);
+                                                p->timing_peer_id, p->timing_clock_id,
+                                                our_addr, p->device.address,
+                                                &sp_data, &sp_len);
 
         resp = NULL; resp_len = 0;
         int sp_status = ap2_rtsp_send(p, method, p->session_url, sp_data, sp_len,
