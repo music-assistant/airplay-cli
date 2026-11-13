@@ -2717,6 +2717,10 @@ static bool ap2_send_setrateanchortime(struct ap2cl_s *p, uint32_t rtp_time,
     ap2_pl_dict_set(root, "networkTimeFrac", ap2_pl_int((int64_t)network_time_frac));
     ap2_pl_dict_set(root, "rtpTime", ap2_pl_int((int64_t)rtp_time));
     ap2_pl_dict_set(root, "rate", ap2_pl_int((int64_t)rate));
+    /* HomePod OS 27 (AirTunes 1005.x) answers an anchor without
+     * networkTimeFlags with 400 Bad Request, so buffered playback never
+     * starts. Apple senders always include the key (0). */
+    ap2_pl_dict_set(root, "networkTimeFlags", ap2_pl_int(0));
 
     uint8_t *body = NULL;
     int body_len = ap2_pl_serialize(root, &body);
