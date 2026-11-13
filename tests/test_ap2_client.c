@@ -59,6 +59,7 @@ void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 bool ap2cl_test_env_enabled(const char *name, bool unset_default);
 bool ap2cl_test_mrp_type130_enabled(void);
+int ap2cl_test_session_setup(bool use_ptp, const char *model, uint8_t **out);
 bool ap2cl_test_control_relay_enabled(const char *txt, const char *am);
 bool ap2cl_test_mrp_session_eligible(bool encrypted, bool stored_credentials,
                                      bool apple_model);
@@ -2816,8 +2817,20 @@ static void test_libraop_ntp_follows_host_clock(void)
     puts("ap2_client libraop host clock test passed");
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
+    /* Emit real SETUP payloads for the independent Python plist decoder. */
+    if (argc == 4 && strcmp(argv[1], "--session-setup") == 0) {
+        assert(strcmp(argv[2], "PTP") == 0 || strcmp(argv[2], "NTP") == 0);
+        uint8_t *data = NULL;
+        int len = ap2cl_test_session_setup(strcmp(argv[2], "PTP") == 0,
+                                           argv[3], &data);
+        assert(len > 0);
+        assert(fwrite(data, 1, (size_t)len, stdout) == (size_t)len);
+        free(data);
+        return 0;
+    }
+    assert(argc == 1);
     test_host_clock_defaults_to_realtime();
     test_retransmit_responder();
     test_route_with_password();

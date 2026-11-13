@@ -244,6 +244,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(EVENT_TEST)
 	$(IO_TEST)
 	$(CLIENT_TEST)
+	python3 tests/check_session_setup.py $(CLIENT_TEST)
 	$(SESSION_TEST)
 	$(PTP_TEST)
 	$(PEERS_TEST)
