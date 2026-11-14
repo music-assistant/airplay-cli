@@ -436,6 +436,25 @@ static const uint8_t INFO_LEGACY[] = {
     0, 0, 0, 0, 0, 0, 0, 51,
 };
 
+/* { supportedFormats: { bufferStream: 0x18000e40000 } }, the mask written as a
+ * 16-byte integer the way Shairport Sync (libplist) sends it. */
+static const uint8_t INFO_LEGACY_WIDE[] = {
+    'b','p','l','i','s','t','0','0',
+    0xD1, 0x01, 0x02,
+    0x5F, 0x10, 0x10,
+    's','u','p','p','o','r','t','e','d','F','o','r','m','a','t','s',
+    0xD1, 0x03, 0x04,
+    0x5C, 'b','u','f','f','e','r','S','t','r','e','a','m',
+    0x14,                                   /* 16-byte int */
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0x00, 0x00, 0x01, 0x80, 0x00, 0xE4, 0x00, 0x00,
+    0x08, 0x0B, 0x1E, 0x21, 0x2E,
+    0, 0, 0, 0, 0, 0, 1, 1,
+    0, 0, 0, 0, 0, 0, 0, 5,
+    0, 0, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 63,
+};
+
 static void test_info_format_tables(void)
 {
     uint64_t mask = 0;
@@ -458,6 +477,23 @@ static void test_info_format_tables(void)
     assert(ap2_bplist_find_dict_uint_array_mask(
                INFO_LEGACY, sizeof(INFO_LEGACY),
                "supportedFormats", "bufferStream", &mask) == 0);
+
+    /* A 16-byte integer is read when its value fits in 64 bits. */
+    assert(ap2_bplist_find_dict_uint(
+               INFO_LEGACY_WIDE, sizeof(INFO_LEGACY_WIDE),
+               "supportedFormats", "bufferStream", &mask) == 1);
+    assert(mask == 0x18000e40000ULL);
+    uint8_t too_wide[sizeof(INFO_LEGACY_WIDE)];
+    memcpy(too_wide, INFO_LEGACY_WIDE, sizeof(too_wide));
+    too_wide[47] = 0x01;                    /* high half of the 16-byte int */
+    assert(ap2_bplist_find_dict_uint(
+               too_wide, sizeof(too_wide),
+               "supportedFormats", "bufferStream", &mask) == 0);
+    for (size_t len = 0; len < sizeof(INFO_LEGACY_WIDE); len++) {
+        assert(ap2_bplist_find_dict_uint(
+                   INFO_LEGACY_WIDE, len,
+                   "supportedFormats", "bufferStream", &mask) == 0);
+    }
 
     /* Truncated input must fail cleanly at every length, never crash. */
     for (size_t len = 0; len < sizeof(INFO_EXTENDED); len++) {
