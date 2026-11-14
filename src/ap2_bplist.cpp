@@ -407,6 +407,29 @@ int ap2_bplist_find_dict_uint_array_mask(const uint8_t *data, size_t len,
     return 1;
 }
 
+int ap2_bplist_find_data(const uint8_t *data, size_t len, const char *key,
+                         const uint8_t **out, size_t *out_len)
+{
+    bp_raw_view view;
+    uint64_t value_ref;
+    if (!key || !out || !out_len || !bp_view_init(data, len, &view) ||
+        !bp_find_value_ref(&view, key, &value_ref))
+        return 0;
+
+    size_t pos = bp_view_obj_ofs(&view, value_ref);
+    if (!pos || pos >= view.table_ofs ||
+        (view.data[pos] & 0xF0) != 0x40)
+        return 0;
+
+    size_t count;
+    if (!bp_read_count(view.data, view.table_ofs, &pos, &count) ||
+        count > view.table_ofs - pos)
+        return 0;
+    *out = view.data + pos;
+    *out_len = count;
+    return 1;
+}
+
 int ap2_bplist_find_array_count(const uint8_t *data, size_t len,
                                 const char *key, size_t *out)
 {

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <ctype.h>
 #include <stdbool.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -331,6 +332,8 @@ struct ap2cl_s {
                                       ap2cl_clock_verify_poll) */
     bool start_join_pending;       /* latched by ap2cl_set_start_join */
     bool apple_model;              /* model=/am= names an Apple receiver */
+    char *info_txt;                /* owned TXT decoded from /info; device.txt_records
+                                      borrows it when the caller gave none */
     uint64_t clock_verify_requested_unix_ms;
     uint64_t clock_verify_anchor_unix_ms;
     uint64_t clock_verify_packets_at_arm;
@@ -1778,6 +1781,49 @@ static bool ap2_native_open_socket(struct ap2cl_s *p)
     return true;
 }
 
+/* Decode a DNS-format TXT blob ([len][key=value]...) into the space-separated
+ * "key=value ..." form. Entries containing whitespace or NUL bytes are dropped,
+ * as they would split or cut the string; NULL for an empty or malformed blob. */
+static char *ap2_txt_from_dns(const uint8_t *blob, size_t len)
+{
+    char *out = malloc(len + 1);
+    if (!out) return NULL;
+    size_t n = 0;
+    for (size_t i = 0; i < len;) {
+        size_t elen = blob[i++];
+        if (elen > len - i) { free(out); return NULL; }
+        const uint8_t *e = blob + i;
+        i += elen;
+        bool skip = false;
+        for (size_t j = 0; j < elen; j++)
+            if (!e[j] || isspace(e[j])) { skip = true; break; }
+        if (!elen || skip) continue;
+        if (n) out[n++] = ' ';
+        memcpy(out + n, e, elen);
+        n += elen;
+    }
+    if (!n) { free(out); return NULL; }
+    out[n] = '\0';
+    return out;
+}
+
+/* Use the receiver's own TXT record from the /info reply when the caller
+ * supplied none. */
+static void ap2_adopt_info_txt(struct ap2cl_s *p, const uint8_t *resp, size_t len)
+{
+    if (p->device.txt_records && *p->device.txt_records) return;
+    const uint8_t *blob;
+    size_t blob_len;
+    if (!ap2_bplist_find_data(resp, len, "txtAirPlay", &blob, &blob_len)) return;
+    char *txt = ap2_txt_from_dns(blob, blob_len);
+    if (!txt) return;
+    free(p->info_txt);
+    p->info_txt = txt;
+    p->device.txt_records = txt;
+    p->apple_model = ap2_apple_model(txt, p->am);
+    LOG_INFO("[AP2] No TXT record given; using the receiver's own from /info");
+}
+
 /* GET /info on the (still unencrypted) control connection and read the
  * advertised per-stream format tables from the reply. */
 static bool ap2_native_get_info(struct ap2cl_s *p)
@@ -1792,6 +1838,7 @@ static bool ap2_native_get_info(struct ap2cl_s *p)
     }
     p->audio_format = ap2_audio_format_code(&p->format);
     if (resp && resp_len > 0) {
+        ap2_adopt_info_txt(p, resp, (size_t)resp_len);
         ap2_parse_format_capability(resp, (size_t)resp_len, "audioStream",
                                     &p->realtime_formats,
                                     &p->realtime_formats_known,
@@ -3376,6 +3423,7 @@ bool ap2cl_destroy(struct ap2cl_s *p)
     free(p->dacp_id); free(p->active_remote); free(p->iface); free(p->publish_ip);
     free(p->secret); free(p->password); free(p->et); free(p->md); free(p->am);
     free(p->auth_credentials);
+    free(p->info_txt);
     free(p->meta_title); free(p->meta_artist); free(p->meta_album);
     free(p->meta_item_id);
     free(p);
@@ -5910,6 +5958,24 @@ void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple)
 bool ap2cl_test_apple_model_default(const char *txt, const char *am)
 {
     return ap2_apple_model(txt, am);
+}
+
+char *ap2cl_test_txt_from_dns(const uint8_t *blob, size_t len)
+{
+    return ap2_txt_from_dns(blob, len);
+}
+
+/* Run the /info TXT fallback; returns the effective TXT (caller frees). */
+char *ap2cl_test_adopt_info_txt(const char *caller_txt, const uint8_t *resp,
+                                size_t len, bool *apple_model)
+{
+    struct ap2cl_s p = {0};
+    p.device.txt_records = (char *)caller_txt;
+    ap2_adopt_info_txt(&p, resp, len);
+    char *txt = p.device.txt_records ? strdup(p.device.txt_records) : NULL;
+    if (apple_model) *apple_model = p.apple_model;
+    free(p.info_txt);
+    return txt;
 }
 
 bool ap2cl_test_env_enabled(const char *name, bool unset_default)

@@ -215,7 +215,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 |--------|-------------|
 | `--auth <hex>` | HAP credentials (192 hex chars, from `--pair-setup`). Selects the native flow with pair-verify. |
 | `--ap2-native` | Force the native flow without credentials (transient pairing), whatever the TXT advertises. |
-| `--txt <k=v ...>` | mDNS TXT records of the `_airplay._tcp` service; drives route auto-selection. |
+| `--txt <k=v ...>` | mDNS TXT records of the `_airplay._tcp` service; drives route auto-selection. Without it, the receiver's own TXT record from `/info` is used for the per-receiver decisions made after connecting (route selection still needs `--txt` or `--protocol`). |
 | `--publish-ip <ip>` | Address advertised to devices (timing-peer lists) when it differs from the bind address (Docker bridge, NAT). |
 | `--name <name>` | Device name (native flow). |
 | `--hostname <host>` | Device hostname (native flow). |

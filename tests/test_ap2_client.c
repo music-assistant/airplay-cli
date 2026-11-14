@@ -57,6 +57,9 @@ void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_buffered_sock(struct ap2cl_s *p, int fd);
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
+char *ap2cl_test_txt_from_dns(const uint8_t *blob, size_t len);
+char *ap2cl_test_adopt_info_txt(const char *caller_txt, const uint8_t *resp,
+                                size_t len, bool *apple_model);
 bool ap2cl_test_env_enabled(const char *name, bool unset_default);
 bool ap2cl_test_mrp_type130_enabled(void);
 int ap2cl_test_session_setup(bool use_ptp, const char *model, uint8_t **out);
@@ -1976,6 +1979,60 @@ static uint64_t test_now_unix_ms(void)
     return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
 }
 
+static void test_info_txt_fallback(void)
+{
+    /* DNS wire format: [len][key=value]...; the whitespace, NUL and empty
+     * entries are dropped. */
+    const uint8_t blob[] = {
+        15, 'm','o','d','e','l','=','A','u','d','i','o','A','c','c','.',
+        5, 'i','g','l','=','1',
+        7, 'a','=','b',' ','c','=','d',
+        5, 'n','=','a','\0','b',
+        0,
+        8, 'o','s','v','e','r','s','=','2',
+    };
+    char *txt = ap2cl_test_txt_from_dns(blob, sizeof(blob));
+    assert(txt && strcmp(txt, "model=AudioAcc. igl=1 osvers=2") == 0);
+    free(txt);
+
+    /* Malformed or empty blobs yield nothing. */
+    const uint8_t overrun[] = { 5, 'a','=','b' };
+    assert(!ap2cl_test_txt_from_dns(overrun, sizeof(overrun)));
+    const uint8_t only_blank[] = { 0, 0, 3, 'a',' ','b' };
+    assert(!ap2cl_test_txt_from_dns(only_blank, sizeof(only_blank)));
+    assert(!ap2cl_test_txt_from_dns(blob, 0));
+
+    const uint8_t ho[] = {
+        20, 'm','o','d','e','l','=','A','u','d','i','o','A','c','c','e','s','s','o','r','y',
+    };
+    struct ap2_bplist *bp = ap2_bplist_create();
+    ap2_bplist_add_data(bp, "txtAirPlay", ho, sizeof(ho));
+    uint8_t *plist = NULL;
+    int plen = ap2_bplist_serialize(bp, &plist);
+    assert(plen > 0);
+
+    /* No caller TXT: taken from /info, and the Apple model follows. */
+    bool apple = false;
+    txt = ap2cl_test_adopt_info_txt(NULL, plist, (size_t)plen, &apple);
+    assert(txt && strcmp(txt, "model=AudioAccessory") == 0 && apple);
+    free(txt);
+    txt = ap2cl_test_adopt_info_txt("", plist, (size_t)plen, &apple);
+    assert(txt && strcmp(txt, "model=AudioAccessory") == 0);
+    free(txt);
+
+    /* A caller-supplied TXT is never replaced. */
+    apple = false;
+    txt = ap2cl_test_adopt_info_txt("model=Era 100", plist, (size_t)plen, &apple);
+    assert(txt && strcmp(txt, "model=Era 100") == 0 && !apple);
+    free(txt);
+
+    /* A reply without txtAirPlay changes nothing. */
+    assert(!ap2cl_test_adopt_info_txt(NULL, (const uint8_t *)"junk", 4, NULL));
+    free(plist);
+    ap2_bplist_free(bp);
+    puts("ap2_client /info TXT fallback tests passed");
+}
+
 static void test_apple_model_resolution(void)
 {
     assert(ap2cl_test_apple_model_default(
@@ -2857,6 +2914,7 @@ int main(int argc, char **argv)
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_apple_model_resolution();
+    test_info_txt_fallback();
     test_mrp_session_eligibility();
     test_pacing_window_rate_scaling();
     test_splice_depth_override_vs_reported_buffer();
