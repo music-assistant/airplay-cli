@@ -1981,12 +1981,13 @@ static uint64_t test_now_unix_ms(void)
 
 static void test_info_txt_fallback(void)
 {
-    /* DNS wire format: [len][key=value]...; the whitespace entry and the
-     * empty entry are dropped. */
+    /* DNS wire format: [len][key=value]...; the whitespace, NUL and empty
+     * entries are dropped. */
     const uint8_t blob[] = {
         15, 'm','o','d','e','l','=','A','u','d','i','o','A','c','c','.',
         5, 'i','g','l','=','1',
         7, 'a','=','b',' ','c','=','d',
+        5, 'n','=','a','\0','b',
         0,
         8, 'o','s','v','e','r','s','=','2',
     };

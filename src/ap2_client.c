@@ -1782,8 +1782,8 @@ static bool ap2_native_open_socket(struct ap2cl_s *p)
 }
 
 /* Decode a DNS-format TXT blob ([len][key=value]...) into the space-separated
- * "key=value ..." form. Entries containing whitespace are dropped because the
- * string is split on spaces; NULL for an empty or malformed blob. */
+ * "key=value ..." form. Entries containing whitespace or NUL bytes are dropped,
+ * as they would split or cut the string; NULL for an empty or malformed blob. */
 static char *ap2_txt_from_dns(const uint8_t *blob, size_t len)
 {
     char *out = malloc(len + 1);
@@ -1794,10 +1794,10 @@ static char *ap2_txt_from_dns(const uint8_t *blob, size_t len)
         if (elen > len - i) { free(out); return NULL; }
         const uint8_t *e = blob + i;
         i += elen;
-        bool blank = false;
+        bool skip = false;
         for (size_t j = 0; j < elen; j++)
-            if (isspace(e[j])) { blank = true; break; }
-        if (!elen || blank) continue;
+            if (!e[j] || isspace(e[j])) { skip = true; break; }
+        if (!elen || skip) continue;
         if (n) out[n++] = ' ';
         memcpy(out + n, e, elen);
         n += elen;
