@@ -236,6 +236,12 @@ bool ap2cl_connect(struct ap2cl_s *p);
 /* Disconnect from the device. */
 bool ap2cl_disconnect(struct ap2cl_s *p);
 
+/* End the receiver session now: RTSP TEARDOWN, given at most a second to be
+ * answered, then the connection is closed. For a caller about to exit;
+ * ap2cl_destroy() then sends nothing further on the session. Returns whether
+ * the receiver accepted the TEARDOWN. */
+bool ap2cl_teardown(struct ap2cl_s *p);
+
 /* Start playback at a commanded unix-epoch millisecond instant. A feasible
  * instant is scheduled exactly; an infeasible nonzero one is corrected
  * forward to the earliest feasible instant plus one lead of retry slack (the
@@ -408,6 +414,12 @@ void ap2cl_log_diagnostics(struct ap2cl_s *p);
 
 /* False after terminal RTSP/media/event failures. */
 bool ap2cl_control_healthy(struct ap2cl_s *p);
+
+/* True once the receiver closed the RTSP connection in an orderly way (EOF):
+ * it ended the session itself, e.g. for another sender, and nothing more is
+ * sent on it. A reset, timeout or unreachable receiver is a failure instead,
+ * see ap2cl_control_healthy(). */
+bool ap2cl_receiver_closed(struct ap2cl_s *p);
 
 /* Pause playback. */
 void ap2cl_pause(struct ap2cl_s *p);

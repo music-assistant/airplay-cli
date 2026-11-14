@@ -1,11 +1,23 @@
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <poll.h>
+#include <pthread.h>
+#include <stdarg.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "cross_log.h"
+#include "cross_util.h"
 #include "raop_client.h"
+#include "rtsp_client.h"
+#include "raop_rtsp.h"
 #include "ap2_client.h"
+
+int rtspcl_get_serv_sock(struct rtspcl_s *p);
 
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
@@ -23,11 +35,16 @@ log_level raop_loglevel = lSILENCE;
 #define MAX_CLIENTS 8
 #define MAX_EVENTS 32
 
+/* Like libraop's, each client owns an RTSP client made through the
+ * raop_rtsp_create hook. */
 struct raopcl_s {
     int id;
     raop_state_t state;
     uint32_t latency;
     uint32_t sample_rate;
+    struct rtspcl_s *rtsp;
+    bool connected;
+    bool sane;
 };
 
 typedef enum {
@@ -57,6 +74,7 @@ static struct {
     int flushes;
     int starts;
     struct raopcl_s *last_transport_client;
+    uint16_t rtsp_port;   /* nonzero: connect connects the RTSP client here */
 } mock;
 
 static void record_event(event_type_t type, int client_id)
@@ -106,6 +124,9 @@ struct raopcl_s *ap2_test_raopcl_create(
     mock.clients[id].state = RAOP_DOWN;
     mock.clients[id].latency = 11025;
     mock.clients[id].sample_rate = 44100;
+    mock.clients[id].rtsp = raop_rtsp_create("test");
+    mock.clients[id].connected = true;
+    mock.clients[id].sane = true;
     record_event(EVENT_CREATE, id);
     return &mock.clients[id];
 }
@@ -123,6 +144,11 @@ bool ap2_test_raopcl_connect(
     bool connected = call < (int)mock.connect_result_count
         ? mock.connect_results[call] : false;
     if (connected) client->state = RAOP_FLUSHED;
+    if (connected && mock.rtsp_port) {
+        struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
+        connected = rtspcl_connect(client->rtsp, loopback, loopback,
+                                   mock.rtsp_port, "1");
+    }
     return connected;
 }
 
@@ -138,7 +164,19 @@ bool ap2_test_raopcl_destroy(struct raopcl_s *client)
     mock.destroys++;
     mock.destroy_counts[client->id]++;
     record_event(EVENT_DESTROY, client->id);
+    rtspcl_destroy(client->rtsp);
+    client->rtsp = NULL;
     return true;
+}
+
+bool ap2_test_raopcl_is_connected(struct raopcl_s *client)
+{
+    return client->connected;
+}
+
+bool ap2_test_raopcl_is_sane(struct raopcl_s *client)
+{
+    return client->sane;
 }
 
 raop_state_t ap2_test_raopcl_state(struct raopcl_s *client)
@@ -319,11 +357,131 @@ static bool test_standby_reuses_raop_compatible_connection(void)
     return true;
 }
 
+/* The RAOP-compatible flow is only as healthy as libraop's channel. */
+static bool test_compat_control_health(void)
+{
+    reset_mock();
+    mock.connect_results[0] = true;
+    mock.connect_result_count = 1;
+
+    struct ap2cl_s *client = create_test_client();
+    CHECK(client != NULL);
+    CHECK(ap2cl_connect(client));
+    CHECK(ap2cl_control_healthy(client));
+    mock.clients[1].connected = false;
+    CHECK(!ap2cl_control_healthy(client));
+    mock.clients[1].connected = true;
+    mock.clients[1].sane = false;
+    CHECK(!ap2cl_control_healthy(client));
+    mock.clients[1].sane = true;
+    CHECK(ap2cl_control_healthy(client));
+    CHECK(ap2cl_destroy(client));
+    return true;
+}
+
+static int listen_loopback(void)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t len = sizeof(addr);
+    if (fd < 0 || bind(fd, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+        listen(fd, 1) != 0 ||
+        getsockname(fd, (struct sockaddr *)&addr, &len) != 0)
+        return -1;
+    mock.rtsp_port = ntohs(addr.sin_port);
+    return fd;
+}
+
+typedef struct {
+    int fd;
+    int teardowns;
+    bool closed_after;
+} teardown_peer_t;
+
+/* Answers TEARDOWNs with 200 until the sender closes the connection. */
+static void *run_teardown_peer(void *arg)
+{
+    teardown_peer_t *peer = arg;
+    char buffer[2048];
+    size_t fill = 0;
+    for (;;) {
+        ssize_t n = read(peer->fd, buffer + fill, sizeof(buffer) - fill - 1);
+        if (n <= 0) {
+            peer->closed_after = n == 0 && fill == 0;
+            return NULL;
+        }
+        fill += (size_t)n;
+        buffer[fill] = '\0';
+        char *end = strstr(buffer, "\r\n\r\n");
+        if (!end) continue;
+        int cseq = 0;
+        char *header = strstr(buffer, "\r\nCSeq: ");
+        if (strncmp(buffer, "TEARDOWN ", 9) != 0 || !header ||
+            sscanf(header, "\r\nCSeq: %d", &cseq) != 1)
+            return NULL;
+        peer->teardowns++;
+        char response[96];
+        int len = snprintf(response, sizeof(response),
+                           "RTSP/1.0 200 OK\r\nCSeq: %d\r\n\r\n", cseq);
+        if (write(peer->fd, response, (size_t)len) != len) return NULL;
+        fill -= (size_t)(end + 4 - buffer);
+        memmove(buffer, end + 4, fill);
+    }
+}
+
+/* The RAOP-compatible flow claims libraop's RTSP client at connect, so STOP's
+ * TEARDOWN and the receiver closing the session reach the channel libraop
+ * talks on, and the exit cleanup sends no second TEARDOWN. */
+static bool test_compat_teardown_and_receiver_closed(void)
+{
+    reset_mock();
+    mock.connect_results[0] = true;
+    mock.connect_results[1] = true;
+    mock.connect_result_count = 2;
+
+    int listener = listen_loopback();
+    CHECK(listener >= 0);
+    struct ap2cl_s *client = create_test_client();
+    CHECK(client != NULL);
+    CHECK(ap2cl_connect(client));
+    teardown_peer_t peer = {.fd = accept(listener, NULL, NULL)};
+    CHECK(peer.fd >= 0);
+    pthread_t thread;
+    CHECK(pthread_create(&thread, NULL, run_teardown_peer, &peer) == 0);
+    CHECK(!ap2cl_receiver_closed(client));
+    CHECK(ap2cl_teardown(client));
+    CHECK(ap2cl_destroy(client));
+    CHECK(pthread_join(thread, NULL) == 0);
+    CHECK(peer.teardowns == 1);
+    CHECK(peer.closed_after);
+    close(peer.fd);
+
+    client = create_test_client();
+    CHECK(client != NULL);
+    CHECK(ap2cl_connect(client));
+    int receiver = accept(listener, NULL, NULL);
+    CHECK(receiver >= 0);
+    CHECK(!ap2cl_receiver_closed(client));
+    close(receiver);
+    struct pollfd pfd = {.fd = rtspcl_get_serv_sock(mock.clients[2].rtsp),
+                         .events = POLLIN};
+    CHECK(poll(&pfd, 1, 2000) == 1);
+    CHECK(ap2cl_receiver_closed(client));
+    CHECK(ap2cl_destroy(client));
+    close(listener);
+    return true;
+}
+
 int main(void)
 {
     if (!test_disconnect_reconnect_and_failure_cleanup() ||
         !test_final_cleanup_order() ||
-        !test_standby_reuses_raop_compatible_connection())
+        !test_standby_reuses_raop_compatible_connection() ||
+        !test_compat_control_health() ||
+        !test_compat_teardown_and_receiver_closed())
         return 1;
     puts("AP2 RAOP reconnect lifecycle tests passed");
     return 0;

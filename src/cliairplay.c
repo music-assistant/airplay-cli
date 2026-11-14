@@ -41,6 +41,7 @@
 #include "ap2_ptp.h"
 #include "ap2_hap.h"
 #include "raop_session.h"
+#include "raop_rtsp.h"
 #include "artwork.h"
 #include "announce.h"
 #include "host_clock.h"
@@ -128,6 +129,7 @@ static size_t g_cmdpipe_used = 0;
 
 /* RAOP context (when using RAOP protocol) */
 static _Atomic(struct raopcl_s *) g_raopcl = NULL;
+static struct rtspcl_s *g_raop_rtsp = NULL;   /* g_raopcl's RTSP client */
 
 /* AP2 context (when using AirPlay 2 protocol) */
 static _Atomic(struct ap2cl_s *) g_ap2cl = NULL;
@@ -977,10 +979,17 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
                             "no transport client to stop",
                             "STOP failed");
         }
-        status_print("[STATUS] stopped");
         pthread_mutex_unlock(&g_audio_send_lock);
         /* Blocking announce outside the send lock (see PAUSE above). */
         if (stopped_ap2) ap2cl_mrp_publish_playback_state(g_ap2cl);
+        /* The caller ends the process once it reads the stopped line, so the
+         * receiver is released here: the exit cleanup only gets to it after
+         * joining the client's threads, seconds later. */
+        if (cfg->protocol == PROTO_RAOP)
+            raop_rtsp_teardown(g_raop_rtsp);
+        else if (g_ap2cl)
+            ap2cl_teardown(g_ap2cl);
+        status_print("[STATUS] stopped");
     } else if (strcmp(key, "ACTION") == 0 && strcmp(value, "SENDMETA") == 0) {
         if (send_track_metadata(cfg, metadata_str(g_metadata.title)))
             g_real_metadata_sent = true;
@@ -1261,6 +1270,28 @@ static bool start_stream_session(cli_config_t *cfg, int input_bpf,
     return true;
 }
 
+/* Whether the receiver ended the session itself by closing its control
+ * connection (another sender took over, say), rather than the session
+ * failing. */
+static bool receiver_closed(const cli_config_t *cfg)
+{
+    return cfg->protocol == PROTO_RAOP ? raop_rtsp_peer_closed(g_raop_rtsp)
+                                       : ap2cl_receiver_closed(g_ap2cl);
+}
+
+/* Report why the audio loop has to end the session: [STATUS] receiver_closed
+ * when the receiver closed it, which the caller treats as a remote stop, else
+ * the failure. Returns whether it failed. */
+static bool report_session_end(const cli_config_t *cfg, const char *failure)
+{
+    if (receiver_closed(cfg)) {
+        status_print("[STATUS] receiver_closed");
+        return false;
+    }
+    status_error(failure);
+    return true;
+}
+
 /* ---- RAOP playback loop ---- */
 
 static int run_raop(cli_config_t *cfg)
@@ -1320,6 +1351,7 @@ static int run_raop(cli_config_t *cfg)
         cfg->sample_rate, cfg->bit_depth, cfg->channels,
         cfg->volume > 0 ? raopcl_float_volume(cfg->volume) : -144.0f
     );
+    struct rtspcl_s *rtsp = raop_rtsp_claim();
     if (!client) {
         status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
                         "cannot initialise the RAOP client",
@@ -1341,6 +1373,7 @@ static int run_raop(cli_config_t *cfg)
         return 1;
     }
     atomic_store(&g_raopcl, client);
+    g_raop_rtsp = rtsp;
 
     latency = raopcl_latency(g_raopcl);
     int input_bpf = (cfg->bit_depth <= 16 ? 2 : 4) * cfg->channels;
@@ -1388,9 +1421,12 @@ static int run_raop(cli_config_t *cfg)
         if (ap2_session_state(g_session) == AP2_SESSION_ENDED)
             break;
 
-        if (!raopcl_is_connected(g_raopcl) || !raopcl_is_sane(g_raopcl)) {
-            status_error("RAOP control or media channel failed");
-            playback_failed = true;
+        if (receiver_closed(cfg) || !raopcl_is_connected(g_raopcl) ||
+            !raopcl_is_sane(g_raopcl)) {
+            /* Our own STOP tears the session down from the command thread. */
+            if (g_status != STATUS_STOPPED)
+                playback_failed = report_session_end(
+                    cfg, "RAOP control or media channel failed");
             break;
         }
 
@@ -1486,8 +1522,8 @@ static int run_raop(cli_config_t *cfg)
             uint64_t playtime;
             if (!raopcl_send_chunk(
                     g_raopcl, send_buf, audio_frames, &playtime)) {
-                status_error("RAOP audio send failed");
-                playback_failed = true;
+                playback_failed =
+                    report_session_end(cfg, "RAOP audio send failed");
                 pthread_mutex_unlock(&g_audio_send_lock);
                 break;
             }
@@ -1686,10 +1722,12 @@ static int run_airplay2(cli_config_t *cfg)
         if (ap2_session_state(g_session) == AP2_SESSION_ENDED)
             break;   /* DISCONNECT or idle timeout */
 
-        if (!ap2cl_is_connected(g_ap2cl) ||
+        if (ap2cl_receiver_closed(g_ap2cl) || !ap2cl_is_connected(g_ap2cl) ||
             !ap2cl_control_healthy(g_ap2cl)) {
-            status_error("AirPlay 2 control channel failed");
-            playback_failed = true;
+            /* Our own STOP tears the session down from the command thread. */
+            if (g_status != STATUS_STOPPED)
+                playback_failed = report_session_end(
+                    cfg, "AirPlay 2 control channel failed");
             break;
         }
 
@@ -1751,8 +1789,8 @@ static int run_airplay2(cli_config_t *cfg)
                     ap2cl_accept_frames(g_ap2cl) &&
                     !ap2_send_silence_chunk(cfg, buf, ap2_alac_buf,
                                             ap2_input_bpf)) {
-                    status_error("AirPlay 2 realtime send failed");
-                    playback_failed = true;
+                    playback_failed = report_session_end(
+                        cfg, "AirPlay 2 realtime send failed");
                     pthread_mutex_unlock(&g_audio_send_lock);
                     break;
                 }
@@ -1910,8 +1948,8 @@ static int run_airplay2(cli_config_t *cfg)
             ap2_send_result_t result =
                 ap2cl_send_chunk(g_ap2cl, send, af);
             if (result == AP2_SEND_FATAL) {
-                status_error("AirPlay 2 realtime send failed");
-                playback_failed = true;
+                playback_failed = report_session_end(
+                    cfg, "AirPlay 2 realtime send failed");
                 pthread_mutex_unlock(&g_audio_send_lock);
                 break;
             }
@@ -1948,8 +1986,8 @@ static int run_airplay2(cli_config_t *cfg)
                     ap2cl_accept_frames(g_ap2cl) &&
                     !ap2_send_silence_chunk(cfg, buf, ap2_alac_buf,
                                             ap2_input_bpf)) {
-                    status_error("AirPlay 2 realtime send failed");
-                    playback_failed = true;
+                    playback_failed = report_session_end(
+                        cfg, "AirPlay 2 realtime send failed");
                     pthread_mutex_unlock(&g_audio_send_lock);
                     break;
                 }
@@ -2484,6 +2522,7 @@ int main(int argc, char *argv[])
     if (!join_command_thread()) return 1;
     struct ap2cl_s *ap2_client = atomic_exchange(&g_ap2cl, NULL);
     struct raopcl_s *raop_client = atomic_exchange(&g_raopcl, NULL);
+    g_raop_rtsp = NULL;
     if (cfg.cmdpipe) {
         if (g_cmdpipe_fd >= 0) close(g_cmdpipe_fd);
         unlink(cfg.cmdpipe);
