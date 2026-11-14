@@ -129,6 +129,22 @@ static uint64_t bp_read_be(const uint8_t *p, size_t n)
     return v;
 }
 
+/* Read the payload of a bplist integer object of `bytes` bytes. libplist writes
+ * an unsigned value above INT32_MAX as a 16-byte integer (Shairport Sync's
+ * bufferStream format mask), which is read when its value fits in 64 bits. */
+static bool bp_read_int_value(const uint8_t *p, size_t bytes, uint64_t *out)
+{
+    if (bytes == 16) {
+        for (size_t i = 0; i < 8; i++)
+            if (p[i]) return false;
+        p += 8;
+        bytes = 8;
+    }
+    if (!bytes || bytes > 8) return false;
+    *out = bp_read_be(p, bytes);
+    return true;
+}
+
 /* Bounds-checked view over a raw bplist for keyed traversal into nested
  * containers (dict -> child value, dict -> array of ints). */
 struct bp_raw_view {
@@ -222,10 +238,9 @@ static bool bp_read_uint_ref(const bp_raw_view *view, uint64_t ref, uint64_t *ou
 
     size_t bytes;
     if (!bp_read_count(view->data, view->table_ofs, &pos, &bytes) ||
-        bytes > 8 || pos + bytes > view->table_ofs)
+        bytes > view->table_ofs - pos)
         return false;
-    *out = bp_read_be(view->data + pos, bytes);
-    return true;
+    return bp_read_int_value(view->data + pos, bytes, out);
 }
 
 static bool bp_find_dict_child_ref(const bp_raw_view *view,
@@ -355,10 +370,9 @@ int ap2_bplist_find_uint(const uint8_t *data, size_t len, const char *key, uint6
             if (!bp_read_count(
                     data, (size_t)table_ofs, &vpos, &vbytes))
                 return 0;
-            if (!vbytes || vbytes > 8 || vbytes > table_ofs - vpos)
+            if (vbytes > table_ofs - vpos)
                 return 0;
-            *out = bp_read_be(data + vpos, vbytes);
-            return 1;
+            return bp_read_int_value(data + vpos, vbytes, out) ? 1 : 0;
         }
     }
     return 0;
