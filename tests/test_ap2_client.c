@@ -2031,7 +2031,7 @@ static void test_mrp_bundle_and_pause_publish(void)
                                  (int)sizeof(k_baseline_jpeg), &track_changed,
                                  &info, &push));
     assert(track_changed);
-    assert(info.result == AP2_MRP_ARTWORK_UNCHANGED);
+    assert(info.result == AP2_MRP_ARTWORK_ACCEPTED);
     assert(push.overall_status == 200 && push.nowplaying_status == 200);
 
     assert(pthread_join(peer_thread, NULL) == 0);
@@ -2092,9 +2092,8 @@ static void test_mrp_bundle_and_pause_publish(void)
     assert(!request_has(&peer->requests[13], "updateMRNowPlayingInfo"));
 
     /* Bundle 2: the DMAP copy is re-sent for the new track even though the
-     * bytes are identical, while the MRP push keeps the ArtworkIdentifier
-     * (an identifier flip alone re-renders the receiver's UI) under a fresh
-     * item UniqueIdentifier. */
+     * bytes are identical, and the MRP push carries a fresh ArtworkIdentifier
+     * under a fresh item UniqueIdentifier. */
     assert(strcmp(peer->requests[14].method, "SET_PARAMETER") == 0);
     assert(request_has(&peer->requests[14], "mlit"));
     assert(strcmp(peer->requests[15].method, "SET_PARAMETER") == 0);
@@ -2112,7 +2111,7 @@ static void test_mrp_bundle_and_pause_publish(void)
     assert(find_artwork_identifier(peer->requests[16].body,
                                    (size_t)peer->requests[16].body_len,
                                    id_second));
-    assert(strcmp(id_first, id_second) == 0);
+    assert(strcmp(id_first, id_second) != 0);
     uint64_t uid_first = 0;
     uint64_t uid_second = 0;
     assert(ap2_bplist_find_uint(

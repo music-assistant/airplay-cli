@@ -1648,20 +1648,19 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
             m->elapsed_set_at = mrp_cf_now();
         }
     }
+    /* Artwork belongs to its item: the old track's image must not ride the
+     * new item, and the same cover on a new track (one album) is staged
+     * under a fresh ArtworkIdentifier. When consecutive items share one
+     * identifier, tvOS shows the cover on the second item and drops it from
+     * the third on; the new UniqueIdentifier re-renders the receiver's Now
+     * Playing view at a track change anyway. The same item without a new
+     * image keeps what it has (tag refinement). */
+    if (track_changed) mrp_reset_artwork(m);
     if (art && art_len > 0) {
-        /* The staged artwork survives the identity change long enough for
-         * set_artwork's identical-bytes comparison: the same cover riding a
-         * new track (one album) keeps its ArtworkIdentifier, because an
-         * identifier flip alone makes the receiver invalidate and re-render
-         * the art it is already showing. A rejected image clears staging the
-         * way set_artwork always does. */
         ap2_mrp_set_artwork(m, mime, art, art_len, info);
     } else {
         mrp_artwork_info_init(info, 0);
         info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
-        /* The old track's staged artwork must not ride the new item; the same
-         * item without a new image keeps what it has (tag refinement). */
-        if (track_changed) mrp_reset_artwork(m);
     }
     m->state_generation++;
     m->state_dirty = true;

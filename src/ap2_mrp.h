@@ -162,11 +162,12 @@ void ap2_mrp_stop(struct ap2_mrp_ctx *m);
  * place. Without ids, identity falls back to the title/artist/album tuple.
  * A track change resets elapsed to zero.
  *
- * Artwork resolves against the retained image (ap2_mrp_set_artwork rules):
- * identical bytes keep the current ArtworkIdentifier even across a track
- * change (an identifier flip alone re-renders the receiver's Now Playing UI),
- * new bytes stage under a fresh identifier, a rejected image clears staging,
- * and no artwork drops the retained image only when the track changed.
+ * Artwork belongs to its item. A track change drops the retained image, so
+ * the new item's artwork always stages under a fresh ArtworkIdentifier, also
+ * when the bytes are identical (one album). For the same item, artwork
+ * resolves against the retained image (ap2_mrp_set_artwork rules): identical
+ * bytes keep the current identifier, new bytes stage under a fresh one, a
+ * rejected image clears staging, and no artwork keeps the retained image.
  *
  * :param duration_ms: track duration in milliseconds (0 = unknown/live).
  * :param item_id: sender's stable per-track identity ("" or NULL = none).

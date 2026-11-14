@@ -766,11 +766,15 @@ a fresh `UniqueIdentifier` only when the item identity (item id, else the
 title/artist/album tuple) actually changes — a redundant re-send under a
 fresh uid reads as a new item and orphans delivered artwork — and a track
 change without new artwork drops the previous track's staged art so it cannot
-ride the new item. Byte-identical artwork is a reported no-op (`unchanged`)
-that keeps the current `ArtworkIdentifier`, including across a track change
-(one album's cover survives its track boundaries): an identifier flip alone
-makes the receiver invalidate and re-resolve what it is already showing,
-which re-renders its Now Playing UI.
+ride the new item. Byte-identical artwork for the same item is a reported
+no-op (`unchanged`) that keeps the current `ArtworkIdentifier`: an identifier
+flip alone makes the receiver invalidate and re-resolve what it is already
+showing, which re-renders its Now Playing UI. A track change stages its
+artwork afresh under a new identifier, also when the bytes are identical (one
+album's cover): with one identifier shared across consecutive items, an Apple
+TV 4K showed the cover on the second track and the generic placeholder from
+the third track on (field report, support#6709), and the new
+`UniqueIdentifier` re-renders the view at a track change anyway.
 
 A track change is therefore pushed as one transaction. The `ARTWORKFILE`
 pipe key stages an artwork path and `ACTION=SENDMETA` consumes it one-shot,
