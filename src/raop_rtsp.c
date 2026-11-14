@@ -5,6 +5,7 @@
 
 #include "raop_rtsp.h"
 
+#include <errno.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdatomic.h>
@@ -30,6 +31,7 @@ typedef struct {
 } teardown_job_t;
 
 static _Atomic(struct rtspcl_s *) g_created = NULL;
+static _Atomic(struct rtspcl_s *) g_reset = NULL;   /* client whose connection was reset */
 
 static void *teardown_main(void *arg)
 {
@@ -83,6 +85,14 @@ bool raop_rtsp_teardown(struct rtspcl_s *rtsp)
 bool raop_rtsp_peer_closed(struct rtspcl_s *rtsp)
 {
     int fd = rtsp ? rtspcl_get_serv_sock(rtsp) : -1;
+    if (fd < 0 || atomic_load(&g_reset) == rtsp) return false;
     char byte;
-    return fd >= 0 && recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+    ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
+    if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
+        /* A reset is reported once and later reads see EOF, so it is
+         * remembered to keep it a failure rather than the receiver closing. */
+        atomic_store(&g_reset, rtsp);
+        return false;
+    }
+    return n == 0;
 }

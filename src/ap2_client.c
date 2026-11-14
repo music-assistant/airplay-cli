@@ -5081,12 +5081,25 @@ bool ap2cl_receiver_closed(struct ap2cl_s *p)
     if (atomic_load(&p->rtsp_dead)) return atomic_load(&p->rtsp_peer_closed);
     /* An exchange in flight holds the lock and reads any EOF itself. */
     if (pthread_mutex_trylock(&p->rtsp_lock) != 0) return false;
+    /* A failure recorded before the lock was taken shut the channel down
+     * locally: that EOF is ours. */
+    if (atomic_load(&p->rtsp_dead)) {
+        pthread_mutex_unlock(&p->rtsp_lock);
+        return atomic_load(&p->rtsp_peer_closed);
+    }
     char byte;
-    bool closed = p->sock_fd >= 0 &&
-                  recv(p->sock_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+    ssize_t n = p->sock_fd >= 0
+                    ? recv(p->sock_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT)
+                    : -1;
+    bool closed = n == 0;
     if (closed) {
         /* Nothing more goes out on it, the exit cleanup's goodbye included. */
         atomic_store(&p->rtsp_peer_closed, true);
+        atomic_store(&p->rtsp_dead, true);
+    } else if (n < 0 && p->sock_fd >= 0 && errno != EAGAIN &&
+               errno != EWOULDBLOCK && errno != EINTR) {
+        /* A reset is reported once and later reads see EOF: record it as the
+         * failure it is. */
         atomic_store(&p->rtsp_dead, true);
     }
     pthread_mutex_unlock(&p->rtsp_lock);

@@ -558,6 +558,9 @@ static void test_raop_rtsp_peer_closed(void)
         else assert(close(peer) == 0);
         wait_readable(fd);
         assert(raop_rtsp_peer_closed(rtsp) == !reset);
+        /* A reset is reported only once; later probes still see a failure. */
+        assert(raop_rtsp_peer_closed(rtsp) == !reset);
+        assert(raop_rtsp_peer_closed(rtsp) == !reset);
         /* Its farewell TEARDOWN fails on the closed connection. */
         rtspcl_destroy(rtsp);
     }
@@ -677,6 +680,33 @@ static void test_native_receiver_closed(void)
         assert(ap2cl_receiver_closed(client) == !reset);
 
         assert(pthread_join(thread, NULL) == 0);
+        ap2cl_test_detach_rtsp_socket(client);
+        assert(close(fd) == 0);
+        assert(ap2cl_destroy(client));
+    }
+
+    /* A reset seen by the audio loop while the channel is idle stays a
+     * failure on every later probe, although later reads see EOF. */
+    {
+        uint16_t port = 0;
+        int listener = listen_loopback(&port);
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(port),
+            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        };
+        assert(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+        int peer = accept(listener, NULL, NULL);
+        assert(peer >= 0 && close(listener) == 0);
+        client = create_native_test_client();
+        ap2cl_test_attach_rtsp_socket(client, fd);
+        assert(!ap2cl_receiver_closed(client));
+        close_with_reset(peer);
+        wait_readable(fd);
+        assert(!ap2cl_receiver_closed(client));
+        assert(!ap2cl_receiver_closed(client));
+        assert(!ap2cl_control_healthy(client));
         ap2cl_test_detach_rtsp_socket(client);
         assert(close(fd) == 0);
         assert(ap2cl_destroy(client));
