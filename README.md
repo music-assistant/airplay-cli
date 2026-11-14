@@ -288,14 +288,21 @@ stdin, the single persistent audio input for the whole process lifetime.
   by that push. `ARTWORK=<local file path or http:// imageproxy URL>` pushes
   artwork on its own, outside a track change.
 
-`[STATUS] stopped` acknowledges `ACTION=STOP` once playback has been torn down.
-`STOP` is terminal: the audio loop exits, the connection is torn down and the
-process exits 0, the same shape as `ACTION=DISCONNECT`. To keep a session
+`[STATUS] stopped` acknowledges `ACTION=STOP` once the receiver session has
+ended: the RTSP `TEARDOWN` was answered, or given up on after a second. A caller
+can end the process as soon as it reads the line. `STOP` is terminal: the audio
+loop exits, the connection is torn down and the process exits 0, the same shape
+as `ACTION=DISCONNECT`. To keep a session
 reusable, use `ACTION=FLUSH` (warm seek/next) or `ACTION=STANDBY` (warm park) —
 both leave the process and the connection up for a later `ACTION=START`.
 
 `[STATUS] eof` means the stdin input ended — the whole feed is done, not just
 one track.
+
+`[STATUS] receiver_closed` means the receiver ended the session itself by
+closing the connection (another sender took over, say); the process then exits
+0. A connection that fails instead (reset, timeout, unreachable receiver) is
+reported as an `[ERROR]`.
 
 Status lines are split across both streams: the lifecycle lines on stderr, and
 the one-shot setup lines (`route`, `capabilities`, `latency`) plus

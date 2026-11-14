@@ -129,7 +129,7 @@ AP2_SOURCES = ap2_client.c ap2_hap.c ap2_io.c ap2_ptp.c ap2_ptp_peers.c ap2_ptp_
 
 # Common/CLI sources
 CLI_SOURCES = cross_log.c cross_ssl.c cross_util.c cross_net.c platform.c host_clock.c \
-	cliairplay.c raop_session.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
+	cliairplay.c raop_session.c raop_rtsp.c artwork.c announce.c pairing.cpp bplist.cpp ap2_bplist.cpp alac_ext.cpp
 
 # Pre-built static libraries
 # We use a patched copy of libcodecs.a with the buggy alac_create_encoder removed,
@@ -180,7 +180,9 @@ RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_start_at=ap2_test_raopcl_start_at \
 	-Draopcl_get_ntp=ap2_test_raopcl_get_ntp \
 	-Draopcl_latency=ap2_test_raopcl_latency \
-	-Draopcl_sample_rate=ap2_test_raopcl_sample_rate
+	-Draopcl_sample_rate=ap2_test_raopcl_sample_rate \
+	-Draopcl_is_connected=ap2_test_raopcl_is_connected \
+	-Draopcl_is_sane=ap2_test_raopcl_is_sane
 RAOP_SESSION_TEST = build/tests/test_raop_session
 ANNOUNCE_TEST = build/tests/test_announce
 
@@ -190,6 +192,13 @@ all: directory $(EXECUTABLE)
 # definition so the one in host_clock.c serves libraop instead (crosstools'
 # own gettime_ms keeps the renamed wall clock version).
 $(BUILDDIR)/cross_util.o: CPPFLAGS += -Dgettime_us=crosstools_gettime_us
+
+# libraop keeps a raopcl's RTSP client private, yet STOP has to send TEARDOWN
+# before raopcl_disconnect joins the RTP threads, and the audio loop has to see
+# the receiver close the connection. Route raop_client.c's rtspcl_create through
+# raop_rtsp.c, which records the client for its owner (tests/test_ap2_client.c
+# pins that raopcl_create still creates it there).
+$(BUILDDIR)/raop_client.o: CPPFLAGS += -Drtspcl_create=raop_rtsp_create
 
 directory:
 	@mkdir -p $(BUILDDIR)

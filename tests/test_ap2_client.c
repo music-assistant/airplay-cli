@@ -9,6 +9,8 @@
 #include <string.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <poll.h>
+#include <stdarg.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <time.h>
@@ -22,6 +24,9 @@
 #include "cross_log.h"
 #include "host_clock.h"
 #include "raop_client.h"
+#include "raop_rtsp.h"
+#include "cross_util.h"
+#include "rtsp_client.h"
 
 #include "mrp_jpeg_fixture.h"
 
@@ -78,6 +83,7 @@ void ap2cl_test_bump_audio_sent(struct ap2cl_s *p);
 void ap2cl_test_set_dev_latency_max(struct ap2cl_s *p, uint32_t frames);
 uint64_t ap2cl_test_pacing_window_frames(struct ap2cl_s *p);
 ap2_connect_error_t ap2cl_test_auth_error_kind(struct ap2cl_s *p);
+int rtspcl_get_serv_sock(struct rtspcl_s *p);
 
 typedef struct {
     int fd;
@@ -384,6 +390,312 @@ static void test_dead_channel_writes_farewell_teardown(void)
     assert(close(sockets[1]) == 0);
     assert(ap2cl_destroy(client));
     puts("ap2_client farewell teardown test passed");
+}
+
+/* A loopback TCP listener for tests that need a real socket (libraop opens its
+ * own, and only TCP can reset). */
+static int listen_loopback(uint16_t *port)
+{
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    assert(fd >= 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    assert(bind(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    assert(listen(fd, 1) == 0);
+    socklen_t len = sizeof(addr);
+    assert(getsockname(fd, (struct sockaddr *)&addr, &len) == 0);
+    *port = ntohs(addr.sin_port);
+    return fd;
+}
+
+/* Connect a libraop RTSP client to a fresh loopback peer; returns the peer's
+ * end of the connection. */
+static int connect_rtsp_peer(struct rtspcl_s *rtsp)
+{
+    uint16_t port = 0;
+    int listener = listen_loopback(&port);
+    struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
+    assert(rtspcl_connect(rtsp, loopback, loopback, port, "1"));
+    int peer = accept(listener, NULL, NULL);
+    assert(peer >= 0);
+    assert(close(listener) == 0);
+    return peer;
+}
+
+/* Close so the other end reads a reset instead of an orderly EOF. */
+static void close_with_reset(int fd)
+{
+    struct linger linger = {.l_onoff = 1, .l_linger = 0};
+    assert(setsockopt(fd, SOL_SOCKET, SO_LINGER, &linger,
+                      sizeof(linger)) == 0);
+    assert(close(fd) == 0);
+}
+
+static void wait_readable(int fd)
+{
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    assert(poll(&pfd, 1, 2000) == 1);
+}
+
+static uint64_t test_monotonic_ms(void)
+{
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000 + (uint64_t)ts.tv_nsec / 1000000;
+}
+
+typedef struct {
+    int fd;
+    const char *methods[3];   /* the requests expected, in order */
+    bool answer;              /* answer each with 200 */
+    int requests;
+    bool closed_after;        /* nothing followed but the close */
+    atomic_bool finished;
+} script_peer_t;
+
+static void *run_script_peer(void *arg)
+{
+    script_peer_t *peer = arg;
+    for (int i = 0; i < 3 && peer->methods[i]; i++) {
+        int cseq = 0;
+        if (!read_rtsp_request_cseq(peer->fd, peer->methods[i], &cseq))
+            return NULL;
+        peer->requests++;
+        if (!peer->answer) continue;
+        char response[96];
+        int len = snprintf(response, sizeof(response),
+                           "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
+                           "Content-Length: 0\r\n\r\n", cseq);
+        if (write(peer->fd, response, (size_t)len) != len) return NULL;
+    }
+    char byte;
+    peer->closed_after = read(peer->fd, &byte, 1) == 0;
+    atomic_store(&peer->finished, true);
+    return NULL;
+}
+
+/* The STOP path reaches libraop's private RTSP client through the
+ * rtspcl_create hook (Makefile): raopcl_create must still create the client
+ * the raopcl then talks on, or STOP silently loses its immediate TEARDOWN. */
+static void test_raopcl_rtsp_hook(void)
+{
+    struct in_addr any = {.s_addr = htonl(INADDR_ANY)};
+    struct raopcl_s *raopcl = raopcl_create(
+        any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, 88200,
+        RAOP_CLEAR, false, "", NULL, "0,4", "0,1,2", 44100, 16, 2, -144.0f);
+    assert(raopcl);
+    struct rtspcl_s *rtsp = raop_rtsp_claim();
+    assert(rtsp);
+    assert(raop_rtsp_claim() == NULL);
+
+    script_peer_t peer = {
+        .fd = connect_rtsp_peer(rtsp),
+        .methods = {"OPTIONS ", "TEARDOWN "},
+        .answer = true,
+    };
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, run_script_peer, &peer) == 0);
+    /* The raopcl's own keepalive arrives on the claimed client's socket. */
+    assert(raopcl_keepalive(raopcl));
+    assert(raopcl_is_connected(raopcl));
+
+    assert(raop_rtsp_teardown(rtsp));
+    assert(!raopcl_is_connected(raopcl));
+    /* libraop's exit path (raopcl_disconnect: FLUSH, then TEARDOWN) and its
+     * keepalive send nothing further on the ended session. */
+    assert(!rtspcl_flush(rtsp, 1, 1));
+    assert(rtspcl_disconnect(rtsp));
+    assert(!raopcl_keepalive(raopcl));
+    assert(raopcl_destroy(raopcl));
+
+    assert(pthread_join(thread, NULL) == 0);
+    assert(peer.requests == 2);
+    assert(peer.closed_after);
+    assert(close(peer.fd) == 0);
+    puts("raop_rtsp hook and teardown test passed");
+}
+
+/* An unanswered TEARDOWN must not hold STOP up for libraop's 10 s budget. */
+static void test_raop_rtsp_teardown_bounded(void)
+{
+    struct rtspcl_s *rtsp = raop_rtsp_create("test");
+    assert(rtsp && raop_rtsp_claim() == rtsp);
+    script_peer_t peer = {
+        .fd = connect_rtsp_peer(rtsp),
+        .methods = {"TEARDOWN "},
+    };
+    pthread_t thread;
+    assert(pthread_create(&thread, NULL, run_script_peer, &peer) == 0);
+
+    uint64_t started = test_monotonic_ms();
+    assert(!raop_rtsp_teardown(rtsp));
+    uint64_t elapsed = test_monotonic_ms() - started;
+    assert(elapsed >= 900 && elapsed < 1500);
+    assert(!raop_rtsp_teardown(rtsp));
+    assert(rtspcl_destroy(rtsp));
+
+    assert(pthread_join(thread, NULL) == 0);
+    assert(peer.requests == 1);
+    assert(peer.closed_after);
+    assert(close(peer.fd) == 0);
+    puts("raop_rtsp bounded teardown test passed");
+}
+
+/* Only an orderly close by the receiver counts as it ending the session; a
+ * reset stays a failure. */
+static void test_raop_rtsp_peer_closed(void)
+{
+    assert(!raop_rtsp_peer_closed(NULL));
+    for (int reset = 0; reset < 2; reset++) {
+        struct rtspcl_s *rtsp = raop_rtsp_create("test");
+        assert(rtsp && raop_rtsp_claim() == rtsp);
+        int peer = connect_rtsp_peer(rtsp);
+        int fd = rtspcl_get_serv_sock(rtsp);
+        assert(!raop_rtsp_peer_closed(rtsp));
+        if (reset) close_with_reset(peer);
+        else assert(close(peer) == 0);
+        wait_readable(fd);
+        assert(raop_rtsp_peer_closed(rtsp) == !reset);
+        /* Its farewell TEARDOWN fails on the closed connection. */
+        rtspcl_destroy(rtsp);
+    }
+    puts("raop_rtsp peer close test passed");
+}
+
+static struct ap2cl_s *create_native_test_client(void)
+{
+    ap2_device_info_t device = {
+        .name = "session end test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    return client;
+}
+
+/* STOP's TEARDOWN goes out once, bounded, and the exit cleanup sends nothing
+ * further on the ended session. */
+static void test_native_teardown(void)
+{
+    for (int answer = 1; answer >= 0; answer--) {
+        int sockets[2];
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+        script_peer_t peer = {
+            .fd = sockets[1],
+            .methods = {"TEARDOWN rtsp://test/session "},
+            .answer = answer,
+        };
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, run_script_peer, &peer) == 0);
+        struct ap2cl_s *client = create_native_test_client();
+        ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+
+        uint64_t started = test_monotonic_ms();
+        assert(ap2cl_teardown(client) == (bool)answer);
+        assert(test_monotonic_ms() - started < 1500);
+        /* The connection closes with the TEARDOWN, not only at exit. */
+        for (int i = 0; i < 100 && !atomic_load(&peer.finished); i++)
+            usleep(10000);
+        assert(atomic_load(&peer.finished));
+        assert(ap2cl_destroy(client));
+
+        assert(pthread_join(thread, NULL) == 0);
+        assert(peer.requests == 1);
+        assert(peer.closed_after);
+        assert(close(sockets[1]) == 0);
+    }
+    puts("ap2_client native teardown test passed");
+}
+
+typedef struct {
+    int fd;
+    bool reset;   /* close with a reset instead of an orderly EOF */
+} closing_peer_t;
+
+static void *run_closing_peer(void *arg)
+{
+    closing_peer_t *peer = arg;
+    int cseq = 0;
+    if (read_rtsp_request_cseq(peer->fd, "POST /feedback ", &cseq)) {
+        if (peer->reset) close_with_reset(peer->fd);
+        else close(peer->fd);
+    }
+    return NULL;
+}
+
+/* The receiver closing the RTSP connection ends the session as its own
+ * choice, whether the audio loop sees it first or an exchange reads it; a
+ * reset or a timeout is a failure. */
+static void test_native_receiver_closed(void)
+{
+    /* Seen by the audio loop while the channel is idle. */
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    struct ap2cl_s *client = create_native_test_client();
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    assert(!ap2cl_receiver_closed(client));
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_receiver_closed(client));
+    /* The closed channel stays closed: no goodbye goes out on it at exit. */
+    assert(!ap2cl_control_healthy(client));
+    assert(ap2cl_receiver_closed(client));
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(ap2cl_destroy(client));
+
+    /* Read by an exchange: EOF, then a reset. */
+    for (int reset = 0; reset < 2; reset++) {
+        uint16_t port = 0;
+        int listener = listen_loopback(&port);
+        int fd = socket(AF_INET, SOCK_STREAM, 0);
+        struct sockaddr_in addr = {
+            .sin_family = AF_INET,
+            .sin_port = htons(port),
+            .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+        };
+        assert(connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+        closing_peer_t peer = {.fd = accept(listener, NULL, NULL),
+                               .reset = reset};
+        assert(peer.fd >= 0 && close(listener) == 0);
+        pthread_t thread;
+        assert(pthread_create(&thread, NULL, run_closing_peer, &peer) == 0);
+        client = create_native_test_client();
+        ap2cl_test_attach_rtsp_socket(client, fd);
+
+        assert(!ap2cl_feedback(client));
+        assert(!ap2cl_control_healthy(client));
+        assert(ap2cl_receiver_closed(client) == !reset);
+
+        assert(pthread_join(thread, NULL) == 0);
+        ap2cl_test_detach_rtsp_socket(client);
+        assert(close(fd) == 0);
+        assert(ap2cl_destroy(client));
+    }
+
+    /* A timeout shuts the channel down locally, which must not read as the
+     * receiver closing it. */
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    client = create_native_test_client();
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_prime_feedback_misses(client);
+    assert(!ap2cl_feedback(client));
+    assert(!ap2cl_control_healthy(client));
+    assert(!ap2cl_receiver_closed(client));
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client receiver closed test passed");
 }
 
 typedef struct {
@@ -3009,6 +3321,11 @@ int main(int argc, char **argv)
     test_mrp_identical_metadata_skip();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
+    test_raopcl_rtsp_hook();
+    test_raop_rtsp_teardown_bounded();
+    test_raop_rtsp_peer_closed();
+    test_native_teardown();
+    test_native_receiver_closed();
     test_apple_model_resolution();
     test_info_txt_fallback();
     test_mrp_session_eligibility();

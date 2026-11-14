@@ -967,7 +967,8 @@ deny-list entry, not a policy retreat.
   encrypted channel.
 - **Socket deadlines** — established RTSP request/response cycles use cumulative
   absolute deadlines appropriate to the request: 2 seconds for feedback and
-  control, 5 seconds for metadata, and 15 seconds for artwork.
+  control, 1 second for `TEARDOWN`, 5 seconds for metadata, and 15 seconds for
+  artwork.
   The deadline also bounds waiting for the RTSP serialization lock, so a long
   artwork transaction cannot silently extend a feedback request's budget. A
   feedback tick that exhausts its budget before acquiring that lock is skipped:
@@ -997,6 +998,22 @@ deny-list entry, not a policy retreat.
   nothing depends on it, and only the write nonce advances, so none is reused.
   Best-effort by nature: a receiver wedged badly enough to miss three
   keepalives may never read it, and the socket shutdown follows immediately.
+  An unanswered `TEARDOWN` gets no farewell: it was the goodbye already.
+- **Stop** — `ACTION=STOP` sends the `TEARDOWN` at once, on every route, and
+  only then reports `[STATUS] stopped`, because the caller ends the process
+  when it reads that line; the exit cleanup reaches the receiver only after
+  joining the client's threads (libraop's RTP threads alone take up to 2 s).
+  libraop keeps a raopcl's RTSP client private, so the build routes
+  raop_client.c's `rtspcl_create` through `raop_rtsp.c`, which records it
+  (Makefile). The connection is closed right after the `TEARDOWN` (Shairport
+  Sync ends a native session only with it), so the exit cleanup sends no
+  second one.
+- **Receiver close** — a receiver that closes the RTSP connection in an orderly
+  way (EOF; Shairport Sync does when another sender takes over) ended the
+  session itself: the audio loop reports `[STATUS] receiver_closed` and exits 0
+  instead of reporting a failure. It peeks the socket for EOF on every
+  iteration, and a native exchange that reads EOF marks it too. A reset,
+  timeout or unreachable receiver stays an `[ERROR]`.
 - **Reverse event channel** — MediaRemote-eligible sessions (§8) derive
   independent `Events-Salt` keys, decrypt receiver HTTP requests (including
   `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
@@ -1185,12 +1202,13 @@ verbosity, never its stream.
 | `[STATUS] flushed` (optional `head_unix_ms=`) | stderr | one per accepted `ACTION=FLUSH` (§10) |
 | `[STATUS] REANCHOR` | stderr | the timeline was shifted to recover a gap |
 | `[STATUS] playing` / `paused` | stderr | `ACTION=PLAY` / `ACTION=PAUSE`, carrying `elapsed_ms=` |
-| `[STATUS] stopped` | stderr | `ACTION=STOP`; the process then exits 0 |
+| `[STATUS] stopped` | stderr | `ACTION=STOP`, once the receiver session ended (§10); the process then exits 0 |
 | `[STATUS] mrp artwork=` | stderr | every artwork attempt (§8) |
 | `[STATUS] announce_started at_unix_ms= duration_ms=` | stderr | once per armed clip: its first sample was committed, at the reported audible instant (§6a) |
 | `[STATUS] announce_done` (optional `cancelled=1`) | stderr | the clip and its tail ramp finished — or were cancelled (§6a) |
 | `[STATUS] eof` | stderr | the stdin input ended |
 | `[STATUS] idle_timeout` | stderr | the orphan timer fired; the process then exits 0 |
+| `[STATUS] receiver_closed` | stderr | the receiver closed the session's RTSP connection (§10); the process then exits 0 |
 | `[STATUS] error code=` | stderr | immediately before the `[ERROR]` line (§3a) |
 
 The utility modes print `CREDENTIALS: <192 hex>` (`--pair-setup`) and

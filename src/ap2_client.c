@@ -56,6 +56,7 @@
 #include "ap2_bplist.h"
 #include "ap2_ptp.h"
 #include "raop_session.h"
+#include "raop_rtsp.h"
 #include "ap2_timeline.h"
 
 extern log_level *loglevel;
@@ -73,6 +74,9 @@ extern log_level *loglevel;
 #define AP2_RTSP_FEEDBACK_TIMEOUT_MS 2000
 #define AP2_RTSP_METADATA_TIMEOUT_MS 5000
 #define AP2_RTSP_ARTWORK_TIMEOUT_MS  15000
+/* A caller ending the session waits on the TEARDOWN answer, so an unresponsive
+ * receiver must not hold it up for long. */
+#define AP2_RTSP_TEARDOWN_TIMEOUT_MS 1000
 /* Budget for the farewell TEARDOWN written on a channel that is being
  * abandoned. It has to land while the receiver still has queued audio to play
  * out — a teardown with audio still queued is clean, an underrun on an armed
@@ -220,8 +224,9 @@ struct ap2cl_s {
     char *am;
     char *auth_credentials;  /* HAP credentials hex (192 chars) */
 
-    /* RAOP-compat flow: libraop client */
+    /* RAOP-compat flow: libraop client and its RTSP client (raop_rtsp.h) */
     struct raopcl_s *raopcl;
+    struct rtspcl_s *raop_rtsp;
     /* Last sent chunk's playtime and frame count: the delivery-head
      * projection for ap2cl_head_audible_unix_ms. Zeroed on every raopcl
      * re-anchor (0 = head unknown until the next chunk is sent). */
@@ -237,6 +242,8 @@ struct ap2cl_s {
      * the wrong request and the HAP nonce sequence stays intact. */
     pthread_mutex_t rtsp_lock;
     atomic_bool rtsp_dead;
+    atomic_bool rtsp_peer_closed;  /* an exchange read EOF: the receiver
+                                      closed the channel */
     atomic_bool media_healthy;
     bool rtsp_established;
     /* Raw bytes received for a response whose exchange was abandoned by a
@@ -720,8 +727,10 @@ static void ap2_mark_rtsp_dead(struct ap2cl_s *p, const char *method,
          * that reset or closed the connection is already gone, and a request
          * that died mid-write left a partial frame no further write can follow.
          * The farewell cannot recurse into here: it writes through the helper,
-         * which reports failures back instead of killing the channel. */
-        if (request_intact && saved_errno == ETIMEDOUT)
+         * which reports failures back instead of killing the channel. An
+         * unanswered TEARDOWN was the goodbye already. */
+        if (request_intact && saved_errno == ETIMEDOUT &&
+            strcmp(method, "TEARDOWN") != 0)
             ap2_rtsp_farewell_teardown(p);
         shutdown(p->sock_fd, SHUT_RDWR);
     }
@@ -732,6 +741,7 @@ static int ap2_rtsp_timeout_ms(struct ap2cl_s *p, const char *method,
                                const char *uri, const char *content_type)
 {
     if (!p->rtsp_established) return AP2_RTSP_SETUP_TIMEOUT_MS;
+    if (!strcmp(method, "TEARDOWN")) return AP2_RTSP_TEARDOWN_TIMEOUT_MS;
     if (!strcmp(uri, "/feedback")) return AP2_RTSP_FEEDBACK_TIMEOUT_MS;
     if (content_type && !strncasecmp(content_type, "image/", 6))
         return AP2_RTSP_ARTWORK_TIMEOUT_MS;
@@ -789,7 +799,10 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
             int n = (int)ap2_io_read_deadline(
                 p->sock_fd, buf + total, sizeof(buf) - (size_t)total,
                 deadline_ms);
-            if (n <= 0) break;
+            if (n <= 0) {
+                if (n == 0) atomic_store(&p->rtsp_peer_closed, true);
+                break;
+            }
             total += n;
             ap2_rtsp_response_t parsed;
             size_t match_offset = 0;
@@ -835,7 +848,10 @@ static int ap2_rtsp_send_ex_unlocked(struct ap2cl_s *p, const char *method, cons
         int n = (int)ap2_io_read_deadline(
             p->sock_fd, buf + total, sizeof(buf) - (size_t)total,
             deadline_ms);
-        if (n <= 0) break;
+        if (n <= 0) {
+            if (n == 0) atomic_store(&p->rtsp_peer_closed, true);
+            break;
+        }
         total += n;
         if (total < 2) continue;
 
@@ -3280,6 +3296,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
         p->et ? p->et : "0,4", p->md ? p->md : "0,1,2",
         p->format.sample_rate, p->format.bit_depth, p->format.channels,
         p->volume > 0 ? raopcl_float_volume(p->volume) : -144.0f);
+    p->raop_rtsp = raop_rtsp_claim();
 
     if (!p->raopcl) {
         ap2_set_connect_error(p, AP2_CONNECT_ERROR_GENERIC, 0,
@@ -3333,6 +3350,7 @@ struct ap2cl_s *ap2cl_create(
     atomic_init(&p->rtx_answered, 0);
     atomic_init(&p->rtx_expired, 0);
     atomic_init(&p->rtsp_dead, false);
+    atomic_init(&p->rtsp_peer_closed, false);
     atomic_init(&p->media_healthy, true);
     atomic_init(&p->feedback_failures, 0);
     atomic_init(&p->mrp_event_health, -1);
@@ -3366,6 +3384,7 @@ static void ap2_raop_head_reset(struct ap2cl_s *p)
 static void ap2_raop_session_cleanup(struct ap2cl_s *p)
 {
     ap2_raop_head_reset(p);
+    p->raop_rtsp = NULL;
     if (p->raopcl) {
         raopcl_destroy(p->raopcl);
         p->raopcl = NULL;
@@ -3653,6 +3672,25 @@ bool ap2cl_disconnect(struct ap2cl_s *p)
     pthread_mutex_unlock(&p->mrp_publish_lock);
     p->state = AP2_DOWN;
     return true;
+}
+
+bool ap2cl_teardown(struct ap2cl_s *p)
+{
+    if (!p) return false;
+    if (p->flow != FLOW_NATIVE_AP2) return raop_rtsp_teardown(p->raop_rtsp);
+    if (p->sock_fd < 0) return false;
+    uint8_t *resp = NULL; int resp_len = 0;
+    int status = ap2_rtsp_send(p, "TEARDOWN", p->session_url, NULL, 0, NULL,
+                               &resp, &resp_len);
+    free(resp);
+    /* Later exchanges fail closed, so the exit cleanup sends no second
+     * TEARDOWN on the ended session. Closing the connection as well releases
+     * receivers that end a session only with it (Shairport Sync). */
+    atomic_store(&p->rtsp_dead, true);
+    pthread_mutex_lock(&p->rtsp_lock);
+    if (p->sock_fd >= 0) shutdown(p->sock_fd, SHUT_RDWR);
+    pthread_mutex_unlock(&p->rtsp_lock);
+    return status == 200;
 }
 
 static uint64_t ap2_unix_ms_to_ntp(uint64_t ms)
@@ -5021,12 +5059,38 @@ bool ap2cl_feedback(struct ap2cl_s *p)
 
 bool ap2cl_control_healthy(struct ap2cl_s *p)
 {
-    if (!p || p->flow != FLOW_NATIVE_AP2) return true;
+    if (!p) return true;
+    /* The RAOP-compat flow rides libraop's RTSP channel: the same check as the
+     * legacy RAOP loop. */
+    if (p->flow != FLOW_NATIVE_AP2)
+        return !p->raopcl ||
+               (raopcl_is_connected(p->raopcl) && raopcl_is_sane(p->raopcl));
     if (atomic_load(&p->rtsp_dead) ||
         !atomic_load(&p->media_healthy) ||
         atomic_load(&p->feedback_failures) >= AP2_FEEDBACK_MAX_CONSECUTIVE_MISSES)
         return false;
     return atomic_load(&p->mrp_event_health) != 0;
+}
+
+bool ap2cl_receiver_closed(struct ap2cl_s *p)
+{
+    if (!p) return false;
+    if (p->flow != FLOW_NATIVE_AP2) return raop_rtsp_peer_closed(p->raop_rtsp);
+    /* A failed channel is shut down locally, which also reads as EOF, so only
+     * an exchange that read the receiver's EOF counts once it is dead. */
+    if (atomic_load(&p->rtsp_dead)) return atomic_load(&p->rtsp_peer_closed);
+    /* An exchange in flight holds the lock and reads any EOF itself. */
+    if (pthread_mutex_trylock(&p->rtsp_lock) != 0) return false;
+    char byte;
+    bool closed = p->sock_fd >= 0 &&
+                  recv(p->sock_fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT) == 0;
+    if (closed) {
+        /* Nothing more goes out on it, the exit cleanup's goodbye included. */
+        atomic_store(&p->rtsp_peer_closed, true);
+        atomic_store(&p->rtsp_dead, true);
+    }
+    pthread_mutex_unlock(&p->rtsp_lock);
+    return closed;
 }
 
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
@@ -5836,6 +5900,7 @@ void ap2cl_test_attach_rtsp_socket(struct ap2cl_s *p, int fd)
     p->rtsp_established = true;
     p->rtsp_carry_len = 0;
     atomic_store(&p->rtsp_dead, false);
+    atomic_store(&p->rtsp_peer_closed, false);
     snprintf(p->session_url, sizeof(p->session_url), "rtsp://test/session");
 }
 
