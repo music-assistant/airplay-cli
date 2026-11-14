@@ -462,11 +462,13 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
  * together — the shape a real Apple sender emits at a track change. item_id
  * is the sender's stable per-track identity ("" = none): MediaRemote keys
  * its now-playing item on it, so later tag refinements for the same item
- * update in place instead of presenting as a new track. Byte-identical
- * artwork keeps its ArtworkIdentifier across a track change; NULL artwork
- * drops retained MRP artwork when the track changed. track_changed_out
- * (optional) receives whether the item identity changed; mrp_info and
- * mrp_push receive the request-scoped artwork verdict and push statuses.
+ * update in place instead of presenting as a new track. A new item stages
+ * its artwork under a fresh ArtworkIdentifier, also when the bytes are
+ * identical; byte-identical artwork for the same item keeps its identifier.
+ * NULL artwork drops retained MRP artwork when the track changed.
+ * track_changed_out (optional) receives whether the item identity changed;
+ * mrp_info and mrp_push receive the request-scoped artwork verdict and push
+ * statuses.
  * Returns whether the whole bundle was delivered (DMAP, and the MRP push
  * where active) — a fully byte-identical bundle after a delivered one is
  * skipped and reported as delivered.
