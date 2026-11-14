@@ -503,12 +503,14 @@ static void test_raopcl_rtsp_hook(void)
 
     assert(raop_rtsp_teardown(rtsp));
     assert(!raopcl_is_connected(raopcl));
+    /* Our own TEARDOWN ended it, not the receiver. */
+    assert(!raop_rtsp_peer_closed(rtsp));
     /* libraop's exit path (raopcl_disconnect: FLUSH, then TEARDOWN) and its
      * keepalive send nothing further on the ended session. */
     assert(!rtspcl_flush(rtsp, 1, 1));
-    assert(rtspcl_disconnect(rtsp));
     assert(!raopcl_keepalive(raopcl));
-    assert(raopcl_destroy(raopcl));
+    /* Its own farewell TEARDOWN fails on the ended connection as well. */
+    assert(!raopcl_destroy(raopcl));
 
     assert(pthread_join(thread, NULL) == 0);
     assert(peer.requests == 2);
@@ -534,7 +536,8 @@ static void test_raop_rtsp_teardown_bounded(void)
     uint64_t elapsed = test_monotonic_ms() - started;
     assert(elapsed >= 900 && elapsed < 1500);
     assert(!raop_rtsp_teardown(rtsp));
-    assert(rtspcl_destroy(rtsp));
+    /* Its farewell TEARDOWN fails on the ended connection. */
+    assert(!rtspcl_destroy(rtsp));
 
     assert(pthread_join(thread, NULL) == 0);
     assert(peer.requests == 1);
@@ -564,6 +567,23 @@ static void test_raop_rtsp_peer_closed(void)
         /* Its farewell TEARDOWN fails on the closed connection. */
         rtspcl_destroy(rtsp);
     }
+    /* A new client reusing a reset client's address gets a clean slate. */
+    struct rtspcl_s *rtsp = raop_rtsp_create("test");
+    assert(rtsp && raop_rtsp_claim() == rtsp);
+    int peer = connect_rtsp_peer(rtsp);
+    close_with_reset(peer);
+    wait_readable(rtspcl_get_serv_sock(rtsp));
+    assert(!raop_rtsp_peer_closed(rtsp));
+    rtspcl_destroy(rtsp);
+    struct rtspcl_s *reused = raop_rtsp_create("test");
+    assert(reused && raop_rtsp_claim() == reused);
+    if (reused == rtsp) {
+        peer = connect_rtsp_peer(reused);
+        assert(close(peer) == 0);
+        wait_readable(rtspcl_get_serv_sock(reused));
+        assert(raop_rtsp_peer_closed(reused));
+    }
+    rtspcl_destroy(reused);
     puts("raop_rtsp peer close test passed");
 }
 

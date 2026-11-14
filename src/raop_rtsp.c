@@ -31,7 +31,9 @@ typedef struct {
 } teardown_job_t;
 
 static _Atomic(struct rtspcl_s *) g_created = NULL;
-static _Atomic(struct rtspcl_s *) g_reset = NULL;   /* client whose connection was reset */
+/* The client whose connection ended without the receiver closing it (a reset,
+ * or our own TEARDOWN): a later EOF on it is not the receiver's doing. */
+static _Atomic(struct rtspcl_s *) g_ended = NULL;
 
 static void *teardown_main(void *arg)
 {
@@ -44,6 +46,9 @@ static void *teardown_main(void *arg)
 struct rtspcl_s *raop_rtsp_create(char *useragent)
 {
     struct rtspcl_s *rtsp = rtspcl_create(useragent);
+    /* A fresh client can reuse the address of an ended one. */
+    struct rtspcl_s *ended = rtsp;
+    atomic_compare_exchange_strong(&g_ended, &ended, NULL);
     atomic_store(&g_created, rtsp);
     return rtsp;
 }
@@ -56,7 +61,7 @@ struct rtspcl_s *raop_rtsp_claim(void)
 bool raop_rtsp_teardown(struct rtspcl_s *rtsp)
 {
     int fd = rtsp ? rtspcl_get_serv_sock(rtsp) : -1;
-    if (fd < 0) return false;
+    if (fd < 0 || atomic_load(&g_ended) == rtsp) return false;
 
     /* libraop waits up to 10 s for the answer, so the request runs on its own
      * thread and is given up on after the timeout. */
@@ -72,26 +77,26 @@ bool raop_rtsp_teardown(struct rtspcl_s *rtsp)
     } else {
         LOG_ERROR("Cannot start the RTSP TEARDOWN thread");
     }
-    /* Ends a TEARDOWN still waiting for its answer, and leaves nothing for
-     * rtspcl_disconnect() to send a second one on: it only closes the socket
-     * and clears the handle, which turns libraop's own exit-time FLUSH and
-     * TEARDOWN into no-ops. */
+    /* Ends a TEARDOWN still waiting for its answer, and nothing more goes out
+     * on the connection: libraop's exit-time FLUSH and TEARDOWN fail on it.
+     * The client itself is left to libraop, whose exit path joins the threads
+     * that also use it (the keepalive) before it disconnects. */
+    atomic_store(&g_ended, rtsp);
     shutdown(fd, SHUT_RDWR);
     if (started) pthread_join(thread, NULL);
-    rtspcl_disconnect(rtsp);
     return job.accepted;
 }
 
 bool raop_rtsp_peer_closed(struct rtspcl_s *rtsp)
 {
     int fd = rtsp ? rtspcl_get_serv_sock(rtsp) : -1;
-    if (fd < 0 || atomic_load(&g_reset) == rtsp) return false;
+    if (fd < 0 || atomic_load(&g_ended) == rtsp) return false;
     char byte;
     ssize_t n = recv(fd, &byte, 1, MSG_PEEK | MSG_DONTWAIT);
     if (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK && errno != EINTR) {
         /* A reset is reported once and later reads see EOF, so it is
          * remembered to keep it a failure rather than the receiver closing. */
-        atomic_store(&g_reset, rtsp);
+        atomic_store(&g_ended, rtsp);
         return false;
     }
     return n == 0;
