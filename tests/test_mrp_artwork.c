@@ -508,15 +508,15 @@ static bool test_set_track_bundle(void)
     CHECK(strcmp(id_again, id_first) == 0);
     free(again);
 
-    /* Track change with byte-identical artwork (one album): fresh uid, but
-     * the ArtworkIdentifier survives — an identifier flip alone makes the
-     * receiver invalidate and re-render the art it is already showing. */
+    /* Track change with byte-identical artwork (one album): fresh uid and a
+     * fresh ArtworkIdentifier — tvOS drops a cover whose identifier was
+     * already used by an earlier item. */
     CHECK(ap2_mrp_set_track(mrp, "Track Two", "Artist", "Album", 200000,
                             "item-2", "image/jpeg", k_baseline_jpeg,
                             (int)sizeof(k_baseline_jpeg), &track_changed,
                             &info));
     CHECK(track_changed);
-    CHECK(info.result == AP2_MRP_ARTWORK_UNCHANGED);
+    CHECK(info.result == AP2_MRP_ARTWORK_ACCEPTED);
     uint8_t *second = NULL;
     int second_len = 0;
     CHECK(ap2_mrp_build_nowplaying_command(mrp, &second, &second_len));
@@ -527,7 +527,7 @@ static bool test_set_track_bundle(void)
     CHECK(uid_second != uid_first);
     char id_second[17];
     CHECK(find_artwork_identifier(second, (size_t)second_len, id_second));
-    CHECK(strcmp(id_second, id_first) == 0);
+    CHECK(strcmp(id_second, id_first) != 0);
     CHECK(bytes_contain(second, (size_t)second_len,
                         k_baseline_jpeg, sizeof(k_baseline_jpeg)));
     free(second);
