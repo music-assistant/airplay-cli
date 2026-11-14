@@ -554,15 +554,19 @@ static int hap_post_pair_setup_path(int sock_fd, const char *path, int cseq, int
                                uint8_t **resp_body, int *resp_body_len,
                                const char *label)
 {
-    char http_req[256];
+    bool pin_start = strcmp(path, "/pair-pin-start") == 0;
+    char http_req[320];
     int hdr_len = snprintf(http_req, sizeof(http_req),
         "POST %s RTSP/1.0\r\n"
         "User-Agent: " AP2_USER_AGENT "\r\n"
+        "%s"
         "Content-Type: application/octet-stream\r\n"
         "X-Apple-HKP: %d\r\n"
         "CSeq: %d\r\n"
         "Content-Length: %d\r\n"
-        "\r\n", path, hkp, cseq, body_len);
+        "\r\n", path,
+        pin_start ? "X-Apple-Client-Name: " AP2_CLIENT_NAME "\r\n" : "",
+        hkp, cseq, body_len);
 
     *resp_body = NULL;
     *resp_body_len = 0;
