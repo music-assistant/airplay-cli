@@ -826,6 +826,44 @@ static void test_auth_error_kind(void)
 
 /* A pair-verify reply without a body fails cleanly, short or long, and keeps
  * its error category: a protocol error after a 200, a rejection otherwise. */
+static const char *test_no_pin(void *arg)
+{
+    (void)arg;
+    return NULL;
+}
+
+/* The PIN request names the sender (OS 27 receivers show no code otherwise);
+ * the pair-setup steps that follow do not. */
+static void test_pair_pin_start_names_the_client(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    const char reply[] = "RTSP/1.0 200 OK\r\nContent-Length: 0\r\n\r\n";
+    assert(write(sockets[1], reply, sizeof(reply) - 1) == (ssize_t)(sizeof(reply) - 1));
+    assert(shutdown(sockets[1], SHUT_WR) == 0);
+
+    struct ap2_hap_ctx *hap = ap2_hap_create(NULL);
+    assert(hap);
+    const uint8_t client_id[] = "0123456789ABCDEF";
+    ap2_hap_set_client_id(hap, client_id, 16);
+    char creds[193];
+    assert(!ap2_hap_pair_setup_pin(hap, sockets[0], test_no_pin, NULL, creds));
+    ap2_hap_destroy(hap);
+    close(sockets[0]);
+
+    char sent[4096];
+    ssize_t n = read(sockets[1], sent, sizeof(sent) - 1);
+    assert(n > 0);
+    sent[n] = '\0';
+    close(sockets[1]);
+    char *setup = strstr(sent, "POST /pair-setup ");
+    assert(strncmp(sent, "POST /pair-pin-start ", 21) == 0 && setup);
+    char *name = strstr(sent, "X-Apple-Client-Name: Music Assistant\r\n");
+    assert(name && name < setup);
+    assert(!strstr(setup, "X-Apple-Client-Name"));
+    puts("ap2_hap pair-pin-start client name tests passed");
+}
+
 static void test_pair_verify_headers_only_reply(void)
 {
     char creds[192 + 1]; /* 192-hex HAP credential + NUL */
@@ -2841,6 +2879,7 @@ int main(int argc, char **argv)
     test_route_explicit_airplay2();
     test_auth_error_kind();
     test_pair_verify_headers_only_reply();
+    test_pair_pin_start_names_the_client();
     test_info_format_tables();
     test_feedback_stream_counts();
     test_native_flush_resume_reuses_rtsp_session();

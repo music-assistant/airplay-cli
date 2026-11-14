@@ -20,6 +20,10 @@
  */
 #define AP2_USER_AGENT "AirPlay/670.6.2"
 
+/* Sender name a receiver on OS 27 shows next to its pairing code; it shows no
+ * code at all when /pair-pin-start does not name the sender. */
+#define AP2_CLIENT_NAME "Music Assistant"
+
 /*
  * HAP pairing context.
  *
