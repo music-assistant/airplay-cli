@@ -62,6 +62,7 @@ unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p);
 void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_buffered_sock(struct ap2cl_s *p, int fd);
+void ap2cl_test_buffered_rtp_header(struct ap2cl_s *p, uint8_t hdr[12]);
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
 bool ap2cl_test_apple_model_default(const char *txt, const char *am);
 char *ap2cl_test_txt_from_dns(const uint8_t *blob, size_t len);
@@ -2908,16 +2909,18 @@ enum { ANCHOR_PEER_MAX_REQUESTS = 4 };
 
 typedef struct {
     int fd;
-    int requests;       /* SETRATEANCHORTIME requests to serve */
-    int refuse;         /* index of the one request answered 400 */
+    int requests;       /* SETRATEANCHORTIME/FLUSHBUFFERED requests to serve */
+    int refuse;         /* index of the one request answered 400, or -1 */
     bool ok;
     uint64_t rtp[ANCHOR_PEER_MAX_REQUESTS];
     uint64_t rate[ANCHOR_PEER_MAX_REQUESTS];
     uint64_t anchor_ms[ANCHOR_PEER_MAX_REQUESTS];
+    uint64_t flush_until_seq;   /* from the last FLUSHBUFFERED */
 } anchor_peer_t;
 
 /* Serve SETRATEANCHORTIME requests, refusing one as a receiver does before
- * its clock is seated, and record what each one anchors. */
+ * its clock is seated, and record what each one anchors. A FLUSHBUFFERED is
+ * answered too, recording its cut point. */
 static void *run_anchor_peer(void *arg)
 {
     anchor_peer_t *peer = arg;
@@ -2938,7 +2941,9 @@ static void *run_anchor_peer(void *arg)
         int body_len = 0;
         char *cseq_header = strstr((char *)buffer, "\r\nCSeq: ");
         char *len_header = strstr((char *)buffer, "\r\nContent-Length: ");
-        if (strncmp((char *)buffer, "SETRATEANCHORTIME ", 18) != 0 ||
+        bool flush = strncmp((char *)buffer, "FLUSHBUFFERED ", 14) == 0;
+        if ((!flush &&
+             strncmp((char *)buffer, "SETRATEANCHORTIME ", 18) != 0) ||
             !cseq_header || sscanf(cseq_header, "\r\nCSeq: %d", &cseq) != 1 ||
             !len_header ||
             sscanf(len_header, "\r\nContent-Length: %d", &body_len) != 1)
@@ -2949,21 +2954,29 @@ static void *run_anchor_peer(void *arg)
             if (n <= 0) return NULL;
             fill += (size_t)n;
         }
-        uint64_t secs = 0, frac = 0, flags = 1;
-        /* HomePod OS 27 refuses an anchor without networkTimeFlags (400). */
-        if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
-                                  "networkTimeFlags", &flags) || flags != 0 ||
-            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
-                                  "rtpTime", &peer->rtp[request]) ||
-            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len, "rate",
-                                  &peer->rate[request]) ||
-            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
-                                  "networkTimeSecs", &secs) ||
-            !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
-                                  "networkTimeFrac", &frac))
-            return NULL;
-        peer->anchor_ms[request] =
-            secs * 1000ULL + (((frac >> 32) * 1000ULL) >> 32);
+        if (flush) {
+            if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                      "flushUntilSeq", &peer->flush_until_seq))
+                return NULL;
+        } else {
+            uint64_t secs = 0, frac = 0, flags = 1;
+            /* HomePod OS 27 refuses an anchor without networkTimeFlags
+             * (400). */
+            if (!ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                      "networkTimeFlags", &flags) ||
+                flags != 0 ||
+                !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                      "rtpTime", &peer->rtp[request]) ||
+                !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                      "rate", &peer->rate[request]) ||
+                !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                      "networkTimeSecs", &secs) ||
+                !ap2_bplist_find_uint((uint8_t *)body, (size_t)body_len,
+                                      "networkTimeFrac", &frac))
+                return NULL;
+            peer->anchor_ms[request] =
+                secs * 1000ULL + (((frac >> 32) * 1000ULL) >> 32);
+        }
         char response[96];
         int response_len = snprintf(
             response, sizeof(response),
@@ -3094,6 +3107,63 @@ static void test_buffered_resume_anchor_retry_keeps_held_frame(void)
     assert(close(sockets[1]) == 0);
     assert(ap2cl_destroy(client));
     puts("ap2_client buffered resume anchor retry tests passed");
+}
+
+/* A buffered flush names its cut point in the numbering receivers read from
+ * a buffered packet (RTP header bytes 1-3 below the marker bit). Receivers
+ * drop packets until they reach flushUntilSeq, so any other numbering leaves
+ * them silent for the rest of the session. */
+static void test_buffered_flush_names_wire_sequence(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    anchor_peer_t peer = {.fd = sockets[1], .requests = 2, .refuse = -1};
+    pthread_t peer_thread;
+    assert(pthread_create(
+               &peer_thread, NULL, run_anchor_peer, &peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "buffered flush test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 48000,
+        .bit_depth = 24,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, false);
+    ap2cl_test_set_use_buffered(client, true);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    assert(ap2cl_start(client, 0, NULL) == AP2_COMMIT_OK);
+
+    /* The marker bit flags only the first packet; the number below it is the
+     * same either way. */
+    uint8_t first[12], next[12];
+    ap2cl_test_set_first_packet(client, true);
+    ap2cl_test_buffered_rtp_header(client, first);
+    ap2cl_test_set_first_packet(client, false);
+    ap2cl_test_buffered_rtp_header(client, next);
+    assert(first[0] == 0x80 && next[0] == 0x80);
+    assert(first[1] == (next[1] | 0x80) && !(next[1] & 0x80));
+    assert(memcmp(first + 2, next + 2, 10) == 0);
+    uint32_t wire_seq = ((uint32_t)next[1] << 16) |
+                        ((uint32_t)next[2] << 8) | next[3];
+
+    assert(ap2cl_flush(client));
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.ok);
+    assert(peer.flush_until_seq == wire_seq);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    puts("ap2_client buffered flush wire sequence tests passed");
 }
 
 /* Readiness reported from connect, so a caller can plan a join anchor the
@@ -3479,6 +3549,7 @@ int main(int argc, char **argv)
     test_clock_verified_anchor();
     test_buffered_anchor_retry_acks_scheduled_instant();
     test_buffered_resume_anchor_retry_keeps_held_frame();
+    test_buffered_flush_names_wire_sequence();
     test_clock_readiness_report();
     test_clock_stall_detection();
     test_clock_unprobed_receiver();
