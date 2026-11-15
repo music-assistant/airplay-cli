@@ -112,6 +112,12 @@ extern log_level *loglevel;
 #define AP2_CLOCK_LOCK_MS            2300
 #define AP2_CLOCK_SETTLE_MS          250
 #define AP2_CLOCK_SEAT_EXCHANGES     3
+/* Shairport Sync renders once its nqptp has followed our clock for 400 ms,
+ * counted from the first Follow_Up after a fresh Announce (shairport-sync
+ * rtp.c, nqptp handle_follow_up). Its stream SETUP restarts that count and
+ * our SETPEERS kick, sent right before connect, delivers both; the rest
+ * covers the kick's engine cycle and the receiver's own start-up. */
+#define AP2_CLOCK_NQPTP_MS           800
 /* Nothing to measure for this long, counted from the last streak seen or from
  * connect while none ever has been, means the receiver is not answering our
  * clock at all — over four times the 1.078 s first-probe latency measured on a
@@ -3722,16 +3728,29 @@ static uint64_t ap2_ntp_to_unix_ms(uint64_t ntp)
 
 /* ---- Receiver clock readiness (PTP probe streak) ---- */
 
+/* Shairport Sync's PTP client (nqptp) follows our Sync/Follow_Up without ever
+ * sending a Delay_Req, so it builds no probe streak and its silence says
+ * nothing about its clock. Its streak is counted from connect instead, which
+ * is when our clock reaches it: readiness gets nqptp's own window
+ * (AP2_CLOCK_NQPTP_MS), and the receiver never reads as stalled. */
+static bool ap2_clock_unprobed(const struct ap2cl_s *p)
+{
+    return ap2_model_prefix(p->device.txt_records, p->am, "ShairportSync");
+}
+
 /* Earliest instant (unix ms) the receiver can seat an anchor, from a live
  * probe-streak snapshot. Third-party receivers get the full servo-lock
- * window from the streak start; Apple models also honor the observed fast
- * bound (third exchange + settle), whichever is earlier. */
+ * window from the streak start, Shairport Sync its nqptp window; Apple models
+ * also honor the observed fast bound (third exchange + settle), whichever is
+ * earlier. */
 static uint64_t ap2_clock_ready_from(const struct ap2cl_s *p,
                                      const struct ap2_ptp_exchange *ex,
                                      uint64_t now_unix_ms)
 {
     uint64_t first_ms = ex->first_ms < now_unix_ms ? ex->first_ms : now_unix_ms;
-    uint64_t ready = now_unix_ms - first_ms + AP2_CLOCK_LOCK_MS;
+    uint64_t lock_ms = ap2_clock_unprobed(p) ? AP2_CLOCK_NQPTP_MS
+                                             : AP2_CLOCK_LOCK_MS;
+    uint64_t ready = now_unix_ms - first_ms + lock_ms;
     if (p->apple_model && ex->count >= AP2_CLOCK_SEAT_EXCHANGES) {
         uint64_t third_ms =
             ex->third_ms < now_unix_ms ? ex->third_ms : now_unix_ms;
@@ -3747,16 +3766,6 @@ static uint64_t ap2_clock_ready_from(const struct ap2cl_s *p,
 static bool ap2_clock_query(struct ap2cl_s *p, struct ap2_ptp_exchange *ex)
 {
     return ap2_ptp_peer_exchange(p->ptp, p->device.address, ex);
-}
-
-/* Shairport Sync's PTP client (nqptp) follows our Sync/Follow_Up without ever
- * sending a Delay_Req, so it builds no probe streak and its silence says
- * nothing about its clock. Its streak is counted from connect instead, which
- * is when our clock reaches it: readiness gets the same lock window as any
- * other third-party receiver, and the receiver never reads as stalled. */
-static bool ap2_clock_unprobed(const struct ap2cl_s *p)
-{
-    return ap2_model_prefix(p->device.txt_records, p->am, "ShairportSync");
 }
 
 /* The connect-counted streak of a receiver that never probes (see

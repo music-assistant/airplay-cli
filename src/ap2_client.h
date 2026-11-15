@@ -375,7 +375,7 @@ bool ap2cl_uses_ptp(struct ap2cl_s *p);
  * the first reading afterwards measures a window nobody was watching.
  * Stalled is not terminal — a receiver that begins probing late reports
  * probing and then ready as usual. Shairport Sync never probes our clock at
- * all, so its readiness is projected one lock window from connect instead and
+ * all, so its readiness is projected from connect, over nqptp's window, and
  * it never reports stalled. Safe to call from the audio loop: it never
  * blocks on the network. Recompute per use — ready_at_unix_ms is a projection
  * against the wall clock and must not be cached.
