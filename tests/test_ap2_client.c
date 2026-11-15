@@ -3301,8 +3301,9 @@ static void test_clock_stall_detection(void)
 }
 
 /* Shairport Sync never probes our clock, so its readiness is counted from
- * connect and its silence never reads as a stall — while any other receiver
- * that stays silent, a HomePod included, still does. */
+ * connect over the 800 ms its nqptp needs, and its silence never reads as a
+ * stall — while any other receiver that stays silent, a HomePod included,
+ * still does. */
 static void test_clock_unprobed_receiver(void)
 {
     ap2_device_info_t device = {
@@ -3329,20 +3330,28 @@ static void test_clock_unprobed_receiver(void)
     ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_COLD);
 
-    /* A second after connect: one lock window from connect, with no probe
+    /* Just after connect: nqptp's window from connect, with no probe
      * claimed. The two clock reads inside the call can be a millisecond
      * apart, so the projection is bracketed by the call's own span. */
-    uint64_t connected = test_now_unix_ms() - 1000;
+    uint64_t connected = test_now_unix_ms() - 300;
     ap2cl_test_set_clock_marks(client, connected, 0);
     uint64_t before = test_now_unix_ms();
     ap2cl_clock_readiness(client, &r);
     uint64_t after = test_now_unix_ms();
     assert(r.state == AP2_CLOCK_PROBING);
     assert(r.exchanges == 0);
-    assert(r.ready_at_unix_ms >= connected + 2300);
-    assert(r.ready_at_unix_ms <= connected + 2300 + (after - before));
+    assert(r.ready_at_unix_ms >= connected + 800);
+    assert(r.ready_at_unix_ms <= connected + 800 + (after - before));
     assert(r.ready_in_ms >= r.ready_at_unix_ms - after);
     assert(r.ready_in_ms <= r.ready_at_unix_ms - before);
+
+    /* A second after connect it is ready, well before the 2.3 s servo-lock
+     * window a probing third-party receiver still gets. */
+    connected = test_now_unix_ms() - 1000;
+    ap2cl_test_set_clock_marks(client, connected, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+    assert(r.ready_in_ms == 0);
 
     /* Well past the stall window with still no probe: ready, not stalled, and
      * a watch restart at the re-arm leaves the projection where it was. */
@@ -3362,7 +3371,8 @@ static void test_clock_unprobed_receiver(void)
     uint64_t at = 0;
     ap2cl_set_start_join(client, true);
     assert(ap2cl_start(client, connected + 500, &at) == AP2_COMMIT_OK);
-    assert(at >= connected + 2300);
+    assert(at >= connected + 800);
+    assert(at < connected + 2300);
     assert(!ap2cl_clock_verify_armed(client));
     assert(!ap2cl_start_ack_deferred(client));
     ap2cl_destroy(client);

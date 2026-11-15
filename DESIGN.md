@@ -457,9 +457,14 @@ binary reports what it measures instead of leaving the caller to guess:
   stays cold. Shairport Sync (`model=`/`am=ShairportSync`) cannot stall either:
   its nqptp follows Sync/Follow_Up but never sends a Delay_Req (it sends only
   two Announce messages per new clock), so it has no streak to lose. Its streak
-  is counted from connect instead, when our clock reaches it, which projects
-  readiness 2.3 s after connect (Shairport Sync itself waits for 400 ms of
-  nqptp mastership) and keeps the commit floor and verification consistent.
+  is counted from connect instead, when our clock reaches it. Its stream SETUP
+  resets nqptp's record of our clock, which then needs a fresh Announce;
+  mastership starts at the next Follow_Up, and Shairport Sync renders once it
+  is 400 ms old (shairport-sync `rtp.c`, nqptp `handle_follow_up`). Our
+  SETPEERS kick sends both just before connect, so readiness is projected
+  0.8 s after connect (400 ms plus room for the kick's engine cycle and the
+  receiver's own start-up), which keeps the commit floor and verification
+  consistent.
   `ready_in_ms`/`ready_at_unix_ms` are 0 and mean nothing, as while cold.
 - `streak_ms`/`exchanges` are the streak's first-probe age and probe count,
   the same two numbers the commit-time floor logs, so field reports compare

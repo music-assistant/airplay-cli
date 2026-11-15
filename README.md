@@ -104,7 +104,8 @@ report rather than something to wait out; the usual cause is UDP 319/320 not
 reaching this host from the speaker. It is not final, though: a receiver that
 starts probing late, or picks up again, reports `probing` and then `ready`.
 Shairport Sync never probes our clock (its nqptp only listens), so it is never
-reported stalled: its readiness is projected one lock window from connect.
+reported stalled: its readiness is projected 0.8 s from connect, the 400 ms its
+nqptp needs plus margin.
 
 Starting before readiness is still supported and still corrected — see
 `START_JOIN=1` below.
