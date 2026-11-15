@@ -903,6 +903,14 @@ commanded instant on the shared PTP timeline, which is also why a mixed
 group (buffered and realtime members) can share one start instant: both
 stream types express the same timeline, two ways.
 
+Receivers read a buffered packet's sequence number from RTP header bytes 1-3
+below the marker bit, so the payload type sits above our 16-bit counter
+(`0x67xxxx`). `flushUntilSeq` names the cut point in that same numbering
+(`ap2_buffered_wire_seq()`): a receiver drops packets until it reaches it,
+so any other numbering silences the rest of the session (Shairport Sync 5.x).
+The counter wraps every 65536 packets, so a flush whose dropped tail
+straddles the wrap can end early.
+
 The receiver **owns its buffer** and pulls the TCP stream on its own
 schedule — bursts ahead of render, long read pauses in between (a warm
 receiver has ingested 75 s ≈ 10 MB at line speed; a cold-clock one prefetches

@@ -2805,6 +2805,31 @@ static bool ap2_encrypt_audio(const uint8_t key[32], const uint8_t nonce[12],
 
 /* ---- Native AP2 buffered audio (type 103) ---- */
 
+/* Sequence number of a buffered packet as receivers read it: RTP header bytes
+ * 1-3 below the marker bit, so the payload type (103) sits above the 16-bit
+ * counter. FLUSHBUFFERED names its cut point in this numbering: a receiver
+ * drops packets until it reaches flushUntilSeq. The counter wraps every 65536
+ * packets, so a flush whose dropped tail straddles the wrap can end early. */
+static uint32_t ap2_buffered_wire_seq(uint16_t seq)
+{
+    return (103u << 16) | seq;
+}
+
+/* Fill the 12-byte RTP header of the next buffered packet. The marker bit is
+ * set on the first packet, mirroring the realtime header shape. */
+static void ap2_buffered_rtp_header(const struct ap2cl_s *p, uint8_t hdr[12])
+{
+    uint32_t seq = ap2_buffered_wire_seq(p->seq_number);
+    hdr[0] = 0x80;
+    hdr[1] = (uint8_t)((p->first_packet ? 0x80 : 0x00) | (seq >> 16));
+    hdr[2] = (uint8_t)(seq >> 8);
+    hdr[3] = (uint8_t)seq;
+    uint32_t ts_be = htonl(p->rtp_timestamp);
+    memcpy(hdr + 4, &ts_be, 4);
+    uint32_t ssrc_be = htonl(p->ssrc);
+    memcpy(hdr + 8, &ssrc_be, 4);
+}
+
 /* Send the SETRATEANCHORTIME anchor. It pins an RTP sample number to a point
  * on the PTP timeline at a playback rate, so the receiver can schedule every
  * buffered sample: "sample rtpTime renders at PTP time networkTime, at rate".
@@ -2968,8 +2993,9 @@ static void ap2_buffered_quiesce_data(struct ap2cl_s *p)
 static bool ap2_send_flushbuffered(struct ap2cl_s *p)
 {
     ap2_buffered_quiesce_data(p);
+    uint32_t until_seq = ap2_buffered_wire_seq(p->seq_number);
     ap2_pl_node *root = ap2_pl_dict();
-    ap2_pl_dict_set(root, "flushUntilSeq", ap2_pl_int((int64_t)p->seq_number));
+    ap2_pl_dict_set(root, "flushUntilSeq", ap2_pl_int((int64_t)until_seq));
     ap2_pl_dict_set(root, "flushUntilTS", ap2_pl_int((int64_t)p->rtp_timestamp));
 
     uint8_t *body = NULL;
@@ -2983,7 +3009,7 @@ static bool ap2_send_flushbuffered(struct ap2cl_s *p)
     free(body);
     free(resp);
     LOG_INFO("[AP2] FLUSHBUFFERED untilSeq=%u untilTS=%u -> %d",
-             p->seq_number, p->rtp_timestamp, status);
+             until_seq, p->rtp_timestamp, status);
     p->anchored = false;
     p->buffered_paused = false;
     return status == 200;
@@ -3043,17 +3069,8 @@ static ap2_send_result_t ap2_buffered_send_chunk(
         return AP2_SEND_FATAL;
     }
 
-    /* RTP header (12 bytes). Payload type = stream type (103), marker bit set
-     * on the first packet, mirroring the realtime header shape. */
     uint8_t rtp_hdr[12];
-    rtp_hdr[0] = 0x80;
-    rtp_hdr[1] = p->first_packet ? 0xE7 : 0x67;   /* 0x67 = PT 103 */
-    rtp_hdr[2] = (p->seq_number >> 8) & 0xFF;
-    rtp_hdr[3] = p->seq_number & 0xFF;
-    uint32_t ts_be = htonl(p->rtp_timestamp);
-    memcpy(rtp_hdr + 4, &ts_be, 4);
-    uint32_t ssrc_be = htonl(p->ssrc);
-    memcpy(rtp_hdr + 8, &ssrc_be, 4);
+    ap2_buffered_rtp_header(p, rtp_hdr);
     /* Nonce = 4 zero bytes + an 8-byte little-endian per-packet counter at
      * offset 4; the same 8 counter bytes trail the packet so the receiver
      * reconstructs the nonce explicitly (a 2-byte sequence would wrap and
@@ -6078,6 +6095,11 @@ void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable)
 void ap2cl_test_set_buffered_sock(struct ap2cl_s *p, int fd)
 {
     p->buffered_sock = fd;
+}
+
+void ap2cl_test_buffered_rtp_header(struct ap2cl_s *p, uint8_t hdr[12])
+{
+    ap2_buffered_rtp_header(p, hdr);
 }
 
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple)
