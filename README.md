@@ -103,6 +103,8 @@ plays **silence** however healthy the session looks. Treat it as a failure to
 report rather than something to wait out; the usual cause is UDP 319/320 not
 reaching this host from the speaker. It is not final, though: a receiver that
 starts probing late, or picks up again, reports `probing` and then `ready`.
+Shairport Sync never probes our clock (its nqptp only listens), so it is never
+reported stalled: its readiness is projected one lock window from connect.
 
 Starting before readiness is still supported and still corrected — see
 `START_JOIN=1` below.

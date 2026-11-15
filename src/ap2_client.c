@@ -3732,6 +3732,31 @@ static bool ap2_clock_query(struct ap2cl_s *p, struct ap2_ptp_exchange *ex)
     return ap2_ptp_peer_exchange(p->ptp, p->device.address, ex);
 }
 
+/* Shairport Sync's PTP client (nqptp) follows our Sync/Follow_Up without ever
+ * sending a Delay_Req, so it builds no probe streak and its silence says
+ * nothing about its clock. Its streak is counted from connect instead, which
+ * is when our clock reaches it: readiness gets the same lock window as any
+ * other third-party receiver, and the receiver never reads as stalled. */
+static bool ap2_clock_unprobed(const struct ap2cl_s *p)
+{
+    return ap2_model_prefix(p->device.txt_records, p->am, "ShairportSync");
+}
+
+/* The connect-counted streak of a receiver that never probes (see
+ * ap2_clock_unprobed); false before connect. Takes clock_verify_lock. */
+static bool ap2_clock_unprobed_streak(struct ap2cl_s *p,
+                                      struct ap2_ptp_exchange *ex)
+{
+    pthread_mutex_lock(&p->clock_verify_lock);
+    uint64_t connected_ms = p->clock_connected_unix_ms;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    if (!connected_ms) return false;
+    uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
+    memset(ex, 0, sizeof(*ex));
+    ex->first_ms = now_ms > connected_ms ? now_ms - connected_ms : 0;
+    return true;
+}
+
 /* Raise a commit's feasibility floor to the receiver's clock readiness. With
  * no live streak the clock is cold: the floor is left alone (a receiver that
  * has just connected takes about a second to start probing, so an early
@@ -3744,7 +3769,9 @@ static uint64_t ap2_clock_floor(struct ap2cl_s *p, uint64_t floor_ntp,
     *clock_cold = false;
     if (p->flow != FLOW_NATIVE_AP2 || !p->use_ptp) return floor_ntp;
     struct ap2_ptp_exchange ex;
-    if (!ap2_clock_query(p, &ex)) {
+    bool have = ap2_clock_unprobed(p) ? ap2_clock_unprobed_streak(p, &ex)
+                                      : ap2_clock_query(p, &ex);
+    if (!have) {
         *clock_cold = true;
         return floor_ntp;
     }
@@ -4704,8 +4731,11 @@ void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
     pthread_mutex_unlock(&p->clock_verify_lock);
     /* The in-process engine answers from its own lock, so the audio loop may
      * ask it directly; shared-daemon mode must take the poller's snapshot,
-     * whose staleness only ever pushes readiness later — the safe direction. */
-    if (!have && !ap2_ptp_shared_active(p->ptp))
+     * whose staleness only ever pushes readiness later — the safe direction.
+     * A receiver that never probes has no streak to snapshot either way. */
+    if (ap2_clock_unprobed(p))
+        have = ap2_clock_unprobed_streak(p, &ex);
+    else if (!have && !ap2_ptp_shared_active(p->ptp))
         have = ap2_clock_query(p, &ex);
 
     uint64_t now_ms = ap2_ntp_to_unix_ms(raopcl_get_ntp(NULL));
