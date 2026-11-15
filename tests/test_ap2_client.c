@@ -3341,7 +3341,8 @@ static void test_clock_unprobed_receiver(void)
     assert(r.exchanges == 0);
     assert(r.ready_at_unix_ms >= connected + 2300);
     assert(r.ready_at_unix_ms <= connected + 2300 + (after - before));
-    assert(r.ready_in_ms > 1200 && r.ready_in_ms <= 1300);
+    assert(r.ready_in_ms >= r.ready_at_unix_ms - after);
+    assert(r.ready_in_ms <= r.ready_at_unix_ms - before);
 
     /* Well past the stall window with still no probe: ready, not stalled, and
      * a watch restart at the re-arm leaves the projection where it was. */
