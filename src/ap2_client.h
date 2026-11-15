@@ -147,24 +147,30 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
 bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
                         const char *am, bool forced);
 
+/* When the PTP engine follows a receiver's OWN clock instead of serving it ours. */
+typedef enum {
+    AP2_FOLLOW_NEVER = 0, /* the receiver is served our clock */
+    AP2_FOLLOW_FALLBACK,  /* served our clock, followed once it leaves that clock unanswered */
+    AP2_FOLLOW_ALWAYS,    /* followed from connect */
+} ap2_follow_policy_t;
+
 /*
- * Whether the PTP engine should follow this receiver's OWN clock instead of
- * serving it ours. True for a standalone HomePod — `model=`/`am=`
- * AudioAccessory*, `igl=1`, and neither `pgid` (Apple TV audio-output group
- * member) nor `tsid` (stereo pair), and advertising HomePod OS 27+ (osvers,
- * or the srcvers/`vs` firmware) — which on that OS never slaves to the
- * sender's grandmaster and stays silent on a sender-anchored stream. Earlier
- * firmware slaves and plays, so it is left on our grandmaster.
- * CLIAIRPLAY_PTP_FOLLOW outranks the rule (0 = never, else = always).
+ * Resolve the follow policy for a receiver. Every receiver is served our
+ * clock, so a whole sync group plays on one timeline. A HomePod —
+ * `model=`/`am=` AudioAccessory* — advertising HomePod OS 27+ (osvers, or the
+ * srcvers/`vs` firmware) gets the fallback: one that never probes our clock
+ * would stay silent, so the session then follows its clock, where it plays at
+ * its own rate. CLIAIRPLAY_PTP_FOLLOW outranks the rule for every receiver
+ * (0 = never, else = always).
  *
  * :param txt: full _airplay._tcp TXT blob, or NULL.
  * :param am: mDNS am= model override (RAOP discovery), or NULL.
  */
-bool ap2_follow_receiver_clock(const char *txt, const char *am);
+ap2_follow_policy_t ap2_follow_policy(const char *txt, const char *am);
 
 /*
  * Build the SETPEERS body naming the timing group [receiver, us]. An Apple
- * receiver, or one whose clock we follow (see ap2_follow_receiver_clock),
+ * receiver, or one whose clock we follow (see ap2_follow_policy),
  * gets SETPEERSX: one timing-peer dict per member as current Apple senders
  * send it, ours repeating the session SETUP entry. On a bare SETPEERS the
  * HomePod mini 2 (AudioAccessory11,1) ignores our clock and, when followed,
@@ -368,8 +374,11 @@ bool ap2cl_uses_ptp(struct ap2cl_s *p);
  * AP2_CLOCK_STALL_MS — counted from the last streak this call saw, or from
  * connect while it has seen none — reports AP2_CLOCK_STALLED: that receiver is
  * not slaved to our clock, so it can seat no render position and stays silent
- * however cleanly the audio paces. Under the shared daemon the snapshot poller
- * keeps that mark current for the whole session; the in-process engine has no
+ * however cleanly the audio paces. A receiver with the follow fallback (see
+ * ap2_follow_policy) is switched to its own clock at that point instead, and
+ * reads cold while that clock gets a window of its own. Under the shared
+ * daemon the snapshot poller keeps that mark current for the whole session;
+ * the in-process engine has no
  * poller, so the mark only moves while a caller is asking. A caller that stops
  * asking must therefore call ap2cl_clock_watch_restart before it resumes, or
  * the first reading afterwards measures a window nobody was watching.

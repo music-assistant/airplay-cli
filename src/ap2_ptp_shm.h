@@ -52,7 +52,7 @@
  * a receiver expresses its anchor in the receiver's timeline (clock_id, and
  * local ns + offset). */
 /* Sized to match AP2_PTP_MAX_PEERS (the daemon's receiver ceiling): every receiver
- * it serves may be a standalone OS 27 HomePod whose own clock we follow, so the
+ * it serves may be a receiver whose own clock we follow, so the
  * follow table has to hold as many entries as there are peers. Must equal
  * PTP_MAX_FOLLOW (see the _Static_assert in ap2_ptp.c); growing it changes this
  * struct's layout, so bump AP2_PTP_SHM_VERSION when it changes. */
@@ -161,7 +161,8 @@ void ap2_ptp_shm_reader_close(struct ap2_ptp_shm_reader *r);
  *   R <ip> [F] [<ip> [F] ...] [pid=<n>]
  *                       register (add) receiver IP(s) into the timing peer set;
  *                       an "F" after an ip follows that receiver's own clock
- *                       (standalone HomePod, see ap2_ptp_follow_receiver)
+ *                       (see ap2_ptp_follow_receiver); registering an ip again
+ *                       for the same pid updates it
  *   U <ip> [<ip> ...] [pid=<n>]
  *                       unregister (remove) receiver IP(s): with pid, that
  *                       process's registration; without, one registration of

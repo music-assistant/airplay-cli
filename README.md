@@ -103,6 +103,9 @@ plays **silence** however healthy the session looks. Treat it as a failure to
 report rather than something to wait out; the usual cause is UDP 319/320 not
 reaching this host from the speaker. It is not final, though: a receiver that
 starts probing late, or picks up again, reports `probing` and then `ready`.
+A HomePod on HomePod OS 27+ is first switched to its own clock at that point
+(see `CLIAIRPLAY_PTP_FOLLOW`) and keeps reading `cold`; it is reported
+`stalled` only when that clock stays silent for another 5 s.
 Shairport Sync never probes our clock (its nqptp only listens), so it is never
 reported stalled: its readiness is projected one lock window from connect.
 
@@ -225,7 +228,7 @@ cliairplay [options] --cmdpipe <path> <host_ip>
 | `--timing <auto\|ptp\|ntp>` | Session timing. `auto` (default) follows the SupportsPTP bit (or `--ptp`); `ntp` forces the NTP responder — the escape for receivers that advertise PTP but never answer a clock probe (e.g. AirPlay-2 video-class TVs). An NTP-timed route never selects the buffered stream. |
 | `--buffered` | Force the buffered stream (type 103, RTP over TCP + PTP anchor) on a native PTP route. Default: auto by the SupportsBufferedAudio feature bit (in-code deny-list for measured-hostile models). `CLIAIRPLAY_BUFFERED=0\|1` outranks both — kill switch / fleet A/B lever. |
 | `--ptp-shared` | Prefer the shared PTP daemon clock (multi-room): attach the daemon's shm instead of running an engine; fall back to the in-process engine when no daemon is live. Picks the clock *source*, not the timing mode — pair it with `--ptp` or a `--txt` advertising SupportsPTP. |
-| `CLIAIRPLAY_PTP_FOLLOW=0\|1` (env) | Override for following a receiver's **own** PTP clock instead of serving it ours. Default: auto — a standalone HomePod on HomePod OS 27+ (`model=AudioAccessory*`, `igl=1`, no `pgid`, no `tsid`, `osvers`>=27) is followed, because it keeps announcing its own grandmaster for the whole session and never renders audio anchored to the sender's timeline; every other receiver is served our grandmaster as before. `0` never follows (kill switch), `1` follows every receiver. Per receiver: the engine (or the `--ptp-daemon`) stays grandmaster for the other peers, so mixed multi-room keeps working. |
+| `CLIAIRPLAY_PTP_FOLLOW=0\|1` (env) | Override for following a receiver's **own** PTP clock instead of serving it ours. Default: every receiver is served our grandmaster, so a sync group stays on one timeline; a followed receiver plays at its own clock's rate and slowly drifts out of its group. Only a HomePod on HomePod OS 27+ (`model=AudioAccessory*`, `osvers`>=27) that leaves our clock unanswered for 5 s is switched to its own clock mid-session, because it would stay silent otherwise; the log then names its model and OS version. `0` never follows (kill switch, no fallback either), `1` follows every receiver from connect. Per receiver: the engine (or the `--ptp-daemon`) stays grandmaster for the other peers, so mixed multi-room keeps working. |
 
 ### Utility / daemon modes
 

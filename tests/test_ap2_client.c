@@ -21,6 +21,7 @@
 #include "ap2_client.h"
 #include "ap2_hap.h"
 #include "ap2_io.h"
+#include "ap2_ptp.h"
 #include "cross_log.h"
 #include "host_clock.h"
 #include "raop_client.h"
@@ -60,6 +61,10 @@ void ap2cl_test_rtx_store(struct ap2cl_s *p, uint16_t seq,
 unsigned long long ap2cl_test_rtx_answered(struct ap2cl_s *p);
 unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p);
 void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable);
+struct ap2_ptp_ctx *ap2cl_test_attach_ptp(struct ap2cl_s *p);
+bool ap2cl_test_follow_clock(struct ap2cl_s *p);
+bool ap2cl_test_set_ctrl_peer(struct ap2cl_s *p, uint16_t port);
+bool ap2cl_test_send_periodic_sync(struct ap2cl_s *p);
 void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_buffered_sock(struct ap2cl_s *p, int fd);
 void ap2cl_test_set_apple_model(struct ap2cl_s *p, bool apple);
@@ -972,11 +977,12 @@ static void test_route_with_password(void)
  * advertises SupportsBufferedAudio (bit 40); --buffered forces it there, and
  * CLIAIRPLAY_BUFFERED overrides both ways. The deny-list ships empty — adding
  * an entry must consciously update the pins here. */
-/* A standalone HomePod (AudioAccessory, own group, no parent group, no
- * stereo partner) has its clock followed; every other shape — Apple TV
- * audio-output member, stereo pair, non-Apple receiver — keeps the sender's
- * grandmaster. CLIAIRPLAY_PTP_FOLLOW overrides both ways. */
-static void test_follow_receiver_clock_resolution(void)
+/* Every receiver is served our clock, so nothing is followed from connect. A
+ * HomePod on HomePod OS 27 or newer — standalone, stereo pair or Apple TV
+ * group member alike — gets the fallback to its own clock; any other
+ * receiver, and a HomePod whose OS version cannot be read, gets none.
+ * CLIAIRPLAY_PTP_FOLLOW overrides both ways. */
+static void test_follow_policy_resolution(void)
 {
     unsetenv("CLIAIRPLAY_PTP_FOLLOW");
     const char *standalone =
@@ -984,8 +990,6 @@ static void test_follow_receiver_clock_resolution(void)
         "gid=11111111-1111-1111-1111-111111111111+22222222-2222-2222-2222-222222222222 "
         "igl=1 gcgl=1 model=AudioAccessory1,1 protovers=1.1 "
         "pi=33333333-3333-3333-3333-333333333333 srcvers=980.77.2 osvers=27.0";
-    const char *standalone_os26 =
-        "igl=1 gcgl=1 model=AudioAccessory5,1 srcvers=960.13.1 osvers=26.6";
     const char *tv_member =
         "features=0x4A7FCA00,0x3C354BD0 flags=0xb8c04 gid=44444444-4444-4444-4444-444444444444 "
         "igl=0 gpn=Living Room gcgl=1 pgid=44444444-4444-4444-4444-444444444444 pgcgl=1 "
@@ -993,34 +997,47 @@ static void test_follow_receiver_clock_resolution(void)
     const char *stereo_pair =
         "features=0x4A7FCA00,0x3C354BD0 gid=55555555-5555-5555-5555-555555555555 igl=1 "
         "gcgl=1 tsid=66666666-6666-6666-6666-666666666666 model=AudioAccessory5,1 osvers=27.0";
-    const char *sonos = "features=0x445F8A00,0x1C340 igl=1 model=Sonos One";
+    static const char sonos[] = "features=0x445F8A00,0x1C340 igl=1 model=Sonos One";
+    const struct {
+        const char *txt;
+        const char *am;
+        ap2_follow_policy_t policy;
+    } rules[] = {
+        {standalone, NULL, AP2_FOLLOW_FALLBACK},
+        {"igl=1 model=AudioAccessory6,1 osvers=27.1", NULL, AP2_FOLLOW_FALLBACK},
+        {"igl=1 model=AudioAccessory11,1 osvers=27.2", NULL, AP2_FOLLOW_FALLBACK},
+        {"igl=1 model=AudioAccessory11,1 osvers=28.0", NULL, AP2_FOLLOW_FALLBACK},
+        {stereo_pair, NULL, AP2_FOLLOW_FALLBACK},
+        {tv_member, NULL, AP2_FOLLOW_FALLBACK},
+        /* am= carries the model on _raop, where the OS version is ov=. */
+        {"igl=1 osvers=27.0", "AudioAccessory1,1", AP2_FOLLOW_FALLBACK},
+        {"ov=27.2", "AudioAccessory11,1", AP2_FOLLOW_FALLBACK},
+        /* srcvers (980.x = OS 27) covers a receiver that omits osvers, and
+         * osvers wins when the two disagree. */
+        {"igl=1 model=AudioAccessory1,1 srcvers=980.77.2", NULL, AP2_FOLLOW_FALLBACK},
+        {"igl=1 model=AudioAccessory1,1 osvers=26.6 srcvers=980.0", NULL, AP2_FOLLOW_NEVER},
+        {"igl=1 gcgl=1 model=AudioAccessory5,1 srcvers=960.13.1 osvers=26.6", NULL,
+         AP2_FOLLOW_NEVER},
+        /* An unknown OS version is treated as pre-27. */
+        {"igl=1 model=AudioAccessory1,1", NULL, AP2_FOLLOW_NEVER},
+        {NULL, "AudioAccessory1,1", AP2_FOLLOW_NEVER},
+        {"model=AppleTV14,1 osvers=27.2", NULL, AP2_FOLLOW_NEVER},
+        {sonos, NULL, AP2_FOLLOW_NEVER},
+        {NULL, NULL, AP2_FOLLOW_NEVER},
+    };
+    const size_t count = sizeof(rules) / sizeof(rules[0]);
+    for (size_t i = 0; i < count; i++)
+        assert(ap2_follow_policy(rules[i].txt, rules[i].am) == rules[i].policy);
 
-    assert(ap2_follow_receiver_clock(standalone, NULL));
-    assert(ap2_follow_receiver_clock(NULL, "AudioAccessory1,1") == false); /* no igl */
-    assert(ap2_follow_receiver_clock("igl=1 osvers=27.0", "AudioAccessory1,1")); /* am= carries the model */
-    assert(!ap2_follow_receiver_clock(tv_member, NULL));
-    assert(!ap2_follow_receiver_clock(stereo_pair, NULL));
-    assert(!ap2_follow_receiver_clock(sonos, NULL));
-    /* "gid=" must not be mistaken for "pgid=". */
-    assert(ap2_follow_receiver_clock("igl=1 gid=X model=AudioAccessory5,1 osvers=27.0", NULL));
-    assert(!ap2_follow_receiver_clock("igl=1 pgid=X model=AudioAccessory5,1 osvers=27.0", NULL));
-
-    /* OS gate: only OS 27+ standalone HomePods are followed. Earlier firmware
-     * slaves to the sender and must keep our grandmaster; an unknown version
-     * is treated as pre-27. srcvers (980.x = OS 27) covers a receiver that
-     * omits osvers, and osvers wins when the two disagree. */
-    assert(!ap2_follow_receiver_clock(standalone_os26, NULL));
-    assert(!ap2_follow_receiver_clock("igl=1 model=AudioAccessory1,1", NULL));   /* no version */
-    assert(ap2_follow_receiver_clock("igl=1 model=AudioAccessory1,1 srcvers=980.77.2", NULL));
-    assert(!ap2_follow_receiver_clock("igl=1 model=AudioAccessory1,1 osvers=26.6 srcvers=980.0", NULL));
-
+    /* The override bypasses model and version, in both directions. */
     setenv("CLIAIRPLAY_PTP_FOLLOW", "0", 1);
-    assert(!ap2_follow_receiver_clock(standalone, NULL));
+    for (size_t i = 0; i < count; i++)
+        assert(ap2_follow_policy(rules[i].txt, rules[i].am) == AP2_FOLLOW_NEVER);
     setenv("CLIAIRPLAY_PTP_FOLLOW", "1", 1);
-    assert(ap2_follow_receiver_clock(sonos, NULL));           /* env override bypasses model + version */
-    assert(ap2_follow_receiver_clock(standalone_os26, NULL)); /* ... including the OS gate */
+    for (size_t i = 0; i < count; i++)
+        assert(ap2_follow_policy(rules[i].txt, rules[i].am) == AP2_FOLLOW_ALWAYS);
     unsetenv("CLIAIRPLAY_PTP_FOLLOW");
-    puts("ap2_client follow-receiver-clock resolution tests passed");
+    puts("ap2_client follow policy resolution tests passed");
 }
 
 static size_t count_bytes(const uint8_t *data, int len, const char *needle)
@@ -3395,6 +3412,212 @@ static void test_clock_unprobed_receiver(void)
     puts("ap2_client unprobed receiver clock tests passed");
 }
 
+typedef struct {
+    uint8_t header;      /* 0x90 announces a stream start, 0x80 a periodic sync */
+    uint32_t frame;
+    uint64_t wall_ns;
+    uint64_t clock_id;
+} sync_packet_t;
+
+/* Take the next PTP sync packet off the fake receiver's control port. */
+static sync_packet_t read_sync_packet(int fd)
+{
+    uint8_t pkt[64];
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    assert(poll(&pfd, 1, 2000) == 1);
+    assert(recv(fd, pkt, sizeof(pkt), 0) == 28);
+    assert(pkt[1] == 0xd7);
+    sync_packet_t sync = {.header = pkt[0]};
+    for (int i = 0; i < 4; i++) sync.frame = (sync.frame << 8) | pkt[4 + i];
+    for (int i = 0; i < 8; i++) sync.wall_ns = (sync.wall_ns << 8) | pkt[8 + i];
+    for (int i = 0; i < 8; i++) sync.clock_id = (sync.clock_id << 8) | pkt[20 + i];
+    return sync;
+}
+
+/* A connected PTP session to `txt`, with the follow policy a connect resolves. */
+static struct ap2cl_s *follow_test_client(const char *txt, struct ap2_ptp_ctx **ptp)
+{
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    ap2_device_info_t device = {
+        .name = "follow test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = (char *)txt,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, true);
+    ap2cl_test_set_use_ptp(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
+    struct ap2_ptp_ctx *ctx = ap2cl_test_attach_ptp(client);
+    assert(ctx);
+    if (ptp) *ptp = ctx;
+    return client;
+}
+
+/* A HomePod on OS 27 that leaves our clock unanswered is not reported stalled:
+ * the session follows the HomePod's own clock instead, freezes a fresh anchor
+ * once the timeline has moved onto it, and only reports the stall when that
+ * clock stays silent too. CLIAIRPLAY_PTP_FOLLOW=0 takes the fallback away. */
+static void test_follow_fallback(void)
+{
+    const char *homepod = "igl=1 model=AudioAccessory11,1 srcvers=1005.4 osvers=27.2";
+    const uint64_t our_clock = 0x0200000000000001ULL;
+    const uint64_t homepod_clock = 0x0A0B0C0D0E0F1011ULL;
+    unsetenv("CLIAIRPLAY_PTP_FOLLOW");
+
+    /* The fake receiver: it takes our sync packets and never probes our clock. */
+    int receiver = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t addr_len = sizeof(addr);
+    assert(receiver >= 0);
+    assert(bind(receiver, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    assert(getsockname(receiver, (struct sockaddr *)&addr, &addr_len) == 0);
+
+    struct ap2_ptp_ctx *ptp = NULL;
+    struct ap2cl_s *client = follow_test_client(homepod, &ptp);
+    ap2_ptp_set_clock_id(ptp, our_clock);
+    assert(ap2cl_test_set_ctrl_peer(client, ntohs(addr.sin_port)));
+    assert(!ap2cl_test_follow_clock(client));
+    ap2_clock_readiness_t r;
+
+    /* The start is announced on our clock, and periodic syncs stay on it. */
+    assert(ap2cl_start(client, test_now_unix_ms() + 2000, NULL) == AP2_COMMIT_OK);
+    sync_packet_t start = read_sync_packet(receiver);
+    assert(start.header == 0x90 && start.clock_id == our_clock);
+    ap2cl_test_set_first_packet(client, false);
+    assert(ap2cl_test_send_periodic_sync(client));
+    sync_packet_t sync = read_sync_packet(receiver);
+    assert(sync.header == 0x80 && sync.clock_id == our_clock);
+
+    /* Inside the stall window nothing changes. */
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 1000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    assert(!ap2cl_test_follow_clock(client));
+
+    /* Past it without a probe: the session follows the receiver's clock and
+     * reads cold, never stalled, and the log names the unit that needed it. */
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    fflush(stderr);
+    int saved_stderr = dup(2);
+    int capture[2];
+    assert(saved_stderr >= 0 && pipe(capture) == 0);
+    assert(dup2(capture[1], 2) == 2);
+    assert(close(capture[1]) == 0);
+    test_log_level = lWARN;
+    ap2cl_clock_readiness(client, &r);
+    test_log_level = lSILENCE;
+    fflush(stderr);
+    assert(dup2(saved_stderr, 2) == 2);
+    assert(close(saved_stderr) == 0);
+    assert(r.state == AP2_CLOCK_COLD);
+    assert(r.ready_at_unix_ms == 0);
+    assert(ap2cl_test_follow_clock(client));
+    char captured[512] = {0};
+    assert(read(capture[0], captured, sizeof(captured) - 1) > 0);
+    assert(close(capture[0]) == 0);
+    assert(strstr(captured, "model=AudioAccessory11,1 osvers=27.2 srcvers=1005.4"));
+
+    /* The followed clock gets a stall window of its own. */
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+
+    /* Until that clock locks the timeline is still ours and the line stands. */
+    assert(ap2cl_test_send_periodic_sync(client));
+    sync = read_sync_packet(receiver);
+    assert(sync.header == 0x80 && sync.clock_id == our_clock);
+    assert(!ap2cl_test_first_packet(client));
+
+    /* The receiver's clock locks and the timeline moves onto it: the next
+     * sync freezes a fresh anchor there and announces it as a stream start,
+     * on the schedule the start commanded. */
+    ap2_ptp_set_clock_id(ptp, homepod_clock);
+    assert(ap2cl_test_send_periodic_sync(client));
+    sync = read_sync_packet(receiver);
+    assert(sync.header == 0x90 && sync.clock_id == homepod_clock);
+    assert(ap2cl_test_first_packet(client));
+    int64_t frames = (int32_t)(sync.frame - start.frame);
+    int64_t expected =
+        (int64_t)(sync.wall_ns - start.wall_ns) * 44100 / 1000000000LL;
+    assert(frames >= expected - 2 && frames <= expected + 2);
+
+    /* That line stands from there on. */
+    ap2cl_test_set_first_packet(client, false);
+    assert(ap2cl_test_send_periodic_sync(client));
+    sync = read_sync_packet(receiver);
+    assert(sync.header == 0x80 && sync.clock_id == homepod_clock);
+
+    /* The followed clock's own Syncs are its probe streak. */
+    ap2cl_test_inject_clock_exchange(client, 24, 3000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+    ap2cl_destroy(client);
+
+    /* A followed clock that never locks is the stall, and it stays one. */
+    client = follow_test_client(homepod, NULL);
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    assert(ap2cl_test_follow_clock(client));
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 12000,
+                               test_now_unix_ms() - 6000);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+    ap2cl_destroy(client);
+
+    /* A buffered stream cannot take a fresh anchor, so it has no fallback. */
+    client = follow_test_client(homepod, NULL);
+    ap2cl_test_set_use_buffered(client, true);
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+    assert(!ap2cl_test_follow_clock(client));
+    ap2cl_destroy(client);
+
+    /* Neither has a HomePod whose OS version cannot be read. */
+    client = follow_test_client("igl=1 model=AudioAccessory5,1", NULL);
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+    assert(!ap2cl_test_follow_clock(client));
+    ap2cl_destroy(client);
+
+    /* CLIAIRPLAY_PTP_FOLLOW=0 never follows: the stall is reported as it is. */
+    setenv("CLIAIRPLAY_PTP_FOLLOW", "0", 1);
+    client = follow_test_client(homepod, NULL);
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+    assert(!ap2cl_test_follow_clock(client));
+    ap2cl_destroy(client);
+
+    /* CLIAIRPLAY_PTP_FOLLOW=1 follows from connect, so nothing is left to
+     * fall back to. */
+    setenv("CLIAIRPLAY_PTP_FOLLOW", "1", 1);
+    client = follow_test_client(homepod, NULL);
+    assert(ap2cl_test_follow_clock(client));
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+    ap2cl_destroy(client);
+    unsetenv("CLIAIRPLAY_PTP_FOLLOW");
+
+    assert(close(receiver) == 0);
+    puts("ap2_client follow fallback tests passed");
+}
+
 static int64_t realtime_ns(void)
 {
     struct timespec ts;
@@ -3443,7 +3666,7 @@ int main(int argc, char **argv)
     test_route_with_password();
     test_buffered_route_resolution();
     test_forced_timing_and_compat_route();
-    test_follow_receiver_clock_resolution();
+    test_follow_policy_resolution();
     test_setpeers_body();
     test_route_explicit_airplay2();
     test_auth_error_kind();
@@ -3482,6 +3705,7 @@ int main(int argc, char **argv)
     test_clock_readiness_report();
     test_clock_stall_detection();
     test_clock_unprobed_receiver();
+    test_follow_fallback();
 
     ap2_device_info_t device = {
         .name = "test",

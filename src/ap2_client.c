@@ -401,6 +401,7 @@ struct ap2cl_s {
      * and wobbles with pipe pacing), and each inconsistent re-anchor makes
      * the receiver re-seat its timeline and drop its buffer. */
     bool rt_anchor_valid;
+    uint64_t rt_anchor_clock_id;   /* the master clock the line is expressed in */
     uint64_t rt_anchor_wall0;      /* master-clock ns of the anchor point */
     uint32_t rt_anchor_pos0;       /* rtp timestamp at the anchor point */
     uint64_t start_ntp;            /* shared group start (NTP fixed-point), 0 = none */
@@ -438,7 +439,9 @@ struct ap2cl_s {
     bool ptp_forced;   /* ap2cl_set_ptp() was called (overrides auto-detect) */
     bool ptp_enabled;  /* value passed to ap2cl_set_ptp() */
     bool ptp_shared;   /* prefer a shared PTP daemon clock (multi-room) if present */
-    bool follow_clock; /* the engine follows this receiver's own clock (standalone HomePod) */
+    bool follow_clock; /* the engine follows this receiver's own clock */
+    bool follow_fallback; /* follow it once it leaves our clock unanswered (see
+                             ap2_follow_policy) */
     char timing_peer_id[37]; /* our timing-peer ID in the session SETUP and SETPEERSX */
     uint64_t timing_clock_id; /* the timeline clock ID advertised in that SETUP */
 };
@@ -1395,7 +1398,7 @@ static int ap2_txt_version_major(const char *txt, const char *key)
 /* True only for a receiver advertising HomePod OS 27 or newer. Trust osvers
  * (`ov` on _raop); fall back to the AirPlay firmware (srcvers/`vs`, 980.x ships
  * with OS 27) when the OS version is absent, and stay false when neither is
- * known — so a receiver whose version we cannot read is never followed. */
+ * known — so a receiver whose version we cannot read never gets the fallback. */
 static bool ap2_receiver_os_ge_27(const char *txt)
 {
     int osv = ap2_txt_version_major(txt, "osvers");
@@ -1406,26 +1409,29 @@ static bool ap2_receiver_os_ge_27(const char *txt)
     return src >= 980;
 }
 
-bool ap2_follow_receiver_clock(const char *txt, const char *am)
+ap2_follow_policy_t ap2_follow_policy(const char *txt, const char *am)
 {
     /* CLIAIRPLAY_PTP_FOLLOW outranks the auto rule (0 = never, else = every
      * receiver): the kill switch, and the lever for testing a receiver the
      * rule does not name yet. */
     if (getenv("CLIAIRPLAY_PTP_FOLLOW"))
-        return ap2_env_enabled("CLIAIRPLAY_PTP_FOLLOW", false);
-    /* A HomePod that leads its own group (igl=1) with no parent group (not
-     * an Apple TV's audio output) and no tight-sync partner (not a stereo
-     * pair): the standalone HomePod. On HomePod OS 27 it never slaves to the
-     * sender's grandmaster — it keeps announcing its own for the whole
-     * session and stays silent — whereas the same model as an Apple TV
-     * group member stops announcing within ~0.4 s and plays. Gate on the OS
-     * version: on OS 26 and earlier the same standalone HomePod slaves to the
-     * sender and plays, so following it there would break what works today. */
-    if (!ap2_model_prefix(txt, am, "AudioAccessory")) return false;
-    const char *igl = ap2_txt_field(txt, "igl");
-    if (!igl || igl[0] != '1') return false;
-    if (ap2_txt_field(txt, "pgid") || ap2_txt_field(txt, "tsid")) return false;
-    return ap2_receiver_os_ge_27(txt);
+        return ap2_env_enabled("CLIAIRPLAY_PTP_FOLLOW", false)
+                   ? AP2_FOLLOW_ALWAYS : AP2_FOLLOW_NEVER;
+    /* A followed receiver plays at its own crystal's rate and drifts out of
+     * its sync group, so following is only the way out for a HomePod that
+     * would otherwise stay silent. Gate on the OS version: following was
+     * only ever measured to work on HomePod OS 27. */
+    if (ap2_model_prefix(txt, am, "AudioAccessory") && ap2_receiver_os_ge_27(txt))
+        return AP2_FOLLOW_FALLBACK;
+    return AP2_FOLLOW_NEVER;
+}
+
+/* Set how this session treats the receiver's clock from its follow policy. */
+static void ap2_follow_resolve(struct ap2cl_s *p)
+{
+    ap2_follow_policy_t policy = ap2_follow_policy(p->device.txt_records, p->am);
+    p->follow_clock = policy == AP2_FOLLOW_ALWAYS;
+    p->follow_fallback = policy == AP2_FOLLOW_FALLBACK;
 }
 
 bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
@@ -2159,15 +2165,14 @@ static bool ap2_native_connect(struct ap2cl_s *p)
          * than running our own engine (only one process per host can bind
          * 319/320). Without --ptp-shared, or with no live daemon, fall through to
          * the in-process engine — the single-device path, byte-for-byte. */
-        /* A receiver that only renders against its OWN clock (standalone
-         * HomePod on OS 27, see ap2_follow_receiver_clock) is followed rather
-         * than served: the engine — in-process or the shared daemon — reads
-         * its Announce/Sync and expresses this session's timeline in it. */
-        bool follow = ap2_follow_receiver_clock(p->device.txt_records, p->am);
-        p->follow_clock = follow;
+        /* A followed receiver (see ap2_follow_policy) is not served our
+         * clock: the engine — in-process or the shared daemon — reads its
+         * Announce/Sync and expresses this session's timeline in it. */
+        ap2_follow_resolve(p);
+        bool follow = p->follow_clock;
         if (follow)
-            LOG_INFO("[AP2] Receiver keeps its own PTP clock (standalone HomePod); "
-                     "following it instead of serving ours");
+            LOG_INFO("[AP2] Following the receiver's own PTP clock instead of "
+                     "serving ours (CLIAIRPLAY_PTP_FOLLOW)");
         if (p->ptp_shared && ap2_ptp_attach_shared(p->ptp)) {
             p->use_ptp = true;
             ap2_ptp_shared_register(p->ptp, p->device.address, follow);
@@ -2671,6 +2676,26 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
         return AP2_SEND_FATAL;
     }
 
+    /* The timeline's clock and its time, read as one pair: a followed clock
+     * can lock, or be dropped, between the two reads. */
+    uint64_t cid, wall;
+    do {
+        cid = ap2_ptp_master_clock_id(p->ptp);
+        wall = ap2_ptp_master_now_ns(p->ptp);
+    } while (cid != ap2_ptp_master_clock_id(p->ptp));
+    /* A frozen line only holds in the clock it was frozen in. When the
+     * timeline moves to another clock mid-session (the receiver's own clock
+     * locking after a switch to follow mode, or being dropped again), the
+     * same schedule is frozen afresh in that clock and announced the way a
+     * stream start is. */
+    if (p->rt_anchor_valid && cid != p->rt_anchor_clock_id) {
+        LOG_INFO("[AP2] timeline clock changed %016" PRIx64 " -> %016" PRIx64
+                 "; freezing a fresh anchor", p->rt_anchor_clock_id, cid);
+        p->rt_anchor_valid = false;
+        p->first_packet = true;
+        first = true;
+    }
+
     uint8_t pkt[28];
     pkt[0] = first ? 0x90 : 0x80;
     pkt[1] = 0xd7;
@@ -2683,7 +2708,6 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
      * 77175). The mapping is FROZEN at stream start — playback of the first
      * frame begins lead_ms after the anchor point — and every periodic
      * packet extrapolates along that same line, so all time-announces agree. */
-    uint64_t wall = ap2_ptp_master_now_ns(p->ptp);
     if (!p->rt_anchor_valid) {
         if (p->start_ntp) {
             /* Group playback: derive the line from the SHARED start time so
@@ -2710,6 +2734,7 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
             p->rt_anchor_pos0 = p->rtp_timestamp;
         }
         p->rt_anchor_valid = true;
+        p->rt_anchor_clock_id = cid;
         /* The frozen schedule handed to the receiver. audible_in_ms is how long
          * the device still has between this announce and the instant its first
          * sample must be rendering — the budget a woken-from-standby amp has to
@@ -2743,7 +2768,6 @@ static ap2_send_result_t ap2_send_sync_packet_ptp(struct ap2cl_s *p, bool first)
     be = htonl(frame_2);
     memcpy(pkt + 16, &be, 4);
 
-    uint64_t cid = ap2_ptp_master_clock_id(p->ptp);
     uint32_t cid_hi = htonl((uint32_t)(cid >> 32));
     uint32_t cid_lo = htonl((uint32_t)(cid & 0xFFFFFFFF));
     memcpy(pkt + 20, &cid_hi, 4);
@@ -4689,6 +4713,45 @@ bool ap2cl_uses_ptp(struct ap2cl_s *p)
     return p && p->flow == FLOW_NATIVE_AP2 && p->use_ptp;
 }
 
+/* Length of a TXT field value, which runs to the next space. */
+static int ap2_txt_value_len(const char *value)
+{
+    return value ? (int)strcspn(value, " ") : 0;
+}
+
+/* Switch a session whose receiver left our clock unanswered to following the
+ * receiver's own clock (see ap2_follow_policy). The engine stops serving it
+ * ours; once its clock locks the timeline moves onto it, and the next sync
+ * packet freezes a fresh anchor there. The stall window restarts at now_ms,
+ * so the followed clock gets the same grace our own had. Never blocks.
+ * Returns false when the session has no fallback to take. */
+static bool ap2_follow_fallback(struct ap2cl_s *p, uint64_t now_ms)
+{
+    /* A buffered stream is anchored by SETRATEANCHORTIME, which cannot be
+     * frozen afresh under it when the timeline moves. */
+    if (!p->follow_fallback || p->use_buffered) return false;
+    p->follow_fallback = false;
+    if (!ap2_ptp_follow_receiver(p->ptp, p->device.address)) return false;
+    p->follow_clock = true;
+    pthread_mutex_lock(&p->clock_verify_lock);
+    p->clock_last_streak_unix_ms = now_ms;
+    pthread_mutex_unlock(&p->clock_verify_lock);
+    const char *txt = p->device.txt_records;
+    const char *model = ap2_txt_field(txt, "model");
+    if (!model) model = p->am;
+    const char *os = ap2_txt_field(txt, "osvers");
+    if (!os) os = ap2_txt_field(txt, "ov");
+    const char *fw = ap2_txt_field(txt, "srcvers");
+    if (!fw) fw = ap2_txt_field(txt, "vs");
+    LOG_WARN("[AP2] the receiver left our PTP clock unanswered for %d ms; "
+             "following its own clock instead, where it plays at its own rate "
+             "(model=%.*s osvers=%.*s srcvers=%.*s)", AP2_CLOCK_STALL_MS,
+             ap2_txt_value_len(model), model ? model : "",
+             ap2_txt_value_len(os), os ? os : "",
+             ap2_txt_value_len(fw), fw ? fw : "");
+    return true;
+}
+
 void ap2cl_clock_watch_restart(struct ap2cl_s *p)
 {
     if (!p) return;
@@ -4743,8 +4806,12 @@ void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
         /* Nothing to measure this long after the receiver was last heard from
          * means it is not slaved to our clock: it can seat no render position
          * and renders silence however cleanly the audio paces. Reported as its
-         * own state because a cold receiver looks the same on the way there. */
-        if (stall_from_ms && now_ms >= stall_from_ms + AP2_CLOCK_STALL_MS)
+         * own state because a cold receiver looks the same on the way there.
+         * A receiver with the follow fallback gets its own clock tried first
+         * and reads cold meanwhile: only that clock staying silent for a
+         * window of its own is the stall. */
+        if (stall_from_ms && now_ms >= stall_from_ms + AP2_CLOCK_STALL_MS &&
+            !ap2_follow_fallback(p, now_ms))
             out->state = AP2_CLOCK_STALLED;
         return;
     }
@@ -6067,6 +6134,38 @@ unsigned long long ap2cl_test_rtx_expired(struct ap2cl_s *p)
 void ap2cl_test_set_use_ptp(struct ap2cl_s *p, bool enable)
 {
     p->use_ptp = enable;
+}
+
+/* Give the client the PTP context and follow policy a connect would, and
+ * hand the context back so a test can move the timeline under the session. */
+struct ap2_ptp_ctx *ap2cl_test_attach_ptp(struct ap2cl_s *p)
+{
+    p->ptp = ap2_ptp_create();
+    ap2_follow_resolve(p);
+    return p->ptp;
+}
+
+bool ap2cl_test_follow_clock(struct ap2cl_s *p)
+{
+    return p->follow_clock;
+}
+
+/* Aim the control socket at a local UDP port, so a test can play the receiver
+ * end of the sync packets. */
+bool ap2cl_test_set_ctrl_peer(struct ap2cl_s *p, uint16_t port)
+{
+    p->ctrl_sock = socket(AF_INET, SOCK_DGRAM, 0);
+    memset(&p->ctrl_addr, 0, sizeof(p->ctrl_addr));
+    p->ctrl_addr.sin_family = AF_INET;
+    p->ctrl_addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    p->ctrl_addr.sin_port = htons(port);
+    return p->ctrl_sock >= 0;
+}
+
+/* The periodic sync packet the audio path sends every hundred chunks. */
+bool ap2cl_test_send_periodic_sync(struct ap2cl_s *p)
+{
+    return ap2_send_sync_packet_ptp(p, false) == AP2_SEND_SENT;
 }
 
 void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable)
