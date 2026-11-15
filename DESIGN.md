@@ -454,7 +454,12 @@ binary reports what it measures instead of leaving the caller to guess:
   because the reporting stops there: for most of a session nothing else is
   watching, and a mark left to age with the reporting would make the first
   reading after a re-arm read stale. Only a PTP session can stall; `mode=ntp`
-  stays cold.
+  stays cold. Shairport Sync (`model=`/`am=ShairportSync`) cannot stall either:
+  its nqptp follows Sync/Follow_Up but never sends a Delay_Req (it sends only
+  two Announce messages per new clock), so it has no streak to lose. Its streak
+  is counted from connect instead, when our clock reaches it, which projects
+  readiness 2.3 s after connect (Shairport Sync itself waits for 400 ms of
+  nqptp mastership) and keeps the commit floor and verification consistent.
   `ready_in_ms`/`ready_at_unix_ms` are 0 and mean nothing, as while cold.
 - `streak_ms`/`exchanges` are the streak's first-probe age and probe count,
   the same two numbers the commit-time floor logs, so field reports compare

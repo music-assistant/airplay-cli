@@ -3300,6 +3300,101 @@ static void test_clock_stall_detection(void)
     puts("ap2_client clock stall detection tests passed");
 }
 
+/* Shairport Sync never probes our clock, so its readiness is counted from
+ * connect and its silence never reads as a stall — while any other receiver
+ * that stays silent, a HomePod included, still does. */
+static void test_clock_unprobed_receiver(void)
+{
+    ap2_device_info_t device = {
+        .name = "unprobed test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=ShairportSync",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, true);
+    ap2cl_test_set_use_ptp(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
+    ap2_clock_readiness_t r;
+
+    /* Nothing to count from before connect. */
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+
+    /* A second after connect: one lock window from connect, with no probe
+     * claimed. The two clock reads inside the call can be a millisecond
+     * apart, so the projection is bracketed by the call's own span. */
+    uint64_t connected = test_now_unix_ms() - 1000;
+    ap2cl_test_set_clock_marks(client, connected, 0);
+    uint64_t before = test_now_unix_ms();
+    ap2cl_clock_readiness(client, &r);
+    uint64_t after = test_now_unix_ms();
+    assert(r.state == AP2_CLOCK_PROBING);
+    assert(r.exchanges == 0);
+    assert(r.ready_at_unix_ms >= connected + 2300);
+    assert(r.ready_at_unix_ms <= connected + 2300 + (after - before));
+    assert(r.ready_in_ms >= r.ready_at_unix_ms - after);
+    assert(r.ready_in_ms <= r.ready_at_unix_ms - before);
+
+    /* Well past the stall window with still no probe: ready, not stalled, and
+     * a watch restart at the re-arm leaves the projection where it was. */
+    connected = test_now_unix_ms() - 6000;
+    ap2cl_test_set_clock_marks(client, connected, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+    assert(r.ready_in_ms == 0);
+    ap2cl_clock_watch_restart(client);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+
+    /* A join committed inside the projection is moved onto it, with no
+     * verification armed and no ack withheld for a probe that never comes. */
+    connected = test_now_unix_ms();
+    ap2cl_test_set_clock_marks(client, connected, 0);
+    uint64_t at = 0;
+    ap2cl_set_start_join(client, true);
+    assert(ap2cl_start(client, connected + 500, &at) == AP2_COMMIT_OK);
+    assert(at >= connected + 2300);
+    assert(!ap2cl_clock_verify_armed(client));
+    assert(!ap2cl_start_ack_deferred(client));
+    ap2cl_destroy(client);
+
+    /* The RAOP model field identifies it just as well. */
+    device.txt_records = "features=0x1C340405D4A00";
+    client = ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_set_raop_props(client, NULL, NULL, NULL, NULL, "ShairportSync");
+    ap2cl_force_native(client);
+    ap2cl_test_set_use_ptp(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_READY);
+    ap2cl_destroy(client);
+
+    /* A HomePod that stays silent is a real fault and still stalls. */
+    device.txt_records = "model=AudioAccessory5,1";
+    client = ap2cl_create(&device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_use_ptp(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_STALLED);
+    ap2cl_destroy(client);
+
+    puts("ap2_client unprobed receiver clock tests passed");
+}
+
 static int64_t realtime_ns(void)
 {
     struct timespec ts;
@@ -3386,6 +3481,7 @@ int main(int argc, char **argv)
     test_buffered_resume_anchor_retry_keeps_held_frame();
     test_clock_readiness_report();
     test_clock_stall_detection();
+    test_clock_unprobed_receiver();
 
     ap2_device_info_t device = {
         .name = "test",
