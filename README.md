@@ -105,7 +105,8 @@ reaching this host from the speaker. It is not final, though: a receiver that
 starts probing late, or picks up again, reports `probing` and then `ready`.
 A HomePod on HomePod OS 27+ is first switched to its own clock at that point
 (see `CLIAIRPLAY_PTP_FOLLOW`) and keeps reading `cold`; it is reported
-`stalled` only when that clock stays silent for another 5 s.
+`stalled` only when that clock stays silent for another 15 s, the time it
+needs to give up ours and announce its own.
 Shairport Sync never probes our clock (its nqptp only listens), so it is never
 reported stalled: its readiness is projected one lock window from connect.
 

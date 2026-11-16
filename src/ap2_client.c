@@ -121,6 +121,10 @@ extern log_level *loglevel;
  * against, so it answers "is this receiver definitively not answering" and is
  * deliberately slower than any caller's own wait for a readiness projection. */
 #define AP2_CLOCK_STALL_MS           5000
+/* The stall window for a receiver's own, followed clock. A HomePod switched to
+ * it by the follow fallback first has to give up ours before it announces its
+ * own: 9.3-9.7 s after the switch on a HomePod mini (OS 27.2). */
+#define AP2_CLOCK_FOLLOW_STALL_MS    15000
 /* Verification needs room to act before the initial fill starts releasing
  * real frames at anchor - pacing depth: anchors closer than the depth plus
  * one poll round plus slack can never be corrected, so they are not armed. */
@@ -4723,7 +4727,7 @@ static int ap2_txt_value_len(const char *value)
  * receiver's own clock (see ap2_follow_policy). The engine stops serving it
  * ours; once its clock locks the timeline moves onto it, and the next sync
  * packet freezes a fresh anchor there. The stall window restarts at now_ms,
- * so the followed clock gets the same grace our own had. Never blocks.
+ * as AP2_CLOCK_FOLLOW_STALL_MS. Never blocks.
  * Returns false when the session has no fallback to take. */
 static bool ap2_follow_fallback(struct ap2cl_s *p, uint64_t now_ms)
 {
@@ -4810,7 +4814,9 @@ void ap2cl_clock_readiness(struct ap2cl_s *p, ap2_clock_readiness_t *out)
          * A receiver with the follow fallback gets its own clock tried first
          * and reads cold meanwhile: only that clock staying silent for a
          * window of its own is the stall. */
-        if (stall_from_ms && now_ms >= stall_from_ms + AP2_CLOCK_STALL_MS &&
+        uint64_t window_ms = p->follow_clock ? AP2_CLOCK_FOLLOW_STALL_MS
+                                             : AP2_CLOCK_STALL_MS;
+        if (stall_from_ms && now_ms >= stall_from_ms + window_ms &&
             !ap2_follow_fallback(p, now_ms))
             out->state = AP2_CLOCK_STALLED;
         return;

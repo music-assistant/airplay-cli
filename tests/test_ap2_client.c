@@ -3572,6 +3572,10 @@ static void test_follow_fallback(void)
     ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 12000,
                                test_now_unix_ms() - 6000);
     ap2cl_clock_readiness(client, &r);
+    assert(r.state == AP2_CLOCK_COLD);
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 22000,
+                               test_now_unix_ms() - 16000);
+    ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_STALLED);
     ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_STALLED);
@@ -3608,7 +3612,7 @@ static void test_follow_fallback(void)
     setenv("CLIAIRPLAY_PTP_FOLLOW", "1", 1);
     client = follow_test_client(homepod, NULL);
     assert(ap2cl_test_follow_clock(client));
-    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 6000, 0);
+    ap2cl_test_set_clock_marks(client, test_now_unix_ms() - 16000, 0);
     ap2cl_clock_readiness(client, &r);
     assert(r.state == AP2_CLOCK_STALLED);
     ap2cl_destroy(client);
