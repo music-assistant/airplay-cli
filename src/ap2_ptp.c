@@ -138,13 +138,12 @@ _Static_assert(PTP_MAX_FOLLOW == AP2_PTP_SHM_MAX_FOLLOW,
                "engine and shm follow tables must match; bump AP2_PTP_SHM_MAX_FOLLOW "
                "(and AP2_PTP_SHM_VERSION) when PTP_MAX_PEERS changes");
 
-/* A receiver whose own clock we follow instead of serving ours. Standalone
- * HomePods on OS 27 never render audio anchored to a sender's timeline: they
- * keep announcing their own grandmaster for the whole session and stay silent.
- * Slaving to their clock (unicast Sync/Follow_Up they send us after SETPEERS)
- * and expressing the session anchor in THEIR timeline makes them play. Kept
- * per receiver so the engine can still serve its own grandmaster to every
- * other peer at the same time (multi-room with mixed receivers). */
+/* A receiver whose own clock we follow instead of serving ours: a HomePod
+ * that never takes a sender's clock stays silent on a sender-anchored stream.
+ * Slaving to its clock (the unicast Sync/Follow_Up it sends us once we stop
+ * offering ours) and expressing the session anchor in ITS timeline makes it
+ * play. Kept per receiver so the engine can still serve its own grandmaster
+ * to every other peer at the same time (multi-room with mixed receivers). */
 struct ptp_follow {
     struct in_addr addr;            /* s_addr == 0: free slot */
     bool have_clock;                /* an Announce named its grandmaster */
@@ -162,6 +161,11 @@ struct ptp_follow {
  * PTP client stopped (session teardown); the next probe then starts a NEW
  * streak, which is what clock-readiness is measured from. */
 #define PTP_EXCHANGE_GAP_NS    3000000000ULL      /* silence that ends a probe streak */
+
+/* A receiver that takes our clock announces a grandmaster of its own only in
+ * the first moments of a session (three Announces within ~0.4 s). One that
+ * still does this much later within one probe streak has not taken it. */
+#define PTP_OWN_GM_SPAN_NS     5000000000ULL      /* 5 s */
 
 /* An IEEE-1588 best-master dataset: the grandmaster attributes carried in an
  * Announce (or synthesised for ourselves), enough to run the dataset
@@ -246,6 +250,8 @@ struct ap2_ptp_ctx {
         struct in_addr addr;
         uint64_t first_ns, third_ns, last_ns;
         uint32_t count;
+        uint64_t own_gm_ns;     /* first Announce of its own grandmaster this streak */
+        bool own_gm_noted;      /* ptp_note_own_grandmaster logged this streak */
     } exchange[PTP_EXCHANGE_SLOTS];
 
     /* ---- shared daemon clock (streaming side, --ptp-shared) ---- */
@@ -371,6 +377,8 @@ static void ptp_write_hdr(uint8_t *b, int msg_type, uint16_t msg_len, uint16_t f
 }
 
 static bool ptp_follow_is_configured(struct ap2_ptp_ctx *ctx, struct in_addr addr);
+static bool ptp_shared_send_register(const char *ip, bool follow, int timeout_ms,
+                                     char *ack, int ack_len);
 
 /* Send a PTP message unicast to every timing peer, as iOS senders do (never an
  * open multicast election). Without timing peers nothing is sent. */
@@ -907,6 +915,9 @@ bool ap2_ptp_follow_receiver(struct ap2_ptp_ctx *ctx, const char *ip)
 {
     struct in_addr addr;
     if (!ctx || !ip || inet_pton(AF_INET, ip, &addr) != 1) return false;
+    /* The daemon owns the engine: update our registration there, without
+     * waiting for the ack so a caller on the audio path never blocks. */
+    if (ctx->shm_active) return ptp_shared_send_register(ip, true, 0, NULL, 0);
     pthread_mutex_lock(&ctx->lock);
     bool ok = ptp_follow_is_configured(ctx, addr);
     if (!ok && ctx->nfollow_cfg < PTP_MAX_FOLLOW) {
@@ -1080,6 +1091,8 @@ static void ptp_track_exchange(struct ap2_ptp_ctx *ctx, struct in_addr addr, uin
         ctx->exchange[slot].first_ns = rx;
         ctx->exchange[slot].third_ns = 0;
         ctx->exchange[slot].count = 1;
+        ctx->exchange[slot].own_gm_ns = 0;
+        ctx->exchange[slot].own_gm_noted = false;
     } else if (ctx->exchange[slot].count < UINT32_MAX) {
         ctx->exchange[slot].count++;
         if (ctx->exchange[slot].count == 3) ctx->exchange[slot].third_ns = rx;
@@ -1087,6 +1100,39 @@ static void ptp_track_exchange(struct ap2_ptp_ctx *ctx, struct in_addr addr, uin
     ctx->exchange[slot].last_ns = rx;
 
     pthread_mutex_unlock(&ctx->lock);
+}
+
+/* Note a served receiver that probes our clock but keeps announcing a
+ * grandmaster of its own (see PTP_OWN_GM_SPAN_NS): it plays on its own clock
+ * or stays silent. Logged once per probe streak; nothing acts on it. */
+static void ptp_note_own_grandmaster(struct ap2_ptp_ctx *ctx, const uint8_t *buf, int n,
+                                     uint64_t rx_ns, struct in_addr src, const char *srcip)
+{
+    struct ptp_dataset peer;
+    if (!ptp_parse_announce(buf, n, &peer)) return;
+    uint64_t streak_ns = 0;
+    pthread_mutex_lock(&ctx->lock);
+    bool own = peer.grandmaster_identity != ctx->clock_id;
+    for (int i = 0; own && i < PTP_EXCHANGE_SLOTS; i++) {
+        if (ctx->exchange[i].addr.s_addr != src.s_addr) continue;
+        /* Only within a live streak: an Announce outside one says nothing
+         * about a receiver that is measuring our clock. */
+        if (!ctx->exchange[i].count || ctx->exchange[i].own_gm_noted ||
+            rx_ns - ctx->exchange[i].last_ns > PTP_EXCHANGE_GAP_NS)
+            break;
+        if (!ctx->exchange[i].own_gm_ns) {
+            ctx->exchange[i].own_gm_ns = rx_ns;
+        } else if (rx_ns - ctx->exchange[i].own_gm_ns >= PTP_OWN_GM_SPAN_NS) {
+            ctx->exchange[i].own_gm_noted = true;
+            streak_ns = rx_ns - ctx->exchange[i].first_ns;
+        }
+        break;
+    }
+    pthread_mutex_unlock(&ctx->lock);
+    if (streak_ns)
+        LOG_INFO("[PTP] Receiver %s probes our clock (streak %" PRIu64 " ms) but keeps "
+                 "announcing its own grandmaster gm=%016" PRIx64 ": it has not taken "
+                 "our clock", srcip, streak_ns / 1000000ULL, peer.grandmaster_identity);
 }
 
 static void *ptp_thread_func(void *arg)
@@ -1189,8 +1235,10 @@ static void *ptp_thread_func(void *arg)
                 ptp_send_pdelay_resp(ctx, buf, rx, &src);
                 break;
             case PTP_MSG_ANNOUNCE:
-                if (!ptp_follow_announce(ctx, buf, n, rx, src.sin_addr, srcip))
+                if (!ptp_follow_announce(ctx, buf, n, rx, src.sin_addr, srcip)) {
                     ptp_handle_announce(ctx, buf, n, rx, srcip);
+                    ptp_note_own_grandmaster(ctx, buf, n, rx, src.sin_addr, srcip);
+                }
                 break;
             case PTP_MSG_SYNC:
                 /* A followed receiver's Sync is its clock probe (counts toward
@@ -1656,13 +1704,20 @@ bool ap2_ptp_attach_shared(struct ap2_ptp_ctx *ctx)
     return true;
 }
 
+/* Register (or re-register) `ip` with the daemon for this process. */
+static bool ptp_shared_send_register(const char *ip, bool follow, int timeout_ms,
+                                     char *ack, int ack_len)
+{
+    char cmd[64];
+    snprintf(cmd, sizeof(cmd), follow ? "R %s F pid=%d" : "R %s pid=%d", ip, (int)getpid());
+    return ap2_ptp_ctrl_send(cmd, timeout_ms, ack, ack_len);
+}
+
 void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip, bool follow)
 {
     if (!ctx || !ctx->shm_active || !ip || !*ip) return;
-    char cmd[64];
-    snprintf(cmd, sizeof(cmd), follow ? "R %s F pid=%d" : "R %s pid=%d", ip, (int)getpid());
     char ack[128] = {0};
-    bool ok = ap2_ptp_ctrl_send(cmd, 250, ack, sizeof(ack));
+    bool ok = ptp_shared_send_register(ip, follow, 250, ack, sizeof(ack));
     if (!ctx->shared_ip) {
         ctx->shared_ip = strdup(ip);
         inet_pton(AF_INET, ip, &ctx->own_receiver);

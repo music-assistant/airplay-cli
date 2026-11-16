@@ -279,29 +279,43 @@ grandmaster — but MA spawns one cliairplay per device. The split
   binding 319/320 or running an engine. With no live daemon the stream runs
   the in-process engine, byte-for-byte the single-device path.
 - **Followed receivers** — the exception to "the sender owns the timeline".
-  A standalone HomePod on HomePod OS 27 never slaves to the sender: it
-  announces its own grandmaster (prio1 248) every ~20 s for the whole
-  session and stays silent, whereas the same model as an Apple TV audio
-  output (`igl=0`, `pgid` set) or in a stereo pair (`tsid`) stops announcing
-  within ~0.4 s and plays. `ap2_follow_receiver_clock()` recognises the
-  standalone shape from the TXT (`model=AudioAccessory*`, `igl=1`, no
-  `pgid`, no `tsid`, and `osvers`>=27 — earlier firmware slaves to the sender
-  and plays, so it keeps our grandmaster; `CLIAIRPLAY_PTP_FOLLOW=0|1`
-  overrides) and the stream
-  registers the receiver as followed (`ap2_ptp_follow_receiver()` in-process,
-  `R <ip> F` on the daemon). For a followed receiver the engine records the
+  Every receiver is served our clock, so a sync group plays on one timeline.
+  A followed receiver plays at the rate of its own clock instead (a HomePod
+  measured 3–7 ppm slow, wandering) and drifts out of its group, so following
+  is only the way out for a HomePod that would otherwise stay silent.
+  `ap2_follow_policy()` gives a HomePod on HomePod OS 27 or newer
+  (`model=`/`am=AudioAccessory*`, `osvers`>=27, the only firmware following
+  was measured on) the **fallback**: when it leaves our clock unanswered for
+  the stall window (§6), the session switches to following it and logs its
+  model and OS version. `CLIAIRPLAY_PTP_FOLLOW=0|1` overrides for every
+  receiver: `0` never follows, the fallback included, and `1` follows from
+  connect. The stream registers the receiver as followed with
+  `ap2_ptp_follow_receiver()`: directly on the in-process engine, and on the
+  daemon by registering again as `R <ip> F`, without waiting for the ack so
+  the audio loop never blocks. For a followed receiver the engine records the
   grandmasterIdentity from its Announce, folds the local->peer offset from
-  the unicast two-step Sync/Follow_Up it then sends (~8 Hz), counts those
-  Syncs toward its exchange streak (clock readiness), and never sends it our
-  Announce/Sync; it stays grandmaster for every other peer. The daemon
-  publishes up to sixty-four followed clocks in the shm sample (layout v4, one per
-  timing peer); a
-  stream picks the entry for its own registered receiver, so
+  the unicast two-step Sync/Follow_Up it sends once we stop offering our
+  clock (~8 Hz), counts those Syncs toward its exchange streak (clock
+  readiness), and never sends it our Announce/Sync; it stays grandmaster for
+  every other peer. The daemon publishes up to sixty-four followed clocks in
+  the shm sample (layout v4, one per timing peer); a stream picks the entry
+  for its own registered receiver, so
   `ap2_ptp_master_clock_id()`/`ap2_ptp_master_now_ns()` and with them the
   realtime sync packets and the START anchor (shifted from host
-  CLOCK_REALTIME into the followed timeline) are per receiver. The session
-  SETUP still names our clock (the receiver has not announced yet); measured
-  not to matter. A followed clock silent for 60 s is dropped.
+  CLOCK_REALTIME into the followed timeline) are per receiver. They answer
+  in our clock until the followed clock has locked, so on a switch
+  mid-session the timeline's clock changes under a running stream: the next
+  sync packet freezes the anchor line (§6) afresh in the new clock. The
+  session SETUP and SETPEERSX still name our clock (the receiver has not
+  announced yet); measured not to matter. A followed clock silent for 60 s is
+  dropped.
+- **Receivers that keep their own grandmaster** — a receiver that takes our
+  clock announces a grandmaster of its own only in the first moments of a
+  session (three Announces within ~0.4 s). One that still does 5 s later
+  within one probe streak measures our clock without taking it, and plays on
+  its own clock or stays silent. The engine logs that once per streak
+  (`Receiver <ip> probes our clock ... but keeps announcing its own
+  grandmaster`); nothing acts on it.
 
 ## 6. Timing and the start contract
 
@@ -454,7 +468,11 @@ binary reports what it measures instead of leaving the caller to guess:
   because the reporting stops there: for most of a session nothing else is
   watching, and a mark left to age with the reporting would make the first
   reading after a re-arm read stale. Only a PTP session can stall; `mode=ntp`
-  stays cold. Shairport Sync (`model=`/`am=ShairportSync`) cannot stall either:
+  stays cold. A HomePod with the follow fallback (§5) is not reported stalled
+  at that point: the session switches to the HomePod's own clock and reads
+  `cold` while that clock gets a window of its own, so `stalled` there means
+  the HomePod answered neither clock for two windows. Shairport Sync
+  (`model=`/`am=ShairportSync`) cannot stall either:
   its nqptp follows Sync/Follow_Up but never sends a Delay_Req (it sends only
   two Announce messages per new clock), so it has no streak to lose. Its streak
   is counted from connect instead, when our clock reaches it. Its stream SETUP
@@ -516,7 +534,11 @@ Per path:
   extrapolates along that line. Re-deriving the anchor from the send head
   per packet makes consecutive anchors disagree (the head races ahead during
   buffer fill), and each inconsistent re-anchor makes the receiver re-seat
-  its timeline and drop its buffer. A time announce is sent **immediately**
+  its timeline and drop its buffer. The line holds in the clock it was frozen
+  in: when the timeline moves to another clock (a followed receiver's clock
+  locking mid-session, §5), the same schedule is frozen afresh in that clock
+  and announced the way a stream start is (first-sync header, RTP marker). A
+  time announce is sent **immediately**
   at `start_at` (a receiver that sees no announce shortly after RECORD can
   abandon the stream), then coupled to the audio send.
 - **Native AP2, NTP realtime** — owntone-style 20-byte sync packets

@@ -172,15 +172,17 @@ bool ap2_ptp_shared_active(struct ap2_ptp_ctx *ctx);
 void ap2_ptp_shared_register(struct ap2_ptp_ctx *ctx, const char *ip, bool follow);
 
 /*
- * Follow a receiver's OWN clock instead of serving it ours (in-process engine;
- * call before ap2_ptp_engine_start()). Its Announce names the timeline and its
- * unicast Sync/Follow_Up give the local->receiver offset; it is excluded from
- * our Announce/Sync while the engine stays grandmaster for every other peer.
- * ap2_ptp_master_clock_id()/ap2_ptp_master_now_ns() then answer in that
- * receiver's timeline for the context serving it. Standalone HomePods on
- * HomePod OS 27 need this (see ap2_follow_receiver_clock in ap2_client.h).
- * Returns false when the follow table is full. In shared mode pass
- * follow=true to ap2_ptp_shared_register() instead (daemon command "R <ip> F").
+ * Follow a receiver's OWN clock instead of serving it ours, from connect or on
+ * a session that is already up (see ap2_follow_policy in ap2_client.h). Its
+ * Announce names the timeline and its unicast Sync/Follow_Up give the
+ * local->receiver offset; it is excluded from our Announce/Sync while the
+ * engine stays grandmaster for every other peer. Once its clock has locked,
+ * ap2_ptp_master_clock_id()/ap2_ptp_master_now_ns() answer in that receiver's
+ * timeline for the context serving it; until then they keep answering in ours.
+ * On a context attached to the shared daemon this re-registers the receiver
+ * as followed (daemon command "R <ip> F") without waiting for the ack, so it
+ * never blocks. Returns false when the follow table is full or the daemon
+ * could not be told.
  */
 bool ap2_ptp_follow_receiver(struct ap2_ptp_ctx *ctx, const char *ip);
 void ap2_ptp_unfollow_receiver(struct ap2_ptp_ctx *ctx, const char *ip);
