@@ -772,7 +772,7 @@ explicitly not a receiver limit. Rejection clears previous MRP artwork,
 preventing stale cover art. No image codec is embedded in production code.
 
 Staged JPEG bytes ride **every** `replace` now-playing push while artwork is
-retained. The `npi-text` / `mergePolicy: "replace"` bridge replaces the
+retained, except the item push at a track change (below). The `npi-text` / `mergePolicy: "replace"` bridge replaces the
 receiver's whole now-playing info per push: hardware measurement (Apple TV 4K,
 tvOS 26/27, via the receiver's own MRP `SET_STATE` re-broadcasts) shows that a
 replace push without `ArtworkData` flips `artworkAvailable` to false — with
