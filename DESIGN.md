@@ -772,7 +772,7 @@ explicitly not a receiver limit. Rejection clears previous MRP artwork,
 preventing stale cover art. No image codec is embedded in production code.
 
 Staged JPEG bytes ride **every** `replace` now-playing push while artwork is
-retained. The `npi-text` / `mergePolicy: "replace"` bridge replaces the
+retained, except the item push at a track change (below). The `npi-text` / `mergePolicy: "replace"` bridge replaces the
 receiver's whole now-playing info per push: hardware measurement (Apple TV 4K,
 tvOS 26/27, via the receiver's own MRP `SET_STATE` re-broadcasts) shows that a
 replace push without `ArtworkData` flips `artworkAvailable` to false — with
@@ -803,31 +803,38 @@ no-op (`unchanged`) that keeps the current `ArtworkIdentifier`: an identifier
 flip alone makes the receiver invalidate and re-resolve what it is already
 showing, which re-renders its Now Playing UI. A track change stages its
 artwork afresh under a new identifier, also when the bytes are identical (one
-album's cover): with one identifier shared across consecutive items, an Apple
-TV 4K showed the cover on the second track and the generic placeholder from
-the third track on (field report, support#6709), and the new
-`UniqueIdentifier` re-renders the view at a track change anyway.
+album's cover); the new `UniqueIdentifier` re-renders the view at a track
+change anyway.
 
-A track change is therefore pushed as one transaction. The `ARTWORKFILE`
-pipe key stages an artwork path and `ACTION=SENDMETA` consumes it one-shot,
-applying metadata and artwork to MRP state in a single change
-(`ap2_mrp_set_track`) and emitting a single replace push that carries item,
-duration, elapsed, rate and artwork together — the shape a real Apple sender
-emits at a track change. The earlier split sequence (a replace without art,
-a timeline correction, then a second replace re-minting the artwork
-identifier for byte-identical art) rewrote the receiver's now-playing state
-three times within ~100 ms of every track change; observed on tvOS, that
-burst left the Now Playing view degraded (progress bar gone, artwork not
-re-rendered) until the app was re-entered. The DMAP `SET_PARAMETER` copy is
-still re-sent on every identity change, byte-identical or not, since
-Sonos-class receivers consume only that path. A fully byte-identical bundle —
-every metadata field and the artwork bytes unchanged since a delivered push —
-is skipped end to end on both paths: the receiver already holds exactly that
-state, and each redundant replace push re-renders its Now Playing view.
+The `ARTWORKFILE` pipe key stages an artwork path and `ACTION=SENDMETA`
+consumes it one-shot, applying metadata and artwork to MRP state in a single
+change (`ap2_mrp_set_track`). At a track change the item and its artwork then
+go out as two replace pushes, directly after each other: first the item
+(title, duration, elapsed, rate) without any artwork key, then the artwork
+for that same item. The Apple TV's own screen ignores artwork that arrives in
+the same push as a new item and shows artwork pushed for the item it already
+holds. Measured on an Apple TV 4K (tvOS 27.2): with item and artwork in one
+push the TV showed the cover for the first track (sometimes the second) and
+not after, also when the bytes differed but the picture looked the same,
+while the receiver's now-playing state (an iPhone viewing the Apple TV)
+held the cover throughout; with the artwork in its own push the TV showed it
+on every track, with or without a delay after the item push, at the cost of a
+short flicker on some track changes. The order applies to every receiver that
+gets MediaRemote now-playing pushes. Without a track change (refined tags, a
+new image for the current item) one replace push carries item and artwork
+together, as on the `ARTWORK` key. The DMAP `SET_PARAMETER` copy of the
+artwork is still re-sent on every identity change, byte-identical or not,
+since Sonos-class receivers consume only that path; at a track change it goes
+out between the two pushes. A fully byte-identical bundle — every metadata
+field and the artwork bytes unchanged since a delivered bundle, its artwork
+push included — is skipped end to end on both paths: the receiver already
+holds exactly that state, and each redundant replace push re-renders its Now
+Playing view.
 
 The complete registration/now-playing/extended-state sequence is serialized;
 its return value carries request-scoped overall and `updateMRNowPlayingInfo`
-statuses, so concurrent pushes cannot overwrite the artwork response.
+statuses, so concurrent pushes cannot overwrite the artwork response. The
+artwork result reports the status of the push that carried the artwork.
 Every artwork attempt emits a non-deduplicated result with the exact source
 properties and command response:
 

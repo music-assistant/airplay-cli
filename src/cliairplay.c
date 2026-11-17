@@ -658,11 +658,9 @@ static char *metadata_take_artwork_file(void)
 }
 
 /* Push the current metadata — and any staged artwork file — as one track
- * bundle. On AP2 this reaches the receiver as a single now-playing replace
- * push carrying item + timeline + artwork (the real Apple sender shape);
- * split pushes make tvOS re-render its Now Playing UI on every track change.
- * Returns whether the metadata text bundle reached the receiver (artwork
- * delivery does not gate it). */
+ * bundle (on AP2 a track change pushes the item first and its artwork right
+ * after it, see ap2cl_set_metadata_ex). Returns whether the metadata text
+ * bundle reached the receiver (artwork delivery does not gate it). */
 static bool send_track_metadata(const cli_config_t *cfg, const char *title)
 {
     bool delivered = false;
@@ -695,12 +693,14 @@ static bool send_track_metadata(const cli_config_t *cfg, const char *title)
     } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
         ap2_mrp_artwork_info_t mrp_info;
         ap2_mrp_push_result_t push;
+        ap2_mrp_push_result_t art_push;
         bool track_changed = false;
         delivered = ap2cl_set_metadata_ex(
             g_ap2cl, title, metadata_str(g_metadata.artist),
             metadata_str(g_metadata.album), g_metadata.duration,
             metadata_str(g_metadata.item_id), image ? content_type : NULL,
-            image, (int)image_size, &track_changed, &mrp_info, &push);
+            image, (int)image_size, &track_changed, &mrp_info, &push,
+            &art_push);
         if (artwork_failed && track_changed && push.overall_status >= 0) {
             /* The track changed, so the retained art was dropped and the
              * bundle push above already went out without artwork: no
@@ -711,9 +711,10 @@ static bool send_track_metadata(const cli_config_t *cfg, const char *title)
             status_print("[STATUS] mrp artwork=rejected reason=invalid_artwork "
                          "clear_status=%d", push.nowplaying_status);
         } else if (!artwork_failed) {
-            mrp_artwork_status_report(&mrp_info, push.nowplaying_status);
+            mrp_artwork_status_report(&mrp_info, art_push.nowplaying_status);
         }
         mrp_status_report(push.overall_status);
+        mrp_status_report(art_push.overall_status);
     }
     free(image);
     free(artwork_file);
