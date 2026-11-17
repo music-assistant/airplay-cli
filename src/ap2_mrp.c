@@ -1650,11 +1650,9 @@ bool ap2_mrp_set_track(struct ap2_mrp_ctx *m, const char *title,
     }
     /* Artwork belongs to its item: the old track's image must not ride the
      * new item, and the same cover on a new track (one album) is staged
-     * under a fresh ArtworkIdentifier. When consecutive items share one
-     * identifier, tvOS shows the cover on the second item and drops it from
-     * the third on; the new UniqueIdentifier re-renders the receiver's Now
-     * Playing view at a track change anyway. The same item without a new
-     * image keeps what it has (tag refinement). */
+     * under a fresh ArtworkIdentifier; the new UniqueIdentifier re-renders
+     * the receiver's Now Playing view at a track change anyway. The same
+     * item without a new image keeps what it has (tag refinement). */
     if (track_changed) mrp_reset_artwork(m);
     if (art && art_len > 0) {
         ap2_mrp_set_artwork(m, mime, art, art_len, info);
@@ -1868,8 +1866,8 @@ int ap2_mrp_event_status(struct ap2_mrp_ctx *m)
     return atomic_load(&m->event_connected) ? 1 : 0;
 }
 
-bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
-                                      uint8_t **out, int *out_len)
+static bool mrp_build_nowplaying(struct ap2_mrp_ctx *m, bool include_artwork,
+                                 uint8_t **out, int *out_len)
 {
     if (!m || !out || !out_len) return false;
 
@@ -1907,7 +1905,7 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                     ap2_pl_string("MRMediaRemoteMediaTypeMusic"));
     ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoUniqueIdentifier",
                     ap2_pl_int((int64_t)m->np_uid));
-    if (m->artwork && m->artwork_len > 0) {
+    if (include_artwork && m->artwork && m->artwork_len > 0) {
         ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkIdentifier",
                         ap2_pl_string(m->artwork_id));
         ap2_pl_dict_set(info, "kMRMediaRemoteNowPlayingInfoArtworkMIMEType",
@@ -1917,7 +1915,8 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
          * on every push: a push carrying only the ArtworkIdentifier drops the
          * artwork on tvOS (hardware-verified on tvOS 26/27 — artworkAvailable
          * flips false on an elapsed-only push with stable identifiers). The
-         * bytes therefore ride EVERY push while artwork is retained. Pushes
+         * bytes therefore ride EVERY push while artwork is retained, except
+         * the item push at a track change, which carries no artwork key. Pushes
          * are rare by design (seek, track change, play/pause; the receiver
          * extrapolates steady-state progress), so the cost stays a few tens
          * of KB on the control channel, and a receiver that dropped its art
@@ -1939,6 +1938,18 @@ bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
     if (len <= 0) return false;
     *out_len = len;
     return true;
+}
+
+bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
+                                      uint8_t **out, int *out_len)
+{
+    return mrp_build_nowplaying(m, true, out, out_len);
+}
+
+bool ap2_mrp_build_nowplaying_item_command(struct ap2_mrp_ctx *m,
+                                           uint8_t **out, int *out_len)
+{
+    return mrp_build_nowplaying(m, false, out, out_len);
 }
 
 bool ap2_mrp_build_nowplaying_progress_command(struct ap2_mrp_ctx *m,

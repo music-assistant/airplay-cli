@@ -5694,12 +5694,14 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                            const char *content_type, const uint8_t *art_data,
                            int art_len, bool *track_changed_out,
                            ap2_mrp_artwork_info_t *mrp_info,
-                           ap2_mrp_push_result_t *mrp_push)
+                           ap2_mrp_push_result_t *mrp_push,
+                           ap2_mrp_push_result_t *art_push)
 {
     ap2_mrp_artwork_info_t local_info;
     if (!mrp_info) mrp_info = &local_info;
     if (track_changed_out) *track_changed_out = false;
     if (mrp_push) *mrp_push = ap2_mrp_push_result_empty();
+    if (art_push) *art_push = ap2_mrp_push_result_empty();
     memset(mrp_info, 0, sizeof(*mrp_info));
     mrp_info->result = AP2_MRP_ARTWORK_NOT_APPLICABLE;
     mrp_info->bytes = art_len > 0 ? (size_t)art_len : 0;
@@ -5745,32 +5747,47 @@ bool ap2cl_set_metadata_ex(struct ap2cl_s *p, const char *title,
                                   "astn", 'i', 1);
     else
         dmap_ok = false;
+    /* The Apple TV's own screen ignores artwork that arrives in the same push
+     * as a new item (the now-playing state takes it, the screen does not),
+     * but shows artwork pushed for the item it already has. So at a track
+     * change the item goes out without its artwork, and the artwork follows
+     * directly in its own push. */
+    bool art_after_item = have_mrp && track_changed &&
+                          mrp_info->result == AP2_MRP_ARTWORK_ACCEPTED;
     /* DMAP re-sends the art on any identity change, byte-identical or not:
      * Sonos-class receivers key it to the track they were just told about.
      * Only a same-item redundant image (MRP verdict "unchanged") is skipped,
      * matching ap2cl_set_artwork; MRP-rejected bytes still go out on DMAP. */
-    if (have_art && (!have_mrp || track_changed ||
-                     mrp_info->result != AP2_MRP_ARTWORK_UNCHANGED))
+    if (have_art && !art_after_item &&
+        (!have_mrp || track_changed ||
+         mrp_info->result != AP2_MRP_ARTWORK_UNCHANGED))
         ap2_send_dmap_artwork(p, content_type, art_len,
                               (const char *)art_data);
     bool delivered = dmap_ok;
+    bool art_delivered = true;
     if (have_mrp) {
-        /* One full replace push carries item + timeline + artwork together —
-         * the real Apple sender shape. Splitting it (a replace without art,
-         * then a second replace with it) makes tvOS tear down and rebuild
-         * its Now Playing view on every track change. */
-        ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
+        ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized_with(
+            p, art_after_item ? ap2_mrp_build_nowplaying_item_command
+                              : ap2_mrp_build_nowplaying_command);
         if (mrp_push) *mrp_push = result;
+        if (art_push) *art_push = result;
         delivered = delivered && ap2_mrp_status_ok(result.overall_status);
     }
-    if (delivered)
+    if (art_after_item) {
+        ap2_send_dmap_artwork(p, content_type, art_len,
+                              (const char *)art_data);
+        ap2_mrp_push_result_t result = ap2cl_mrp_push_serialized(p);
+        if (art_push) *art_push = result;
+        art_delivered = ap2_mrp_status_ok(result.overall_status);
+    }
+    if (delivered && art_delivered)
         ap2_meta_delivered_store(p, title, artist, album, duration, item_id);
     else
         p->meta_delivered = false;
     pthread_mutex_unlock(&p->mrp_publish_lock);
-    /* Full-bundle delivery, matching the stored identity above: a caller
-     * gating a retry on this (the first-START placeholder skip) must not
-     * read a DMAP-only success with a failed MRP push as delivered. */
+    /* A caller gating a retry on this (the first-START placeholder skip)
+     * must not read a DMAP-only success with a failed MRP item push as
+     * delivered. */
     return delivered;
 }
 
@@ -5778,7 +5795,7 @@ bool ap2cl_set_metadata(struct ap2cl_s *p, const char *title, const char *artist
                         const char *album, int duration, const char *item_id)
 {
     return ap2cl_set_metadata_ex(p, title, artist, album, duration, item_id,
-                                 NULL, NULL, 0, NULL, NULL, NULL);
+                                 NULL, NULL, 0, NULL, NULL, NULL, NULL);
 }
 
 bool ap2cl_set_artwork(struct ap2cl_s *p, const char *content_type, int size,

@@ -292,6 +292,11 @@ int ap2_mrp_event_status(struct ap2_mrp_ctx *m);
 bool ap2_mrp_build_nowplaying_command(struct ap2_mrp_ctx *m,
                                       uint8_t **out, int *out_len);
 
+/* Build the same replace body without the artwork keys: the item push at a
+ * track change, which the artwork follows in its own push. */
+bool ap2_mrp_build_nowplaying_item_command(struct ap2_mrp_ctx *m,
+                                           uint8_t **out, int *out_len);
+
 /* Build the now-playing body for a pure timeline correction (seek): a
  * mergePolicy "update" push carrying only the timeline fields, so the
  * receiver keeps its artwork untouched (a replace push without the bytes
