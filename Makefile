@@ -52,6 +52,7 @@ CLIENT_TEST   = build/tests/test_ap2_client
 SESSION_TEST  = build/tests/test_ap2_session
 PTP_TEST      = build/tests/test_ap2_ptp
 PEERS_TEST    = build/tests/test_ap2_ptp_peers
+HOST_CLOCK_TEST = build/tests/test_host_clock
 TEST_CFLAGS   = -Wall -Wextra -Werror -O2 $(CPPFLAGS) $(EXTRA_CFLAGS)
 
 # Compiler flags
@@ -247,7 +248,7 @@ no_sanitizer_report = case "$(1)" in *Sanitizer*|*"runtime error:"*) \
 	printf '%s\n' "$(1)" >&2; false;; esac
 
 test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT_TEST) \
-		$(SESSION_TEST) $(PTP_TEST) $(PEERS_TEST) $(TEST_EXECUTABLE) \
+		$(SESSION_TEST) $(PTP_TEST) $(PEERS_TEST) $(HOST_CLOCK_TEST) $(TEST_EXECUTABLE) \
 		$(RAOP_LIFECYCLE_TEST_EXECUTABLE) $(RAOP_SESSION_TEST) $(ANNOUNCE_TEST)
 	$(TIMELINE_TEST)
 	$(EVENT_TEST)
@@ -257,6 +258,7 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 	$(SESSION_TEST)
 	$(PTP_TEST)
 	$(PEERS_TEST)
+	$(HOST_CLOCK_TEST)
 	$(TEST_EXECUTABLE)
 	$(RAOP_LIFECYCLE_TEST_EXECUTABLE)
 	$(RAOP_SESSION_TEST)
@@ -342,6 +344,11 @@ $(PEERS_TEST): tests/test_ap2_ptp_peers.c src/ap2_ptp_peers.c src/ap2_ptp_peers.
 		src/ap2_ptp_shm.h Makefile
 	@mkdir -p $(dir $@)
 	$(CC) $(TEST_CFLAGS) -Isrc tests/test_ap2_ptp_peers.c src/ap2_ptp_peers.c \
+		$(EXTRA_LDFLAGS) -o $@
+
+$(HOST_CLOCK_TEST): tests/test_host_clock.c src/host_clock.c src/host_clock.h Makefile
+	@mkdir -p $(dir $@)
+	$(CC) $(TEST_CFLAGS) -Isrc tests/test_host_clock.c src/host_clock.c \
 		$(EXTRA_LDFLAGS) -o $@
 
 $(TIMELINE_TEST): tests/test_ap2_timeline.c src/ap2_timeline.h Makefile
