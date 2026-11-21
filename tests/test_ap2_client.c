@@ -980,8 +980,9 @@ static void test_route_with_password(void)
  * an entry must consciously update the pins here. */
 /* Every receiver is served our clock, so nothing is followed from connect. A
  * HomePod on HomePod OS 27 or newer — standalone, stereo pair or Apple TV
- * group member alike — gets the fallback to its own clock; any other
- * receiver, and a HomePod whose OS version cannot be read, gets none.
+ * group member alike — and a HomeView on OS 27 or newer get the fallback to
+ * their own clock; any other receiver, and one whose OS version cannot be
+ * read, gets none.
  * CLIAIRPLAY_PTP_FOLLOW overrides both ways. */
 static void test_follow_policy_resolution(void)
 {
@@ -1023,6 +1024,9 @@ static void test_follow_policy_resolution(void)
         {"igl=1 model=AudioAccessory1,1", NULL, AP2_FOLLOW_NEVER},
         {NULL, "AudioAccessory1,1", AP2_FOLLOW_NEVER},
         {"model=AppleTV14,1 osvers=27.2", NULL, AP2_FOLLOW_NEVER},
+        {"igl=1 model=HomeAccessory17,1 osvers=27.2 srcvers=1010.13.1", NULL,
+         AP2_FOLLOW_FALLBACK},
+        {"model=HomeAccessory17,1 osvers=26.6", NULL, AP2_FOLLOW_NEVER},
         {sonos, NULL, AP2_FOLLOW_NEVER},
         {NULL, NULL, AP2_FOLLOW_NEVER},
     };
@@ -1175,6 +1179,16 @@ static void test_buffered_route_resolution(void)
     assert(!ap2_buffered_route(&atv_route, atv, NULL, false));
     assert(ap2_buffered_route(&atv_route, atv, NULL, true));
     assert(!ap2_buffered_route(&atv_route, NULL, "AudioAccessory5,1", false));
+    /* Paired HomeView (flags bit 0x200 blocks a transient native route). */
+    const char *homeview =
+        "model=HomeAccessory17,1 features=0x4A7FDFD5,0x3C177FDE flags=0x120604 "
+        "osvers=27.2 srcvers=1010.13.1";
+    ap2_route_t hv_route = ap2_resolve_route(AP2_PROTO_AUTO, homeview, NULL,
+                                             true, false, 16, false, false,
+                                             false);
+    assert(hv_route.native && hv_route.ptp);
+    assert(!ap2_buffered_route(&hv_route, homeview, NULL, false));
+    assert(ap2_buffered_route(&hv_route, homeview, NULL, true));
     const char *sonos = "model=Era 100 features=0x445F8A00,0x801C340";
     ap2_route_t sonos_route = ap2_resolve_route(AP2_PROTO_AUTO, sonos, NULL,
                                                 false, false, 16, false,
@@ -2647,6 +2661,9 @@ static void test_apple_model_resolution(void)
     assert(ap2cl_test_apple_model_default("model=Mac16,10", NULL));
     /* HomePod mini 2: needs SETPEERSX (ap2_build_setpeers). */
     assert(ap2cl_test_apple_model_default("acl=0 model=AudioAccessory11,1 osvers=27.2", NULL));
+    /* HomeView. */
+    assert(ap2cl_test_apple_model_default("model=HomeAccessory17,1 osvers=27.2", NULL));
+    assert(ap2cl_test_apple_model_default(NULL, "HomeAccessory17,1"));
     assert(!ap2cl_test_apple_model_default("model=Era 100", NULL));
     assert(!ap2cl_test_apple_model_default("model=HW-LS60D", NULL));
     assert(!ap2cl_test_apple_model_default(NULL, "Era 100"));
