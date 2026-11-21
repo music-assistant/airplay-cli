@@ -2170,7 +2170,8 @@ static void print_usage(const char *name)
     printf("                             host clock plus this offset instead of the wall\n");
     printf("                             clock. Give every process of a group the same value\n");
     printf("  --clock-rate-ppb <ppb>     Correct the raw host clock's rate by this many parts\n");
-    printf("                             per billion (+-2000000). Needs --clock-offset-ns\n");
+    printf("                             per billion (+-2000000); the offset applies on top.\n");
+    printf("                             Needs --clock-offset-ns; same value in every process\n");
     printf("  --pair                     Legacy AppleTV RAOP pairing (--secret)\n");
     printf("  --pair-setup               HomeKit pair-setup: the device shows a PIN,\n");
     printf("                             prints --auth credentials on success. Needs\n");
@@ -2249,6 +2250,7 @@ int main(int argc, char *argv[])
     bool pairing_mode = false;
     bool ptp_daemon_mode = false;
     bool pair_setup_mode = false;
+    bool clock_rate_given = false;
 
     static struct option long_options[] = {
         {"protocol",     required_argument, 0, 'P'},
@@ -2369,6 +2371,7 @@ int main(int argc, char *argv[])
                 return 1;
             }
             host_clock_set_rate_ppb(ppb);
+            clock_rate_given = true;
             break;
         }
         case 1002:
@@ -2386,7 +2389,7 @@ int main(int argc, char *argv[])
 
     int64_t clock_offset_ns;
     bool clock_raw = host_clock_offset_ns(&clock_offset_ns);
-    if (host_clock_rate_ppb() != 0 && !clock_raw) {
+    if (clock_rate_given && !clock_raw) {
         fprintf(stderr, "--clock-rate-ppb needs --clock-offset-ns\n");
         return 1;
     }
