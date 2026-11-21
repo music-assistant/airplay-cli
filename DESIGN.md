@@ -70,11 +70,11 @@ Decision order:
    UDP 319/320 cannot be bound (no privilege, no daemon), the session falls
    back to NTP.
 4. **Stream type** — on a native PTP route, buffered (103) when the receiver
-   advertises SupportsBufferedAudio (bit 40) and its model is not on the
-   in-code buffered deny-list; realtime (96) otherwise. `--buffered` forces
-   the buffered stream on any native PTP route, and `CLIAIRPLAY_BUFFERED`
-   (0 = never, else = always) outranks both — the fleet A/B lever and kill
-   switch. 16- and 24-bit ride either stream type (§9).
+   advertises SupportsBufferedAudio (bit 40) and is neither an Apple
+   receiver nor on the in-code buffered deny-list; realtime (96) otherwise.
+   `--buffered` forces the buffered stream on any native PTP route, and
+   `CLIAIRPLAY_BUFFERED` (0 = never, else = always) outranks both — the fleet
+   A/B lever and kill switch. 16- and 24-bit ride either stream type (§9).
 
 ## 3. The two AirPlay 2 flows
 
@@ -282,12 +282,13 @@ grandmaster — but MA spawns one cliairplay per device. The split
   Every receiver is served our clock, so a sync group plays on one timeline.
   A followed receiver plays at the rate of its own clock instead (a HomePod
   measured 3–7 ppm slow, wandering) and drifts out of its group, so following
-  is only the way out for a HomePod that would otherwise stay silent.
-  `ap2_follow_policy()` gives a HomePod on HomePod OS 27 or newer
+  is only the way out for a HomePod or HomeView that would otherwise stay
+  silent. `ap2_follow_policy()` gives a HomePod on HomePod OS 27 or newer
   (`model=`/`am=AudioAccessory*`, `osvers`>=27, the only firmware following
-  was measured on) the **fallback**: when it leaves our clock unanswered for
-  the stall window (§6), the session switches to following it and logs its
-  model and OS version. `CLIAIRPLAY_PTP_FOLLOW=0|1` overrides for every
+  was measured on) and a HomeView on OS 27 or newer (`HomeAccessory*`) the
+  **fallback**: when it leaves our clock unanswered for the stall window
+  (§6), the session switches to following it and logs its model and OS
+  version. `CLIAIRPLAY_PTP_FOLLOW=0|1` overrides for every
   receiver: `0` never follows, the fallback included, and `1` follows from
   connect. The stream registers the receiver as followed with
   `ap2_ptp_follow_receiver()`: directly on the in-process engine, and on the
@@ -468,10 +469,10 @@ binary reports what it measures instead of leaving the caller to guess:
   because the reporting stops there: for most of a session nothing else is
   watching, and a mark left to age with the reporting would make the first
   reading after a re-arm read stale. Only a PTP session can stall; `mode=ntp`
-  stays cold. A HomePod with the follow fallback (§5) is not reported stalled
-  at that point: the session switches to the HomePod's own clock and reads
+  stays cold. A receiver with the follow fallback (§5) is not reported stalled
+  at that point: the session switches to the receiver's own clock and reads
   `cold` while that clock gets a window of its own, so `stalled` there means
-  the HomePod answered neither clock for two windows. Shairport Sync
+  the receiver answered neither clock for two windows. Shairport Sync
   (`model=`/`am=ShairportSync`) cannot stall either:
   its nqptp follows Sync/Follow_Up but never sends a Delay_Req (it sends only
   two Announce messages per new clock), so it has no streak to lose. Its streak

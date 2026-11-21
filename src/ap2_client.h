@@ -136,8 +136,8 @@ ap2_route_t ap2_resolve_route(ap2_proto_pref_t pref, const char *txt, const char
  * native AP2 + PTP route can carry it; there, in order of precedence:
  * the CLIAIRPLAY_BUFFERED environment variable (0 = never, else = always),
  * the --buffered force flag, and finally auto-selection — the receiver
- * advertises SupportsBufferedAudio (features bit 40) and its model is not on
- * the in-code buffered deny-list.
+ * advertises SupportsBufferedAudio (features bit 40) and is neither an Apple
+ * receiver nor on the in-code buffered deny-list.
  *
  * :param route: the resolved route (ap2_resolve_route), plus any overrides.
  * :param txt: full _airplay._tcp TXT blob, or NULL.
@@ -156,12 +156,12 @@ typedef enum {
 
 /*
  * Resolve the follow policy for a receiver. Every receiver is served our
- * clock, so a whole sync group plays on one timeline. A HomePod —
- * `model=`/`am=` AudioAccessory* — advertising HomePod OS 27+ (osvers, or the
- * srcvers/`vs` firmware) gets the fallback: one that never probes our clock
- * would stay silent, so the session then follows its clock, where it plays at
- * its own rate. CLIAIRPLAY_PTP_FOLLOW outranks the rule for every receiver
- * (0 = never, else = always).
+ * clock, so a whole sync group plays on one timeline. A HomePod or HomeView —
+ * `model=`/`am=` AudioAccessory* or HomeAccessory* — advertising OS 27+
+ * (osvers, or the srcvers/`vs` firmware) gets the fallback: one that never
+ * probes our clock would stay silent, so the session then follows its clock,
+ * where it plays at its own rate. CLIAIRPLAY_PTP_FOLLOW outranks the rule for
+ * every receiver (0 = never, else = always).
  *
  * :param txt: full _airplay._tcp TXT blob, or NULL.
  * :param am: mDNS am= model override (RAOP discovery), or NULL.

@@ -1405,7 +1405,7 @@ static int ap2_txt_version_major(const char *txt, const char *key)
     return major;
 }
 
-/* True only for a receiver advertising HomePod OS 27 or newer. Trust osvers
+/* True only for a receiver advertising OS 27 or newer. Trust osvers
  * (`ov` on _raop); fall back to the AirPlay firmware (srcvers/`vs`, 980.x ships
  * with OS 27) when the OS version is absent, and stay false when neither is
  * known — so a receiver whose version we cannot read never gets the fallback. */
@@ -1430,8 +1430,11 @@ ap2_follow_policy_t ap2_follow_policy(const char *txt, const char *am)
     /* A followed receiver plays at its own crystal's rate and drifts out of
      * its sync group, so following is only the way out for a HomePod that
      * would otherwise stay silent. Gate on the OS version: following was
-     * only ever measured to work on HomePod OS 27. */
-    if (ap2_model_prefix(txt, am, "AudioAccessory") && ap2_receiver_os_ge_27(txt))
+     * only ever measured to work on HomePod OS 27. The HomeView gets the same
+     * way out, its clock behaviour unmeasured. */
+    if ((ap2_model_prefix(txt, am, "AudioAccessory") ||
+         ap2_model_prefix(txt, am, "HomeAccessory")) &&
+        ap2_receiver_os_ge_27(txt))
         return AP2_FOLLOW_FALLBACK;
     return AP2_FOLLOW_NEVER;
 }
@@ -1480,7 +1483,8 @@ bool ap2_buffered_route(const ap2_route_t *route, const char *txt,
 static bool ap2_apple_model(const char *txt, const char *am)
 {
     static const char *const prefixes[] = {
-        "AppleTV", "AudioAccessory", "iPhone", "iPad", "iPod", "Mac", NULL,
+        "AppleTV", "AudioAccessory", "HomeAccessory", "iPhone", "iPad",
+        "iPod", "Mac", NULL,
     };
     const char *model = txt ? strstr(txt, "model=") : NULL;
     if (model) model += strlen("model=");
