@@ -15,6 +15,7 @@
 
 static bool g_raw;
 static int64_t g_offset_ns;
+static int64_t g_rate_ppb;
 
 static int64_t read_ns(clockid_t id)
 {
@@ -35,10 +36,29 @@ bool host_clock_offset_ns(int64_t *offset_ns)
     return g_raw;
 }
 
+void host_clock_set_rate_ppb(int64_t ppb)
+{
+    g_rate_ppb = ppb;
+}
+
+int64_t host_clock_rate_ppb(void)
+{
+    return g_rate_ppb;
+}
+
+/* Whole seconds and the remainder are scaled apart so the products stay far
+ * inside int64_t however long the host has been up, and so 32-bit builds need
+ * no 128-bit arithmetic. */
+int64_t host_clock_rate_term_ns(int64_t raw_ns, int64_t ppb)
+{
+    return (raw_ns / 1000000000) * ppb + ((raw_ns % 1000000000) * ppb) / 1000000000;
+}
+
 uint64_t host_clock_now_ns(void)
 {
     if (!g_raw) return (uint64_t)read_ns(CLOCK_REALTIME);
-    return (uint64_t)(read_ns(HOST_CLOCK_RAW) + g_offset_ns);
+    int64_t raw_ns = read_ns(HOST_CLOCK_RAW);
+    return (uint64_t)(raw_ns + g_offset_ns + host_clock_rate_term_ns(raw_ns, g_rate_ppb));
 }
 
 /* Replaces crosstools' gettime_us, see the Makefile. */

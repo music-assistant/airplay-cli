@@ -52,6 +52,8 @@
 #define CLIAIRPLAY_VERSION VERSION
 #endif
 #define AP2_FRAMES_PER_CHUNK 352
+/* Largest accepted |--clock-rate-ppb| (2000 ppm), far beyond any real clock error. */
+#define MAX_CLOCK_RATE_PPB 2000000
 
 /* Protocol selection (resolved, concrete protocol used for dispatch). */
 typedef enum {
@@ -2167,6 +2169,9 @@ static void print_usage(const char *name)
     printf("  --clock-offset-ns <ns>     Run START_UNIX_MS and AirPlay timing on the raw\n");
     printf("                             host clock plus this offset instead of the wall\n");
     printf("                             clock. Give every process of a group the same value\n");
+    printf("  --clock-rate-ppb <ppb>     Correct the raw host clock's rate by this many parts\n");
+    printf("                             per billion (+-2000000); the offset applies on top.\n");
+    printf("                             Needs --clock-offset-ns; same value in every process\n");
     printf("  --pair                     Legacy AppleTV RAOP pairing (--secret)\n");
     printf("  --pair-setup               HomeKit pair-setup: the device shows a PIN,\n");
     printf("                             prints --auth credentials on success. Needs\n");
@@ -2245,6 +2250,7 @@ int main(int argc, char *argv[])
     bool pairing_mode = false;
     bool ptp_daemon_mode = false;
     bool pair_setup_mode = false;
+    bool clock_rate_given = false;
 
     static struct option long_options[] = {
         {"protocol",     required_argument, 0, 'P'},
@@ -2285,6 +2291,7 @@ int main(int argc, char *argv[])
         {"pair",         no_argument,       0, 1003},
         {"pair-setup",   no_argument,       0, 1013},
         {"clock-offset-ns", required_argument, 0, 1015},
+        {"clock-rate-ppb", required_argument, 0, 1016},
         {"help",         no_argument,       0, 'h'},
         {0, 0, 0, 0}
     };
@@ -2353,6 +2360,20 @@ int main(int argc, char *argv[])
             host_clock_set_offset_ns(offset);
             break;
         }
+        case 1016: {
+            char *end = NULL;
+            errno = 0;
+            long long ppb = strtoll(optarg, &end, 10);
+            if (errno || *end || end == optarg || ppb < -MAX_CLOCK_RATE_PPB ||
+                ppb > MAX_CLOCK_RATE_PPB) {
+                fprintf(stderr, "Invalid --clock-rate-ppb (integer within +-%d): %s\n",
+                        MAX_CLOCK_RATE_PPB, optarg);
+                return 1;
+            }
+            host_clock_set_rate_ppb(ppb);
+            clock_rate_given = true;
+            break;
+        }
         case 1002:
             printf("cliairplay v%s check\n", CLIAIRPLAY_VERSION);
             return 0;
@@ -2366,6 +2387,13 @@ int main(int argc, char *argv[])
         }
     }
 
+    int64_t clock_offset_ns;
+    bool clock_raw = host_clock_offset_ns(&clock_offset_ns);
+    if (clock_rate_given && !clock_raw) {
+        fprintf(stderr, "--clock-rate-ppb needs --clock-offset-ns\n");
+        return 1;
+    }
+
     /* The only streaming positional argument is the target host. */
     if (optind < argc) cfg.host = argv[optind++];
 
@@ -2375,9 +2403,9 @@ int main(int argc, char *argv[])
     util_loglevel = debug_levels[cfg.debug_level].util;
     raop_loglevel = debug_levels[cfg.debug_level].raop;
     main_log = debug_levels[cfg.debug_level].main;
-    int64_t clock_offset_ns;
-    if (host_clock_offset_ns(&clock_offset_ns)) {
+    if (clock_raw) {
         LOG_INFO("[CLOCK] host clock offset %" PRId64 " ns", clock_offset_ns);
+        LOG_INFO("[CLOCK] host clock rate %" PRId64 " ppb", host_clock_rate_ppb());
     } else {
         LOG_INFO("[CLOCK] host clock realtime");
     }
