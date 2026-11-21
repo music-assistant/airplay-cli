@@ -52,7 +52,7 @@
 #define CLIAIRPLAY_VERSION VERSION
 #endif
 #define AP2_FRAMES_PER_CHUNK 352
-/* Largest |--clock-rate-ppb| the split arithmetic in host_clock.c stays exact for. */
+/* Largest accepted |--clock-rate-ppb| (2000 ppm), far beyond any real clock error. */
 #define MAX_CLOCK_RATE_PPB 2000000
 
 /* Protocol selection (resolved, concrete protocol used for dispatch). */
