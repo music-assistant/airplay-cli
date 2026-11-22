@@ -53,6 +53,8 @@ Their license files remain in the submodule tree next to their sources.
 
 The corresponding source for every release is this repository at the release
 tag, together with the `libraop` submodule at the commit pinned by that tag.
+The build applies the patches in `patches/` to the libraop sources it compiles;
+each patch describes what it changes.
 GitHub's auto-generated source archives do not include submodule contents;
 use `git clone --recursive` at the release tag to obtain the complete
 corresponding source.

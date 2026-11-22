@@ -1878,6 +1878,7 @@ typedef struct {
     int fd;
     int expected_requests;
     int reject_request; /* 1-based request answered 500; 0 = none */
+    const char *setup_headers; /* extra header lines on a SETUP answer */
     int request_count;
     command_peer_request_t requests[COMMAND_PEER_MAX_REQUESTS];
     bool ok;
@@ -1956,11 +1957,15 @@ static void *run_command_peer(void *arg)
         req->rtptime = rtptime;
         peer->request_count++;
         bool reject = peer->request_count == peer->reject_request;
-        char response[96];
+        const char *extra = peer->setup_headers &&
+                                    strcmp(req->method, "SETUP") == 0
+                                ? peer->setup_headers
+                                : "";
+        char response[256];
         int response_len = snprintf(
             response, sizeof(response),
-            "RTSP/1.0 %s\r\nCSeq: %d\r\nContent-Length: 0\r\n\r\n",
-            reject ? "500 Internal Server Error" : "200 OK", cseq);
+            "RTSP/1.0 %s\r\nCSeq: %d\r\n%sContent-Length: 0\r\n\r\n",
+            reject ? "500 Internal Server Error" : "200 OK", cseq, extra);
         if (write(peer->fd, response, (size_t)response_len) != response_len) {
             peer->ok = false;
             return NULL;
@@ -2700,6 +2705,86 @@ static void test_metadata_before_start_on_stream_timeline(void)
     assert(ap2cl_destroy(client));
     free(peer);
     puts("ap2_client metadata before start timeline tests passed");
+}
+
+/* run_command_peer on the first connection to the listening socket in fd. */
+static void *run_accepting_command_peer(void *arg)
+{
+    command_peer_t *peer = arg;
+    int listener = peer->fd;
+    peer->fd = accept(listener, NULL, NULL);
+    close(listener);
+    if (peer->fd < 0) {
+        peer->ok = false;
+        return NULL;
+    }
+    return run_command_peer(peer);
+}
+
+/* The RAOP routes (AirPlay 1 and the AirPlay 2 compatibility flow) stamp
+ * metadata in libraop (patches/libraop-raop_client.patch): before the first
+ * frame it lands on the stream's RTP timeline too, at the head that frame will
+ * carry plus the latency libraop adds once streaming. */
+static void test_raopcl_metadata_before_first_frame_on_stream_timeline(void)
+{
+    const uint32_t latency = 88200;
+    uint16_t port = 0;
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = listen_loopback(&port);
+    /* ANNOUNCE, SETUP, RECORD, three SET_PARAMETERs, FLUSH, TEARDOWN */
+    peer->expected_requests = 8;
+    peer->setup_headers = "Transport: RTP/AVP/UDP;unicast;mode=record;"
+                          "server_port=6000;control_port=6001;"
+                          "timing_port=6002\r\nSession: 1\r\n";
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_accepting_command_peer,
+                          peer) == 0);
+
+    struct in_addr any = {.s_addr = htonl(INADDR_ANY)};
+    struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
+    struct raopcl_s *raopcl = raopcl_create(
+        any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, latency,
+        RAOP_CLEAR, false, "", NULL, "0,1", "0,1,2", 44100, 16, 2, -144.0f);
+    assert(raopcl);
+    assert(raop_rtsp_claim());
+    assert(raopcl_connect(raopcl, loopback, port, false));
+
+    uint32_t before = (uint32_t)NTP2TS(raopcl_get_ntp(NULL), 44100);
+    assert(raopcl_set_daap(raopcl, 4, "minm", 's', "Station", "asar", 's',
+                           "Artist", "asal", 's', "Album", "astn", 'i', 1));
+    assert(raopcl_set_artwork(raopcl, "image/jpeg",
+                              (int)sizeof(k_baseline_jpeg),
+                              (char *)k_baseline_jpeg));
+    uint32_t after = (uint32_t)NTP2TS(raopcl_get_ntp(NULL), 44100);
+
+    uint64_t start_ntp = raopcl_get_ntp(NULL) + MS2NTP(500);
+    assert(raopcl_start_at(raopcl, start_ntp));
+    assert(raopcl_set_daap(raopcl, 4, "minm", 's', "Station", "asar", 's',
+                           "Artist", "asal", 's', "Album", "astn", 'i', 1));
+
+    assert(raopcl_destroy(raopcl));
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok);
+    assert(peer->request_count == 8);
+    assert(strcmp(peer->requests[2].method, "RECORD") == 0);
+
+    /* Before START: now on the stream timeline, plus the latency. */
+    for (int i = 3; i < 5; i++) {
+        assert(strcmp(peer->requests[i].method, "SET_PARAMETER") == 0);
+        assert(peer->requests[i].has_rtptime);
+        uint32_t stamp = peer->requests[i].rtptime - latency;
+        assert((int32_t)(stamp - before) >= 0);
+        assert((int32_t)(after - stamp) >= 0);
+    }
+    /* After START, before the first frame: the commanded start head. */
+    assert(peer->requests[5].has_rtptime);
+    assert(peer->requests[5].rtptime ==
+           (uint32_t)(NTP2TS(start_ntp, 44100) + latency));
+
+    assert(close(peer->fd) == 0);
+    free(peer);
+    puts("raopcl metadata before first frame timeline tests passed");
 }
 
 static void test_info_txt_fallback(void)
@@ -4025,6 +4110,7 @@ int main(int argc, char **argv)
     test_mrp_identical_metadata_skip();
     test_mrp_artwork_push_status();
     test_metadata_before_start_on_stream_timeline();
+    test_raopcl_metadata_before_first_frame_on_stream_timeline();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_raopcl_rtsp_hook();
