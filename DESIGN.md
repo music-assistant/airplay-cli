@@ -573,7 +573,8 @@ identical RTP positions two sessions from one host are wire-identical twins
 cross-wires them and the stricter device goes silent. Each process therefore
 offsets its on-wire RTP timeline (and sequence numbers) by a pid-derived
 constant; the anchor line carries the same offset, so the audible schedule is
-untouched.
+untouched. The offset is set when the client is created, so the metadata and
+progress sent before the first `START` already carry the stream's timeline.
 
 **Lead**: the anchor→render lead is a fixed 2000 ms request (the
 AirPlay-standard 2 s) with no external knob, clamped into the device-reported
@@ -1162,10 +1163,14 @@ deny-list entry, not a policy retreat.
 - **Initial metadata** — pushed at the first START with a placeholder title if the
   caller has not set any (Sonos withholds audio until it has metadata; the
   native flow also requires `RTP-Info` on the metadata request — Sonos 400s
-  without it). A `SENDMETA` processed before the first START already delivered
-  real metadata — the command thread only runs with the transport connected —
-  so the placeholder push is skipped then, rather than re-sending the same
-  bundle as a byte-identical replace burst (§8).
+  without it). Before the first START that `RTP-Info` carries the stream's
+  timeline at the current wall time, just before its first frame: some
+  receivers (Bose) hold metadata until playback reaches its rtptime, so a time
+  off the timeline can keep it from ever showing. A `SENDMETA` processed
+  before the first START already delivered real metadata — the command thread
+  only runs with the transport connected — so the placeholder push is skipped
+  then, rather than re-sending the same bundle as a byte-identical replace
+  burst (§8).
 - **Apple MediaRemote metadata** — MediaRemote-eligible native sessions (§8) register a
   DEVICE_INFO origin, then send `updateMRNowPlayingInfo` followed by supported
   commands, explicit playback state, and a serialized NowPlayingClient.

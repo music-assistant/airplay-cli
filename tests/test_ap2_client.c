@@ -1870,6 +1870,8 @@ typedef struct {
     char uri[64];
     uint8_t body[COMMAND_PEER_BODY_MAX];
     int body_len;
+    bool has_rtptime;
+    uint32_t rtptime; /* RTP-Info rtptime, when has_rtptime */
 } command_peer_request_t;
 
 typedef struct {
@@ -1924,6 +1926,11 @@ static void *run_command_peer(void *arg)
         }
         if (length_header)
             content_length = strtol(length_header + 18, NULL, 10);
+        uint32_t rtptime = 0;
+        char *rtp_info = strstr((char *)buffer, "\r\nRTP-Info: rtptime=");
+        bool has_rtptime =
+            rtp_info && rtp_info < body_start &&
+            sscanf(rtp_info, "\r\nRTP-Info: rtptime=%u", &rtptime) == 1;
         if (content_length < 0 || content_length > COMMAND_PEER_BODY_MAX ||
             header_len + (size_t)content_length > sizeof(buffer) - 1) {
             peer->ok = false;
@@ -1945,6 +1952,8 @@ static void *run_command_peer(void *arg)
         }
         memcpy(req->body, buffer + header_len, (size_t)content_length);
         req->body_len = (int)content_length;
+        req->has_rtptime = has_rtptime;
+        req->rtptime = rtptime;
         peer->request_count++;
         bool reject = peer->request_count == peer->reject_request;
         char response[96];
@@ -2597,6 +2606,100 @@ static uint64_t test_now_unix_ms(void)
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+}
+
+/* Metadata, artwork and progress pushed before the first START land on the
+ * stream's RTP timeline, just before its first frame: a receiver that holds
+ * metadata until playback reaches its rtptime (Bose) shows it at the start.
+ * After START, metadata rides the wire head as before. */
+static void test_metadata_before_start_on_stream_timeline(void)
+{
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    peer->expected_requests = 4;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "timeline metadata test",
+        .address = "127.0.0.1",
+        .port = 7000,
+        .txt_records = "model=Era 100",
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+    ap2cl_test_set_splice(client, true);
+
+    /* START is commanded far enough out that every request before it goes
+     * out first, however slow the runner. */
+    uint64_t t0_ms = NTP2MS(raopcl_get_ntp(NULL));
+    uint64_t start_ms = t0_ms + 10000;
+
+    /* Before START: DMAP metadata, DMAP artwork, then progress. */
+    assert(ap2cl_set_metadata_ex(client, "Station", "Artist", "Album", 0,
+                                 "item-1", "image/jpeg", k_baseline_jpeg,
+                                 (int)sizeof(k_baseline_jpeg), NULL, NULL,
+                                 NULL, NULL));
+    assert(ap2cl_set_progress(client, 0, 0));
+
+    uint64_t at = 0;
+    assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
+    assert(at == start_ms);
+    uint32_t first_frame = ap2cl_test_rtp_timestamp(client);
+
+    /* After START: a new item rides the wire head. */
+    assert(ap2cl_set_metadata_ex(client, "Next", "Artist", "Album", 0,
+                                 "item-2", NULL, NULL, 0, NULL, NULL, NULL,
+                                 NULL));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok);
+    assert(peer->request_count == 4);
+
+    /* The pre-START stamps fall between the first request and the first
+     * frame (plus 10 ms for rounding). */
+    const int32_t max_ahead =
+        (int32_t)((start_ms - t0_ms) * 44100 / 1000) + 441;
+    assert(request_has(&peer->requests[0], "mlit"));
+    assert(bytes_contain(peer->requests[1].body,
+                         (size_t)peer->requests[1].body_len,
+                         k_baseline_jpeg, sizeof(k_baseline_jpeg)));
+    for (int i = 0; i < 2; i++) {
+        assert(peer->requests[i].has_rtptime);
+        int32_t ahead = (int32_t)(first_frame - peer->requests[i].rtptime);
+        assert(ahead > 0 && ahead <= max_ahead);
+    }
+    unsigned progress_start = 0, progress_now = 0, progress_end = 0;
+    char progress_body[COMMAND_PEER_BODY_MAX + 1];
+    memcpy(progress_body, peer->requests[2].body,
+           (size_t)peer->requests[2].body_len);
+    progress_body[peer->requests[2].body_len] = '\0';
+    assert(sscanf(progress_body, "progress: %u/%u/%u", &progress_start,
+                  &progress_now, &progress_end) == 3);
+    int32_t progress_ahead = (int32_t)(first_frame - (uint32_t)progress_now);
+    assert(progress_ahead > 0 && progress_ahead <= max_ahead);
+
+    assert(request_has(&peer->requests[3], "Next"));
+    assert(peer->requests[3].has_rtptime);
+    assert(peer->requests[3].rtptime == first_frame);
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    puts("ap2_client metadata before start timeline tests passed");
 }
 
 static void test_info_txt_fallback(void)
@@ -3921,6 +4024,7 @@ int main(int argc, char **argv)
     test_mrp_bundle_and_pause_publish();
     test_mrp_identical_metadata_skip();
     test_mrp_artwork_push_status();
+    test_metadata_before_start_on_stream_timeline();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_raopcl_rtsp_hook();
