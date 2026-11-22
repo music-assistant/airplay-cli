@@ -415,7 +415,7 @@ struct ap2cl_s {
     uint64_t rt_anchor_wall0;      /* master-clock ns of the anchor point */
     uint32_t rt_anchor_pos0;       /* rtp timestamp at the anchor point */
     uint64_t start_ntp;            /* shared group start (NTP fixed-point), 0 = none */
-    _Atomic uint32_t rtp_offset;   /* per-process timeline offset (see start_at) */
+    _Atomic uint32_t rtp_offset;   /* see ap2_timeline_offset */
     uint64_t audio_nonce_counter;
     /* Requested audioFormat and the /info-advertised per-stream format tables
      * (bit masks in the audioFormat bit space; "known" = the table was present,
@@ -3373,6 +3373,17 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
     return true;
 }
 
+/* Offset the RTP timeline per process: streams in one group share
+ * ntpstart, and with identical pos0 two sessions from one host are
+ * wire-identical twins (same clock id, anchor tuple, ssrc, source) —
+ * Sonos household stream tracking then cross-wires them and one
+ * device goes silent. The anchor line carries the same offset, so
+ * the audible schedule is untouched. */
+static uint32_t ap2_timeline_offset(void)
+{
+    return (uint32_t)(getpid() * 2654435761u) & 0x0FFFFF00u;
+}
+
 /* ---- Public API ---- */
 
 struct ap2cl_s *ap2cl_create(
@@ -3410,7 +3421,9 @@ struct ap2cl_s *ap2cl_create(
     atomic_init(&p->feedback_failures, 0);
     atomic_init(&p->mrp_event_health, -1);
     atomic_init(&p->feedback_stop, true);
-    atomic_init(&p->rtp_offset, 0);
+    /* Set before the first START, so the metadata and progress pushed ahead
+     * of it already land on the stream's timeline. */
+    atomic_init(&p->rtp_offset, ap2_timeline_offset());
     if (dacp_id) p->dacp_id = strdup(dacp_id);
     if (active_remote) p->active_remote = strdup(active_remote);
     if (password) p->password = strdup(password);
@@ -4013,14 +4026,6 @@ ap2_commit_result_t ap2cl_start(struct ap2cl_s *p, uint64_t start_unix_ms,
     ap2_resolve_start(start_unix_ms, floor_ntp, &ntp_start, &at_local);
     if (at_unix_ms) *at_unix_ms = at_local;
     if (p->flow == FLOW_NATIVE_AP2) {
-        /* Offset the RTP timeline per process: streams in one group share
-         * ntpstart, and with identical pos0 two sessions from one host are
-         * wire-identical twins (same clock id, anchor tuple, ssrc, source) —
-         * Sonos household stream tracking then cross-wires them and one
-         * device goes silent. The anchor line carries the same offset, so
-         * the audible schedule is untouched. */
-        atomic_store(&p->rtp_offset,
-                     (uint32_t)(getpid() * 2654435761u) & 0x0FFFFF00u);
         /* head_ts stays in the pure scheduling domain (pacing compares it to
          * the wall frame clock); the offset is applied only to the on-wire
          * RTP timestamps and the anchor, which advance in lockstep. */
@@ -5263,6 +5268,18 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
     return false;
 }
 
+/* RTP time for the RTP-Info of a native metadata or artwork request: the wire
+ * head once the first START anchored the stream, before that the stream's
+ * timeline at the current wall time, which falls just before its first frame.
+ * Some receivers (Bose) hold metadata until playback reaches this time, so a
+ * time off the timeline can keep it from ever showing. */
+static uint32_t ap2_metadata_rtptime(struct ap2cl_s *p)
+{
+    if (p->head_ts) return p->rtp_timestamp;
+    return (uint32_t)NTP2TS(raopcl_get_ntp(NULL), p->format.sample_rate) +
+           atomic_load(&p->rtp_offset);
+}
+
 /* Build a DMAP "mlit" metadata blob (libraop's rtspcl_set_daap wire format) and
  * push it over the native encrypted RTSP channel. Sonos withholds audio until it
  * receives track metadata, so the native flow must send this to become audible
@@ -5302,7 +5319,8 @@ static bool ap2_native_send_metadata(struct ap2cl_s *p, const char *title,
     /* Anchor the metadata to the current RTP position; the RAOP-compat path
      * sends this via RTP-Info and Sonos 400s a metadata request without it. */
     char rtpinfo[48];
-    snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
+    snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n",
+             ap2_metadata_rtptime(p));
 
     uint8_t *resp = NULL; int resp_len = 0;
     int status = ap2_rtsp_send_ex(p, "SET_PARAMETER", p->session_url,
@@ -5676,7 +5694,8 @@ static bool ap2_send_dmap_artwork(struct ap2cl_s *p, const char *content_type,
     if (!content_type || !*content_type || !data || size <= 0) return false;
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
         char rtpinfo[48];
-        snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n", p->rtp_timestamp);
+        snprintf(rtpinfo, sizeof(rtpinfo), "RTP-Info: rtptime=%u\r\n",
+                 ap2_metadata_rtptime(p));
         uint8_t *resp = NULL; int resp_len = 0;
         int status = ap2_rtsp_send_ex(p, "SET_PARAMETER", p->session_url,
                                       (const uint8_t *)data, size, content_type,
