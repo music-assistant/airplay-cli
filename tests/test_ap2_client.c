@@ -2641,6 +2641,11 @@ static void test_metadata_before_start_on_stream_timeline(void)
     ap2cl_test_attach_rtsp_socket(client, sockets[0]);
     ap2cl_test_set_splice(client, true);
 
+    /* START is commanded far enough out that every request before it goes
+     * out first, however slow the runner. */
+    uint64_t t0_ms = NTP2MS(raopcl_get_ntp(NULL));
+    uint64_t start_ms = t0_ms + 10000;
+
     /* Before START: DMAP metadata, DMAP artwork, then progress. */
     assert(ap2cl_set_metadata_ex(client, "Station", "Artist", "Album", 0,
                                  "item-1", "image/jpeg", k_baseline_jpeg,
@@ -2648,7 +2653,6 @@ static void test_metadata_before_start_on_stream_timeline(void)
                                  NULL, NULL));
     assert(ap2cl_set_progress(client, 0, 0));
 
-    uint64_t start_ms = test_now_unix_ms() + 3000;
     uint64_t at = 0;
     assert(ap2cl_start(client, start_ms, &at) == AP2_COMMIT_OK);
     assert(at == start_ms);
@@ -2663,9 +2667,10 @@ static void test_metadata_before_start_on_stream_timeline(void)
     assert(peer->ok);
     assert(peer->request_count == 4);
 
-    /* The pre-START stamps fall within the 3 s lead before the first frame,
-     * with margin for a slow runner. */
-    const int32_t max_ahead = 5 * 44100;
+    /* The pre-START stamps fall between the first request and the first
+     * frame (plus 10 ms for rounding). */
+    const int32_t max_ahead =
+        (int32_t)((start_ms - t0_ms) * 44100 / 1000) + 441;
     assert(request_has(&peer->requests[0], "mlit"));
     assert(bytes_contain(peer->requests[1].body,
                          (size_t)peer->requests[1].body_len,
