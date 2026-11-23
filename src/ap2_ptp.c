@@ -49,8 +49,6 @@
 
 extern log_level *loglevel;
 
-#define NTP_EPOCH_DELTA 0x83AA7E80
-
 /* ---- PTP (IEEE 1588-2008) grandmaster constants ---- */
 
 #define PTP_MCAST_ADDR      "224.0.1.129"   /* primary PTP multicast group */
@@ -182,9 +180,6 @@ struct ptp_dataset {
 };
 
 struct ap2_ptp_ctx {
-    /* PTP-to-local offset in nanoseconds (set by provider) */
-    int64_t offset_ns;
-
     /* NTP timing responder */
     int timing_sock;
     pthread_t timing_thread;
@@ -265,13 +260,6 @@ struct ap2_ptp_ctx {
 
 /* ---- NTP timing responder ---- */
 
-static void get_ntp_time(uint32_t *sec, uint32_t *frac)
-{
-    uint64_t ns = host_clock_now_ns();
-    *sec = (uint32_t)(ns / 1000000000ULL + NTP_EPOCH_DELTA);
-    *frac = (uint32_t)(((ns % 1000000000ULL) << 32) / 1000000000ULL);
-}
-
 static void *timing_thread_func(void *arg)
 {
     struct ap2_ptp_ctx *ctx = (struct ap2_ptp_ctx *)arg;
@@ -300,18 +288,11 @@ static void *timing_thread_func(void *arg)
         /* Reference time = request's send time (bytes 24-31) */
         memcpy(resp + 8, buf + 24, 8);
 
-        /* Receive time = now */
-        uint32_t sec, frac;
-        get_ntp_time(&sec, &frac);
-
-        /* Apply PTP offset if set */
-        if (ctx->offset_ns != 0) {
-            int64_t ns = (int64_t)sec * 1000000000LL +
-                         (int64_t)frac * 1000000000LL / (1LL << 32);
-            ns += ctx->offset_ns;
-            sec = (uint32_t)(ns / 1000000000LL);
-            frac = (uint32_t)(((uint64_t)(ns % 1000000000LL) << 32) / 1000000000ULL);
-        }
+        /* Receive time = now, on the NTP clock the sync packets carry: the
+         * receiver reads their times through the offset these replies give. */
+        uint64_t now = raopcl_get_ntp(NULL);
+        uint32_t sec = (uint32_t)(now >> 32);
+        uint32_t frac = (uint32_t)now;
 
         resp[16] = (sec >> 24) & 0xFF;
         resp[17] = (sec >> 16) & 0xFF;
@@ -1299,11 +1280,6 @@ void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx)
     free(ctx);
 }
 
-void ap2_ptp_set_offset(struct ap2_ptp_ctx *ctx, int64_t offset_ns)
-{
-    if (ctx) ctx->offset_ns = offset_ns;
-}
-
 bool ap2_ptp_start(struct ap2_ptp_ctx *ctx, const char *device_ip)
 {
     if (!ctx) return false;
@@ -1334,8 +1310,7 @@ bool ap2_ptp_start(struct ap2_ptp_ctx *ctx, const char *device_ip)
     struct sockaddr_in local;
     socklen_t len = sizeof(local);
     getsockname(ctx->timing_sock, (struct sockaddr *)&local, &len);
-    LOG_INFO("[PTP] Timing responder on port %d (offset=%" PRId64 "ns)",
-             ntohs(local.sin_port), ctx->offset_ns);
+    LOG_INFO("[PTP] Timing responder on port %d", ntohs(local.sin_port));
 
     return true;
 }
@@ -1371,37 +1346,6 @@ int ap2_ptp_get_timing_port(struct ap2_ptp_ctx *ctx)
     socklen_t len = sizeof(local);
     getsockname(ctx->timing_sock, (struct sockaddr *)&local, &len);
     return ntohs(local.sin_port);
-}
-
-uint64_t ap2_ptp_get_time(struct ap2_ptp_ctx *ctx)
-{
-    uint32_t sec, frac;
-    get_ntp_time(&sec, &frac);
-
-    if (ctx && ctx->offset_ns != 0) {
-        int64_t ns = (int64_t)(sec - NTP_EPOCH_DELTA) * 1000000000LL +
-                     (int64_t)frac * 1000000000LL / (1LL << 32);
-        ns += ctx->offset_ns;
-        sec = (uint32_t)(ns / 1000000000LL) + NTP_EPOCH_DELTA;
-        frac = (uint32_t)(((uint64_t)(ns % 1000000000LL) << 32) / 1000000000ULL);
-    }
-
-    return ((uint64_t)sec << 32) | frac;
-}
-
-uint64_t ap2_ptp_local_to_device(struct ap2_ptp_ctx *ctx, uint64_t local_ntp)
-{
-    if (!ctx || ctx->offset_ns == 0) return local_ntp;
-
-    /* Convert NTP to nanoseconds, apply offset, convert back */
-    uint32_t sec = (uint32_t)(local_ntp >> 32);
-    uint32_t frac = (uint32_t)(local_ntp & 0xFFFFFFFF);
-    int64_t ns = (int64_t)(sec - NTP_EPOCH_DELTA) * 1000000000LL +
-                 (int64_t)frac * 1000000000LL / (1LL << 32);
-    ns += ctx->offset_ns;
-    sec = (uint32_t)(ns / 1000000000LL) + NTP_EPOCH_DELTA;
-    frac = (uint32_t)(((uint64_t)(ns % 1000000000LL) << 32) / 1000000000ULL);
-    return ((uint64_t)sec << 32) | frac;
 }
 
 /* ---- PTP grandmaster engine: public API ---- */

@@ -18,6 +18,7 @@
 #include "ap2_ptp_shm.h"
 #include "cross_log.h"
 #include "host_clock.h"
+#include "raop_client.h"
 
 static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
@@ -73,6 +74,14 @@ void get_mac(uint8_t mac[])
 {
     static const uint8_t fixed[6] = {0x02, 0x00, 0x00, 0x00, 0x00, 0x01};
     memcpy(mac, fixed, sizeof(fixed));
+}
+
+/* The NTP timing responder reads libraop's clock; these tests never start it
+ * (test_ap2_client covers it against the real one). */
+uint64_t raopcl_get_ntp(struct ntp_s *ntp)
+{
+    (void)ntp;
+    return 0;
 }
 
 static int sends_count(void)

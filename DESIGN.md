@@ -543,8 +543,12 @@ Per path:
   at `start_at` (a receiver that sees no announce shortly after RECORD can
   abandon the stream), then coupled to the audio send.
 - **Native AP2, NTP realtime** — owntone-style 20-byte sync packets
-  (`0x90d4` first / `0x80d4`) carrying now-playing and now-rendering RTP
-  positions against the NTP wall clock.
+  (`0x90d4` first / `0x80d4`) on the clock the timing responder answers with
+  (libraop's `raopcl_get_ntp`). Each announces the frame the line makes
+  audible 11025 frames after the packet's NTP time — `samples(t) +
+  rtp_offset + 11025`, the offset the `0x0007` flag makes receivers add — so
+  it holds the same line as the PTP anchor at any queue depth; bytes 16–19
+  carry the send head.
 
 PTP sync packets are the 28-byte form (`0x90d7`/`0x80d7`): current RTP
 timestamp, master-timebase nanoseconds, rendering position, and our PTP clock
