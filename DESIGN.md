@@ -1166,7 +1166,10 @@ deny-list entry, not a policy retreat.
   without it). Before the first START that `RTP-Info` carries the stream's
   timeline at the current wall time, just before its first frame: some
   receivers (Bose) hold metadata until playback reaches its rtptime, so a time
-  off the timeline can keep it from ever showing. A `SENDMETA` processed
+  off the timeline can keep it from ever showing. On the RAOP routes libraop
+  stamps it; the build patches its raop_client.c (`patches/`) to use the head
+  the first frame will carry (the commanded start, or now) plus the latency,
+  where upstream uses 0. A `SENDMETA` processed
   before the first START already delivered real metadata — the command thread
   only runs with the transport connected — so the placeholder push is skipped
   then, rather than re-sending the same bundle as a byte-identical replace

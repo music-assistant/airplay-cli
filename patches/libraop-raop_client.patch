@@ -1,0 +1,47 @@
+Music Assistant changes to libraop's src/raop_client.c, against the pinned
+submodule commit. The build applies this to a copy of the file (see the
+Makefile).
+
+Metadata and artwork sent before the first frame are stamped on the
+stream's RTP timeline, with the head that frame will carry (the commanded
+start, or now), instead of 0. Receivers that hold metadata until playback
+reaches its rtptime (Bose) would otherwise miss it.
+
+diff --git a/src/raop_client.c b/src/raop_client.c
+index 84a60a5..7732387 100644
+--- a/src/raop_client.c
++++ b/src/raop_client.c
+@@ -812,12 +812,23 @@ uint64_t raopcl_get_progress_ms(struct raopcl_s* p)
+ 	return elapsed;
+ }
+ 
++/*----------------------------------------------------------------------------*/
++static uint32_t _raopcl_metadata_ts(struct raopcl_s *p)
++{
++	uint64_t head_ts = p->head_ts;
++
++	// head_ts is set by the first frame, so before it use the one that frame will carry
++	if (!head_ts) head_ts = p->start_ts ? p->start_ts : NTP2TS(raopcl_get_ntp(NULL), p->sample_rate);
++
++	return head_ts + p->latency_frames;
++}
++
+ /*----------------------------------------------------------------------------*/
+ bool raopcl_set_artwork(struct raopcl_s *p, char *content_type, int size, char *image)
+ {
+ 	if (!p || !p->rtspcl || p->state < RAOP_FLUSHED || !(p->md_caps & MD_ARTWORK)) return false;
+ 
+-	return rtspcl_set_artwork(p->rtspcl, p->head_ts + p->latency_frames, content_type, size, image);
++	return rtspcl_set_artwork(p->rtspcl, _raopcl_metadata_ts(p), content_type, size, image);
+ }
+ 
+ /*----------------------------------------------------------------------------*/
+@@ -829,7 +840,7 @@ bool raopcl_set_daap(struct raopcl_s *p, int count, ...)
+ 
+ 	va_start(args, count);
+ 
+-	return rtspcl_set_daap(p->rtspcl, p->head_ts + p->latency_frames, count, args);
++	return rtspcl_set_daap(p->rtspcl, _raopcl_metadata_ts(p), count, args);
+ }
+ 
+ /*----------------------------------------------------------------------------*/

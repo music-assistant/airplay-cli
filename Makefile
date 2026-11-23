@@ -201,6 +201,19 @@ $(BUILDDIR)/cross_util.o: CPPFLAGS += -Dgettime_us=crosstools_gettime_us
 # pins that raopcl_create still creates it there).
 $(BUILDDIR)/raop_client.o: CPPFLAGS += -Drtspcl_create=raop_rtsp_create
 
+# Our fixes to libraop's raop_client.c live in patches/: the build compiles a
+# patched copy and the submodule stays at its pinned commit. A patch that no
+# longer applies fails the build.
+RAOP_CLIENT_PATCH = patches/libraop-raop_client.patch
+
+$(BUILDDIR)/raop_client.c: $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
+	@mkdir -p $(dir $@)
+	patch -s -F0 -o $@.tmp $< $(RAOP_CLIENT_PATCH)
+	mv $@.tmp $@
+
+$(BUILDDIR)/raop_client.o: $(BUILDDIR)/raop_client.c
+	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
+
 directory:
 	@mkdir -p $(BUILDDIR)
 	@mkdir -p $(BINDIR)
