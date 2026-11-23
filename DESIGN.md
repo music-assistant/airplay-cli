@@ -548,7 +548,9 @@ Per path:
   audible 11025 frames after the packet's NTP time — `samples(t) +
   rtp_offset + 11025`, the offset the `0x0007` flag makes receivers add — so
   it holds the same line as the PTP anchor at any queue depth; bytes 16–19
-  carry the send head.
+  carry the send head. Receivers read 16–19 less 4–7 as their latency, so a
+  periodic packet waits while the head trails the announced frame (catching
+  up after a stall).
 
 PTP sync packets are the 28-byte form (`0x90d7`/`0x80d7`): current RTP
 timestamp, master-timebase nanoseconds, rendering position, and our PTP clock

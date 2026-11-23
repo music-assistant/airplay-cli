@@ -2654,7 +2654,8 @@ static uint64_t test_now_unix_ms(void)
 }
 
 /* Play the receiver end of an NTP session: a sync packet must place the
- * started line where START committed it, however far ahead the queue runs. */
+ * started line where START committed it, however far ahead the queue runs,
+ * and never announce a frame beyond the head it carries. */
 static void test_ntp_sync_announces_start_line(void)
 {
     int receiver = socket(AF_INET, SOCK_DGRAM, 0);
@@ -2680,8 +2681,8 @@ static void test_ntp_sync_announces_start_line(void)
     assert(ap2cl_test_set_ctrl_peer(client, ntohs(addr.sin_port)));
 
     /* Start well inside the 2 s lead, as a shallow queue reaches it. */
-    uint64_t at_ms = 0;
-    assert(ap2cl_start(client, test_now_unix_ms() + 500, &at_ms) == AP2_COMMIT_OK);
+    assert(ap2cl_start(client, test_now_unix_ms() + 500, NULL) == AP2_COMMIT_OK);
+    uint64_t start_ts = ap2cl_test_head_ts(client);
     uint32_t first_rtp = ap2cl_test_rtp_timestamp(client);
     assert(ap2cl_test_send_periodic_sync(client));
 
@@ -2699,12 +2700,15 @@ static void test_ntp_sync_announces_start_line(void)
     /* The 0x0007 flag has the receiver play the announced frame 11025
      * frames after the packet's NTP time; on the started line that frame is
      * first_rtp shifted by the time from the start instant. */
-    uint64_t start_ntp = ((at_ms / 1000) << 32) | (((at_ms % 1000) << 32) / 1000);
-    uint32_t on_line = first_rtp + 11025 +
-                       (uint32_t)(NTP2TS(ntp, 44100) - NTP2TS(start_ntp, 44100));
-    int32_t off = (int32_t)(announced - on_line);
-    assert(off >= -1 && off <= 1);
+    assert(announced ==
+           first_rtp + 11025 + (uint32_t)(NTP2TS(ntp, 44100) - start_ts));
     assert(head == first_rtp);
+
+    /* A head trailing the announced frame, as it does while catching up
+     * after a stall, holds the periodic packet back. */
+    ap2cl_test_set_head_ts(client, start_ts - 44100);
+    assert(!ap2cl_test_send_periodic_sync(client));
+    assert(poll(&pfd, 1, 200) == 0);
 
     ap2cl_destroy(client);
     close(receiver);

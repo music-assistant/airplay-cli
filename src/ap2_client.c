@@ -2645,7 +2645,14 @@ static ap2_send_result_t ap2_send_sync_packet(struct ap2cl_s *p, bool first)
     uint64_t ntp = raopcl_get_ntp(NULL);
     uint32_t audible = (uint32_t)NTP2TS(ntp, p->format.sample_rate)
                      + atomic_load(&p->rtp_offset);
-    uint32_t ts_be = htonl(audible + 11025);
+    uint32_t announced = audible + 11025;
+    /* Receivers read bytes 16-19 less bytes 4-7 as their latency, so while
+     * the head trails the announced frame (catching up after a stall) a
+     * periodic packet is held back: the line has not moved, and the
+     * receiver keeps the one it has. */
+    if (!first && (int32_t)(p->rtp_timestamp - announced) < 0)
+        return AP2_SEND_DROPPED;
+    uint32_t ts_be = htonl(announced);
     memcpy(pkt + 4, &ts_be, 4);
 
     uint32_t ntp_sec = htonl((uint32_t)(ntp >> 32));
