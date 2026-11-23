@@ -2643,15 +2643,19 @@ static ap2_send_result_t ap2_send_sync_packet(struct ap2cl_s *p, bool first)
      * bytes 4-7 frame 11025 frames after the NTP time (iTunes semantics, see
      * shairport-sync's rtp.c), so that is the frame audible then. */
     uint64_t ntp = raopcl_get_ntp(NULL);
-    uint32_t audible = (uint32_t)NTP2TS(ntp, p->format.sample_rate)
-                     + atomic_load(&p->rtp_offset);
-    uint32_t announced = audible + 11025;
-    /* Receivers read bytes 16-19 less bytes 4-7 as their latency, so while
-     * the head trails the announced frame (catching up after a stall) a
-     * periodic packet is held back: the line has not moved, and the
-     * receiver keeps the one it has. */
-    if (!first && (int32_t)(p->rtp_timestamp - announced) < 0)
-        return AP2_SEND_DROPPED;
+    uint32_t announced = (uint32_t)NTP2TS(ntp, p->format.sample_rate)
+                       + atomic_load(&p->rtp_offset) + 11025;
+    /* Receivers also read bytes 16-19 less bytes 4-7 as their latency, so the
+     * announced frame must not pass the head. Where it would (catching up
+     * after a stall, or a first packet sent under 11025 frames ahead), a
+     * periodic packet is held back, as the receiver keeps the line it has,
+     * and a first packet announces the head at its own, earlier instant on
+     * the same line. */
+    if ((int32_t)(p->rtp_timestamp - announced) < 0) {
+        if (!first) return AP2_SEND_DROPPED;
+        announced = p->rtp_timestamp;
+        ntp = TS2NTP(p->head_ts - 11025, p->format.sample_rate);
+    }
     uint32_t ts_be = htonl(announced);
     memcpy(pkt + 4, &ts_be, 4);
 
@@ -6249,6 +6253,13 @@ bool ap2cl_test_send_periodic_sync(struct ap2cl_s *p)
 {
     return (p->use_ptp ? ap2_send_sync_packet_ptp(p, false)
                        : ap2_send_sync_packet(p, false)) == AP2_SEND_SENT;
+}
+
+/* The sync packet the audio path sends ahead of a line's first chunk. */
+bool ap2cl_test_send_first_sync(struct ap2cl_s *p)
+{
+    return (p->use_ptp ? ap2_send_sync_packet_ptp(p, true)
+                       : ap2_send_sync_packet(p, true)) == AP2_SEND_SENT;
 }
 
 void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable)

@@ -65,6 +65,7 @@ struct ap2_ptp_ctx *ap2cl_test_attach_ptp(struct ap2cl_s *p);
 bool ap2cl_test_follow_clock(struct ap2cl_s *p);
 bool ap2cl_test_set_ctrl_peer(struct ap2cl_s *p, uint16_t port);
 bool ap2cl_test_send_periodic_sync(struct ap2cl_s *p);
+bool ap2cl_test_send_first_sync(struct ap2cl_s *p);
 void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_buffered_sock(struct ap2cl_s *p, int fd);
 void ap2cl_test_buffered_rtp_header(struct ap2cl_s *p, uint8_t hdr[12]);
@@ -2653,6 +2654,28 @@ static uint64_t test_now_unix_ms(void)
     return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
 }
 
+typedef struct {
+    uint8_t header;
+    uint32_t announced;
+    uint64_t ntp;
+    uint32_t head;
+} ntp_sync_t;
+
+/* Take the next NTP sync packet off the fake receiver's control port. */
+static ntp_sync_t read_ntp_sync(int fd)
+{
+    uint8_t pkt[64];
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    assert(poll(&pfd, 1, 2000) == 1);
+    assert(recv(fd, pkt, sizeof(pkt), 0) == 20);
+    assert(pkt[1] == 0xd4 && pkt[2] == 0x00 && pkt[3] == 0x07);
+    ntp_sync_t sync = {.header = pkt[0]};
+    for (int i = 0; i < 4; i++) sync.announced = (sync.announced << 8) | pkt[4 + i];
+    for (int i = 0; i < 8; i++) sync.ntp = (sync.ntp << 8) | pkt[8 + i];
+    for (int i = 0; i < 4; i++) sync.head = (sync.head << 8) | pkt[16 + i];
+    return sync;
+}
+
 /* Play the receiver end of an NTP session: a sync packet must place the
  * started line where START committed it, however far ahead the queue runs,
  * and never announce a frame beyond the head it carries. */
@@ -2680,35 +2703,38 @@ static void test_ntp_sync_announces_start_line(void)
     ap2cl_test_set_session_state(client, AP2_CONNECTED);
     assert(ap2cl_test_set_ctrl_peer(client, ntohs(addr.sin_port)));
 
-    /* Start well inside the 2 s lead, as a shallow queue reaches it. */
     assert(ap2cl_start(client, test_now_unix_ms() + 500, NULL) == AP2_COMMIT_OK);
     uint64_t start_ts = ap2cl_test_head_ts(client);
     uint32_t first_rtp = ap2cl_test_rtp_timestamp(client);
-    assert(ap2cl_test_send_periodic_sync(client));
 
-    uint8_t pkt[64];
-    struct pollfd pfd = {.fd = receiver, .events = POLLIN};
-    assert(poll(&pfd, 1, 2000) == 1);
-    assert(recv(receiver, pkt, sizeof(pkt), 0) == 20);
-    assert(pkt[1] == 0xd4 && pkt[2] == 0x00 && pkt[3] == 0x07);
-    uint32_t announced = 0, head = 0;
-    uint64_t ntp = 0;
-    for (int i = 0; i < 4; i++) announced = (announced << 8) | pkt[4 + i];
-    for (int i = 0; i < 8; i++) ntp = (ntp << 8) | pkt[8 + i];
-    for (int i = 0; i < 4; i++) head = (head << 8) | pkt[16 + i];
-
-    /* The 0x0007 flag has the receiver play the announced frame 11025
-     * frames after the packet's NTP time; on the started line that frame is
+    /* With the head far ahead, however long this test takes, the started
+     * line alone decides the announced frame: the 0x0007 flag has the
+     * receiver play it 11025 frames after the packet's NTP time, so it is
      * first_rtp shifted by the time from the start instant. */
-    assert(announced ==
-           first_rtp + 11025 + (uint32_t)(NTP2TS(ntp, 44100) - start_ts));
-    assert(head == first_rtp);
+    ap2cl_test_set_head_ts(client, start_ts + 30 * 44100);
+    assert(ap2cl_test_send_periodic_sync(client));
+    ntp_sync_t sync = read_ntp_sync(receiver);
+    assert(sync.header == 0x80);
+    assert(sync.announced ==
+           first_rtp + 11025 + (uint32_t)(NTP2TS(sync.ntp, 44100) - start_ts));
+    assert(sync.head == first_rtp + 30 * 44100);
 
-    /* A head trailing the announced frame, as it does while catching up
-     * after a stall, holds the periodic packet back. */
-    ap2cl_test_set_head_ts(client, start_ts - 44100);
+    /* A head that fell behind the line, as while catching up after a stall,
+     * holds a periodic packet back... */
+    uint64_t lapsed = start_ts - 44100;
+    ap2cl_test_set_head_ts(client, lapsed);
     assert(!ap2cl_test_send_periodic_sync(client));
+    struct pollfd pfd = {.fd = receiver, .events = POLLIN};
     assert(poll(&pfd, 1, 200) == 0);
+
+    /* ...while a first packet announces the head itself, at its own instant
+     * on the line. */
+    assert(ap2cl_test_send_first_sync(client));
+    sync = read_ntp_sync(receiver);
+    assert(sync.header == 0x90);
+    assert(sync.announced == first_rtp - 44100 && sync.head == sync.announced);
+    int64_t off = (int64_t)NTP2TS(sync.ntp, 44100) - (int64_t)(lapsed - 11025);
+    assert(off >= -1 && off <= 0);
 
     ap2cl_destroy(client);
     close(receiver);
