@@ -2618,7 +2618,8 @@ static bool ap2_set_nonblocking(int fd, const char *name)
  * Format (from owntone rtp_common.c sync_packet_ntp_make):
  *   bytes 0-1:  header (0x90d4 first, 0x80d4 subsequent)
  *   bytes 2-3:  fixed 0x0007
- *   bytes 4-7:  RTP timestamp - latency (network order)
+ *   bytes 4-7:  RTP timestamp audible 11025 frames after the NTP time
+ *               (network order)
  *   bytes 8-11: NTP seconds (wall clock, network order)
  *   bytes 12-15: NTP fraction (network order)
  *   bytes 16-19: current RTP timestamp (network order)
@@ -2637,14 +2638,27 @@ static ap2_send_result_t ap2_send_sync_packet(struct ap2cl_s *p, bool first)
     pkt[2] = 0x00;
     pkt[3] = 0x07;
 
-    uint32_t latency_frames = MS2TS(p->lead_ms, p->format.sample_rate);
-    uint32_t ts_latency = p->rtp_timestamp >= latency_frames
-                          ? p->rtp_timestamp - latency_frames : 0;
-    uint32_t ts_be = htonl(ts_latency);
+    /* A frame's RTP timestamp less rtp_offset is its audible instant in
+     * samples on this NTP clock. The 0x0007 flag makes receivers play the
+     * bytes 4-7 frame 11025 frames after the NTP time (iTunes semantics, see
+     * shairport-sync's rtp.c), so that is the frame audible then. */
+    uint64_t ntp = raopcl_get_ntp(NULL);
+    uint32_t announced = (uint32_t)NTP2TS(ntp, p->format.sample_rate)
+                       + atomic_load(&p->rtp_offset) + 11025;
+    /* Receivers also read bytes 16-19 less bytes 4-7 as their latency, so the
+     * announced frame must not pass the head. Where it would (catching up
+     * after a stall, or a first packet sent under 11025 frames ahead), a
+     * periodic packet is held back, as the receiver keeps the line it has,
+     * and a first packet announces the head at its own, earlier instant on
+     * the same line. */
+    if ((int32_t)(p->rtp_timestamp - announced) < 0) {
+        if (!first) return AP2_SEND_DROPPED;
+        announced = p->rtp_timestamp;
+        ntp = TS2NTP(p->head_ts - 11025, p->format.sample_rate);
+    }
+    uint32_t ts_be = htonl(announced);
     memcpy(pkt + 4, &ts_be, 4);
 
-    /* NTP time */
-    uint64_t ntp = raopcl_get_ntp(NULL);
     uint32_t ntp_sec = htonl((uint32_t)(ntp >> 32));
     uint32_t ntp_frac = htonl((uint32_t)(ntp & 0xFFFFFFFF));
     memcpy(pkt + 8, &ntp_sec, 4);
@@ -6237,7 +6251,15 @@ bool ap2cl_test_set_ctrl_peer(struct ap2cl_s *p, uint16_t port)
 /* The periodic sync packet the audio path sends every hundred chunks. */
 bool ap2cl_test_send_periodic_sync(struct ap2cl_s *p)
 {
-    return ap2_send_sync_packet_ptp(p, false) == AP2_SEND_SENT;
+    return (p->use_ptp ? ap2_send_sync_packet_ptp(p, false)
+                       : ap2_send_sync_packet(p, false)) == AP2_SEND_SENT;
+}
+
+/* The sync packet the audio path sends ahead of a line's first chunk. */
+bool ap2cl_test_send_first_sync(struct ap2cl_s *p)
+{
+    return (p->use_ptp ? ap2_send_sync_packet_ptp(p, true)
+                       : ap2_send_sync_packet(p, true)) == AP2_SEND_SENT;
 }
 
 void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable)

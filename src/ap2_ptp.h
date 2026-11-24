@@ -21,16 +21,9 @@ struct ap2_ptp_ctx *ap2_ptp_create(void);
 void ap2_ptp_destroy(struct ap2_ptp_ctx *ctx);
 
 /*
- * Set PTP-to-local clock offset in nanoseconds.
- * Provided by the MA provider which runs a centralized PTP client.
- * Positive offset means PTP clock is ahead of local clock.
- */
-void ap2_ptp_set_offset(struct ap2_ptp_ctx *ctx, int64_t offset_ns);
-
-/*
  * Start NTP timing responder on a UDP socket.
- * Responds to NTP timing requests from the AirPlay device.
- * Applies PTP offset if set.
+ * Responds to NTP timing requests from the AirPlay device, on the NTP clock
+ * libraop's raopcl_get_ntp() reads.
  *
  * :param device_ip: IP address of the AirPlay device (for logging).
  * :returns: true on success.
@@ -42,12 +35,6 @@ void ap2_ptp_stop(struct ap2_ptp_ctx *ctx);
 
 /* Get the UDP port the timing responder is listening on. */
 int ap2_ptp_get_timing_port(struct ap2_ptp_ctx *ctx);
-
-/* Get current time as NTP 64-bit timestamp, adjusted by PTP offset. */
-uint64_t ap2_ptp_get_time(struct ap2_ptp_ctx *ctx);
-
-/* Convert a local NTP timestamp to the device's PTP clock domain. */
-uint64_t ap2_ptp_local_to_device(struct ap2_ptp_ctx *ctx, uint64_t local_ntp);
 
 /* ---- PTP grandmaster engine (IEEE 1588 two-step master) ---- */
 

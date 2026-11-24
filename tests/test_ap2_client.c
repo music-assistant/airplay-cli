@@ -65,6 +65,7 @@ struct ap2_ptp_ctx *ap2cl_test_attach_ptp(struct ap2cl_s *p);
 bool ap2cl_test_follow_clock(struct ap2cl_s *p);
 bool ap2cl_test_set_ctrl_peer(struct ap2cl_s *p, uint16_t port);
 bool ap2cl_test_send_periodic_sync(struct ap2cl_s *p);
+bool ap2cl_test_send_first_sync(struct ap2cl_s *p);
 void ap2cl_test_set_use_buffered(struct ap2cl_s *p, bool enable);
 void ap2cl_test_set_buffered_sock(struct ap2cl_s *p, int fd);
 void ap2cl_test_buffered_rtp_header(struct ap2cl_s *p, uint8_t hdr[12]);
@@ -2606,11 +2607,138 @@ static void test_retransmit_responder(void)
     puts("ap2_client retransmit responder tests passed");
 }
 
+/* Play the receiver end: time the NTP responder and check that it answers on
+ * the clock the NTP sync packets carry. */
+static void test_ntp_responder_answers_on_sync_clock(void)
+{
+    struct ap2_ptp_ctx *ptp = ap2_ptp_create();
+    assert(ptp && ap2_ptp_start(ptp, "127.0.0.1"));
+
+    int peer = socket(AF_INET, SOCK_DGRAM, 0);
+    assert(peer >= 0);
+    struct timeval tv = {.tv_sec = 3, .tv_usec = 0};
+    setsockopt(peer, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct sockaddr_in to;
+    memset(&to, 0, sizeof(to));
+    to.sin_family = AF_INET;
+    to.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    to.sin_port = htons((uint16_t)ap2_ptp_get_timing_port(ptp));
+
+    /* Timing request whose send time (bytes 24-31) the reply must echo. */
+    uint8_t req[32] = {0x80, 0xd2, 0x00, 0x07};
+    for (int i = 24; i < 32; i++) req[i] = (uint8_t)i;
+    uint64_t before = raopcl_get_ntp(NULL);
+    assert(sendto(peer, req, sizeof(req), 0,
+                  (struct sockaddr *)&to, sizeof(to)) == (ssize_t)sizeof(req));
+    uint8_t resp[32];
+    assert(recv(peer, resp, sizeof(resp), 0) == (ssize_t)sizeof(resp));
+    uint64_t after = raopcl_get_ntp(NULL);
+
+    assert(resp[0] == 0x80 && resp[1] == 0xd3);
+    assert(!memcmp(resp + 8, req + 24, 8));
+    uint64_t received = 0;
+    for (int i = 16; i < 24; i++) received = (received << 8) | resp[i];
+    assert(received >= before && received <= after);
+    assert(!memcmp(resp + 24, resp + 16, 8));
+
+    close(peer);
+    ap2_ptp_stop(ptp);
+    ap2_ptp_destroy(ptp);
+    puts("ap2_client NTP responder clock test passed");
+}
+
 static uint64_t test_now_unix_ms(void)
 {
     struct timeval tv;
     gettimeofday(&tv, NULL);
     return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+}
+
+typedef struct {
+    uint8_t header;
+    uint32_t announced;
+    uint64_t ntp;
+    uint32_t head;
+} ntp_sync_t;
+
+/* Take the next NTP sync packet off the fake receiver's control port. */
+static ntp_sync_t read_ntp_sync(int fd)
+{
+    uint8_t pkt[64];
+    struct pollfd pfd = {.fd = fd, .events = POLLIN};
+    assert(poll(&pfd, 1, 2000) == 1);
+    assert(recv(fd, pkt, sizeof(pkt), 0) == 20);
+    assert(pkt[1] == 0xd4 && pkt[2] == 0x00 && pkt[3] == 0x07);
+    ntp_sync_t sync = {.header = pkt[0]};
+    for (int i = 0; i < 4; i++) sync.announced = (sync.announced << 8) | pkt[4 + i];
+    for (int i = 0; i < 8; i++) sync.ntp = (sync.ntp << 8) | pkt[8 + i];
+    for (int i = 0; i < 4; i++) sync.head = (sync.head << 8) | pkt[16 + i];
+    return sync;
+}
+
+/* Play the receiver end of an NTP session: a sync packet must place the
+ * started line where START committed it, however far ahead the queue runs,
+ * and never announce a frame beyond the head it carries. */
+static void test_ntp_sync_announces_start_line(void)
+{
+    int receiver = socket(AF_INET, SOCK_DGRAM, 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = htonl(INADDR_LOOPBACK),
+    };
+    socklen_t addr_len = sizeof(addr);
+    assert(receiver >= 0);
+    assert(bind(receiver, (struct sockaddr *)&addr, sizeof(addr)) == 0);
+    assert(getsockname(receiver, (struct sockaddr *)&addr, &addr_len) == 0);
+
+    ap2_device_info_t device = {
+        .name = "ntp sync", .address = "127.0.0.1", .port = 7000};
+    ap2_audio_format_t format = {
+        .sample_rate = 44100, .bit_depth = 16, .channels = 2};
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_set_splice(client, true);
+    ap2cl_test_set_session_state(client, AP2_CONNECTED);
+    assert(ap2cl_test_set_ctrl_peer(client, ntohs(addr.sin_port)));
+
+    assert(ap2cl_start(client, test_now_unix_ms() + 500, NULL) == AP2_COMMIT_OK);
+    uint64_t start_ts = ap2cl_test_head_ts(client);
+    uint32_t first_rtp = ap2cl_test_rtp_timestamp(client);
+
+    /* With the head far ahead, however long this test takes, the started
+     * line alone decides the announced frame: the 0x0007 flag has the
+     * receiver play it 11025 frames after the packet's NTP time, so it is
+     * first_rtp shifted by the time from the start instant. */
+    ap2cl_test_set_head_ts(client, start_ts + 30 * 44100);
+    assert(ap2cl_test_send_periodic_sync(client));
+    ntp_sync_t sync = read_ntp_sync(receiver);
+    assert(sync.header == 0x80);
+    assert(sync.announced ==
+           first_rtp + 11025 + (uint32_t)(NTP2TS(sync.ntp, 44100) - start_ts));
+    assert(sync.head == first_rtp + 30 * 44100);
+
+    /* A head that fell behind the line, as while catching up after a stall,
+     * holds a periodic packet back... */
+    uint64_t lapsed = start_ts - 44100;
+    ap2cl_test_set_head_ts(client, lapsed);
+    assert(!ap2cl_test_send_periodic_sync(client));
+    struct pollfd pfd = {.fd = receiver, .events = POLLIN};
+    assert(poll(&pfd, 1, 200) == 0);
+
+    /* ...while a first packet announces the head itself, at its own instant
+     * on the line. */
+    assert(ap2cl_test_send_first_sync(client));
+    sync = read_ntp_sync(receiver);
+    assert(sync.header == 0x90);
+    assert(sync.announced == first_rtp - 44100 && sync.head == sync.announced);
+    int64_t off = (int64_t)NTP2TS(sync.ntp, 44100) - (int64_t)(lapsed - 11025);
+    assert(off >= -1 && off <= 0);
+
+    ap2cl_destroy(client);
+    close(receiver);
+    puts("ap2_client NTP sync start line test passed");
 }
 
 /* Metadata, artwork and progress pushed before the first START land on the
@@ -4085,6 +4213,8 @@ int main(int argc, char **argv)
     assert(argc == 1);
     test_host_clock_defaults_to_realtime();
     test_retransmit_responder();
+    test_ntp_responder_answers_on_sync_clock();
+    test_ntp_sync_announces_start_line();
     test_route_with_password();
     test_buffered_route_resolution();
     test_forced_timing_and_compat_route();
