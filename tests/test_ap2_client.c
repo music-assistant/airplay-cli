@@ -2915,6 +2915,53 @@ static void test_raopcl_metadata_before_first_frame_on_stream_timeline(void)
     puts("raopcl metadata before first frame timeline tests passed");
 }
 
+/* libraop starts its timing thread before ANNOUNCE and its control thread
+ * after RECORD: a connect that fails earlier tears down only what it started
+ * (patches/libraop-raop_client.patch). */
+static void test_raopcl_connect_failure_teardown(void)
+{
+    struct in_addr any = {.s_addr = htonl(INADDR_ANY)};
+    struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
+
+    /* ANNOUNCE rejected: only the timing thread runs. */
+    uint16_t port = 0;
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = listen_loopback(&port);
+    peer->expected_requests = 1;
+    peer->reject_request = 1;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_accepting_command_peer,
+                          peer) == 0);
+
+    struct raopcl_s *raopcl = raopcl_create(
+        any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, 88200,
+        RAOP_CLEAR, false, "", NULL, "0,1", "0,1,2", 44100, 16, 2, -144.0f);
+    assert(raopcl);
+    assert(raop_rtsp_claim());
+    assert(!raopcl_connect(raopcl, loopback, port, false));
+    assert(raopcl_destroy(raopcl));
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok);
+    assert(peer->request_count == 1);
+    assert(strcmp(peer->requests[0].method, "ANNOUNCE") == 0);
+    assert(close(peer->fd) == 0);
+    free(peer);
+
+    /* Nothing listening: neither thread runs. */
+    int listener = listen_loopback(&port);
+    assert(close(listener) == 0);
+    raopcl = raopcl_create(
+        any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, 88200,
+        RAOP_CLEAR, false, "", NULL, "0,1", "0,1,2", 44100, 16, 2, -144.0f);
+    assert(raopcl);
+    assert(raop_rtsp_claim());
+    assert(!raopcl_connect(raopcl, loopback, port, false));
+    assert(raopcl_destroy(raopcl));
+
+    puts("raopcl connect failure teardown tests passed");
+}
+
 static void test_info_txt_fallback(void)
 {
     /* DNS wire format: [len][key=value]...; the whitespace, NUL and empty
@@ -4241,6 +4288,7 @@ int main(int argc, char **argv)
     test_mrp_artwork_push_status();
     test_metadata_before_start_on_stream_timeline();
     test_raopcl_metadata_before_first_frame_on_stream_timeline();
+    test_raopcl_connect_failure_teardown();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_raopcl_rtsp_hook();
