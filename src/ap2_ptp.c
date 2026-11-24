@@ -17,8 +17,9 @@
  *     shm (see ap2_ptp_shm.h); streams attach read-only, so any number of
  *     concurrent players share one timeline for multi-room sync.
  *
- * This file also implements a minimal NTP timing responder for devices that
- * send NTP timing requests on the timing UDP port (required for RAOP-compat flow).
+ * This file also implements a minimal NTP timing responder, which native
+ * AirPlay 2 sessions use instead of the PTP engine with `--timing ntp`, for
+ * receivers without SupportsPTP, or when UDP 319/320 cannot be bound.
  *
  * Copyright (C) 2024-2026 Music Assistant Contributors
  * SPDX-License-Identifier: Apache-2.0
