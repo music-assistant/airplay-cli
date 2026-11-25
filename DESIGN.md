@@ -1016,7 +1016,10 @@ deny-list entry, not a policy retreat.
   `/feedback` every ~2 s (real senders do; receivers idle-time-out long
   sessions without it), independent of command-pipe metadata, artwork loading,
   and progress updates. The worker services encrypted reverse events after
-  each feedback POST. RAOP paths use libraop's keepalive (~20 s).
+  each feedback POST. RAOP paths rely on libraop's own keepalive, an RTSP
+  `OPTIONS` every ~25 s from its control thread. That thread shares the RTSP
+  connection with the command-pipe thread, so the build patches libraop's
+  rtsp_client.c (`patches/`) to run one request and its answer at a time.
 - **Receiver stream list** — a `/feedback` response may carry the receiver's
   own list of the streams it still holds for us,
   `{"streams": [{"type": 96, "sr": 44100}]}`, logged at DEBUG on each tick that
@@ -1077,7 +1080,10 @@ deny-list entry, not a policy retreat.
   raop_client.c's `rtspcl_create` through `raop_rtsp.c`, which records it
   (Makefile). The connection is closed right after the `TEARDOWN` (Shairport
   Sync ends a native session only with it), so the exit cleanup sends no
-  second one.
+  second one. On RAOP the `TEARDOWN` waits its turn behind a request still in
+  flight (libraop's keepalive) and shares its one second with that wait: a
+  receiver that leaves the earlier request unanswered gets the closed
+  connection as its goodbye.
 - **Receiver close** — a receiver that closes the RTSP connection in an orderly
   way (EOF; Shairport Sync does when another sender takes over) ended the
   session itself: the audio loop reports `[STATUS] receiver_closed` and exits 0
