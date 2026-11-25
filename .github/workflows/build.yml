@@ -163,6 +163,11 @@ jobs:
     # Both arches build on the arm64 runner: arm64 natively, x86_64 cross-compiled
     # via -arch (the Intel macos-13 runner is being retired).
     runs-on: macos-15
+    env:
+      # Oldest macOS the release binaries support; unset, the compiler targets
+      # the runner's own macOS version. 11.0 is what libraop's prebuilt arm64
+      # libraries are built for.
+      MACOSX_DEPLOYMENT_TARGET: "11.0"
     strategy:
       fail-fast: false
       matrix:
@@ -199,6 +204,12 @@ jobs:
             "./$bin" --check | grep -qE "cliairplay.*check"
           else
             file "$bin" | grep -qi "x86_64"
+          fi
+          min_macos=$(otool -l "$bin" | awk '$1 == "minos" {print $2}')
+          echo "Minimum macOS version: ${min_macos:-none}"
+          if [ "$min_macos" != "$MACOSX_DEPLOYMENT_TARGET" ]; then
+            echo "::error::$bin targets macOS ${min_macos:-none}; expected $MACOSX_DEPLOYMENT_TARGET"
+            exit 1
           fi
       - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
