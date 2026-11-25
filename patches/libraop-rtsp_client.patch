@@ -7,7 +7,7 @@ FLUSH and TEARDOWN on a socket that never connected and waits 10 s for
 each answer.
 
 diff --git a/src/rtsp_client.c b/src/rtsp_client.c
-index eeb6c18..ed71a4e 100644
+index d71fa13..92edb26 100644
 --- a/src/rtsp_client.c
 +++ b/src/rtsp_client.c
 @@ -100,7 +100,11 @@ bool rtspcl_connect(struct rtspcl_s *p, struct in_addr local, struct in_addr hos

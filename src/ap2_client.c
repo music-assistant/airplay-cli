@@ -3367,7 +3367,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
         RAOP_ALAC, DEFAULT_FRAMES_PER_CHUNK, latency_frames,
         RAOP_CLEAR, mfi_auth,
         p->secret ? p->secret : "", p->password,
-        p->et ? p->et : "0,4", p->md ? p->md : "0,1,2",
+        p->et ? p->et : "0,4", p->md ? p->md : "0,1,2", p->am,
         p->format.sample_rate, p->format.bit_depth, p->format.channels,
         p->volume > 0 ? raopcl_float_volume(p->volume) : -144.0f);
     p->raop_rtsp = raop_rtsp_claim();
