@@ -2964,6 +2964,24 @@ static void test_raopcl_connect_failure_teardown(void)
     puts("raopcl connect failure teardown tests passed");
 }
 
+/* A connect the system refuses must fail and leave no socket behind. libraop
+ * otherwise carries on with its requests on the dead socket, each of which can
+ * wait 10 s for an answer (patches/libraop-cross_net.patch,
+ * patches/libraop-rtsp_client.patch). */
+static void test_rtspcl_connect_refused(void)
+{
+    uint16_t port = 0;
+    assert(close(listen_loopback(&port)) == 0);
+
+    struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
+    struct rtspcl_s *rtsp = rtspcl_create("test");
+    assert(rtsp);
+    assert(!rtspcl_connect(rtsp, loopback, loopback, port, "1"));
+    assert(rtspcl_get_serv_sock(rtsp) == -1);
+    assert(rtspcl_destroy(rtsp));
+    puts("rtspcl refused connect test passed");
+}
+
 static void test_info_txt_fallback(void)
 {
     /* DNS wire format: [len][key=value]...; the whitespace, NUL and empty
@@ -4291,6 +4309,7 @@ int main(int argc, char **argv)
     test_metadata_before_start_on_stream_timeline();
     test_raopcl_metadata_before_first_frame_on_stream_timeline();
     test_raopcl_connect_failure_teardown();
+    test_rtspcl_connect_refused();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_raopcl_rtsp_hook();
