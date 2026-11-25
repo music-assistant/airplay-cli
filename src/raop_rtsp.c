@@ -77,8 +77,9 @@ bool raop_rtsp_teardown(struct rtspcl_s *rtsp)
     } else {
         LOG_ERROR("Cannot start the RTSP TEARDOWN thread");
     }
-    /* Ends a TEARDOWN still waiting for its answer, and nothing more goes out
-     * on the connection: libraop's exit-time FLUSH and TEARDOWN fail on it.
+    /* Ends a TEARDOWN still waiting for its turn or its answer, and nothing
+     * more goes out on the connection: libraop's exit-time FLUSH and TEARDOWN
+     * fail on it.
      * The client itself is left to libraop, whose exit path joins the threads
      * that also use it (the keepalive) before it disconnects. */
     atomic_store(&g_ended, rtsp);

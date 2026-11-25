@@ -6,11 +6,59 @@ A failed connect closes its socket. Left open, the cleanup after it sends
 FLUSH and TEARDOWN on a socket that never connected and waits 10 s for
 each answer.
 
+Only one request and its answer run on the connection at a time. libraop's
+control thread sends its keepalive on the connection the caller's own thread
+uses for volume, metadata, artwork and FLUSH. Left to overlap, each thread
+reads parts of the other's answer, and one request can land in the middle of
+another's body.
+
 diff --git a/src/rtsp_client.c b/src/rtsp_client.c
-index d71fa13..92edb26 100644
+index d71fa13..2ae31aa 100644
 --- a/src/rtsp_client.c
 +++ b/src/rtsp_client.c
-@@ -100,7 +100,11 @@ bool rtspcl_connect(struct rtspcl_s *p, struct in_addr local, struct in_addr hos
+@@ -48,16 +48,32 @@ typedef struct rtspcl_s {
+ 		char realm[16], nonce[256+1];
+ 		char ha1[32+1];
+ 	} digest;
++	pthread_mutex_t mutex;
+ } rtspcl_t;
+ 
+ extern log_level 	raop_loglevel;
+ static log_level	*loglevel = &raop_loglevel;
+ 
+-static bool exec_request(rtspcl_t *rtspcld, char *cmd, char *content_type,
++static bool exec_request_locked(rtspcl_t *rtspcld, char *cmd, char *content_type,
+ 			 char *content, int length, int get_response, key_data_t *hds,
+ 			 key_data_t *kd, char **resp_content, int *resp_len,
+ 			 char* url);
+ 
++/*----------------------------------------------------------------------------*/
++// several threads share the connection: one request and its answer at a time
++static bool exec_request(rtspcl_t *rtspcld, char *cmd, char *content_type,
++			 char *content, int length, int get_response, key_data_t *hds,
++			 key_data_t *kd, char **resp_content, int *resp_len,
++			 char* url) {
++	if (!rtspcld) return false;
++
++	pthread_mutex_lock(&rtspcld->mutex);
++	bool rc = exec_request_locked(rtspcld, cmd, content_type, content, length, get_response, hds, kd, resp_content, resp_len, url);
++	pthread_mutex_unlock(&rtspcld->mutex);
++
++	return rc;
++}
++
+ /*----------------------------------------------------------------------------*/
+ int rtspcl_get_serv_sock(struct rtspcl_s *p) {
+ 	return p->fd;
+@@ -69,6 +85,7 @@ struct rtspcl_s *rtspcl_create(char const *useragent) {
+ 	memset(rtspcld, 0, sizeof(rtspcl_t));
+ 	rtspcld->useragent = useragent;
+ 	rtspcld->fd = -1;
++	pthread_mutex_init(&rtspcld->mutex, NULL);
+ 	return rtspcld;
+ }
+ 
+@@ -100,7 +117,11 @@ bool rtspcl_connect(struct rtspcl_s *p, struct in_addr local, struct in_addr hos
  
  	p->session = NULL;
  	if ((p->fd = open_tcp_socket(local, NULL, true)) == -1) return false;
@@ -23,3 +71,20 @@ index d71fa13..92edb26 100644
  
  	struct sockaddr_in name;
  	socklen_t namelen = sizeof(name);
+@@ -136,6 +157,7 @@ bool rtspcl_destroy(struct rtspcl_s *p) {
+ 	if (!p) return false;
+ 
+ 	bool rc = rtspcl_disconnect(p);
++	pthread_mutex_destroy(&p->mutex);
+ 	free(p);
+ 
+ 	return rc;
+@@ -560,7 +582,7 @@ bool rtspcl_teardown(struct rtspcl_s *p) {
+  * send RTSP request, and get responce if it's needed
+  * if this gets a success, *kd is allocated or reallocated (if *kd is not NULL)
+  */
+-static bool exec_request(struct rtspcl_s *rtspcld, char *cmd, char *content_type,
++static bool exec_request_locked(struct rtspcl_s *rtspcld, char *cmd, char *content_type,
+ 				char *content, int length, int get_response, key_data_t *hds,
+ 				key_data_t *rkd, char **resp_content, int *resp_len, char* url) {
+ 	char *req;

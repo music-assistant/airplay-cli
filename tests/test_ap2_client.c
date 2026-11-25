@@ -457,7 +457,9 @@ typedef struct {
     int fd;
     const char *methods[3];   /* the requests expected, in order */
     bool answer;              /* answer each with 200 */
-    int requests;
+    int hold_ms;              /* hold each answer back this long */
+    bool overlapped;          /* a request arrived while an answer was held back */
+    atomic_int requests;
     bool closed_after;        /* nothing followed but the close */
     atomic_bool finished;
 } script_peer_t;
@@ -471,6 +473,10 @@ static void *run_script_peer(void *arg)
             return NULL;
         peer->requests++;
         if (!peer->answer) continue;
+        if (peer->hold_ms) {
+            struct pollfd pfd = {.fd = peer->fd, .events = POLLIN};
+            if (poll(&pfd, 1, peer->hold_ms) != 0) peer->overlapped = true;
+        }
         char response[96];
         int len = snprintf(response, sizeof(response),
                            "RTSP/1.0 200 OK\r\nCSeq: %d\r\n"
@@ -551,6 +557,84 @@ static void test_raop_rtsp_teardown_bounded(void)
     assert(peer.closed_after);
     assert(close(peer.fd) == 0);
     puts("raop_rtsp bounded teardown test passed");
+}
+
+/* The thread's exit value tells whether the receiver answered. */
+static void *run_rtspcl_options(void *arg)
+{
+    return rtspcl_options(arg, NULL) ? arg : NULL;
+}
+
+static void wait_for_request(script_peer_t *peer)
+{
+    while (!atomic_load(&peer->requests)) usleep(1000);
+}
+
+/* libraop's control thread sends its keepalive on the connection the command
+ * thread sends on: a request waits until the answer to the one before it has
+ * been read (patches/libraop-rtsp_client.patch). */
+static void test_rtspcl_one_exchange_at_a_time(void)
+{
+    struct rtspcl_s *rtsp = rtspcl_create("test");
+    assert(rtsp);
+    script_peer_t peer = {
+        .fd = connect_rtsp_peer(rtsp),
+        .methods = {"OPTIONS ", "FLUSH ", "TEARDOWN "},
+        .answer = true,
+        .hold_ms = 100,
+    };
+    pthread_t peer_thread;
+    pthread_t keepalive;
+    assert(pthread_create(&peer_thread, NULL, run_script_peer, &peer) == 0);
+    assert(pthread_create(&keepalive, NULL, run_rtspcl_options, rtsp) == 0);
+
+    /* The keepalive is still waiting for its answer. */
+    wait_for_request(&peer);
+    assert(rtspcl_flush(rtsp, 1, 1));
+    void *answered = NULL;
+    assert(pthread_join(keepalive, &answered) == 0);
+    assert(answered);
+    assert(rtspcl_destroy(rtsp));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.requests == 3);
+    assert(!peer.overlapped);
+    assert(peer.closed_after);
+    assert(close(peer.fd) == 0);
+    puts("rtspcl one exchange at a time test passed");
+}
+
+/* STOP stays bounded when its TEARDOWN has to wait for another thread's
+ * unanswered request. */
+static void test_raop_rtsp_teardown_behind_exchange(void)
+{
+    struct rtspcl_s *rtsp = raop_rtsp_create("test");
+    assert(rtsp && raop_rtsp_claim() == rtsp);
+    script_peer_t peer = {
+        .fd = connect_rtsp_peer(rtsp),
+        .methods = {"OPTIONS "},
+    };
+    pthread_t peer_thread;
+    pthread_t keepalive;
+    assert(pthread_create(&peer_thread, NULL, run_script_peer, &peer) == 0);
+    assert(pthread_create(&keepalive, NULL, run_rtspcl_options, rtsp) == 0);
+
+    wait_for_request(&peer);
+    uint64_t started = test_monotonic_ms();
+    assert(!raop_rtsp_teardown(rtsp));
+    uint64_t elapsed = test_monotonic_ms() - started;
+    assert(elapsed >= 900 && elapsed < 1500);
+    void *answered = &peer;
+    assert(pthread_join(keepalive, &answered) == 0);
+    assert(!answered);
+    /* Its farewell TEARDOWN fails on the ended connection. */
+    assert(!rtspcl_destroy(rtsp));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer.requests == 1);
+    assert(peer.closed_after);
+    assert(close(peer.fd) == 0);
+    puts("raop_rtsp teardown behind exchange test passed");
 }
 
 /* Only an orderly close by the receiver counts as it ending the session; a
@@ -4342,6 +4426,8 @@ int main(int argc, char **argv)
     test_dead_channel_writes_farewell_teardown();
     test_raopcl_rtsp_hook();
     test_raop_rtsp_teardown_bounded();
+    test_rtspcl_one_exchange_at_a_time();
+    test_raop_rtsp_teardown_behind_exchange();
     test_raop_rtsp_peer_closed();
     test_native_teardown();
     test_native_receiver_closed();

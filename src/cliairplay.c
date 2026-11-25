@@ -1124,7 +1124,6 @@ static void session_status_line(const char *line)
 static void *cmdpipe_reader_thread(void *arg)
 {
     cli_config_t *cfg = (cli_config_t *)arg;
-    uint64_t last_keepalive = raopcl_get_ntp(NULL);
 
     LOG_INFO("Command pipe ready: %s", cfg->cmdpipe);
 
@@ -1137,16 +1136,9 @@ static void *cmdpipe_reader_thread(void *arg)
          * silence keepalive has already stopped and nothing feeds the wire until
          * TEARDOWN goes out — a receiver whose queue underruns while its session
          * is still armed pops audibly. 100 ms keeps that gap far inside the
-         * 600 ms queue depth. The wait's only other job is pacing libraop's 20 s
-         * RAOP keepalive below, which ten wakeups a second serve as well as one. */
+         * 600 ms queue depth. */
         int n = poll(&pfds, 1, 100);
         if (!g_running) break;
-
-        uint64_t now = raopcl_get_ntp(NULL);
-        if (cfg->protocol == PROTO_RAOP && g_raopcl && now - last_keepalive >= MS2NTP(20000)) {
-            raopcl_keepalive(g_raopcl);
-            last_keepalive = now;
-        }
         if (n <= 0 || !(pfds.revents & POLLIN)) continue;
 
         /* Append to the reassembly buffer and execute only complete

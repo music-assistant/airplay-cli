@@ -1016,7 +1016,10 @@ deny-list entry, not a policy retreat.
   `/feedback` every ~2 s (real senders do; receivers idle-time-out long
   sessions without it), independent of command-pipe metadata, artwork loading,
   and progress updates. The worker services encrypted reverse events after
-  each feedback POST. RAOP paths use libraop's keepalive (~20 s).
+  each feedback POST. RAOP paths rely on libraop's own keepalive, an RTSP
+  `OPTIONS` every ~25 s from its control thread. That thread shares the RTSP
+  connection with the command-pipe thread, so the build patches libraop's
+  rtsp_client.c (`patches/`) to run one request and its answer at a time.
 - **Receiver stream list** — a `/feedback` response may carry the receiver's
   own list of the streams it still holds for us,
   `{"streams": [{"type": 96, "sr": 44100}]}`, logged at DEBUG on each tick that
