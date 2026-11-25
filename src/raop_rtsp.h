@@ -21,9 +21,10 @@ struct rtspcl_s *raop_rtsp_create(const char *useragent);
 /* Take the RTSP client recorded by the last raopcl_create(), or NULL. */
 struct rtspcl_s *raop_rtsp_claim(void);
 
-/* End the receiver session now: send TEARDOWN, wait at most a second for the
- * answer, then close the connection. raopcl_disconnect() later sends nothing
- * further on it. Returns whether the receiver accepted the TEARDOWN. */
+/* End the receiver session now: send TEARDOWN, wait at most a second for its
+ * turn on the connection and the answer, then close the connection.
+ * raopcl_disconnect() later sends nothing further on it. Returns whether the
+ * receiver accepted the TEARDOWN. */
 bool raop_rtsp_teardown(struct rtspcl_s *rtsp);
 
 /* Whether the receiver closed the RTSP connection in an orderly way (EOF),

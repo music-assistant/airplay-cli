@@ -1080,7 +1080,10 @@ deny-list entry, not a policy retreat.
   raop_client.c's `rtspcl_create` through `raop_rtsp.c`, which records it
   (Makefile). The connection is closed right after the `TEARDOWN` (Shairport
   Sync ends a native session only with it), so the exit cleanup sends no
-  second one.
+  second one. On RAOP the `TEARDOWN` waits its turn behind a request still in
+  flight (libraop's keepalive) and shares its one second with that wait: a
+  receiver that leaves the earlier request unanswered gets the closed
+  connection as its goodbye.
 - **Receiver close** — a receiver that closes the RTSP connection in an orderly
   way (EOF; Shairport Sync does when another sender takes over) ended the
   session itself: the audio loop reports `[STATUS] receiver_closed` and exits 0

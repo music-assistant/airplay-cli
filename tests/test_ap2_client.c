@@ -567,7 +567,11 @@ static void *run_rtspcl_options(void *arg)
 
 static void wait_for_request(script_peer_t *peer)
 {
-    while (!atomic_load(&peer->requests)) usleep(1000);
+    uint64_t deadline = test_monotonic_ms() + 2000;
+    while (!atomic_load(&peer->requests)) {
+        assert(test_monotonic_ms() < deadline);
+        usleep(1000);
+    }
 }
 
 /* libraop's control thread sends its keepalive on the connection the command
