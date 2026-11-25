@@ -1818,7 +1818,10 @@ static bool ap2_native_open_socket(struct ap2cl_s *p)
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", p->device.port);
 
-    if (getaddrinfo(p->device.address, port_str, &hints, &res) != 0) return false;
+    if (getaddrinfo(p->device.address, port_str, &hints, &res) != 0) {
+        LOG_ERROR("[AP2] Cannot resolve %s", p->device.address);
+        return false;
+    }
     p->rtsp_carry_len = 0;
     p->sock_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (p->sock_fd >= 0 && p->bind_addr.s_addr != INADDR_ANY) {
@@ -1827,6 +1830,8 @@ static bool ap2_native_open_socket(struct ap2cl_s *p)
             LOG_WARN("[AP2] Cannot bind RTSP socket to %s", inet_ntoa(p->bind_addr));
     }
     if (p->sock_fd < 0 || connect(p->sock_fd, res->ai_addr, res->ai_addrlen) != 0) {
+        LOG_ERROR("[AP2] Cannot connect to %s:%d: %s", p->device.address,
+                  p->device.port, strerror(errno));
         freeaddrinfo(res);
         if (p->sock_fd >= 0) { close(p->sock_fd); p->sock_fd = -1; }
         return false;
