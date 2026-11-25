@@ -305,6 +305,15 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 		grep -q '^\[STATUS\] error code=connect_failed http=0 detail="[^"]*"$$' && \
 		printf '%s\n' "$$setup_failed" | \
 		grep -q "Failed to create command pipe"
+# A native AirPlay 2 connect that never reaches the device (a closed port here)
+# must say why.
+	@pipe_dir="$$(mktemp -d)"; \
+		ap2_refused="$$($(EXECUTABLE) --protocol airplay2 --port 1 --cmdpipe \
+		"$$pipe_dir/pipe" 127.0.0.1 < /dev/null 2>&1 || true)"; \
+		rm -rf "$$pipe_dir"; \
+		$(call no_sanitizer_report,$$ap2_refused) && \
+		printf '%s\n' "$$ap2_refused" | \
+		grep -q "Cannot connect to 127.0.0.1:1: Connection refused"
 # An Apple TV advertising a public key may still accept unpaired RAOP, so no
 # secret is demanded up front: the connect attempt (to a closed port) must run.
 # Skipped under sanitizers: libraop joins never-started RTP threads on a failed
