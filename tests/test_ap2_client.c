@@ -2647,11 +2647,14 @@ static void test_ntp_responder_answers_on_sync_clock(void)
     puts("ap2_client NTP responder clock test passed");
 }
 
+/* The wall clock in ms exactly as the client reads it (ap2_ntp_to_unix_ms of
+ * the NTP clock), which lands an exact millisecond one lower than a plain
+ * read of the same clock does. Reading it the same way keeps a test's reads
+ * and the client's in order, so a call's clock reads can be bracketed. */
 static uint64_t test_now_unix_ms(void)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+    uint64_t ntp = raopcl_get_ntp(NULL);
+    return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
 }
 
 typedef struct {
