@@ -96,7 +96,7 @@ struct raopcl_s *ap2_test_raopcl_create(
     char *dacp_id, char *active_remote,
     raop_codec_t codec, int frame_len, int latency_frames,
     raop_crypto_t crypto, bool auth, char *secret, char *password,
-    char *et, char *md,
+    char *et, char *md, const char *am,
     int sample_rate, int sample_size, int channels, float volume)
 {
     (void)host;
@@ -113,6 +113,7 @@ struct raopcl_s *ap2_test_raopcl_create(
     (void)password;
     (void)et;
     (void)md;
+    (void)am;
     (void)sample_rate;
     (void)sample_size;
     (void)channels;

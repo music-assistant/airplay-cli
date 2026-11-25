@@ -1393,6 +1393,7 @@ static int run_raop(cli_config_t *cfg)
         password,
         cfg->et ? cfg->et : "0,4",
         cfg->md ? cfg->md : "0,1,2",
+        cfg->am,
         cfg->sample_rate, cfg->bit_depth, cfg->channels,
         cfg->volume > 0 ? raopcl_float_volume(cfg->volume) : -144.0f
     );

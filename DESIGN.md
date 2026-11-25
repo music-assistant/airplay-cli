@@ -85,6 +85,10 @@ libraop's RAOP flow with `rtspcl_auth_setup()` performed when the device's
 raopcl code; the binary only adds metadata delivery and the shared start
 contract.
 
+On both RAOP paths the RTSP user agent follows the receiver's model (`--am`):
+libraop sends `AirPlay/999.0.0` to an Apple TV or HomePod and
+`iTunes/7.6.2` to every other receiver.
+
 ### Native AP2
 
 Connect sequence (`ap2_native_connect()`):

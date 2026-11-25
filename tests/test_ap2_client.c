@@ -491,7 +491,7 @@ static void test_raopcl_rtsp_hook(void)
     struct in_addr any = {.s_addr = htonl(INADDR_ANY)};
     struct raopcl_s *raopcl = raopcl_create(
         any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, 88200,
-        RAOP_CLEAR, false, "", NULL, "0,4", "0,1,2", 44100, 16, 2, -144.0f);
+        RAOP_CLEAR, false, "", NULL, "0,4", "0,1,2", NULL, 44100, 16, 2, -144.0f);
     assert(raopcl);
     struct rtspcl_s *rtsp = raop_rtsp_claim();
     assert(rtsp);
@@ -2876,7 +2876,7 @@ static void test_raopcl_metadata_before_first_frame_on_stream_timeline(void)
     struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
     struct raopcl_s *raopcl = raopcl_create(
         any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, latency,
-        RAOP_CLEAR, false, "", NULL, "0,1", "0,1,2", 44100, 16, 2, -144.0f);
+        RAOP_CLEAR, false, "", NULL, "0,1", "0,1,2", NULL, 44100, 16, 2, -144.0f);
     assert(raopcl);
     assert(raop_rtsp_claim());
     assert(raopcl_connect(raopcl, loopback, port, false));
@@ -2936,7 +2936,7 @@ static void raopcl_connect_rejected(char *secret, const char *method)
     struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
     struct raopcl_s *raopcl = raopcl_create(
         any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, 88200,
-        RAOP_CLEAR, false, secret, NULL, "0,1", "0,1,2", 44100, 16, 2, -144.0f);
+        RAOP_CLEAR, false, secret, NULL, "0,1", "0,1,2", NULL, 44100, 16, 2, -144.0f);
     assert(raopcl);
     assert(raop_rtsp_claim());
     assert(!raopcl_connect(raopcl, loopback, port, false));
