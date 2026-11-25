@@ -28,7 +28,13 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   transient-paired Apple receivers such as HomePods) receive the full
   now-playing client, playback-state, transport-command, text and artwork
   sequence used by current Apple senders, and their Siri / touch-surface
-  commands are reported as `[EVENT] remote command=`.
+  commands are reported as `[EVENT] remote command=`. Scrubbing on the
+  receiver is reported as `[EVENT] remote command=seek position_ms=<ms>`. The
+  target is read from the `kMRMediaRemoteOptionPlaybackPosition`,
+  `playbackPosition` or `position` key; a scrub without a usable position (no
+  such key, or not a finite number of seconds from 0 to 10^7) is logged as a
+  `set-position command without a usable position` warning carrying the
+  payload in hex.
 - **PTP timing**: an in-process gPTP-dialect grandmaster engine, plus a
   shared-clock daemon mode (`--ptp-daemon`/`--ptp-shared`) for multi-room.
 - **Route auto-selection** (`--protocol auto`): the binary picks RAOP vs

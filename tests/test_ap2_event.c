@@ -1,4 +1,5 @@
 #include <assert.h>
+#include <math.h>
 #include <stdlib.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -19,6 +20,7 @@
 
 struct command_capture {
     ap2_remote_command_t commands[16];
+    int64_t positions_ms[16];
     int count;
 };
 
@@ -26,10 +28,11 @@ static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
 
 static void capture_remote_command(
-    ap2_remote_command_t command, void *userdata)
+    ap2_remote_command_t command, int64_t position_ms, void *userdata)
 {
     struct command_capture *capture = userdata;
     assert(capture && capture->count < 16);
+    capture->positions_ms[capture->count] = position_ms;
     capture->commands[capture->count++] = command;
 }
 
@@ -240,6 +243,31 @@ static int build_nested_command_request(
     return encrypted_len;
 }
 
+/* A set-position ("spos") command as the receiver sends it on a scrub; the
+ * position node is taken over, or none is sent when it is NULL. */
+static int build_seek_request(uint8_t *encrypted, size_t encrypted_size,
+                              const uint8_t key[KEY_SIZE], uint64_t counter,
+                              int cseq, const char *position_key,
+                              ap2_pl_node *position)
+{
+    ap2_pl_node *root = ap2_pl_dict();
+    ap2_pl_dict_set(root, "type", ap2_pl_string("sendMediaRemoteCommand"));
+    ap2_pl_dict_set(root, "value", ap2_pl_string("spos"));
+    if (position_key && position) {
+        ap2_pl_node *params = ap2_pl_dict();
+        ap2_pl_dict_set(params, position_key, position);
+        ap2_pl_dict_set(root, "params", params);
+    }
+    uint8_t *body = NULL;
+    int body_len = ap2_pl_serialize(root, &body);
+    ap2_pl_free(root);
+    assert(body_len > 0 && body);
+    int encrypted_len = build_event_request(
+        encrypted, encrypted_size, key, counter, cseq, body, body_len);
+    free(body);
+    return encrypted_len;
+}
+
 static void send_request(int fd, const uint8_t key[KEY_SIZE],
                          uint64_t counter, int cseq, const char *value)
 {
@@ -399,6 +427,118 @@ static void test_transient_kdf_secret(void)
         "AAAAAAAA-BBBB-4CCC-8DDD-EEEEEEEEEEEE", session_key, 0));
 }
 
+struct seek_case {
+    const char *key;
+    ap2_pl_node *(*make)(void);
+    int64_t expected_ms; /* -1: the command is ignored */
+};
+
+static ap2_pl_node *seek_real(void) { return ap2_pl_real(83.25); }
+static ap2_pl_node *seek_int(void) { return ap2_pl_int(90); }
+static ap2_pl_node *seek_zero(void) { return ap2_pl_int(0); }
+static ap2_pl_node *seek_negative_int(void) { return ap2_pl_int(-1); }
+static ap2_pl_node *seek_negative_real(void) { return ap2_pl_real(-2.5); }
+static ap2_pl_node *seek_nan(void) { return ap2_pl_real(NAN); }
+static ap2_pl_node *seek_infinite(void) { return ap2_pl_real(INFINITY); }
+static ap2_pl_node *seek_huge(void) { return ap2_pl_real(1e300); }
+static ap2_pl_node *seek_none(void) { return NULL; }
+
+static struct command_capture run_seek_case(const uint8_t secret[KEY_SIZE],
+                                            const struct seek_case *seek,
+                                            char *logs, size_t logs_size);
+
+/* Scrubbing on the receiver arrives as a set-position command carrying the
+ * target in seconds; it is reported as a seek in milliseconds. One without a
+ * usable position (missing, negative, not finite or absurdly large) is
+ * ignored. */
+static void test_seek_command(const uint8_t secret[KEY_SIZE])
+{
+    static const struct seek_case cases[] = {
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_real, 83250},
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_int, 90000},
+        {"playbackPosition", seek_real, 83250},
+        {"position", seek_int, 90000},
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_zero, 0},
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_negative_int, -1},
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_negative_real, -1},
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_nan, -1},
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_infinite, -1},
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_huge, -1},
+        {"kMRMediaRemoteOptionPlaybackPosition", seek_none, -1},
+        {"unknownKey", seek_real, -1},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        struct command_capture capture = run_seek_case(secret, &cases[i], NULL, 0);
+        if (cases[i].expected_ms < 0) {
+            assert(capture.count == 0);
+        } else {
+            assert(capture.count == 1);
+            assert(capture.commands[0] == AP2_REMOTE_COMMAND_SEEK);
+            assert(capture.positions_ms[0] == cases[i].expected_ms);
+        }
+    }
+    assert(strcmp(ap2_remote_command_name(AP2_REMOTE_COMMAND_SEEK), "seek") == 0);
+
+    /* an unrecognised key is logged with the whole payload, so the key shows */
+    static const struct seek_case unknown = {"unknownPositionKey", seek_real, -1};
+    char logs[8192];
+    struct command_capture capture = run_seek_case(secret, &unknown, logs, sizeof(logs));
+    assert(capture.count == 0);
+    assert(strstr(logs, "set-position command without a usable position"));
+    /* "unknownPositionKey" in hex */
+    assert(strstr(logs, "756e6b6e6f776e506f736974696f6e4b6579"));
+}
+
+/* Send one seek command; when `logs` is given, the log output is captured in it. */
+static struct command_capture run_seek_case(const uint8_t secret[KEY_SIZE],
+                                            const struct seek_case *seek,
+                                            char *logs, size_t logs_size)
+{
+    uint8_t receiver_key[KEY_SIZE], sender_key[KEY_SIZE];
+    derive_key_from(secret, KEY_SIZE, "Events-Write-Encryption-Key",
+                    receiver_key);
+    derive_key_from(secret, KEY_SIZE, "Events-Read-Encryption-Key",
+                    sender_key);
+    int sockets[2];
+    struct timeval timeout = {.tv_sec = 2};
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    assert(setsockopt(sockets[1], SOL_SOCKET, SO_RCVTIMEO,
+                      &timeout, sizeof(timeout)) == 0);
+    struct command_capture capture = {0};
+    struct ap2_mrp_ctx *mrp = create_mrp_with_callback(
+        secret, sockets[0], capture_remote_command, &capture);
+
+    uint8_t encrypted[1200];
+    int encrypted_len = build_seek_request(
+        encrypted, sizeof(encrypted), receiver_key, 0, 1,
+        seek->key, seek->make());
+    assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
+    int saved_stderr = -1;
+    FILE *log_capture = NULL;
+    if (logs) {
+        saved_stderr = dup(STDERR_FILENO);
+        log_capture = tmpfile();
+        assert(saved_stderr >= 0 && log_capture);
+        assert(dup2(fileno(log_capture), STDERR_FILENO) >= 0);
+        test_log_level = lWARN;
+    }
+    ap2_mrp_tick(mrp);
+    if (logs) {
+        fflush(stderr);
+        test_log_level = lSILENCE;
+        assert(dup2(saved_stderr, STDERR_FILENO) >= 0);
+        close(saved_stderr);
+        assert(fseek(log_capture, 0, SEEK_SET) == 0);
+        size_t logs_len = fread(logs, 1, logs_size - 1, log_capture);
+        logs[logs_len] = '\0';
+        fclose(log_capture);
+    }
+    read_response(sockets[1], sender_key, 0, 1);
+    ap2_mrp_destroy(mrp);
+    close(sockets[1]);
+    return capture;
+}
+
 int main(void)
 {
     uint8_t secret[KEY_SIZE];
@@ -408,6 +548,7 @@ int main(void)
     derive_key(secret, "Events-Read-Encryption-Key", sender_key);
     test_artwork_snapshot_generation(secret);
     test_transient_kdf_secret();
+    test_seek_command(secret);
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -501,6 +642,7 @@ int main(void)
     assert(capture.count == 5);
     for (int i = 0; i < capture.count; i++) {
         assert(capture.commands[i] == expected_commands[i]);
+        assert(capture.positions_ms[i] == -1);
         assert(strcmp(
                    ap2_remote_command_name(capture.commands[i]),
                    expected_names[i]) == 0);

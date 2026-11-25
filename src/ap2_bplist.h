@@ -94,6 +94,15 @@ int ap2_bplist_find_array_count(const uint8_t *data, size_t len,
 int ap2_bplist_find_data(const uint8_t *data, size_t len, const char *key,
                          const uint8_t **out, size_t *out_len);
 
+/*
+ * Find a number (real or integer) by key anywhere in a raw binary plist.
+ *
+ * :param out: receives the value on success.
+ * :returns: 1 when the key was found with a numeric value, else 0.
+ */
+int ap2_bplist_find_number(const uint8_t *data, size_t len, const char *key,
+                           double *out);
+
 /* Find a string value by key in the root dictionary only. */
 int ap2_bplist_get_root_string(const uint8_t *data, size_t len, const char *key,
                                char *out, size_t out_size);

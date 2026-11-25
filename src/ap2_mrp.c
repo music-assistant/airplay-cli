@@ -24,6 +24,7 @@
 #include <ctype.h>
 #include <unistd.h>
 #include <errno.h>
+#include <math.h>
 #include <time.h>
 #include <poll.h>
 #include <pthread.h>
@@ -1129,15 +1130,46 @@ void ap2_mrp_set_remote_command_callback(
 }
 
 static void mrp_emit_remote_command(
-    struct ap2_mrp_ctx *m, ap2_remote_command_t command)
+    struct ap2_mrp_ctx *m, ap2_remote_command_t command, int64_t position_ms)
 {
     if (m->remote_command_cb)
-        m->remote_command_cb(command, m->remote_command_userdata);
+        m->remote_command_cb(command, position_ms, m->remote_command_userdata);
+}
+
+/* Keys a set-position ("spos") command may carry its target under, in
+ * seconds. */
+static const char *const mrp_seek_position_keys[] = {
+    "kMRMediaRemoteOptionPlaybackPosition",
+    "playbackPosition",
+    "position",
+};
+
+/* A set-position target beyond this (about 115 days) is not a real position. */
+#define MRP_SEEK_POSITION_MAX_SECONDS 1e7
+
+/* A set-position command without a usable position is logged whole up to this
+ * size: the position key sits well past the first bytes of the payload. */
+#define MRP_SEEK_LOG_HEX_MAX 512
+
+/* Write the leading bytes of `body` that fit `hex` (2 characters each, plus the
+ * terminator) as hex; returns how many bytes were written. */
+static int mrp_hex_prefix(char *hex, size_t hex_size,
+                          const uint8_t *body, int body_len)
+{
+    int fits = hex_size > 0 ? (int)((hex_size - 1) / 2) : 0;
+    int shown = body_len < fits ? body_len : fits;
+    if (shown < 0) shown = 0;
+    for (int i = 0; i < shown; i++)
+        snprintf(hex + i * 2, hex_size - (size_t)i * 2, "%02x", body[i]);
+    if (hex_size > 0) hex[shown * 2] = '\0';
+    return shown;
 }
 
 static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
-                                     ap2_remote_command_t *command)
+                                     ap2_remote_command_t *command,
+                                     int64_t *position_ms)
 {
+    *position_ms = -1;
     if (!body || body_len < 8 || !command ||
         memcmp(body, "bplist00", 8) != 0)
         return false;
@@ -1161,7 +1193,28 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
         *command = AP2_REMOTE_COMMAND_NEXT;
     else if (strcmp(value, "pitm") == 0)
         *command = AP2_REMOTE_COMMAND_PREVIOUS;
-    else
+    else if (strcmp(value, "spos") == 0) {
+        /* Scrubbing on the receiver: set the playback position. */
+        double seconds = -1;
+        bool found = false;
+        for (size_t i = 0; !found && i < sizeof(mrp_seek_position_keys) /
+                                         sizeof(mrp_seek_position_keys[0]);
+             i++)
+            found = ap2_bplist_find_number(body, (size_t)body_len,
+                                           mrp_seek_position_keys[i], &seconds);
+        if (!found || !isfinite(seconds) || seconds < 0 ||
+            seconds > MRP_SEEK_POSITION_MAX_SECONDS) {
+            /* the key the receiver uses is not confirmed: show the payload */
+            char hex[MRP_SEEK_LOG_HEX_MAX * 2 + 1];
+            int shown = mrp_hex_prefix(hex, sizeof(hex), body, body_len);
+            LOG_WARN("[MRP] set-position command without a usable position "
+                     "content_length=%d hex=%s%s", body_len, hex,
+                     body_len > shown ? "..." : "");
+            return false;
+        }
+        *command = AP2_REMOTE_COMMAND_SEEK;
+        *position_ms = (int64_t)(seconds * 1000.0 + 0.5);
+    } else
         return false;
     return true;
 }
@@ -1195,13 +1248,8 @@ static void mrp_log_event_command_body(const char *header,
         }
     }
 
-    int shown = body_len < MRP_EVENT_LOG_HEX_MAX
-                    ? body_len : MRP_EVENT_LOG_HEX_MAX;
     char hex[MRP_EVENT_LOG_HEX_MAX * 2 + 1];
-    for (int i = 0; i < shown; i++)
-        snprintf(hex + i * 2, sizeof(hex) - (size_t)i * 2,
-                 "%02x", body[i]);
-    hex[shown * 2] = '\0';
+    int shown = mrp_hex_prefix(hex, sizeof(hex), body, body_len);
     LOG_DEBUG("[MRP] event command body parse failed content_type=%s "
               "content_length=%d hex=%s%s",
               safe_content_type, body_len, hex,
@@ -1272,12 +1320,14 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
         bool is_command = content_len > 0 &&
                           strcasecmp(method, "POST") == 0 &&
                           strcmp(path, "/command") == 0;
-        ap2_remote_command_t remote_command;
+        ap2_remote_command_t remote_command = AP2_REMOTE_COMMAND_PLAY;
+        int64_t remote_position_ms = -1;
         bool have_remote_command = false;
         if (is_command) {
             const uint8_t *body = m->event_plain + off + header_len;
             have_remote_command =
-                mrp_parse_remote_command(body, content_len, &remote_command);
+                mrp_parse_remote_command(body, content_len, &remote_command,
+                                         &remote_position_ms);
             if (*loglevel >= lDEBUG)
                 mrp_log_event_command_body(header, body, content_len);
         }
@@ -1307,7 +1357,7 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             mrp_event_send_response(
                 m, (const uint8_t *)response, response_len);
         if (have_remote_command)
-            mrp_emit_remote_command(m, remote_command);
+            mrp_emit_remote_command(m, remote_command, remote_position_ms);
         if (!response_ok) {
             LOG_ERROR("[MRP] event response send failed");
             return false;
