@@ -1869,6 +1869,7 @@ static bool find_artwork_identifier(const uint8_t *data, size_t len,
 typedef struct {
     char method[16];
     char uri[64];
+    char user_agent[48];
     uint8_t body[COMMAND_PEER_BODY_MAX];
     int body_len;
     bool has_rtptime;
@@ -1886,8 +1887,8 @@ typedef struct {
 } command_peer_t;
 
 /* Receiver end for the MediaRemote publication tests: answer every RTSP
- * request with 200 (reject_request with 500) while capturing method, URI and
- * body for inspection. */
+ * request with 200 (reject_request with 500) while capturing method, URI,
+ * user agent and body for inspection. */
 static void *run_command_peer(void *arg)
 {
     command_peer_t *peer = arg;
@@ -1952,6 +1953,9 @@ static void *run_command_peer(void *arg)
             peer->ok = false;
             return NULL;
         }
+        char *user_agent = strstr((char *)buffer, "\r\nUser-Agent: ");
+        if (user_agent && user_agent < body_start)
+            sscanf(user_agent, "\r\nUser-Agent: %47[^\r]", req->user_agent);
         memcpy(req->body, buffer + header_len, (size_t)content_length);
         req->body_len = (int)content_length;
         req->has_rtptime = has_rtptime;
@@ -2918,9 +2922,17 @@ static void test_raopcl_metadata_before_first_frame_on_stream_timeline(void)
     puts("raopcl metadata before first frame timeline tests passed");
 }
 
-/* Run a raopcl connect against a receiver that rejects the first request,
- * which must be `method`, and tear the failed client down. */
-static void raopcl_connect_rejected(char *secret, const char *method)
+#define RAOP_PAIRING_SECRET \
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+#define RAOP_AGENT_ITUNES "iTunes/7.6.2 (Windows; N;)"
+#define RAOP_AGENT_AIRPLAY "AirPlay/999.0.0"
+
+/* Run a raopcl connect to a receiver of model `am` that rejects the first
+ * request, which must be `method` sent as `user_agent`, and tear the failed
+ * client down. The receiver answers nothing after that, which the cleanup must
+ * not wait for (patches/libraop-raop_client.patch). */
+static void raopcl_connect_rejected(char *secret, const char *am,
+                                    const char *method, const char *user_agent)
 {
     uint16_t port = 0;
     command_peer_t *peer = calloc(1, sizeof(*peer));
@@ -2936,16 +2948,19 @@ static void raopcl_connect_rejected(char *secret, const char *method)
     struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
     struct raopcl_s *raopcl = raopcl_create(
         any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, 88200,
-        RAOP_CLEAR, false, secret, NULL, "0,1", "0,1,2", NULL, 44100, 16, 2, -144.0f);
+        RAOP_CLEAR, false, secret, NULL, "0,1", "0,1,2", am, 44100, 16, 2, -144.0f);
     assert(raopcl);
     assert(raop_rtsp_claim());
+    uint64_t started = test_monotonic_ms();
     assert(!raopcl_connect(raopcl, loopback, port, false));
+    assert(test_monotonic_ms() - started < 5000);
     assert(raopcl_destroy(raopcl));
 
     assert(pthread_join(peer_thread, NULL) == 0);
     assert(peer->ok);
     assert(peer->request_count == 1);
     assert(strcmp(peer->requests[0].method, method) == 0);
+    assert(strcmp(peer->requests[0].user_agent, user_agent) == 0);
     assert(close(peer->fd) == 0);
     free(peer);
 }
@@ -2956,12 +2971,24 @@ static void raopcl_connect_rejected(char *secret, const char *method)
 static void test_raopcl_connect_failure_teardown(void)
 {
     /* Pair-verify rejected: neither thread runs. */
-    raopcl_connect_rejected(
-        "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-        "POST");
+    raopcl_connect_rejected(RAOP_PAIRING_SECRET, NULL, "POST",
+                            RAOP_AGENT_ITUNES);
     /* ANNOUNCE rejected: only the timing thread runs. */
-    raopcl_connect_rejected("", "ANNOUNCE");
+    raopcl_connect_rejected("", NULL, "ANNOUNCE", RAOP_AGENT_ITUNES);
     puts("raopcl connect failure teardown tests passed");
+}
+
+/* libraop names its RTSP user agent after the receiver's model: an Apple TV or
+ * HomePod is told AirPlay, every other receiver iTunes. */
+static void test_raopcl_user_agent(void)
+{
+    raopcl_connect_rejected(RAOP_PAIRING_SECRET, "AppleTV3,2", "POST",
+                            RAOP_AGENT_AIRPLAY);
+    raopcl_connect_rejected(RAOP_PAIRING_SECRET, "AudioAccessory5,1", "POST",
+                            RAOP_AGENT_AIRPLAY);
+    raopcl_connect_rejected(RAOP_PAIRING_SECRET, "AirPort10,115", "POST",
+                            RAOP_AGENT_ITUNES);
+    puts("raopcl user agent tests passed");
 }
 
 /* A connect the system refuses must fail and leave no socket behind. libraop
@@ -4309,6 +4336,7 @@ int main(int argc, char **argv)
     test_metadata_before_start_on_stream_timeline();
     test_raopcl_metadata_before_first_frame_on_stream_timeline();
     test_raopcl_connect_failure_teardown();
+    test_raopcl_user_agent();
     test_rtspcl_connect_refused();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
