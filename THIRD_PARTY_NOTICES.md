@@ -14,7 +14,7 @@ distributed under the GNU General Public License, version 3 — see
 |---|---|---|---|
 | cliairplay (this project) | `src/` | 2024–2026 Music Assistant Contributors | Apache-2.0 per file; `src/cliairplay.c` GPL-2.0-or-later |
 | libraop RAOP core | `libraop/src/raop_client.c`, `rtsp_client.c` (and the `cliraop.c` that `src/cliairplay.c` derives from) | 2004 Shiro Ninomiya; philippe44 | GPL-2.0-or-later (raop_play lineage, see note) |
-| libraop utilities | `libraop/src/pairing.cpp`, `bplist.cpp` | philippe44 | no explicit upstream license (see note) |
+| libraop utilities | `libraop/src/pairing.cpp`, `bplist.cpp` | philippe44 | MIT (see note) |
 | AES | `libraop/src/aes.c` | 2001–2004 Christophe Devine | GPL-2.0-or-later |
 | AES-CTR | `libraop/src/aes_ctr.c` | 2007–2009 Ilya O. Levin; Hal Finney; AES128 2013 Paul Sokolovsky | ISC-style (notice below) |
 | ALAC decoder | `libraop/src/alac.c` | 2005 David Hammerton | MIT-style (notice below) |
@@ -29,15 +29,14 @@ non-static builds link the system `libcrypto` instead.
 
 ### Note on libraop's license
 
-[philippe44/libraop](https://github.com/philippe44/libraop) publishes no
-LICENSE file, although its source headers reference one ("See LICENSE"). Its
-RAOP core descends from Shiro Ninomiya's
-[raop_play](https://sourceforge.net/projects/raop-play/), which is licensed
-GPL-2.0-or-later, so those files can only be conveyed under the GPL and this
-project treats every libraop source it compiles accordingly. `pairing.cpp`
-and `bplist.cpp` are philippe44's own work without an explicit license grant;
-his sibling libraries (crosstools, libmdns, libcodecs) are MIT-licensed. An
-explicit upstream license statement would remove the remaining ambiguity.
+[philippe44/libraop](https://github.com/philippe44/libraop) places its own
+work under the MIT license (`libraop/LICENSE.txt`) and leaves third-party
+parts under their authors' conditions. Its RAOP core descends from Shiro
+Ninomiya's [raop_play](https://sourceforge.net/projects/raop-play/), which is
+licensed GPL-2.0-or-later, so those files can only be conveyed under the GPL
+and this project treats them accordingly. `pairing.cpp` and `bplist.cpp` are
+philippe44's own work and fall under his MIT license, like his sibling
+libraries (crosstools, libmdns, libcodecs).
 
 ## In the source tree but not in the binaries
 
@@ -68,7 +67,10 @@ The full text of the GNU General Public License, version 3, is in
 under "GPL version 2 or (at your option) any later version" and are conveyed
 here, as that grant permits, under version 3. mdnssd is GPL-3.0.
 
-### MIT License (crosstools, libmdns, libcodecs wrappers — philippe44)
+### MIT License (crosstools, libmdns, libcodecs wrappers, libraop utilities — philippe44)
+
+libraop's `LICENSE.txt` carries the notice "(c) Philippe,
+philippe_44@outlook.com" and refers to this license text.
 
 ```text
 MIT License

@@ -1818,7 +1818,10 @@ static bool ap2_native_open_socket(struct ap2cl_s *p)
     char port_str[8];
     snprintf(port_str, sizeof(port_str), "%d", p->device.port);
 
-    if (getaddrinfo(p->device.address, port_str, &hints, &res) != 0) return false;
+    if (getaddrinfo(p->device.address, port_str, &hints, &res) != 0) {
+        LOG_ERROR("[AP2] Cannot resolve %s", p->device.address);
+        return false;
+    }
     p->rtsp_carry_len = 0;
     p->sock_fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (p->sock_fd >= 0 && p->bind_addr.s_addr != INADDR_ANY) {
@@ -1827,6 +1830,8 @@ static bool ap2_native_open_socket(struct ap2cl_s *p)
             LOG_WARN("[AP2] Cannot bind RTSP socket to %s", inet_ntoa(p->bind_addr));
     }
     if (p->sock_fd < 0 || connect(p->sock_fd, res->ai_addr, res->ai_addrlen) != 0) {
+        LOG_ERROR("[AP2] Cannot connect to %s:%d: %s", p->device.address,
+                  p->device.port, strerror(errno));
         freeaddrinfo(res);
         if (p->sock_fd >= 0) { close(p->sock_fd); p->sock_fd = -1; }
         return false;
@@ -3362,7 +3367,7 @@ static bool ap2_raop_compat_connect(struct ap2cl_s *p)
         RAOP_ALAC, DEFAULT_FRAMES_PER_CHUNK, latency_frames,
         RAOP_CLEAR, mfi_auth,
         p->secret ? p->secret : "", p->password,
-        p->et ? p->et : "0,4", p->md ? p->md : "0,1,2",
+        p->et ? p->et : "0,4", p->md ? p->md : "0,1,2", p->am,
         p->format.sample_rate, p->format.bit_depth, p->format.channels,
         p->volume > 0 ? raopcl_float_volume(p->volume) : -144.0f);
     p->raop_rtsp = raop_rtsp_claim();

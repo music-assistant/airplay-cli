@@ -1,0 +1,27 @@
+Music Assistant changes to libraop's crosstools/src/cross_net.c, against the
+pinned submodule commit. The build applies this to a copy of the file (see
+the Makefile).
+
+tcp_connect() makes one attempt and logs why it failed. A second attempt on
+the same socket only delays the error: an unreachable device takes twice as
+long to report on Linux, and macOS refuses the second attempt outright.
+
+diff --git a/src/cross_net.c b/src/cross_net.c
+index 1badfcd..9393a4a 100644
+--- a/src/cross_net.c
++++ b/src/cross_net.c
+@@ -554,12 +554,9 @@ void set_nosigpipe(int sd) {
+ 
+ /*----------------------------------------------------------------------------*/
+ bool tcp_connect(int sd, struct sockaddr_in peer) {
+-	for (size_t count = 0; count < 2; count++) {
+-		if (!connect(sd, (struct sockaddr*) &peer, sizeof(struct sockaddr))) return true;
+-		usleep(100 * 1000);
+-	}
++	if (!connect(sd, (struct sockaddr*) &peer, sizeof(struct sockaddr))) return true;
+ 
+-	LOG_ERROR("cannot connect addr=%s, port=%d", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port));
++	LOG_ERROR("cannot connect addr=%s, port=%d (%s)", inet_ntoa(peer.sin_addr), ntohs(peer.sin_port), strerror(errno));
+ 	return false;
+ }
+ 

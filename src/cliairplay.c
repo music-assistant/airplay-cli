@@ -1299,6 +1299,48 @@ static bool report_session_end(const cli_config_t *cfg, const char *failure)
     return true;
 }
 
+#define LOCAL_NETWORK_BLOCKED_DETAIL \
+    "No route to the device. macOS may be blocking local network access for " \
+    "this program: allow it in the macOS prompt or under System Settings > " \
+    "Privacy & Security > Local Network"
+
+/* How long a blocked run stays alive: macOS only asks the user for the
+ * permission while the program that needs it is still running. */
+#define LOCAL_NETWORK_PROMPT_MS 1000
+
+/* Whether macOS appears to keep this program off the local network, which
+ * makes the device unreachable (never the case on other systems). Such a run
+ * is held here for a moment so that macOS can ask the user for the permission. */
+static bool local_network_blocked(const char *host, int port)
+{
+#ifdef __APPLE__
+    struct addrinfo hints = {.ai_family = AF_INET, .ai_socktype = SOCK_STREAM};
+    struct addrinfo *res;
+    char service[8];
+    snprintf(service, sizeof(service), "%d", port);
+    if (getaddrinfo(host, service, &hints, &res) != 0) return false;
+
+    /* macOS refuses a blocked connection at once with EHOSTUNREACH. A device
+     * that is off gives EHOSTDOWN or no answer at all; only a dead gateway on
+     * the way to another subnet looks the same, so this stays a likely cause. */
+    bool blocked = false;
+    int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
+    if (fd >= 0) {
+        fcntl(fd, F_SETFL, O_NONBLOCK);
+        blocked = connect(fd, res->ai_addr, res->ai_addrlen) != 0 &&
+                  errno == EHOSTUNREACH;
+        close(fd);
+    }
+    freeaddrinfo(res);
+    if (blocked) usleep(LOCAL_NETWORK_PROMPT_MS * 1000);
+    return blocked;
+#else
+    (void)host;
+    (void)port;
+    return false;
+#endif
+}
+
 /* ---- RAOP playback loop ---- */
 
 static int run_raop(cli_config_t *cfg)
@@ -1355,6 +1397,7 @@ static int run_raop(cli_config_t *cfg)
         password,
         cfg->et ? cfg->et : "0,4",
         cfg->md ? cfg->md : "0,1,2",
+        cfg->am,
         cfg->sample_rate, cfg->bit_depth, cfg->channels,
         cfg->volume > 0 ? raopcl_float_volume(cfg->volume) : -144.0f
     );
@@ -1371,7 +1414,10 @@ static int run_raop(cli_config_t *cfg)
     if (!raopcl_connect(client, player_addr, cfg->port, cfg->volume > 0)) {
         /* libraop does not expose the RTSP status of the failure, so a rejected
          * password is not distinguishable from an unreachable device here. */
-        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0, "RAOP connect failed",
+        status_error_ex(ERROR_CODE_CONNECT_FAILED, 0,
+                        local_network_blocked(cfg->host, cfg->port)
+                            ? LOCAL_NETWORK_BLOCKED_DETAIL
+                            : "RAOP connect failed",
                         "Cannot connect to AirPlay device");
         request_command_stop();
         atomic_store(&g_raopcl, NULL);
@@ -1631,6 +1677,8 @@ static int run_airplay2(cli_config_t *cfg)
         const char *code = ERROR_CODE_CONNECT_FAILED;
         if (kind == AP2_CONNECT_ERROR_AUTH_REQUIRED) code = ERROR_CODE_AUTH_REQUIRED;
         else if (kind == AP2_CONNECT_ERROR_AUTH_FAILED) code = ERROR_CODE_AUTH_FAILED;
+        if (local_network_blocked(cfg->host, cfg->port))
+            detail = LOCAL_NETWORK_BLOCKED_DETAIL;
         status_error_ex(code, http, detail,
                         "Cannot connect to AirPlay 2 device");
         request_command_stop();

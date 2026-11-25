@@ -43,7 +43,7 @@ static void *teardown_main(void *arg)
     return NULL;
 }
 
-struct rtspcl_s *raop_rtsp_create(char *useragent)
+struct rtspcl_s *raop_rtsp_create(const char *useragent)
 {
     struct rtspcl_s *rtsp = rtspcl_create(useragent);
     /* A fresh client can reuse the address of an ended one. */

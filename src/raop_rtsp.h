@@ -16,7 +16,7 @@
 struct rtspcl_s;
 
 /* rtspcl_create() for raop_client.c: creates the client and records it. */
-struct rtspcl_s *raop_rtsp_create(char *useragent);
+struct rtspcl_s *raop_rtsp_create(const char *useragent);
 
 /* Take the RTSP client recorded by the last raopcl_create(), or NULL. */
 struct rtspcl_s *raop_rtsp_claim(void);

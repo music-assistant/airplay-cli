@@ -398,6 +398,20 @@ short-lived tokens: administration read access for this repository's immutable
 release preflight, and contents/issues/pull requests write access scoped only
 to the server repository for its pin-update PR.
 
+### macOS Local Network permission
+
+macOS lets a program reach devices on the local network only after the user
+has allowed it under System Settings > Privacy & Security > Local Network.
+Runs started from Terminal or over SSH, as root, or from a LaunchDaemon are
+exempt; a LaunchAgent is not. Until it is allowed the device cannot be reached,
+and the binary reports `[STATUS] error code=connect_failed` with a detail that
+names the permission. It then stays alive for a second, because macOS only
+shows its prompt while the program is running.
+
+On an unattended Mac, start the binary from a LaunchDaemon instead, or allow
+the speaker subnet for all programs (see Apple's
+[TN3179](https://developer.apple.com/documentation/technotes/tn3179-understanding-local-network-privacy)).
+
 ## Architecture
 
 ```

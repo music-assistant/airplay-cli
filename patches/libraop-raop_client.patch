@@ -7,11 +7,49 @@ stream's RTP timeline, with the head that frame will carry (the commanded
 start, or now), instead of 0. Receivers that hold metadata until playback
 reaches its rtptime (Bose) would otherwise miss it.
 
+The RTP threads are told to stop before they are joined. Joined while their
+loop flag is still set, they never end and a disconnect hangs
+(philippe44/libraop#61).
+
+A connect the receiver refuses ends the connection before it cleans up. The
+cleanup's FLUSH and TEARDOWN would otherwise each wait 10 s for an answer
+the receiver need not give.
+
 diff --git a/src/raop_client.c b/src/raop_client.c
-index 84a60a5..7732387 100644
+index 446fbee..990e8c4 100644
 --- a/src/raop_client.c
 +++ b/src/raop_client.c
-@@ -812,12 +812,23 @@ uint64_t raopcl_get_progress_ms(struct raopcl_s* p)
+@@ -187,6 +187,9 @@ static void 	_raopcl_send_sync(struct raopcl_s *p, bool first);
+ static bool 	_raopcl_send_audio(struct raopcl_s *p, rtp_audio_pkt_t *packet, int size);
+ static bool 	_raopcl_disconnect(struct raopcl_s *p, bool force);
+ 
++// defined by rtsp_client.c but left out of its header
++int 			rtspcl_get_serv_sock(struct rtspcl_s *p);
++
+ /*----------------------------------------------------------------------------*/
+ raop_state_t raopcl_state(struct raopcl_s *p)
+ {
+@@ -739,11 +742,15 @@ struct raopcl_s *raopcl_create(struct in_addr host, uint16_t port_base, uint16_t
+ static void _raopcl_terminate_rtp(struct raopcl_s *p)
+ {
+ 	// Terminate RTP threads and close sockets
+-	if (p->ctrl_running) pthread_join(p->ctrl_thread, NULL);
+-	p->ctrl_running = false;
++	if (p->ctrl_running) {
++		p->ctrl_running = false;
++		pthread_join(p->ctrl_thread, NULL);
++	}
+ 
+-	if (p->time_running) pthread_join(p->time_thread, NULL);
+-	p->time_running = false;
++	if (p->time_running) {
++		p->time_running = false;
++		pthread_join(p->time_thread, NULL);
++	}
+ 
+ 	if (p->rtp_ports.ctrl.fd != -1) closesocket(p->rtp_ports.ctrl.fd);
+ 	if (p->rtp_ports.time.fd != -1) closesocket(p->rtp_ports.time.fd);
+@@ -817,12 +824,23 @@ uint64_t raopcl_get_progress_ms(struct raopcl_s* p)
  	return elapsed;
  }
  
@@ -36,7 +74,7 @@ index 84a60a5..7732387 100644
  }
  
  /*----------------------------------------------------------------------------*/
-@@ -829,7 +840,7 @@ bool raopcl_set_daap(struct raopcl_s *p, int count, ...)
+@@ -834,7 +852,7 @@ bool raopcl_set_daap(struct raopcl_s *p, int count, ...)
  
  	va_start(args, count);
  
@@ -45,3 +83,12 @@ index 84a60a5..7732387 100644
  }
  
  /*----------------------------------------------------------------------------*/
+@@ -1100,6 +1118,8 @@ bool raopcl_connect(struct raopcl_s *p, struct in_addr peer, uint16_t destport,
+  erexit:
+ 	if (sac) free(sac);
+ 	kd_free(kd);
++	// a receiver that refused the session may leave the disconnect's FLUSH and TEARDOWN unanswered
++	shutdown(rtspcl_get_serv_sock(p->rtspcl), SHUT_RDWR);
+ 	_raopcl_disconnect(p, true);
+ 
+ 	return false;

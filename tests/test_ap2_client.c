@@ -491,7 +491,7 @@ static void test_raopcl_rtsp_hook(void)
     struct in_addr any = {.s_addr = htonl(INADDR_ANY)};
     struct raopcl_s *raopcl = raopcl_create(
         any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, 88200,
-        RAOP_CLEAR, false, "", NULL, "0,4", "0,1,2", 44100, 16, 2, -144.0f);
+        RAOP_CLEAR, false, "", NULL, "0,4", "0,1,2", NULL, 44100, 16, 2, -144.0f);
     assert(raopcl);
     struct rtspcl_s *rtsp = raop_rtsp_claim();
     assert(rtsp);
@@ -1869,6 +1869,7 @@ static bool find_artwork_identifier(const uint8_t *data, size_t len,
 typedef struct {
     char method[16];
     char uri[64];
+    char user_agent[48];
     uint8_t body[COMMAND_PEER_BODY_MAX];
     int body_len;
     bool has_rtptime;
@@ -1886,8 +1887,8 @@ typedef struct {
 } command_peer_t;
 
 /* Receiver end for the MediaRemote publication tests: answer every RTSP
- * request with 200 (reject_request with 500) while capturing method, URI and
- * body for inspection. */
+ * request with 200 (reject_request with 500) while capturing method, URI,
+ * user agent and body for inspection. */
 static void *run_command_peer(void *arg)
 {
     command_peer_t *peer = arg;
@@ -1952,6 +1953,9 @@ static void *run_command_peer(void *arg)
             peer->ok = false;
             return NULL;
         }
+        char *user_agent = strstr((char *)buffer, "\r\nUser-Agent: ");
+        if (user_agent && user_agent < body_start)
+            sscanf(user_agent, "\r\nUser-Agent: %47[^\r]", req->user_agent);
         memcpy(req->body, buffer + header_len, (size_t)content_length);
         req->body_len = (int)content_length;
         req->has_rtptime = has_rtptime;
@@ -2647,11 +2651,14 @@ static void test_ntp_responder_answers_on_sync_clock(void)
     puts("ap2_client NTP responder clock test passed");
 }
 
+/* The wall clock in ms exactly as the client reads it (ap2_ntp_to_unix_ms of
+ * the NTP clock), which lands an exact millisecond one lower than a plain
+ * read of the same clock does. Reading it the same way keeps a test's reads
+ * and the client's in order, so a call's clock reads can be bracketed. */
 static uint64_t test_now_unix_ms(void)
 {
-    struct timeval tv;
-    gettimeofday(&tv, NULL);
-    return (uint64_t)tv.tv_sec * 1000ULL + (uint64_t)tv.tv_usec / 1000ULL;
+    uint64_t ntp = raopcl_get_ntp(NULL);
+    return (ntp >> 32) * 1000ULL + (((ntp & 0xFFFFFFFFULL) * 1000ULL) >> 32);
 }
 
 typedef struct {
@@ -2873,7 +2880,7 @@ static void test_raopcl_metadata_before_first_frame_on_stream_timeline(void)
     struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
     struct raopcl_s *raopcl = raopcl_create(
         any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, latency,
-        RAOP_CLEAR, false, "", NULL, "0,1", "0,1,2", 44100, 16, 2, -144.0f);
+        RAOP_CLEAR, false, "", NULL, "0,1", "0,1,2", NULL, 44100, 16, 2, -144.0f);
     assert(raopcl);
     assert(raop_rtsp_claim());
     assert(raopcl_connect(raopcl, loopback, port, false));
@@ -2913,6 +2920,93 @@ static void test_raopcl_metadata_before_first_frame_on_stream_timeline(void)
     assert(close(peer->fd) == 0);
     free(peer);
     puts("raopcl metadata before first frame timeline tests passed");
+}
+
+#define RAOP_PAIRING_SECRET \
+    "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
+#define RAOP_AGENT_ITUNES "iTunes/7.6.2 (Windows; N;)"
+#define RAOP_AGENT_AIRPLAY "AirPlay/999.0.0"
+
+/* Run a raopcl connect to a receiver of model `am` that rejects the first
+ * request, which must be `method` sent as `user_agent`, and tear the failed
+ * client down. The receiver answers nothing after that, which the cleanup must
+ * not wait for (patches/libraop-raop_client.patch). */
+static void raopcl_connect_rejected(char *secret, const char *am,
+                                    const char *method, const char *user_agent)
+{
+    uint16_t port = 0;
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = listen_loopback(&port);
+    peer->expected_requests = 1;
+    peer->reject_request = 1;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_accepting_command_peer,
+                          peer) == 0);
+
+    struct in_addr any = {.s_addr = htonl(INADDR_ANY)};
+    struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
+    struct raopcl_s *raopcl = raopcl_create(
+        any, 0, 0, "0011223344556677", "1", RAOP_ALAC_RAW, 352, 88200,
+        RAOP_CLEAR, false, secret, NULL, "0,1", "0,1,2", am, 44100, 16, 2, -144.0f);
+    assert(raopcl);
+    assert(raop_rtsp_claim());
+    uint64_t started = test_monotonic_ms();
+    assert(!raopcl_connect(raopcl, loopback, port, false));
+    assert(test_monotonic_ms() - started < 5000);
+    assert(raopcl_destroy(raopcl));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok);
+    assert(peer->request_count == 1);
+    assert(strcmp(peer->requests[0].method, method) == 0);
+    assert(strcmp(peer->requests[0].user_agent, user_agent) == 0);
+    assert(close(peer->fd) == 0);
+    free(peer);
+}
+
+/* libraop starts its timing thread after pair-verify and its control thread
+ * after RECORD: a connect that fails earlier tears down only what it started
+ * (patches/libraop-raop_client.patch). */
+static void test_raopcl_connect_failure_teardown(void)
+{
+    /* Pair-verify rejected: neither thread runs. */
+    raopcl_connect_rejected(RAOP_PAIRING_SECRET, NULL, "POST",
+                            RAOP_AGENT_ITUNES);
+    /* ANNOUNCE rejected: only the timing thread runs. */
+    raopcl_connect_rejected("", NULL, "ANNOUNCE", RAOP_AGENT_ITUNES);
+    puts("raopcl connect failure teardown tests passed");
+}
+
+/* libraop names its RTSP user agent after the receiver's model: an Apple TV or
+ * HomePod is told AirPlay, every other receiver iTunes. */
+static void test_raopcl_user_agent(void)
+{
+    raopcl_connect_rejected(RAOP_PAIRING_SECRET, "AppleTV3,2", "POST",
+                            RAOP_AGENT_AIRPLAY);
+    raopcl_connect_rejected(RAOP_PAIRING_SECRET, "AudioAccessory5,1", "POST",
+                            RAOP_AGENT_AIRPLAY);
+    raopcl_connect_rejected(RAOP_PAIRING_SECRET, "AirPort10,115", "POST",
+                            RAOP_AGENT_ITUNES);
+    puts("raopcl user agent tests passed");
+}
+
+/* A connect the system refuses must fail and leave no socket behind. libraop
+ * otherwise carries on with its requests on the dead socket, each of which can
+ * wait 10 s for an answer (patches/libraop-cross_net.patch,
+ * patches/libraop-rtsp_client.patch). */
+static void test_rtspcl_connect_refused(void)
+{
+    uint16_t port = 0;
+    assert(close(listen_loopback(&port)) == 0);
+
+    struct in_addr loopback = {.s_addr = htonl(INADDR_LOOPBACK)};
+    struct rtspcl_s *rtsp = rtspcl_create("test");
+    assert(rtsp);
+    assert(!rtspcl_connect(rtsp, loopback, loopback, port, "1"));
+    assert(rtspcl_get_serv_sock(rtsp) == -1);
+    assert(rtspcl_destroy(rtsp));
+    puts("rtspcl refused connect test passed");
 }
 
 static void test_info_txt_fallback(void)
@@ -4241,6 +4335,9 @@ int main(int argc, char **argv)
     test_mrp_artwork_push_status();
     test_metadata_before_start_on_stream_timeline();
     test_raopcl_metadata_before_first_frame_on_stream_timeline();
+    test_raopcl_connect_failure_teardown();
+    test_raopcl_user_agent();
+    test_rtspcl_connect_refused();
     test_feedback_miss_tolerated_then_recovered();
     test_dead_channel_writes_farewell_teardown();
     test_raopcl_rtsp_hook();

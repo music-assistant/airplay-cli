@@ -85,6 +85,10 @@ libraop's RAOP flow with `rtspcl_auth_setup()` performed when the device's
 raopcl code; the binary only adds metadata delivery and the shared start
 contract.
 
+On both RAOP paths the RTSP user agent follows the receiver's model (`--am`):
+libraop sends `AirPlay/999.0.0` to an Apple TV or HomePod and
+`iTunes/7.6.2` to every other receiver.
+
 ### Native AP2
 
 Connect sequence (`ap2_native_connect()`):
@@ -552,6 +556,12 @@ Per path:
   the announced frame never passes the head: while the head trails it
   (catching up after a stall) a periodic packet waits, and a first packet
   announces the head itself at its own, earlier instant on the line.
+  Receivers map those NTP times onto their own clock through the offset they
+  measure against the timing responder, so the start is only as accurate as
+  that offset. Measured on a HomePod: the start lands where PTP's does on
+  average and scatters a few ms per session. The first exchange sets the
+  offset, so a first reply that Wi-Fi delays by D leaves the start about D/2
+  late until the offset settles, over tens of seconds (90 ms → ~45 ms).
 
 PTP sync packets are the 28-byte form (`0x90d7`/`0x80d7`): current RTP
 timestamp, master-timebase nanoseconds, rendering position, and our PTP clock

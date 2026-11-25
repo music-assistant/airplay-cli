@@ -34,6 +34,7 @@ log_level raop_loglevel = lSILENCE;
 
 #define MAX_CLIENTS 8
 #define MAX_EVENTS 32
+#define TEST_MODEL "Test1,1"
 
 /* Like libraop's, each client owns an RTSP client made through the
  * raop_rtsp_create hook. */
@@ -75,6 +76,7 @@ static struct {
     int starts;
     struct raopcl_s *last_transport_client;
     uint16_t rtsp_port;   /* nonzero: connect connects the RTSP client here */
+    char am[32];          /* receiver model the last create was given */
 } mock;
 
 static void record_event(event_type_t type, int client_id)
@@ -96,7 +98,7 @@ struct raopcl_s *ap2_test_raopcl_create(
     char *dacp_id, char *active_remote,
     raop_codec_t codec, int frame_len, int latency_frames,
     raop_crypto_t crypto, bool auth, char *secret, char *password,
-    char *et, char *md,
+    char *et, char *md, const char *am,
     int sample_rate, int sample_size, int channels, float volume)
 {
     (void)host;
@@ -119,6 +121,7 @@ struct raopcl_s *ap2_test_raopcl_create(
     (void)volume;
 
     int id = ++mock.creates;
+    snprintf(mock.am, sizeof(mock.am), "%s", am ? am : "");
     if (id >= MAX_CLIENTS) return NULL;
     mock.clients[id].id = id;
     mock.clients[id].state = RAOP_DOWN;
@@ -238,8 +241,11 @@ static struct ap2cl_s *create_test_client(void)
         .bit_depth = 16,
         .channels = 2,
     };
-    return ap2cl_create(
+    struct ap2cl_s *client = ap2cl_create(
         &device, &format, NULL, NULL, "0011223344556677", "1", 2000, 50);
+    if (client)
+        ap2cl_set_raop_props(client, NULL, NULL, NULL, NULL, TEST_MODEL);
+    return client;
 }
 
 static bool check_events(const event_t *expected, size_t count)
@@ -284,6 +290,7 @@ static bool test_disconnect_reconnect_and_failure_cleanup(void)
     };
     CHECK(check_events(expected, sizeof(expected) / sizeof(expected[0])));
     CHECK(mock.creates == 3);
+    CHECK(strcmp(mock.am, TEST_MODEL) == 0);
     CHECK(mock.destroys == 3);
     CHECK(mock.destroy_counts[1] == 1);
     CHECK(mock.destroy_counts[2] == 1);
