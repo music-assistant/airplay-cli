@@ -7,11 +7,34 @@ stream's RTP timeline, with the head that frame will carry (the commanded
 start, or now), instead of 0. Receivers that hold metadata until playback
 reaches its rtptime (Bose) would otherwise miss it.
 
+A failed connect joins only the RTP threads it started. Joining one that
+was never created crashes on Linux.
+
 diff --git a/src/raop_client.c b/src/raop_client.c
-index 84a60a5..7732387 100644
+index 84a60a5..642b3b5 100644
 --- a/src/raop_client.c
 +++ b/src/raop_client.c
-@@ -812,12 +812,23 @@ uint64_t raopcl_get_progress_ms(struct raopcl_s* p)
+@@ -734,11 +734,15 @@ struct raopcl_s *raopcl_create(struct in_addr host, uint16_t port_base, uint16_t
+ static void _raopcl_terminate_rtp(struct raopcl_s *p)
+ {
+ 	// Terminate RTP threads and close sockets
+-	p->ctrl_running = false;
+-	pthread_join(p->ctrl_thread, NULL);
++	if (p->ctrl_running) {
++		p->ctrl_running = false;
++		pthread_join(p->ctrl_thread, NULL);
++	}
+ 
+-	p->time_running = false;
+-	pthread_join(p->time_thread, NULL);
++	if (p->time_running) {
++		p->time_running = false;
++		pthread_join(p->time_thread, NULL);
++	}
+ 
+ 	if (p->rtp_ports.ctrl.fd != -1) closesocket(p->rtp_ports.ctrl.fd);
+ 	if (p->rtp_ports.time.fd != -1) closesocket(p->rtp_ports.time.fd);
+@@ -812,12 +816,23 @@ uint64_t raopcl_get_progress_ms(struct raopcl_s* p)
  	return elapsed;
  }
  
@@ -36,7 +59,7 @@ index 84a60a5..7732387 100644
  }
  
  /*----------------------------------------------------------------------------*/
-@@ -829,7 +840,7 @@ bool raopcl_set_daap(struct raopcl_s *p, int count, ...)
+@@ -829,7 +844,7 @@ bool raopcl_set_daap(struct raopcl_s *p, int count, ...)
  
  	va_start(args, count);
  
