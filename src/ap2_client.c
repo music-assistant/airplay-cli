@@ -472,11 +472,11 @@ static void ap2_clock_poller_ensure(struct ap2cl_s *p);
 static uint64_t ap2_ntp_to_unix_ms(uint64_t ntp);
 
 static void ap2_remote_command_received(
-    ap2_remote_command_t command, void *userdata)
+    ap2_remote_command_t command, int64_t position_ms, void *userdata)
 {
     struct ap2cl_s *p = userdata;
     if (p && p->remote_command_cb)
-        p->remote_command_cb(command, p->remote_command_userdata);
+        p->remote_command_cb(command, position_ms, p->remote_command_userdata);
 }
 
 /* ---- Environment toggles ---- */

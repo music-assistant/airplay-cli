@@ -1077,7 +1077,12 @@ deny-list entry, not a policy retreat.
 - **Reverse event channel** — MediaRemote-eligible sessions (§8) derive
   independent `Events-Salt` keys, decrypt receiver HTTP requests (including
   `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
-  reported as `[EVENT] remote command=`), and return encrypted
+  reported as `[EVENT] remote command=`, and the `spos` set-position of a
+  scrub, reported as `[EVENT] remote command=seek position_ms=<ms>` when its
+  target is under `kMRMediaRemoteOptionPlaybackPosition`, `playbackPosition`
+  or `position` and is a finite, non-negative number of seconds up to 10^7;
+  otherwise a warning logs the payload in hex), and
+  return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
   to tear down a MediaRemote-active stream after roughly 30 seconds.
 - **Single-stream flush-and-refill** — one reader thread drains the persistent
@@ -1260,7 +1265,7 @@ verbosity, never its stream.
 | `[STATUS] latency` | stdout | once after connect, AirPlay 2 route only |
 | `[STATUS] mrp path=channel` | stdout | once after connect, only when type-130 is enabled (§8) |
 | `[STATUS] mrp path=command` | stdout | on each change of the `/command` HTTP status |
-| `[EVENT] remote command=` | stdout | device-originated remote-control press |
+| `[EVENT] remote command=` | stdout | device-originated remote-control press; a scrub carries `position_ms=` |
 | `[STATUS] connected` | stderr | once, when the session is up |
 | `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |
 | `[STATUS] audio buffered_ms=` | stderr | once per start cycle, re-armed by FLUSH (§10) |

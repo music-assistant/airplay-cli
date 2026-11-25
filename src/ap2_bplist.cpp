@@ -467,3 +467,43 @@ int ap2_bplist_find_array_count(const uint8_t *data, size_t len,
 }
 
 } /* extern "C" */
+
+int ap2_bplist_find_number(const uint8_t *data, size_t len, const char *key,
+                           double *out)
+{
+    bp_raw_view view;
+    uint64_t ref;
+    if (!key || !out || !bp_view_init(data, len, &view) ||
+        !bp_find_value_ref(&view, key, &ref))
+        return 0;
+    size_t pos = bp_view_obj_ofs(&view, ref);
+    if (!pos || pos >= view.table_ofs) return 0;
+
+    uint8_t marker = view.data[pos];
+    if ((marker & 0xF0) == 0x20) {
+        size_t bytes = (size_t)1 << (marker & 0x0F);
+        if (bytes > view.table_ofs - pos - 1) return 0;
+        uint64_t raw = bp_read_be(view.data + pos + 1, bytes);
+        if (bytes == 8) {
+            double d;
+            memcpy(&d, &raw, sizeof(d));
+            *out = d;
+            return 1;
+        }
+        if (bytes == 4) {
+            uint32_t raw32 = (uint32_t)raw;
+            float f;
+            memcpy(&f, &raw32, sizeof(f));
+            *out = f;
+            return 1;
+        }
+        return 0;
+    }
+    uint64_t value;
+    if (bp_read_uint_ref(&view, ref, &value)) {
+        /* 1, 2 and 4-byte integers are unsigned and fit; 8-byte ones are signed */
+        *out = (double)(int64_t)value;
+        return 1;
+    }
+    return 0;
+}
