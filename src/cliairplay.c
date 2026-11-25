@@ -1296,17 +1296,17 @@ static bool report_session_end(const cli_config_t *cfg, const char *failure)
 }
 
 #define LOCAL_NETWORK_BLOCKED_DETAIL \
-    "macOS is blocking local network access for this program; allow it in " \
-    "the macOS prompt or under System Settings > Privacy & Security > " \
-    "Local Network"
+    "No route to the device. macOS may be blocking local network access for " \
+    "this program: allow it in the macOS prompt or under System Settings > " \
+    "Privacy & Security > Local Network"
 
 /* How long a blocked run stays alive: macOS only asks the user for the
  * permission while the program that needs it is still running. */
 #define LOCAL_NETWORK_PROMPT_MS 1000
 
-/* Whether macOS is keeping this program off the local network, which makes
- * the device unreachable (never the case on other systems). A blocked run is
- * held here for a moment so that macOS can ask the user for the permission. */
+/* Whether macOS appears to keep this program off the local network, which
+ * makes the device unreachable (never the case on other systems). Such a run
+ * is held here for a moment so that macOS can ask the user for the permission. */
 static bool local_network_blocked(const char *host, int port)
 {
 #ifdef __APPLE__
@@ -1316,9 +1316,9 @@ static bool local_network_blocked(const char *host, int port)
     snprintf(service, sizeof(service), "%d", port);
     if (getaddrinfo(host, service, &hints, &res) != 0) return false;
 
-    /* macOS refuses a blocked connection at once with EHOSTUNREACH; a device
-     * that is merely off or out of reach never answers that fast, so the
-     * non-blocking attempt tells the two apart without waiting. */
+    /* macOS refuses a blocked connection at once with EHOSTUNREACH. A device
+     * that is off gives EHOSTDOWN or no answer at all; only a dead gateway on
+     * the way to another subnet looks the same, so this stays a likely cause. */
     bool blocked = false;
     int fd = socket(res->ai_family, res->ai_socktype, res->ai_protocol);
     if (fd >= 0) {
