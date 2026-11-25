@@ -201,17 +201,17 @@ $(BUILDDIR)/cross_util.o: CPPFLAGS += -Dgettime_us=crosstools_gettime_us
 # pins that raopcl_create still creates it there).
 $(BUILDDIR)/raop_client.o: CPPFLAGS += -Drtspcl_create=raop_rtsp_create
 
-# Our fixes to libraop's raop_client.c live in patches/: the build compiles a
-# patched copy and the submodule stays at its pinned commit. A patch that no
-# longer applies fails the build.
-RAOP_CLIENT_PATCH = patches/libraop-raop_client.patch
+# Our fixes to libraop's sources live in patches/, one file per source: the
+# build compiles a patched copy and the submodule stays at its pinned commit.
+# A patch that no longer applies fails the build.
+PATCHED_SOURCES = $(patsubst patches/libraop-%.patch,%,$(wildcard patches/libraop-*.patch))
 
-$(BUILDDIR)/raop_client.c: $(LIBRAOP)/src/raop_client.c $(RAOP_CLIENT_PATCH)
+$(BUILDDIR)/%.c: %.c patches/libraop-%.patch
 	@mkdir -p $(dir $@)
-	patch -s -F0 -o $@.tmp $< $(RAOP_CLIENT_PATCH)
+	patch -s -F0 -o $@.tmp $^
 	mv $@.tmp $@
 
-$(BUILDDIR)/raop_client.o: $(BUILDDIR)/raop_client.c
+$(PATCHED_SOURCES:%=$(BUILDDIR)/%.o): $(BUILDDIR)/%.o: $(BUILDDIR)/%.c
 	$(CC) $(CFLAGS) $(CPPFLAGS) $(INCLUDE) $< -c -o $@
 
 directory:
@@ -316,17 +316,14 @@ test: directory $(EXECUTABLE) $(TIMELINE_TEST) $(EVENT_TEST) $(IO_TEST) $(CLIENT
 		grep -q "Cannot connect to 127.0.0.1:1: Connection refused"
 # An Apple TV advertising a public key may still accept unpaired RAOP, so no
 # secret is demanded up front: the connect attempt (to a closed port) must run.
-# Skipped under sanitizers: libraop joins never-started RTP threads on a failed
-# connect, which ASan aborts on.
-ifeq ($(SANITIZE),)
 	@pipe_dir="$$(mktemp -d)"; \
 		appletv_pk="$$($(EXECUTABLE) --protocol raop --port 1 --cmdpipe \
 		"$$pipe_dir/pipe" --am AppleTV2,1 \
 		--pk 0000000000000000000000000000000000000000000000000000000000000000 \
 		127.0.0.1 < /dev/null 2>&1 || true)"; \
 		rm -rf "$$pipe_dir"; \
+		$(call no_sanitizer_report,$$appletv_pk) && \
 		printf '%s\n' "$$appletv_pk" | grep -q 'detail="RAOP connect failed"'
-endif
 
 $(RAOP_SESSION_TEST): tests/test_raop_session.c src/raop_session.c \
 		src/raop_session.h Makefile

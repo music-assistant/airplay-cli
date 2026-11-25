@@ -1,0 +1,25 @@
+Music Assistant changes to libraop's src/rtsp_client.c, against the pinned
+submodule commit. The build applies this to a copy of the file (see the
+Makefile).
+
+A failed connect closes its socket. Left open, the cleanup after it sends
+FLUSH and TEARDOWN on a socket that never connected and waits 10 s for
+each answer.
+
+diff --git a/src/rtsp_client.c b/src/rtsp_client.c
+index eeb6c18..ed71a4e 100644
+--- a/src/rtsp_client.c
++++ b/src/rtsp_client.c
+@@ -100,7 +100,11 @@ bool rtspcl_connect(struct rtspcl_s *p, struct in_addr local, struct in_addr hos
+ 
+ 	p->session = NULL;
+ 	if ((p->fd = open_tcp_socket(local, NULL, true)) == -1) return false;
+-	if (!tcp_connect_by_host(p->fd, host, destport)) return false;
++	if (!tcp_connect_by_host(p->fd, host, destport)) {
++		closesocket(p->fd);
++		p->fd = -1;
++		return false;
++	}
+ 
+ 	struct sockaddr_in name;
+ 	socklen_t namelen = sizeof(name);
