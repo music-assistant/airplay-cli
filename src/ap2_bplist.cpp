@@ -466,8 +466,6 @@ int ap2_bplist_find_array_count(const uint8_t *data, size_t len,
     return 1;
 }
 
-} /* extern "C" */
-
 int ap2_bplist_find_number(const uint8_t *data, size_t len, const char *key,
                            double *out)
 {
@@ -507,3 +505,5 @@ int ap2_bplist_find_number(const uint8_t *data, size_t len, const char *key,
     }
     return 0;
 }
+
+} /* extern "C" */
