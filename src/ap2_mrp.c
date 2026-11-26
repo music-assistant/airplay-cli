@@ -2108,7 +2108,8 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
     (void)m;
     if (!out || !out_len) return false;
     /* Command list, options and MRMediaRemoteCommand numbering captured VERBATIM
-     * from a real iPhone sender (DESIGN.md §8). Order preserved. Note this
+     * from a real iPhone sender (DESIGN.md §8), except for the scrubbing option
+     * of the seek command below. Order preserved. Note this
      * is MRMediaRemoteCommand numbering (Play=0, Pause=1, ...), distinct from
      * the pyatv protobuf Command enum used in the type-130 SET_STATE path. */
     ap2_pl_node *arr = ap2_pl_array();
@@ -2121,9 +2122,12 @@ bool ap2_mrp_build_supportedcommands_command(struct ap2_mrp_ctx *m,
     ap2_pl_dict_set(o25, "kMRMediaRemoteCommandInfoRepeatMode", ap2_pl_int(1));
     ap2_pl_array_append(arr, mrp_cmd_info_blob(25, true, o25));
 
+    /* Seek, controllable by scrubbing (false in the capture): without it an
+     * iPhone controlling the receiver lets its time bar be dragged but sends
+     * no command. */
     ap2_pl_node *o24 = ap2_pl_dict();
     ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey",
-                    ap2_pl_bool(false));
+                    ap2_pl_bool(true));
     ap2_pl_dict_set(o24, "kMRMediaRemoteCommandInfoSupportsReferencePosition",
                     ap2_pl_bool(false));
     ap2_pl_array_append(arr, mrp_cmd_info_blob(24, true, o24));
