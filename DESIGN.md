@@ -938,6 +938,13 @@ The iPhone moves its bar to the target by itself and counts on from there, also
 when the caller does not follow the seek. An item without a `Duration` shows no
 time bar there, so it cannot be scrubbed.
 
+Skip forward and back (17, 18) are advertised as disabled, as captured. Siri on
+an Apple TV (tvOS 27.2) sends `skpf` and `skpb` all the same, with 15 seconds
+when no number is asked; a HomePod (audioOS 27.2) sent `skpf` as well. A hold
+of the right arrow on the Apple TV remote sends begin and end fast-forward
+(`bffd`, `plrs`; 8, 9); those are not reported, as the caller has no
+fast-forward.
+
 **Type-130 remote-control channel — off by default.** A dedicated
 length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
 DataStream keys derived from the pair-verify shared secret) exists for *inbound*
