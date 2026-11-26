@@ -1099,9 +1099,9 @@ deny-list entry, not a policy retreat.
   `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
   reported as `[EVENT] remote command=`, and the `spos` set-position of a
   scrub, reported as `[EVENT] remote command=seek position_ms=<ms>` when its
-  target is under `kMRMediaRemoteOptionPlaybackPosition`, `playbackPosition`
-  or `position` and is a finite, non-negative number of seconds up to 10^7;
-  otherwise a warning logs the payload in hex), and
+  target is under `kMRMediaRemoteOptionPlaybackPosition` (seen from an Apple
+  HomeView, Apple TV and HomePod) and is a finite, non-negative number of
+  seconds up to 10^7; otherwise a warning logs the payload in hex), and
   return encrypted
   `200 OK` responses with echoed `CSeq`. Leaving this socket idle causes tvOS
   to tear down a MediaRemote-active stream after roughly 30 seconds.

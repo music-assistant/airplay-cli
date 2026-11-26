@@ -455,8 +455,6 @@ static void test_seek_command(const uint8_t secret[KEY_SIZE])
     static const struct seek_case cases[] = {
         {"kMRMediaRemoteOptionPlaybackPosition", seek_real, 83250},
         {"kMRMediaRemoteOptionPlaybackPosition", seek_int, 90000},
-        {"playbackPosition", seek_real, 83250},
-        {"position", seek_int, 90000},
         {"kMRMediaRemoteOptionPlaybackPosition", seek_zero, 0},
         {"kMRMediaRemoteOptionPlaybackPosition", seek_negative_int, -1},
         {"kMRMediaRemoteOptionPlaybackPosition", seek_negative_real, -1},
@@ -465,6 +463,8 @@ static void test_seek_command(const uint8_t secret[KEY_SIZE])
         {"kMRMediaRemoteOptionPlaybackPosition", seek_huge, -1},
         {"kMRMediaRemoteOptionPlaybackPosition", seek_none, -1},
         {"unknownKey", seek_real, -1},
+        {"playbackPosition", seek_real, -1},
+        {"position", seek_real, -1},
     };
     for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
         struct command_capture capture = run_seek_case(secret, &cases[i], NULL, 0);
@@ -519,14 +519,17 @@ static int build_raw_real_seek_body(uint8_t *out, uint8_t marker,
         memcpy(out + n, strings[i], len);
         n += (int)len;
     }
-    offsets[objects++] = (uint8_t)n; /* 6: params dict, "position" -> 8 */
+    offsets[objects++] = (uint8_t)n; /* 6: params dict, position key -> 8 */
     const uint8_t params[] = {0xD1, 7, 8};
     memcpy(out + n, params, sizeof(params));
     n += (int)sizeof(params);
     offsets[objects++] = (uint8_t)n; /* 7 */
-    out[n++] = 0x58; /* "position" */
-    memcpy(out + n, "position", 8);
-    n += 8;
+    static const char position_key[] = "kMRMediaRemoteOptionPlaybackPosition";
+    out[n++] = 0x5F;
+    out[n++] = 0x10; /* the count as a 1-byte int */
+    out[n++] = (uint8_t)(sizeof(position_key) - 1);
+    memcpy(out + n, position_key, sizeof(position_key) - 1);
+    n += (int)(sizeof(position_key) - 1);
     offsets[objects++] = (uint8_t)n; /* 8: the real */
     out[n++] = marker;
     memcpy(out + n, payload, payload_len);
