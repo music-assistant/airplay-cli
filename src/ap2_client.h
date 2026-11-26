@@ -466,6 +466,13 @@ bool ap2cl_feedback(struct ap2cl_s *p);
 /* Set volume (0-100). */
 bool ap2cl_set_volume(struct ap2cl_s *p, int volume);
 
+/* Set volume in dB (-144 mutes, 0 is full volume), clamped by
+ * ap2_clamp_volume_db. */
+bool ap2cl_set_volume_db(struct ap2cl_s *p, float volume_db);
+
+/* Clamp an AirPlay volume in dB to -144 (mute) .. 0. */
+float ap2_clamp_volume_db(float volume_db);
+
 /*
  * Set the track metadata and artwork as one bundle: DMAP metadata (and, when
  * artwork is given, DMAP artwork) on the transport in use, plus a serialized

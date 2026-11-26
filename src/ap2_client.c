@@ -38,6 +38,7 @@
 #include <stdarg.h>
 #include <stdatomic.h>
 #include <inttypes.h>
+#include <math.h>
 
 #include <openssl/rand.h>
 #include <openssl/evp.h>
@@ -5263,17 +5264,22 @@ bool ap2cl_receiver_closed(struct ap2cl_s *p)
     return closed;
 }
 
-bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
+float ap2_clamp_volume_db(float volume_db)
+{
+    if (volume_db <= -144.0f) return -144.0f;
+    return volume_db >= 0.0f ? 0.0f : volume_db;
+}
+
+bool ap2cl_set_volume_db(struct ap2cl_s *p, float volume_db)
 {
     if (!p) return false;
-    p->volume = volume;
+    float vol_db = ap2_clamp_volume_db(volume_db);
+    /* A RAOP-compatible client created later starts at the nearest percent
+     * on the -30..0 scale. */
+    p->volume = vol_db <= -30.0f
+                    ? 0
+                    : (int)lroundf((vol_db + 30.0f) * 100.0f / 30.0f);
     if (p->flow == FLOW_NATIVE_AP2 && p->sock_fd >= 0) {
-        /* Same percent->dB mapping as the RAOP path (libraop): linear in dB
-         * over -30..0, mute at 0. This is the AirPlay convention (iOS,
-         * shairport-sync use the same range), so a given slider position is
-         * equally loud on every protocol path and matches other senders. */
-        float vol_db = volume <= 0 ? -144.0f
-                       : raopcl_float_volume(volume > 100 ? 100 : volume);
         char body[32];
         int blen = snprintf(body, sizeof(body), "volume: %.6f\r\n", vol_db);
         uint8_t *resp = NULL; int resp_len = 0;
@@ -5283,8 +5289,19 @@ bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
         free(resp);
         return true;
     }
-    if (p->raopcl) return raopcl_set_volume(p->raopcl, raopcl_float_volume(volume));
+    if (p->raopcl) return raopcl_set_volume(p->raopcl, vol_db);
     return false;
+}
+
+bool ap2cl_set_volume(struct ap2cl_s *p, int volume)
+{
+    /* Same percent->dB mapping as the RAOP path (libraop): linear in dB
+     * over -30..0, mute at 0. This is the AirPlay convention (iOS,
+     * shairport-sync use the same range), so a given slider position is
+     * equally loud on every protocol path and matches other senders. */
+    float vol_db = volume <= 0 ? -144.0f
+                   : raopcl_float_volume(volume > 100 ? 100 : volume);
+    return ap2cl_set_volume_db(p, vol_db);
 }
 
 /* RTP time for the RTP-Info of a native metadata or artwork request: the wire

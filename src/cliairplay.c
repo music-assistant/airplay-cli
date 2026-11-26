@@ -831,6 +831,19 @@ static void handle_command(const char *key, const char *value, cli_config_t *cfg
         } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
             ap2cl_set_volume(g_ap2cl, vol);
         }
+    } else if (strcmp(key, "VOLUME_DB") == 0) {
+        char *end = NULL;
+        float vol_db = strtof(value, &end);
+        if (end == value || !isfinite(vol_db)) {
+            LOG_WARN("Ignoring VOLUME_DB=%s: not a finite number", value);
+        } else {
+            LOG_INFO("Setting volume to: %.2f dB", vol_db);
+            if (cfg->protocol == PROTO_RAOP && g_raopcl) {
+                raopcl_set_volume(g_raopcl, ap2_clamp_volume_db(vol_db));
+            } else if (cfg->protocol == PROTO_AIRPLAY2 && g_ap2cl) {
+                ap2cl_set_volume_db(g_ap2cl, vol_db);
+            }
+        }
     } else if (strcmp(key, "START_UNIX_MS") == 0) {
         g_pend_start_unix_ms = strtoull(value, NULL, 10);
     } else if (strcmp(key, "START_JOIN") == 0) {

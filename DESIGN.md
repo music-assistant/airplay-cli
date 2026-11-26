@@ -680,7 +680,10 @@ shairport-sync, libraop all use this range), so a given slider position is
 equally loud on every protocol path and matches other senders. 0 mutes
 (-144 dB). The native flow sends it as `SET_PARAMETER volume:`; loudness
 alignment against non-AirPlay ecosystems belongs in the caller's per-player
-normalization, not in the protocol curve.
+normalization, not in the protocol curve. `VOLUME_DB=<dB>` sets the dB value as
+given instead (at or below -144 mutes, above 0 is 0): it hands a receiver back
+the exact level it reported over DACP (`dmcp.device-volume`), which a whole
+percent can miss by a step on the receiver's own scale.
 
 ## 8. MediaRemote (Apple TV now-playing)
 

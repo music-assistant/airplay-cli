@@ -2950,6 +2950,67 @@ static void test_metadata_before_start_on_stream_timeline(void)
     puts("ap2_client metadata before start timeline tests passed");
 }
 
+/* The native flow sends a dB volume as given, clamped to -144 (mute) .. 0,
+ * and a percent on the -30..0 scale. */
+static void test_native_volume(void)
+{
+    static const char *const bodies[] = {
+        "volume: -28.650000\r\n",
+        "volume: -28.500000\r\n",
+        "volume: -60.000000\r\n",
+        "volume: -144.000000\r\n",
+        "volume: 0.000000\r\n",
+    };
+    const int count = (int)(sizeof(bodies) / sizeof(bodies[0]));
+    int sockets[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    command_peer_t *peer = calloc(1, sizeof(*peer));
+    assert(peer);
+    peer->fd = sockets[1];
+    peer->expected_requests = count;
+    pthread_t peer_thread;
+    assert(pthread_create(&peer_thread, NULL, run_command_peer, peer) == 0);
+
+    ap2_device_info_t device = {
+        .name = "volume test",
+        .address = "127.0.0.1",
+        .port = 7000,
+    };
+    ap2_audio_format_t format = {
+        .sample_rate = 44100,
+        .bit_depth = 16,
+        .channels = 2,
+    };
+    struct ap2cl_s *client = ap2cl_create(
+        &device, &format, NULL, NULL, NULL, NULL, 2000, 100);
+    assert(client);
+    ap2cl_force_native(client);
+    ap2cl_test_attach_rtsp_socket(client, sockets[0]);
+
+    assert(ap2cl_set_volume_db(client, -28.65f));
+    assert(ap2cl_set_volume(client, 5));
+    assert(ap2cl_set_volume_db(client, -60.0f));
+    assert(ap2cl_set_volume_db(client, -200.0f));
+    assert(ap2cl_set_volume_db(client, 3.0f));
+
+    assert(pthread_join(peer_thread, NULL) == 0);
+    assert(peer->ok);
+    assert(peer->request_count == count);
+    for (int i = 0; i < count; i++) {
+        assert(strcmp(peer->requests[i].method, "SET_PARAMETER") == 0);
+        assert(peer->requests[i].body_len == (int)strlen(bodies[i]));
+        assert(memcmp(peer->requests[i].body, bodies[i],
+                      strlen(bodies[i])) == 0);
+    }
+
+    ap2cl_test_detach_rtsp_socket(client);
+    assert(close(sockets[0]) == 0);
+    assert(close(sockets[1]) == 0);
+    assert(ap2cl_destroy(client));
+    free(peer);
+    puts("ap2_client native volume tests passed");
+}
+
 /* run_command_peer on the first connection to the listening socket in fd. */
 static void *run_accepting_command_peer(void *arg)
 {
@@ -4442,6 +4503,7 @@ int main(int argc, char **argv)
     test_mrp_identical_metadata_skip();
     test_mrp_artwork_push_status();
     test_metadata_before_start_on_stream_timeline();
+    test_native_volume();
     test_raopcl_metadata_before_first_frame_on_stream_timeline();
     test_raopcl_connect_failure_teardown();
     test_raopcl_user_agent();
