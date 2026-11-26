@@ -608,6 +608,26 @@ static void test_rtspcl_one_exchange_at_a_time(void)
     puts("rtspcl one exchange at a time test passed");
 }
 
+/* A connection the receiver closed takes no further request: libraop's exit
+ * path (FLUSH, then TEARDOWN) sends nothing on it
+ * (patches/libraop-rtsp_client.patch). */
+static void test_rtspcl_sends_nothing_after_peer_close(void)
+{
+    struct rtspcl_s *rtsp = rtspcl_create("test");
+    assert(rtsp);
+    int peer = connect_rtsp_peer(rtsp);
+    /* Closing only its sending side lets the peer read whatever still comes. */
+    assert(shutdown(peer, SHUT_WR) == 0);
+    wait_readable(rtspcl_get_serv_sock(rtsp));
+
+    assert(!rtspcl_flush(rtsp, 1, 1));
+    assert(!rtspcl_destroy(rtsp));
+    char byte;
+    assert(read(peer, &byte, 1) == 0);
+    assert(close(peer) == 0);
+    puts("rtspcl peer close test passed");
+}
+
 /* STOP stays bounded when its TEARDOWN has to wait for another thread's
  * unanswered request. */
 static void test_raop_rtsp_teardown_behind_exchange(void)
@@ -4431,6 +4451,7 @@ int main(int argc, char **argv)
     test_raopcl_rtsp_hook();
     test_raop_rtsp_teardown_bounded();
     test_rtspcl_one_exchange_at_a_time();
+    test_rtspcl_sends_nothing_after_peer_close();
     test_raop_rtsp_teardown_behind_exchange();
     test_raop_rtsp_peer_closed();
     test_native_teardown();

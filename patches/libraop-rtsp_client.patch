@@ -12,8 +12,15 @@ uses for volume, metadata, artwork and FLUSH. Left to overlap, each thread
 reads parts of the other's answer, and one request can land in the middle of
 another's body.
 
+No request goes out on a connection the receiver closed. libraop only
+recognises a connection that is down on both sides, so the cleanup's FLUSH and
+TEARDOWN are otherwise sent and each log a failed request: after the receiver
+ended the session itself (another sender took over), and on macOS after our
+own TEARDOWN, where a connection the receiver closed first cannot be shut
+down.
+
 diff --git a/src/rtsp_client.c b/src/rtsp_client.c
-index d71fa13..2ae31aa 100644
+index d71fa13..52832ca 100644
 --- a/src/rtsp_client.c
 +++ b/src/rtsp_client.c
 @@ -48,16 +48,32 @@ typedef struct rtspcl_s {
@@ -88,3 +95,13 @@ index d71fa13..2ae31aa 100644
  				char *content, int length, int get_response, key_data_t *hds,
  				key_data_t *rkd, char **resp_content, int *resp_len, char* url) {
  	char *req;
+@@ -576,6 +598,9 @@ static bool exec_request(struct rtspcl_s *rtspcld, char *cmd, char *content_type
+ 	i = poll(&pfds, 1, 0);
+ 	if (i == -1 || (pfds.revents & POLLERR) || (pfds.revents & POLLHUP)) return false;
+ 
++	// a connection closed by the peer alone passes the poll above, yet no answer can come on it
++	if (recv(rtspcld->fd, buf, 1, MSG_PEEK | MSG_DONTWAIT) == 0) return false;
++
+ 	if ((req = malloc(4096+length)) == NULL) return false;
+ 
+ 	sprintf(req, "%s %s RTSP/1.0\r\n",cmd, url ? url : rtspcld->url);
