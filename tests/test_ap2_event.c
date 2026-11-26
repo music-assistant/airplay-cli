@@ -243,12 +243,11 @@ static int build_nested_command_request(
     return encrypted_len;
 }
 
-/* A set-position ("spos") command as the receiver sends it on a scrub; the
- * position node is taken over, or none is sent when it is NULL. */
-static int build_seek_request(uint8_t *encrypted, size_t encrypted_size,
-                              const uint8_t key[KEY_SIZE], uint64_t counter,
-                              int cseq, const char *position_key,
-                              ap2_pl_node *position)
+/* The body of a set-position ("spos") command as the receiver sends it on a
+ * scrub; the position node is taken over, or none is sent when it is NULL.
+ * Returns the body length; the caller frees `*body`. */
+static int build_seek_body(const char *position_key, ap2_pl_node *position,
+                           uint8_t **body)
 {
     ap2_pl_node *root = ap2_pl_dict();
     ap2_pl_dict_set(root, "type", ap2_pl_string("sendMediaRemoteCommand"));
@@ -258,14 +257,11 @@ static int build_seek_request(uint8_t *encrypted, size_t encrypted_size,
         ap2_pl_dict_set(params, position_key, position);
         ap2_pl_dict_set(root, "params", params);
     }
-    uint8_t *body = NULL;
-    int body_len = ap2_pl_serialize(root, &body);
+    *body = NULL;
+    int body_len = ap2_pl_serialize(root, body);
     ap2_pl_free(root);
-    assert(body_len > 0 && body);
-    int encrypted_len = build_event_request(
-        encrypted, encrypted_size, key, counter, cseq, body, body_len);
-    free(body);
-    return encrypted_len;
+    assert(body_len > 0 && *body);
+    return body_len;
 }
 
 static void send_request(int fd, const uint8_t key[KEY_SIZE],
@@ -446,6 +442,9 @@ static ap2_pl_node *seek_none(void) { return NULL; }
 static struct command_capture run_seek_case(const uint8_t secret[KEY_SIZE],
                                             const struct seek_case *seek,
                                             char *logs, size_t logs_size);
+static struct command_capture run_seek_body(const uint8_t secret[KEY_SIZE],
+                                            const uint8_t *body, int body_len,
+                                            char *logs, size_t logs_size);
 
 /* Scrubbing on the receiver arrives as a set-position command carrying the
  * target in seconds; it is reported as a seek in milliseconds. One without a
@@ -489,9 +488,103 @@ static void test_seek_command(const uint8_t secret[KEY_SIZE])
     assert(strstr(logs, "756e6b6e6f776e506f736974696f6e4b6579"));
 }
 
+/* A bplist body with a set-position command whose position is the given raw
+ * real object: `marker` followed by `payload_len` bytes. The serializer only
+ * writes 8-byte reals, so the object table is laid out by hand. */
+static int build_raw_real_seek_body(uint8_t *out, uint8_t marker,
+                                    const uint8_t *payload, size_t payload_len)
+{
+    static const char *const strings[] = {
+        "type", "value", "params", "sendMediaRemoteCommand", "spos", NULL};
+    uint8_t offsets[16];
+    int objects = 0;
+    int n = 0;
+    memcpy(out, "bplist00", 8);
+    n = 8;
+
+    offsets[objects++] = (uint8_t)n; /* 0: root dict, keys 1-3 -> values 4-6 */
+    const uint8_t root[] = {0xD3, 1, 2, 3, 4, 5, 6};
+    memcpy(out + n, root, sizeof(root));
+    n += (int)sizeof(root);
+    for (int i = 0; strings[i]; i++) { /* 1-5 */
+        size_t len = strlen(strings[i]);
+        offsets[objects++] = (uint8_t)n;
+        if (len < 15) {
+            out[n++] = (uint8_t)(0x50 | len);
+        } else {
+            out[n++] = 0x5F;
+            out[n++] = 0x10; /* the count as a 1-byte int */
+            out[n++] = (uint8_t)len;
+        }
+        memcpy(out + n, strings[i], len);
+        n += (int)len;
+    }
+    offsets[objects++] = (uint8_t)n; /* 6: params dict, "position" -> 8 */
+    const uint8_t params[] = {0xD1, 7, 8};
+    memcpy(out + n, params, sizeof(params));
+    n += (int)sizeof(params);
+    offsets[objects++] = (uint8_t)n; /* 7 */
+    out[n++] = 0x58; /* "position" */
+    memcpy(out + n, "position", 8);
+    n += 8;
+    offsets[objects++] = (uint8_t)n; /* 8: the real */
+    out[n++] = marker;
+    memcpy(out + n, payload, payload_len);
+    n += (int)payload_len;
+
+    int table_ofs = n;
+    memcpy(out + n, offsets, (size_t)objects);
+    n += objects;
+    memset(out + n, 0, 32); /* trailer */
+    out[n + 6] = 1; /* offset size */
+    out[n + 7] = 1; /* object ref size */
+    out[n + 15] = (uint8_t)objects;
+    out[n + 31] = (uint8_t)table_ofs;
+    return n + 32;
+}
+
+/* A speaker may send the position as a 4-byte real; one whose bytes run past
+ * the object table is ignored. */
+static void test_seek_raw_real(const uint8_t secret[KEY_SIZE])
+{
+    float position = 83.25f;
+    uint32_t bits;
+    memcpy(&bits, &position, sizeof(bits));
+    const uint8_t payload[4] = {(uint8_t)(bits >> 24), (uint8_t)(bits >> 16),
+                                (uint8_t)(bits >> 8), (uint8_t)bits};
+    uint8_t body[256];
+
+    int body_len = build_raw_real_seek_body(body, 0x22, payload, 4);
+    struct command_capture capture = run_seek_body(secret, body, body_len,
+                                                   NULL, 0);
+    assert(capture.count == 1);
+    assert(capture.commands[0] == AP2_REMOTE_COMMAND_SEEK);
+    assert(capture.positions_ms[0] == 83250);
+
+    /* The first 4 bytes of an 8-byte real (83.25) with the rest missing; read
+     * past the end, the object table would complete it into a valid position. */
+    static const uint8_t truncated[4] = {0x40, 0x54, 0xD0, 0x00};
+    body_len = build_raw_real_seek_body(body, 0x23, truncated, 4);
+    capture = run_seek_body(secret, body, body_len, NULL, 0);
+    assert(capture.count == 0);
+}
+
 /* Send one seek command; when `logs` is given, the log output is captured in it. */
 static struct command_capture run_seek_case(const uint8_t secret[KEY_SIZE],
                                             const struct seek_case *seek,
+                                            char *logs, size_t logs_size)
+{
+    uint8_t *body = NULL;
+    int body_len = build_seek_body(seek->key, seek->make(), &body);
+    struct command_capture capture = run_seek_body(secret, body, body_len,
+                                                   logs, logs_size);
+    free(body);
+    return capture;
+}
+
+/* Send a command with the given body; `logs` as for run_seek_case(). */
+static struct command_capture run_seek_body(const uint8_t secret[KEY_SIZE],
+                                            const uint8_t *body, int body_len,
                                             char *logs, size_t logs_size)
 {
     uint8_t receiver_key[KEY_SIZE], sender_key[KEY_SIZE];
@@ -509,9 +602,8 @@ static struct command_capture run_seek_case(const uint8_t secret[KEY_SIZE],
         secret, sockets[0], capture_remote_command, &capture);
 
     uint8_t encrypted[1200];
-    int encrypted_len = build_seek_request(
-        encrypted, sizeof(encrypted), receiver_key, 0, 1,
-        seek->key, seek->make());
+    int encrypted_len = build_event_request(
+        encrypted, sizeof(encrypted), receiver_key, 0, 1, body, body_len);
     assert(write(sockets[1], encrypted, (size_t)encrypted_len) == encrypted_len);
     int saved_stderr = -1;
     FILE *log_capture = NULL;
@@ -549,6 +641,7 @@ int main(void)
     test_artwork_snapshot_generation(secret);
     test_transient_kdf_secret();
     test_seek_command(secret);
+    test_seek_raw_real(secret);
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
