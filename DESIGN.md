@@ -924,6 +924,20 @@ identifiers use MRMediaRemoteCommand numbering, which is not pyatv's `Command`
 enum** — the two enumerations disagree, so the wire values here
 (0,1,2,3,4,5,8,9,10,11,17,18,24,25,26) are Apple's, not pyatv's.
 
+The list is the one an iPhone sent while playing from the Spotify app, with one
+change: seek (24) is advertised with
+`kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey` true instead of false.
+With false, the time bar on an iPhone's Control Center card for an Apple TV
+(tvOS 27.2) can be dragged, but no command reaches the sender and the bar stops
+counting. With true each drag arrives as one `spos`. A receiver's own controls
+(a HomeView's screen, Siri on a HomePod, the Apple TV remote) sent `spos` with
+false as well. `kMRMediaRemoteCommandInfoSupportsReferencePosition` stays false
+as captured.
+
+The iPhone moves its bar to the target by itself and counts on from there, also
+when the caller does not follow the seek. An item without a `Duration` shows no
+time bar there, so it cannot be scrubbed.
+
 **Type-130 remote-control channel — off by default.** A dedicated
 length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
 DataStream keys derived from the pair-verify shared secret) exists for *inbound*

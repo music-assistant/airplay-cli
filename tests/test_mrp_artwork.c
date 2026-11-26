@@ -13,6 +13,7 @@
 #include "ap2_bplist.h"
 #include "ap2_client.h"
 #include "ap2_mrp_sync.h"
+#include "ap2_plist.h"
 
 #include "mrp_jpeg_fixture.h"
 
@@ -658,6 +659,49 @@ static bool test_set_track_duration_keep(void)
     return true;
 }
 
+/* An iPhone controlling the receiver only sends its scrub when the seek
+ * command (MRMediaRemoteCommand 24) is advertised as controllable by
+ * scrubbing. */
+static bool test_supportedcommands_scrubbable_seek(void)
+{
+    struct ap2_mrp_ctx *mrp = ap2_mrp_create(
+        "127.0.0.1", 7000, NULL, "0011223344556677", "Test sender",
+        "11111111-1111-1111-1111-111111111111",
+        "22222222-2222-2222-2222-222222222222", NULL, 0);
+    CHECK(mrp != NULL);
+
+    ap2_pl_node *options = ap2_pl_dict();
+    ap2_pl_dict_set(options,
+                    "kMRMediaRemoteCommandInfoCanBeControlledByScrubbingKey",
+                    ap2_pl_bool(true));
+    ap2_pl_dict_set(options,
+                    "kMRMediaRemoteCommandInfoSupportsReferencePosition",
+                    ap2_pl_bool(false));
+    ap2_pl_node *seek = ap2_pl_dict();
+    ap2_pl_dict_set(seek, "kCommandInfoCommandKey", ap2_pl_int(24));
+    ap2_pl_dict_set(seek, "kCommandInfoEnabledKey", ap2_pl_bool(true));
+    ap2_pl_dict_set(seek, "kCommandInfoOptionsKey", options);
+    uint8_t *expected = NULL;
+    int expected_len = ap2_pl_serialize(seek, &expected);
+    ap2_pl_free(seek);
+    CHECK(expected_len > 0);
+
+    uint8_t *body = NULL;
+    int body_len = 0;
+    CHECK(ap2_mrp_build_supportedcommands_command(mrp, &body, &body_len));
+    CHECK(bytes_contain_string(body, (size_t)body_len,
+                               "updateMRSupportedCommands"));
+    /* Each command-info is its own serialized plist inside the list. */
+    CHECK(bytes_contain(body, (size_t)body_len,
+                        expected, (size_t)expected_len));
+    free(expected);
+    free(body);
+
+    ap2_mrp_destroy(mrp);
+    puts("MRP supported commands tests passed");
+    return true;
+}
+
 typedef struct {
     ap2_mrp_serial_t serial;
     atomic_int active;
@@ -732,6 +776,7 @@ int main(int argc, char **argv)
         !test_nowplaying_command_payload() ||
         !test_set_track_bundle() ||
         !test_set_track_duration_keep() ||
+        !test_supportedcommands_scrubbable_seek() ||
         !test_push_result_scope())
         return 1;
     for (int i = 1; i < argc; i++) {
