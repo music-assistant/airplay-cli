@@ -1130,10 +1130,10 @@ void ap2_mrp_set_remote_command_callback(
 }
 
 static void mrp_emit_remote_command(
-    struct ap2_mrp_ctx *m, ap2_remote_command_t command, int64_t position_ms)
+    struct ap2_mrp_ctx *m, ap2_remote_command_t command, int64_t value_ms)
 {
     if (m->remote_command_cb)
-        m->remote_command_cb(command, position_ms, m->remote_command_userdata);
+        m->remote_command_cb(command, value_ms, m->remote_command_userdata);
 }
 
 /* The key a set-position ("spos") command carries its target under, in seconds
@@ -1145,9 +1145,14 @@ static void mrp_emit_remote_command(
 /* A set-position target beyond this (about 115 days) is not a real position. */
 #define MRP_SEEK_POSITION_MAX_SECONDS 1e7
 
-/* A set-position command without a usable position is logged whole up to this
- * size: the position key sits well past the first bytes of the payload. */
-#define MRP_SEEK_LOG_HEX_MAX 512
+/* A command without a usable option is logged whole up to this size: the
+ * option key sits well past the first bytes of the payload. */
+#define MRP_COMMAND_LOG_HEX_MAX 512
+
+/* The key a skip ("skpf", "skpb") command carries its interval under, in
+ * seconds as a real. Confirmed on a HomePod (AudioAccessory11,1, audioOS
+ * 27.2.1) and an Apple TV 4K (AppleTV18,1, tvOS 27.2.1), both asked by Siri. */
+#define MRP_SKIP_INTERVAL_KEY "kMRMediaRemoteOptionSkipInterval"
 
 /* Write the leading bytes of `body` that fit `hex` (2 characters each, plus the
  * terminator) as hex; returns how many bytes were written. */
@@ -1163,11 +1168,22 @@ static int mrp_hex_prefix(char *hex, size_t hex_size,
     return shown;
 }
 
+/* Warn about a command without a usable option and show its payload: a
+ * receiver nobody has tested may send it differently. */
+static void mrp_warn_unusable_command(const char *problem,
+                                      const uint8_t *body, int body_len)
+{
+    char hex[MRP_COMMAND_LOG_HEX_MAX * 2 + 1];
+    int shown = mrp_hex_prefix(hex, sizeof(hex), body, body_len);
+    LOG_WARN("[MRP] %s content_length=%d hex=%s%s", problem, body_len, hex,
+             body_len > shown ? "..." : "");
+}
+
 static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
                                      ap2_remote_command_t *command,
-                                     int64_t *position_ms)
+                                     int64_t *value_ms)
 {
-    *position_ms = -1;
+    *value_ms = -1;
     if (!body || body_len < 8 || !command ||
         memcmp(body, "bplist00", 8) != 0)
         return false;
@@ -1198,17 +1214,27 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
                                     MRP_SEEK_POSITION_KEY, &seconds) ||
             !isfinite(seconds) || seconds < 0 ||
             seconds > MRP_SEEK_POSITION_MAX_SECONDS) {
-            /* a receiver nobody has tested may send it differently: show the
-             * payload */
-            char hex[MRP_SEEK_LOG_HEX_MAX * 2 + 1];
-            int shown = mrp_hex_prefix(hex, sizeof(hex), body, body_len);
-            LOG_WARN("[MRP] set-position command without a usable position "
-                     "content_length=%d hex=%s%s", body_len, hex,
-                     body_len > shown ? "..." : "");
+            mrp_warn_unusable_command(
+                "set-position command without a usable position",
+                body, body_len);
             return false;
         }
         *command = AP2_REMOTE_COMMAND_SEEK;
-        *position_ms = (int64_t)(seconds * 1000.0 + 0.5);
+        *value_ms = (int64_t)(seconds * 1000.0 + 0.5);
+    } else if (strcmp(value, "skpf") == 0 || strcmp(value, "skpb") == 0) {
+        /* Siri on the receiver: skip forward or back by an interval. */
+        double seconds = -1;
+        if (!ap2_bplist_find_number(body, (size_t)body_len,
+                                    MRP_SKIP_INTERVAL_KEY, &seconds) ||
+            !isfinite(seconds) || seconds <= 0 ||
+            seconds > MRP_SEEK_POSITION_MAX_SECONDS) {
+            mrp_warn_unusable_command(
+                "skip command without a usable interval", body, body_len);
+            return false;
+        }
+        int64_t interval_ms = (int64_t)(seconds * 1000.0 + 0.5);
+        *command = AP2_REMOTE_COMMAND_SKIP;
+        *value_ms = strcmp(value, "skpb") == 0 ? -interval_ms : interval_ms;
     } else
         return false;
     return true;
@@ -1316,13 +1342,13 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
                           strcasecmp(method, "POST") == 0 &&
                           strcmp(path, "/command") == 0;
         ap2_remote_command_t remote_command = AP2_REMOTE_COMMAND_PLAY;
-        int64_t remote_position_ms = -1;
+        int64_t remote_value_ms = -1;
         bool have_remote_command = false;
         if (is_command) {
             const uint8_t *body = m->event_plain + off + header_len;
             have_remote_command =
                 mrp_parse_remote_command(body, content_len, &remote_command,
-                                         &remote_position_ms);
+                                         &remote_value_ms);
             if (*loglevel >= lDEBUG)
                 mrp_log_event_command_body(header, body, content_len);
         }
@@ -1352,7 +1378,7 @@ static bool mrp_process_event_requests(struct ap2_mrp_ctx *m)
             mrp_event_send_response(
                 m, (const uint8_t *)response, response_len);
         if (have_remote_command)
-            mrp_emit_remote_command(m, remote_command, remote_position_ms);
+            mrp_emit_remote_command(m, remote_command, remote_value_ms);
         if (!response_ok) {
             LOG_ERROR("[MRP] event response send failed");
             return false;

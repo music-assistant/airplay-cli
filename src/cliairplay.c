@@ -516,14 +516,17 @@ static void raop_head_reset(void)
 }
 
 static void remote_command_event(
-    ap2_remote_command_t command, int64_t position_ms, void *userdata)
+    ap2_remote_command_t command, int64_t value_ms, void *userdata)
 {
     (void)userdata;
     const char *name = ap2_remote_command_name(command);
     if (!name) return;
     if (command == AP2_REMOTE_COMMAND_SEEK)
         printf("[EVENT] remote command=%s position_ms=%" PRId64 "\n",
-               name, position_ms);
+               name, value_ms);
+    else if (command == AP2_REMOTE_COMMAND_SKIP)
+        printf("[EVENT] remote command=%s interval_ms=%" PRId64 "\n",
+               name, value_ms);
     else
         printf("[EVENT] remote command=%s\n", name);
     fflush(stdout);

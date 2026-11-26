@@ -34,7 +34,8 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   from an Apple HomeView, Apple TV and HomePod); a scrub without a usable
   position (no such key, or not a finite number of seconds from 0 to 10^7) is
   logged as a `set-position command without a usable position` warning
-  carrying the payload in hex.
+  carrying the payload in hex. A skip by Siri is reported as
+  `[EVENT] remote command=skip interval_ms=<ms>`, negative for a skip back.
 - **PTP timing**: an in-process gPTP-dialect grandmaster engine, plus a
   shared-clock daemon mode (`--ptp-daemon`/`--ptp-shared`) for multi-room.
 - **Route auto-selection** (`--protocol auto`): the binary picks RAOP vs

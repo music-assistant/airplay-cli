@@ -938,6 +938,13 @@ The iPhone moves its bar to the target by itself and counts on from there, also
 when the caller does not follow the seek. An item without a `Duration` shows no
 time bar there, so it cannot be scrubbed.
 
+Skip forward and back (17, 18) are advertised as disabled, as captured. Siri on
+an Apple TV (tvOS 27.2) sends `skpf` and `skpb` all the same, with 15 seconds
+when no number is asked; a HomePod (audioOS 27.2) sent `skpf` as well. A hold
+of the right arrow on the Apple TV remote sends begin and end fast-forward
+(`bffd`, `plrs`; 8, 9); those are not reported, as the caller has no
+fast-forward.
+
 **Type-130 remote-control channel — off by default.** A dedicated
 length-prefixed protobuf data channel (ChaCha20-Poly1305 with HKDF-SHA512
 DataStream keys derived from the pair-verify shared secret) exists for *inbound*
@@ -1114,7 +1121,10 @@ deny-list entry, not a policy retreat.
 - **Reverse event channel** — MediaRemote-eligible sessions (§8) derive
   independent `Events-Salt` keys, decrypt receiver HTTP requests (including
   `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
-  reported as `[EVENT] remote command=`, and the `spos` set-position of a
+  reported as `[EVENT] remote command=`, the `skpf`/`skpb` skip forward or
+  back of Siri, reported as `[EVENT] remote command=skip interval_ms=<ms>`
+  (negative for `skpb`) from its `kMRMediaRemoteOptionSkipInterval` seconds
+  (seen from a HomePod and an Apple TV), and the `spos` set-position of a
   scrub, reported as `[EVENT] remote command=seek position_ms=<ms>` when its
   target is under `kMRMediaRemoteOptionPlaybackPosition` (seen from an Apple
   HomeView, Apple TV and HomePod) and is a finite, non-negative number of
@@ -1302,7 +1312,7 @@ verbosity, never its stream.
 | `[STATUS] latency` | stdout | once after connect, AirPlay 2 route only |
 | `[STATUS] mrp path=channel` | stdout | once after connect, only when type-130 is enabled (§8) |
 | `[STATUS] mrp path=command` | stdout | on each change of the `/command` HTTP status |
-| `[EVENT] remote command=` | stdout | device-originated remote-control press; a scrub carries `position_ms=` |
+| `[EVENT] remote command=` | stdout | device-originated remote-control press; a scrub carries `position_ms=`, a skip `interval_ms=` (negative skips back) |
 | `[STATUS] connected` | stderr | once, when the session is up |
 | `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |
 | `[STATUS] audio buffered_ms=` | stderr | once per start cycle, re-armed by FLUSH (§10) |

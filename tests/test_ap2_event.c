@@ -20,7 +20,7 @@
 
 struct command_capture {
     ap2_remote_command_t commands[16];
-    int64_t positions_ms[16];
+    int64_t values_ms[16];
     int count;
 };
 
@@ -28,11 +28,11 @@ static log_level test_log_level = lSILENCE;
 log_level *loglevel = &test_log_level;
 
 static void capture_remote_command(
-    ap2_remote_command_t command, int64_t position_ms, void *userdata)
+    ap2_remote_command_t command, int64_t value_ms, void *userdata)
 {
     struct command_capture *capture = userdata;
     assert(capture && capture->count < 16);
-    capture->positions_ms[capture->count] = position_ms;
+    capture->values_ms[capture->count] = value_ms;
     capture->commands[capture->count++] = command;
 }
 
@@ -243,18 +243,18 @@ static int build_nested_command_request(
     return encrypted_len;
 }
 
-/* The body of a set-position ("spos") command as the receiver sends it on a
- * scrub; the position node is taken over, or none is sent when it is NULL.
- * Returns the body length; the caller frees `*body`. */
-static int build_seek_body(const char *position_key, ap2_pl_node *position,
-                           uint8_t **body)
+/* The body of a MediaRemote command (e.g. "spos" on a scrub) with one entry
+ * under "params"; the param node is taken over, or none is sent when it is
+ * NULL. Returns the body length; the caller frees `*body`. */
+static int build_param_command_body(const char *value, const char *param_key,
+                                    ap2_pl_node *param, uint8_t **body)
 {
     ap2_pl_node *root = ap2_pl_dict();
     ap2_pl_dict_set(root, "type", ap2_pl_string("sendMediaRemoteCommand"));
-    ap2_pl_dict_set(root, "value", ap2_pl_string("spos"));
-    if (position_key && position) {
+    ap2_pl_dict_set(root, "value", ap2_pl_string(value));
+    if (param_key && param) {
         ap2_pl_node *params = ap2_pl_dict();
-        ap2_pl_dict_set(params, position_key, position);
+        ap2_pl_dict_set(params, param_key, param);
         ap2_pl_dict_set(root, "params", params);
     }
     *body = NULL;
@@ -473,7 +473,7 @@ static void test_seek_command(const uint8_t secret[KEY_SIZE])
         } else {
             assert(capture.count == 1);
             assert(capture.commands[0] == AP2_REMOTE_COMMAND_SEEK);
-            assert(capture.positions_ms[0] == cases[i].expected_ms);
+            assert(capture.values_ms[0] == cases[i].expected_ms);
         }
     }
     assert(strcmp(ap2_remote_command_name(AP2_REMOTE_COMMAND_SEEK), "seek") == 0);
@@ -562,7 +562,7 @@ static void test_seek_raw_real(const uint8_t secret[KEY_SIZE])
                                                    NULL, 0);
     assert(capture.count == 1);
     assert(capture.commands[0] == AP2_REMOTE_COMMAND_SEEK);
-    assert(capture.positions_ms[0] == 83250);
+    assert(capture.values_ms[0] == 83250);
 
     /* The first 4 bytes of an 8-byte real (83.25) with the rest missing; read
      * past the end, the object table would complete it into a valid position. */
@@ -572,13 +572,63 @@ static void test_seek_raw_real(const uint8_t secret[KEY_SIZE])
     assert(capture.count == 0);
 }
 
+static ap2_pl_node *skip_real(void) { return ap2_pl_real(30.0); }
+static ap2_pl_node *skip_int(void) { return ap2_pl_int(15); }
+
+/* Siri's "skip 30 seconds" arrives as a skip forward or back command carrying
+ * the interval in seconds; it is reported as a skip in milliseconds, negative
+ * for a skip back. One without a usable interval (missing, not positive, not
+ * finite or absurdly large) is ignored with a warning. */
+static void test_skip_command(const uint8_t secret[KEY_SIZE])
+{
+    static const struct {
+        const char *value;
+        ap2_pl_node *(*make)(void);
+        int64_t expected_ms; /* 0: the command is ignored */
+    } cases[] = {
+        {"skpf", skip_real, 30000},
+        {"skpf", skip_int, 15000},
+        {"skpb", skip_real, -30000},
+        {"skpb", skip_int, -15000},
+        {"skpf", seek_none, 0},
+        {"skpf", seek_zero, 0},
+        {"skpf", seek_negative_int, 0},
+        {"skpf", seek_negative_real, 0},
+        {"skpf", seek_nan, 0},
+        {"skpf", seek_infinite, 0},
+        {"skpf", seek_huge, 0},
+        {"skpb", seek_none, 0},
+        {"skpb", seek_negative_real, 0},
+    };
+    for (size_t i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+        uint8_t *body = NULL;
+        int body_len = build_param_command_body(
+            cases[i].value, "kMRMediaRemoteOptionSkipInterval",
+            cases[i].make(), &body);
+        char logs[8192];
+        struct command_capture capture = run_seek_body(secret, body, body_len,
+                                                       logs, sizeof(logs));
+        free(body);
+        if (cases[i].expected_ms == 0) {
+            assert(capture.count == 0);
+            assert(strstr(logs, "skip command without a usable interval"));
+        } else {
+            assert(capture.count == 1);
+            assert(capture.commands[0] == AP2_REMOTE_COMMAND_SKIP);
+            assert(capture.values_ms[0] == cases[i].expected_ms);
+        }
+    }
+    assert(strcmp(ap2_remote_command_name(AP2_REMOTE_COMMAND_SKIP), "skip") == 0);
+}
+
 /* Send one seek command; when `logs` is given, the log output is captured in it. */
 static struct command_capture run_seek_case(const uint8_t secret[KEY_SIZE],
                                             const struct seek_case *seek,
                                             char *logs, size_t logs_size)
 {
     uint8_t *body = NULL;
-    int body_len = build_seek_body(seek->key, seek->make(), &body);
+    int body_len = build_param_command_body("spos", seek->key, seek->make(),
+                                            &body);
     struct command_capture capture = run_seek_body(secret, body, body_len,
                                                    logs, logs_size);
     free(body);
@@ -645,6 +695,7 @@ int main(void)
     test_transient_kdf_secret();
     test_seek_command(secret);
     test_seek_raw_real(secret);
+    test_skip_command(secret);
 
     int sockets[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
@@ -738,7 +789,7 @@ int main(void)
     assert(capture.count == 5);
     for (int i = 0; i < capture.count; i++) {
         assert(capture.commands[i] == expected_commands[i]);
-        assert(capture.positions_ms[i] == -1);
+        assert(capture.values_ms[i] == -1);
         assert(strcmp(
                    ap2_remote_command_name(capture.commands[i]),
                    expected_names[i]) == 0);

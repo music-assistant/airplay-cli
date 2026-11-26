@@ -18,11 +18,13 @@ typedef enum {
     AP2_REMOTE_COMMAND_NEXT,
     AP2_REMOTE_COMMAND_PREVIOUS,
     AP2_REMOTE_COMMAND_SEEK,
+    AP2_REMOTE_COMMAND_SKIP,
 } ap2_remote_command_t;
 
-/* position_ms carries the target of a SEEK and is -1 for every other command. */
+/* value_ms carries the target position of a SEEK or the interval of a SKIP
+ * (negative skips back), and is -1 for every other command. */
 typedef void (*ap2_remote_command_cb_t)(ap2_remote_command_t command,
-                                        int64_t position_ms,
+                                        int64_t value_ms,
                                         void *userdata);
 
 static inline const char *ap2_remote_command_name(ap2_remote_command_t command)
@@ -34,6 +36,7 @@ static inline const char *ap2_remote_command_name(ap2_remote_command_t command)
     case AP2_REMOTE_COMMAND_NEXT: return "next";
     case AP2_REMOTE_COMMAND_PREVIOUS: return "previous";
     case AP2_REMOTE_COMMAND_SEEK: return "seek";
+    case AP2_REMOTE_COMMAND_SKIP: return "skip";
     default: return NULL;
     }
 }
