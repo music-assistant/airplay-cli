@@ -179,6 +179,7 @@ RAOP_LIFECYCLE_TEST_DEFINES = \
 	-Draopcl_stop=ap2_test_raopcl_stop \
 	-Draopcl_flush=ap2_test_raopcl_flush \
 	-Draopcl_start_at=ap2_test_raopcl_start_at \
+	-Draopcl_set_volume=ap2_test_raopcl_set_volume \
 	-Draopcl_get_ntp=ap2_test_raopcl_get_ntp \
 	-Draopcl_latency=ap2_test_raopcl_latency \
 	-Draopcl_sample_rate=ap2_test_raopcl_sample_rate \

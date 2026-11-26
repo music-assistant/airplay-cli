@@ -293,6 +293,8 @@ stdin, the single persistent audio input for the whole process lifetime.
   warm), `ACTION=DISCONNECT` (end the session).
 - Transport: `ACTION=PLAY|PAUSE|STOP`.
 - `VOLUME=<0-100>`.
+- `VOLUME_DB=<dB>` — sets that exact AirPlay volume (-144 mutes), to hand a
+  receiver back the level it reported.
 - Metadata: `TITLE=`, `ARTIST=`, `ALBUM=`, `DURATION=<s>`, `PROGRESS=<s>`,
   `ITEMID=<stable per-track id>`,
   `ARTWORKFILE=<local file path or http:// imageproxy URL>` (staged; an empty
