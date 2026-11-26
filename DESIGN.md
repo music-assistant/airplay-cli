@@ -1114,7 +1114,9 @@ deny-list entry, not a policy retreat.
 - **Reverse event channel** — MediaRemote-eligible sessions (§8) derive
   independent `Events-Salt` keys, decrypt receiver HTTP requests (including
   `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
-  reported as `[EVENT] remote command=`, and the `spos` set-position of a
+  reported as `[EVENT] remote command=`, the `skpf` skip forward of Siri,
+  reported as `[EVENT] remote command=skip interval_ms=<ms>` from its
+  `kMRMediaRemoteOptionSkipInterval` seconds, and the `spos` set-position of a
   scrub, reported as `[EVENT] remote command=seek position_ms=<ms>` when its
   target is under `kMRMediaRemoteOptionPlaybackPosition` (seen from an Apple
   HomeView, Apple TV and HomePod) and is a finite, non-negative number of
@@ -1302,7 +1304,7 @@ verbosity, never its stream.
 | `[STATUS] latency` | stdout | once after connect, AirPlay 2 route only |
 | `[STATUS] mrp path=channel` | stdout | once after connect, only when type-130 is enabled (§8) |
 | `[STATUS] mrp path=command` | stdout | on each change of the `/command` HTTP status |
-| `[EVENT] remote command=` | stdout | device-originated remote-control press; a scrub carries `position_ms=` |
+| `[EVENT] remote command=` | stdout | device-originated remote-control press; a scrub carries `position_ms=`, a skip `interval_ms=` (negative skips back) |
 | `[STATUS] connected` | stderr | once, when the session is up |
 | `[STATUS] clock_ready` | stderr | after `connected`, then on material change until `state=ready` (§6) |
 | `[STATUS] audio buffered_ms=` | stderr | once per start cycle, re-armed by FLUSH (§10) |

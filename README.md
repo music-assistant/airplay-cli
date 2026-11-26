@@ -28,7 +28,8 @@ Protocol and architecture detail lives in `DESIGN.md`; open work in `TODO.md`.
   transient-paired Apple receivers such as HomePods) receive the full
   now-playing client, playback-state, transport-command, text and artwork
   sequence used by current Apple senders, and their Siri / touch-surface
-  commands are reported as `[EVENT] remote command=`. Scrubbing on the
+  commands are reported as `[EVENT] remote command=`. A skip by Siri is
+  reported as `[EVENT] remote command=skip interval_ms=<ms>`. Scrubbing on the
   receiver is reported as `[EVENT] remote command=seek position_ms=<ms>`. The
   target is read from the `kMRMediaRemoteOptionPlaybackPosition` key (seen
   from an Apple HomeView, Apple TV and HomePod); a scrub without a usable
