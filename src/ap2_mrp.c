@@ -1136,13 +1136,11 @@ static void mrp_emit_remote_command(
         m->remote_command_cb(command, position_ms, m->remote_command_userdata);
 }
 
-/* Keys a set-position ("spos") command may carry its target under, in
- * seconds. */
-static const char *const mrp_seek_position_keys[] = {
-    "kMRMediaRemoteOptionPlaybackPosition",
-    "playbackPosition",
-    "position",
-};
+/* The key a set-position ("spos") command carries its target under, in seconds
+ * as a real. Confirmed on an Apple HomeView, an Apple TV 4K (AppleTV14,1,
+ * tvOS 27.2.1) and a HomePod (AudioAccessory11,1, audioOS 27.2.1, scrubbed by
+ * Siri). */
+#define MRP_SEEK_POSITION_KEY "kMRMediaRemoteOptionPlaybackPosition"
 
 /* A set-position target beyond this (about 115 days) is not a real position. */
 #define MRP_SEEK_POSITION_MAX_SECONDS 1e7
@@ -1196,15 +1194,12 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
     else if (strcmp(value, "spos") == 0) {
         /* Scrubbing on the receiver: set the playback position. */
         double seconds = -1;
-        bool found = false;
-        for (size_t i = 0; !found && i < sizeof(mrp_seek_position_keys) /
-                                         sizeof(mrp_seek_position_keys[0]);
-             i++)
-            found = ap2_bplist_find_number(body, (size_t)body_len,
-                                           mrp_seek_position_keys[i], &seconds);
-        if (!found || !isfinite(seconds) || seconds < 0 ||
+        if (!ap2_bplist_find_number(body, (size_t)body_len,
+                                    MRP_SEEK_POSITION_KEY, &seconds) ||
+            !isfinite(seconds) || seconds < 0 ||
             seconds > MRP_SEEK_POSITION_MAX_SECONDS) {
-            /* the key the receiver uses is not confirmed: show the payload */
+            /* a receiver nobody has tested may send it differently: show the
+             * payload */
             char hex[MRP_SEEK_LOG_HEX_MAX * 2 + 1];
             int shown = mrp_hex_prefix(hex, sizeof(hex), body, body_len);
             LOG_WARN("[MRP] set-position command without a usable position "
