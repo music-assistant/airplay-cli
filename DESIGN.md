@@ -1089,7 +1089,11 @@ deny-list entry, not a policy retreat.
   session itself: the audio loop reports `[STATUS] receiver_closed` and exits 0
   instead of reporting a failure. It peeks the socket for EOF on every
   iteration, and a native exchange that reads EOF marks it too. A reset,
-  timeout or unreachable receiver stays an `[ERROR]`.
+  timeout or unreachable receiver stays an `[ERROR]`. On RAOP the exit cleanup
+  sends nothing on such a connection: the build patches libraop's
+  rtsp_client.c (`patches/`) to send no request once the receiver closed it,
+  which also covers a receiver that hangs up right after the stop's
+  `TEARDOWN` (macOS refuses to shut that connection down).
 - **Reverse event channel** — MediaRemote-eligible sessions (§8) derive
   independent `Events-Salt` keys, decrypt receiver HTTP requests (including
   `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
