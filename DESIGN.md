@@ -1114,9 +1114,10 @@ deny-list entry, not a policy retreat.
 - **Reverse event channel** — MediaRemote-eligible sessions (§8) derive
   independent `Events-Salt` keys, decrypt receiver HTTP requests (including
   `sendMediaRemoteCommand` presses: `nitm`/`pitm`/`play`/`paus`/`plps`,
-  reported as `[EVENT] remote command=`, the `skpf` skip forward of Siri,
-  reported as `[EVENT] remote command=skip interval_ms=<ms>` from its
-  `kMRMediaRemoteOptionSkipInterval` seconds, and the `spos` set-position of a
+  reported as `[EVENT] remote command=`, the `skpf`/`skpb` skip forward or
+  back of Siri, reported as `[EVENT] remote command=skip interval_ms=<ms>`
+  (negative for `skpb`) from its `kMRMediaRemoteOptionSkipInterval` seconds
+  (seen from a HomePod and an Apple TV), and the `spos` set-position of a
   scrub, reported as `[EVENT] remote command=seek position_ms=<ms>` when its
   target is under `kMRMediaRemoteOptionPlaybackPosition` (seen from an Apple
   HomeView, Apple TV and HomePod) and is a finite, non-negative number of

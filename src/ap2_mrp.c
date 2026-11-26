@@ -1145,12 +1145,13 @@ static void mrp_emit_remote_command(
 /* A set-position target beyond this (about 115 days) is not a real position. */
 #define MRP_SEEK_POSITION_MAX_SECONDS 1e7
 
-/* A set-position command without a usable position is logged whole up to this
- * size: the position key sits well past the first bytes of the payload. */
-#define MRP_SEEK_LOG_HEX_MAX 512
+/* A command without a usable option is logged whole up to this size: the
+ * option key sits well past the first bytes of the payload. */
+#define MRP_COMMAND_LOG_HEX_MAX 512
 
-/* Key a skip command carries its interval under, in seconds as a real; confirmed
- * on a HomePod (AudioAccessory11,1, audioOS 27.2.1) asked by Siri. */
+/* The key a skip ("skpf", "skpb") command carries its interval under, in
+ * seconds as a real. Confirmed on a HomePod (AudioAccessory11,1, audioOS
+ * 27.2.1) and an Apple TV 4K (AppleTV18,1, tvOS 27.2.1), both asked by Siri. */
 #define MRP_SKIP_INTERVAL_KEY "kMRMediaRemoteOptionSkipInterval"
 
 /* Write the leading bytes of `body` that fit `hex` (2 characters each, plus the
@@ -1165,6 +1166,17 @@ static int mrp_hex_prefix(char *hex, size_t hex_size,
         snprintf(hex + i * 2, hex_size - (size_t)i * 2, "%02x", body[i]);
     if (hex_size > 0) hex[shown * 2] = '\0';
     return shown;
+}
+
+/* Warn about a command without a usable option and show its payload: a
+ * receiver nobody has tested may send it differently. */
+static void mrp_warn_unusable_command(const char *problem,
+                                      const uint8_t *body, int body_len)
+{
+    char hex[MRP_COMMAND_LOG_HEX_MAX * 2 + 1];
+    int shown = mrp_hex_prefix(hex, sizeof(hex), body, body_len);
+    LOG_WARN("[MRP] %s content_length=%d hex=%s%s", problem, body_len, hex,
+             body_len > shown ? "..." : "");
 }
 
 static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
@@ -1202,33 +1214,27 @@ static bool mrp_parse_remote_command(const uint8_t *body, int body_len,
                                     MRP_SEEK_POSITION_KEY, &seconds) ||
             !isfinite(seconds) || seconds < 0 ||
             seconds > MRP_SEEK_POSITION_MAX_SECONDS) {
-            /* a receiver nobody has tested may send it differently: show the
-             * payload */
-            char hex[MRP_SEEK_LOG_HEX_MAX * 2 + 1];
-            int shown = mrp_hex_prefix(hex, sizeof(hex), body, body_len);
-            LOG_WARN("[MRP] set-position command without a usable position "
-                     "content_length=%d hex=%s%s", body_len, hex,
-                     body_len > shown ? "..." : "");
+            mrp_warn_unusable_command(
+                "set-position command without a usable position",
+                body, body_len);
             return false;
         }
         *command = AP2_REMOTE_COMMAND_SEEK;
         *value_ms = (int64_t)(seconds * 1000.0 + 0.5);
-    } else if (strcmp(value, "skpf") == 0) {
-        /* Skip forward by an interval (Siri: "skip 30 seconds"). */
+    } else if (strcmp(value, "skpf") == 0 || strcmp(value, "skpb") == 0) {
+        /* Siri on the receiver: skip forward or back by an interval. */
         double seconds = -1;
         if (!ap2_bplist_find_number(body, (size_t)body_len,
                                     MRP_SKIP_INTERVAL_KEY, &seconds) ||
             !isfinite(seconds) || seconds <= 0 ||
             seconds > MRP_SEEK_POSITION_MAX_SECONDS) {
-            char hex[MRP_SEEK_LOG_HEX_MAX * 2 + 1];
-            int shown = mrp_hex_prefix(hex, sizeof(hex), body, body_len);
-            LOG_WARN("[MRP] skip command without a usable interval "
-                     "content_length=%d hex=%s%s", body_len, hex,
-                     body_len > shown ? "..." : "");
+            mrp_warn_unusable_command(
+                "skip command without a usable interval", body, body_len);
             return false;
         }
+        int64_t interval_ms = (int64_t)(seconds * 1000.0 + 0.5);
         *command = AP2_REMOTE_COMMAND_SKIP;
-        *value_ms = (int64_t)(seconds * 1000.0 + 0.5);
+        *value_ms = strcmp(value, "skpb") == 0 ? -interval_ms : interval_ms;
     } else
         return false;
     return true;
